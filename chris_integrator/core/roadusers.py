@@ -234,9 +234,15 @@ def from_lights(msg, calib, sensor="cam", cfg=PROJ_CFG):
         label = LABELS.get(o["cls"], o["cls"])
         p = project(o, cam, cfg)
         clip = o.get("clip") or ""
-        out["objects"].append(dict(p, **{"class": label, "class_conf": o.get("score"), "det_class": o["cls"],
-                                         "rider": bool(o.get("rider")), "clip": clip, "box": o["box"],
-                                         "weight": cfg["clipped_weight"] if clip else 1.0}))
+        q = dict(p, **{"class": label, "class_conf": o.get("score"), "det_class": o["cls"],
+                       "rider": bool(o.get("rider")), "clip": clip, "box": o["box"],
+                       "weight": cfg["clipped_weight"] if clip else 1.0})
+        # how fast the object's image grows, measured by the detector on the pixels themselves (1/s over
+        # `scale_dt_s`): a range rate without the box edges' jitter
+        if fin(o.get("scale_rate")) and fin(o.get("scale_rate_std")) and o["scale_rate_std"] > 0.0:
+            q["scale_rate"], q["scale_rate_std"] = float(o["scale_rate"]), float(o["scale_rate_std"])
+            q["scale_dt_s"] = float(o["scale_dt_s"]) if fin(o.get("scale_dt_s")) and o["scale_dt_s"] > 0.0 else 0.0
+        out["objects"].append(q)
     return out
 
 

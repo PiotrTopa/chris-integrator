@@ -167,6 +167,7 @@ class Radar:
                                  "R": np.array([sa * sa, sb * sb, sh * sh]), "attrs": at, "w": wa})
                 else:
                     dets.append({"kind": "rb", "z": np.array([ang, b]), "R": np.array([sa * sa, sb * sb]), "attrs": at, "w": wa})
+                self._scale_rate(dets[-1], o)
             elif "b" in clip:
                 top = None
                 if box and "t" not in clip and self.cam is not None and hpx:
@@ -177,9 +178,10 @@ class Radar:
                     dets.append({"kind": "bt", "z": np.array([b, top]), "R": np.array([sb * sb, st * st]), "attrs": at, "w": wa})
                 else:
                     dets.append({"kind": "b", "z": np.array([b]), "R": np.array([sb * sb]), "attrs": at, "w": wa})
+                self._scale_rate(dets[-1], o)
         # the detector's size limit in this view, as its boxes show it: the smallest seen, forgotten slowly
         key = round(cover["ground_min_m"]) if cover else None
-        hs = [math.exp(d["z"][2]) for d in dets if d["kind"] == "rbh"]
+        hs = [math.exp(d["z"][2]) for d in dets if d["kind"] in ("rbh", "rbhs")]
         hm = self.h_min.get(key)
         if hs:
             hm = min(hs) if hm is None else min(min(hs), hm * 1.002)
@@ -187,6 +189,18 @@ class Radar:
         elif hm is None and self.h_min:
             hm = float("inf")                            # a box feed, but this view has not shown a box yet
         self._push((ts / NS, msg.get("sensor") or "cam", CameraBoxes(cover, c, f, hc, hm), dets))
+
+    def _scale_rate(self, det, o):
+        """The detector's own measurement of how fast the object's image grows (`scale_rate`, 1/s, with its
+        1 sigma and baseline) becomes one more row of the detection (kind + "s")."""
+        r, sd = o.get("scale_rate"), o.get("scale_rate_std")
+        if not (_fin(r) and _fin(sd) and sd > 0.0) or not self.camera_cfg["use_scale_rate"]:
+            return
+        sd = max(float(sd), self.camera_cfg["scale_rate_floor"])
+        det["kind"] += "s"
+        det["z"] = np.append(det["z"], float(r))
+        det["R"] = np.append(det["R"], sd * sd)
+        det["sdt"] = round(float(o.get("scale_dt_s") or 0.0), 3)
 
     def on_calib(self, msg):
         """The camera's calibration message: the focal length that turns a box height into a size at a distance."""

@@ -81,6 +81,11 @@ class Sensor:
         return None
 
 
+def base(kind):
+    """A detection kind without the mark of an extra scale-rate row ("rbhs" -> "rbh")."""
+    return kind[:-1] if kind and kind.endswith("s") else kind
+
+
 def _rel(x, pose):
     dx, dy = x[PX] - pose[0], x[PY] - pose[1]
     r = max(math.hypot(dx, dy), 0.5)
@@ -152,8 +157,11 @@ class CameraBoxes(Sensor):
         self.clutter = self.extraneous / self.vol["rb"]
 
     def density(self, det):
-        d = self.extraneous / self.vol[det["kind"]]
-        if det["kind"] != "rbh":
+        k = base(det["kind"])
+        d = self.extraneous / self.vol[k]
+        if k != det["kind"]:
+            d /= self.cfg["scale_rate_span"]             # one more row: scale rates of unknown things, anywhere
+        if k != "rbh":
             return d
         # objects are mostly born where they become detectable: as small boxes. A part appears anywhere (from
         # behind another, from the side): uniform over the heights
@@ -172,11 +180,39 @@ class CameraBoxes(Sensor):
         return p * min(1.0, max(self.cfg["p_small"], ramp))
 
     def rows(self, det):
-        k = det["kind"] if det else "rb"
-        return (0,) if k in ("b", "bt") else (1,)
+        k = base(det["kind"]) if det else "rb"
+        return (0,) if k in ("b", "bt") else () if k == "" else (1,)
+
+    def _scale_row(self, x, pose, det):
+        """How fast the object's image grows: the detector's measurement on the pixels of two frames
+        `sdt` apart, (ln size now - ln size then) / sdt. A thing of fixed size seen from depth d along the
+        camera's axis has size ~ 1 / d, so this is ln(d_then / d_now) / sdt, with d_then = d_now - d' sdt for the
+        relative motion now: no size, no road, no pitch in it. For a standing thing it is the car's own speed
+        over the distance: a range. Returns (value, Jacobian row)."""
+        dx, dy = x[PX] - pose[0], x[PY] - pose[1]
+        c, s_ = math.cos(pose[2]), math.sin(pose[2])
+        depth = max(c * dx + s_ * dy, 0.5)
+        w = pose[5] if len(pose) > 5 else 0.0
+        rate = c * (x[VX] - pose[3]) + s_ * (x[VY] - pose[4]) + w * (-s_ * dx + c * dy)     # d(depth)/dt
+        dt = max(float(det.get("sdt") or 0.0), 1e-3)
+        u = max(1.0 - rate * dt / depth, 0.05)
+        row = np.zeros(N)
+        row[VX], row[VY] = -c / (u * depth), -s_ / (u * depth)
+        row[PX] = (w * s_ / depth + rate * c / (depth * depth)) / u
+        row[PY] = (-w * c / depth + rate * s_ / (depth * depth)) / u
+        return math.log(u) / dt, row
 
     def h(self, x, pose, det=None):
         k = det["kind"] if det else "rb"
+        if k.endswith("s"):                               # the base kind's rows, then the scale rate
+            zs, rs = self._scale_row(x, pose, det)
+            if k == "s":
+                return np.array([zs]), rs.reshape(1, N)
+            z0, H0 = self._h(x, pose, k[:-1])
+            return np.append(z0, zs), np.vstack([H0, rs])
+        return self._h(x, pose, k)
+
+    def _h(self, x, pose, k):
         dx, dy, r = _rel(x, pose)
         brow = np.zeros(N)
         brow[PX], brow[PY] = -dy / (r * r), dx / (r * r)
@@ -216,13 +252,14 @@ class CameraBoxes(Sensor):
         return self.p_d
 
     def takes(self, det, xc, yc):
-        if det["kind"] not in ("b", "bt") or self.cover is None:
+        if base(det["kind"]) not in ("b", "bt") or self.cover is None:
             return True
         # a bearing alone fits everything on its ray: it holds only an object near enough to be cut at the bottom
         return math.hypot(xc, yc) <= self.cfg["near_margin"] * self.cover["ground_min_m"]
 
     def start(self, det, pose, label):
-        if det["kind"] in ("b", "bt"):
+        kd = base(det["kind"])
+        if kd in ("b", "bt", ""):
             return None
         k = kin(label)
         hc = self.hc
@@ -238,7 +275,7 @@ class CameraBoxes(Sensor):
         J = (rg * rg + hc * hc) / hc                      # distance per angle
         var_g = J * J * (det["R"][0] + p_dp)
         r, var_r, wg, rh = rg, var_g, 1.0, 0.0
-        if det["kind"] == "rbh":
+        if kd == "rbh":
             # a second range, independent of the first: the object's own size
             rh = math.exp(self.logf + x0[LH] - float(det["z"][2])) / max(math.cos(b), 0.3)
             var_h = rh * rh * (k["h_rel"] ** 2 + det["R"][2])
@@ -268,6 +305,8 @@ CAMERA_CFG = dict(
     born_small=0.7, born_small_scale=0.5,     # share of new objects that appear at the smallest box size (log scale)
     h_full_rel=2.0,              # a box this many times the smallest is detected as well as any
     p_small=0.1,                 # ... and one at the limit this much of that
+    use_scale_rate=True, scale_rate_floor=0.01,   # (1/s) the detector's stated spread is not believed below this
+    scale_rate_span=1.5,         # (1/s) scale rates of things not known yet lie within about this much
     max_range_m=80.0,
     near_margin=1.25,            # the bearing-only zone reaches this far beyond the view's first ground point
     cam_height_m=1.22,           # until the calibration message says

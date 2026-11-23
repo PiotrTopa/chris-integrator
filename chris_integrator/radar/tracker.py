@@ -45,7 +45,7 @@ from . import models as M
 from .models import CA, CV, N, PX, PY, STAND, VX, VY
 
 CFG = dict(
-    gate={1: 9.0, 2: 13.8, 3: 16.3},          # chi-square gates (99.7 %) by measurement dimension: the first sieve
+    gate={1: 9.0, 2: 13.8, 3: 16.3, 4: 18.5},          # chi-square gates (99.7 %) by measurement dimension: the first sieve
     new_rate_gain=0.1,           # how fast the count of unexplained detections per scan is followed
     # where detections that no object explained have been turning up lately (a map of them, in the sensor's
     # measurement space): there a detection is more probably one more of those than a known object's
@@ -306,7 +306,7 @@ class Tracker:
         """Unexplained detections per scan and unit of measurement space around this detection, from the map:
         (total, {object id: the part that is that object's own first detection})."""
         mem = self.unexplained.get(src)
-        k = d.get("kind")
+        k = (d.get("kind") or "").rstrip("s")
         if not mem or k not in ("rb", "rbh"):
             return 0.0, {}
         n = len(k)                                        # "rb": 2 rows, "rbh": 3
@@ -450,8 +450,8 @@ class Tracker:
             veh = np.array([0 if l is None else (1 if l in M.VEHICLES else -1) for l in labs])
             wid = np.array([float(d.get("w") or 0.0) for d in dets])
             kinds = {}                                   # a sensor's detections may be of several kinds
-            for jj, d in enumerate(dets):
-                kinds.setdefault(d.get("kind"), []).append(jj)
+            for jj, d in enumerate(dets):                # (a scale rate's baseline is part of what is predicted)
+                kinds.setdefault((d.get("kind"), d.get("sdt")), []).append(jj)
             groups = []
             for k, J in kinds.items():
                 J = np.array(J)
@@ -616,7 +616,9 @@ class Tracker:
             o.history.append((t, float(x0[PX]), float(x0[PY]), 0.0, 0.0))
             if d.get("w"):
                 o.last_box = (t, src, d["w"])
-            mem.append((t, d.get("kind"), np.asarray(d["z"], float), o.id))
+            if (d.get("kind") or "").endswith("s"):      # its first box already says how fast it comes nearer
+                self._first_rate(o, d, sensor, pose)
+            mem.append((t, (d.get("kind") or "").rstrip("s"), np.asarray(d["z"], float), o.id))
             self.objects.append(o)
             st["started"] += 1
         r0 = self.new_rate.get(src, 0.0)
@@ -635,7 +637,7 @@ class Tracker:
         v, w = [], []
         for i, j in pairs:
             o, d = objs[i], dets[j]
-            if d.get("kind") not in ("rb", "rbh") or o.state not in ("confirmed", "coast") or o.hits < 4 \
+            if (d.get("kind") or "").rstrip("s") not in ("rb", "rbh") or o.state not in ("confirmed", "coast") or o.hits < 4 \
                     or pair[i, j] < c["common_pair"]:
                 continue
             zp, H = sensor.h(o.x, pose, d)
@@ -658,10 +660,43 @@ class Tracker:
         sensor.bias, sensor.bias_var = b[0], b[1]
         left = jit * (1.0 - jit / tot)                   # what is still not known of this scan's own pitch
         for j, d in enumerate(dets):
-            if d.get("kind") in ("rb", "rbh"):
+            if (d.get("kind") or "").rstrip("s") in ("rb", "rbh"):
                 d["z"] = np.array(d["z"], float)
                 d["z"][0] -= fast
                 Rs[j][0, 0] = max(Rs[j][0, 0] - jit + left, 0.25 * Rs[j][0, 0])
+
+    def _first_rate(self, o, d, sensor, pose):
+        """A new object's first box came with a scale rate: how fast its image grows. That is its speed along
+        the line of sight over its distance, measured, before a second box exists. Every hypothesis takes it
+        (for "it stands" it is a range: the car's own speed over the distance), and how well each had expected
+        it weighs them at once: a thing that grows as the car's speed says stands; one that does not grow
+        drives with the traffic."""
+        c = self.cfg
+        z = float(d["z"][-1])
+        R = float(d["R"][-1])
+        sd = {"kind": "s", "sdt": d.get("sdt")}
+        like = np.zeros(len(M.MODELS))
+        for j in range(len(M.MODELS) + 1):
+            x, P = (o.xf, o.Pf) if j == len(M.MODELS) else (o.xs[j], o.Ps[j])
+            zp, H = sensor.h(x, pose, sd)
+            S = float(H[0] @ P @ H[0]) + R
+            nu = z - float(zp[0])
+            K = P @ H[0] / S
+            xn = x + K * nu
+            Pn = P - np.outer(K, K) * S
+            Pn = 0.5 * (Pn + Pn.T)
+            if j == len(M.MODELS):
+                o.xf, o.Pf = xn, Pn
+                break
+            like[j] = math.exp(-0.5 * min(nu * nu / S, 400.0)) / math.sqrt(2.0 * math.pi * S)
+            o.xs[j], o.Ps[j] = xn, Pn
+            if j == STAND:
+                o.xs[j][VX:VY + 3] = 0.0
+        w = o.mu * like
+        if float(w.sum()) > 0.0:
+            o.mu = np.clip(w / float(w.sum()), c["mu_floor"], None)
+            o.mu /= o.mu.sum()
+        o.x, o.P = M.combine(o.xs, o.Ps, o.mu)
 
     @staticmethod
     def _compatible(o, det):
@@ -748,7 +783,7 @@ class Tracker:
         # own speed keeps its bearing exactly like a standing one). So the weighing starts once the object has
         # been seen `mu_hold_hits` times (two-point initialisation of the velocity), unless the sensor measures
         # speed itself. No hypothesis is ever ruled out for good (`mu_floor`): the next seconds may bring it back.
-        if tot > 0.0 and (sensor.velocity or o.hits >= c["mu_hold_hits"]):
+        if tot > 0.0 and (sensor.velocity or o.hits >= c["mu_hold_hits"] or (d.get("kind") or "").endswith("s")):
             o.mu = np.clip(w / float(w.sum()), c["mu_floor"], None)
             o.mu /= o.mu.sum()
         elif tot > 0.0 and float(w[1:].sum()) > 0.0:
