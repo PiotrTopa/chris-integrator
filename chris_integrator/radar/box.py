@@ -289,6 +289,18 @@ class Radar:
             return s, 0.0, 0.0
         return math.sin(k * s) / k, (1.0 - math.cos(k * s)) / k, k * s
 
+    @staticmethod
+    def _class(o, T):
+        """classvote.result(o.vote, T): it changes with a vote only (kept on the object until the next one) and
+        lapses with its age."""
+        cls = o.cls
+        if cls is None:
+            cls = o.cls = (classvote.result(o.vote),)
+        cls = cls[0]
+        if cls is not None and o.vote.get("t") is not None and max(0.0, T - o.vote["t"]) > classvote.EXPIRE_S:
+            return None
+        return cls
+
     def _ncfg(self):
         c = self.cfg
         return (c["corridor_m"], c["corridor_rel"], c["path_max_m"], c["ttc_min_closing"], c["in_path_sigma"],
@@ -378,13 +390,20 @@ class Radar:
         out = []
         shown = [o for o in tr.objects if o.state != "tentative" or c["tentative"]]
         if _NR is not None:
+            # the objects of the message in one native call: numbers, flags with their hysteresis, the dicts
             hz = (0.0,) + tuple(c["predict_s"])
             kin = [M._KIN4.get(o.label) or M._KIN4[None] for o in shown]
-            nums = _NR.radar_frame(tr.store.a, [o.slot for o in shown], [[T + h - o.t for h in hz] for o in shown], kin,
-                                   M._native_par(tr.mcfg), (X, Y, psi), (v_ego, w_ego), self._ncfg(),
-                                   tuple(c["predict_s"]), self.path[0] if self.path is not None else None,
-                                   self.path[1] if self.path is not None else None,
-                                   [0.0 if o.state == "tentative" else 1.0 for o in shown], [k[3] for k in kin])
+            out = _NR.radar_frame(tr.store.a, [o.slot for o in shown], [[T + h - o.t for h in hz] for o in shown], kin,
+                                  M._native_par(tr.mcfg), (X, Y, psi), (v_ego, w_ego), self._ncfg(),
+                                  tuple(c["predict_s"]), self.path[0] if self.path is not None else None,
+                                  self.path[1] if self.path is not None else None,
+                                  [0.0 if o.state == "tentative" else 1.0 for o in shown], [k[3] for k in kin],
+                                  [(o.id, o.state, o.logodds, o.t0, o.hits, o.sources, o.last_seen, o.verdict, o.flags,
+                                    o.label, o.range_t, o.consistency, o.pred_err, self._class(o, T)) for o in shown],
+                                  self._in_since, self._threat_since, T,
+                                  (c["in_path_hold_s"], c["threat_p"], c["threat_range_s"], c["threat_hold_s"],
+                                   c["parked_offset_m"]))
+            shown = ()
         else:
             nums = self._numbers(T, shown, X, Y, psi, v_ego, w_ego)
         for n, o in enumerate(shown):
@@ -419,13 +438,7 @@ class Radar:
                 flags.add("parked")
             if along is not None:
                 flags.add("with_traffic")
-            # the class vote's result changes with a vote only, and lapses with its age
-            cls = o.cls
-            if cls is None:
-                cls = o.cls = (classvote.result(o.vote),)
-            cls = cls[0]
-            if cls is not None and o.vote.get("t") is not None and max(0.0, T - o.vote["t"]) > classvote.EXPIRE_S:
-                cls = None
+            cls = self._class(o, T)
             out.append({
                 "id": o.id, "state": o.state, "exist": round(o.exist, 3), "age_s": round(T - o.t0, 2), "hits": o.hits,
                 "sources": sorted(o.sources), "seen": {s: round(max(0.0, T - t), 3) for s, t in o.last_seen.items()},

@@ -4213,8 +4213,19 @@ static void r_path_point(const RPath *p, double s, double *out)
     out[2] = k * s;
 }
 
-static PyObject *rkey[12];
-static const char *const RKEYS[12] = {"t_s", "x_m", "y_m", "std_m", "stand", "cv", "ca", NULL};
+/* the keys of the message's object (box.py), interned once */
+enum { RK_TS, RK_XM, RK_YM, RK_STDM, RK_STAND, RK_CV, RK_CA, RK_ID, RK_STATE, RK_EXIST, RK_AGE, RK_HITS, RK_SOURCES,
+       RK_SEEN, RK_VX, RK_VY, RK_AX, RK_AY, RK_SPEED, RK_HEADING, RK_VREL, RK_STD, RK_MOTION, RK_PST, RK_MODELS,
+       RK_CLASS, RK_FLAGS, RK_POFF, RK_TTC, RK_PTHR, RK_CONS, RK_PERR, RK_ANG, RK_PRED, RK_PPATH, RK_LABEL, RK_CONF,
+       RK_SOURCE, RK_VOTES, RK_ON_PATH, RK_IN_PATH, RK_THREAT, RK_PARKED, RK_WITH, RK_STATIONARY, RK_HUMAN, RK_BIKE,
+       RK_MOTORBIKE, RK_N };
+static PyObject *rkey[RK_N + 1];
+static const char *const RKEYS[RK_N + 1] = {
+    "t_s", "x_m", "y_m", "std_m", "stand", "cv", "ca", "id", "state", "exist", "age_s", "hits", "sources", "seen",
+    "vx_mps", "vy_mps", "ax_mps2", "ay_mps2", "speed_mps", "heading_rad", "v_rel_mps", "std", "motion",
+    "p_stationary", "models", "class", "flags", "path_offset_m", "ttc_s", "p_threat", "consistency", "pred_err_m",
+    "angle_offset_deg", "predict", "predict_path", "label", "confidence", "source", "votes", "on_path", "in_path",
+    "threat", "parked", "with_traffic", "stationary", "human", "bike", "motorbike", NULL};
 
 static int rkeys_init(void)
 {
@@ -4234,22 +4245,216 @@ static int dset(PyObject *d, int key, PyObject *v)
     return r;
 }
 
+/* d[rkey[key]] = v (borrowed); -1 on error */
+static int dput(PyObject *d, int key, PyObject *v)
+{
+    return v == NULL ? -1 : PyDict_SetItem(d, rkey[key], v);
+}
+
+/* round(x, n) of a number object, or None for None */
+static PyObject *round_or_none(PyObject *o, int n)
+{
+    if (o == Py_None) {
+        Py_INCREF(Py_None);
+        return Py_None;
+    }
+    double v = PyFloat_AsDouble(o);
+    if (v == -1.0 && PyErr_Occurred())
+        return NULL;
+    return round_obj(v, n);
+}
+
+/* a sorted list of a set's / dict's items */
+static PyObject *sorted_list(PyObject *o)
+{
+    PyObject *l = PySequence_List(o);
+    if (l != NULL && PyList_Sort(l) < 0)
+        Py_CLEAR(l);
+    return l;
+}
+
+#define RFLAGS 5                 /* in_path_hold_s, threat_p, threat_range_s, threat_hold_s, parked_offset_m */
+#define RATTR 14                 /* id, state, logodds, t0, hits, sources, last_seen, verdict, flags, label, range_t,
+                                    consistency, pred_err, class (classvote.result or None) */
+
+/* the message's object (box.py `Radar.frame`) from radar_frame's numbers t and the object's attributes a; the
+ * flags with their hysteresis (hin, hthr: the box's _in_since, _threat_since, updated here) */
+static PyObject *r_obj_dict(PyObject *t, PyObject *a, PyObject *hin, PyObject *hthr, double T, const double *fc)
+{
+    if (!PyTuple_Check(a) || PyTuple_Size(a) != RATTR) {
+        PyErr_SetString(PyExc_TypeError, "radar_frame: an object's attributes are a tuple of 14");
+        return NULL;
+    }
+#define TI(o, k) PyTuple_GetItem(o, k)
+    PyObject *id = TI(a, 0), *verdict = TI(a, 7), *label = TI(a, 9), *cls = TI(a, 13), *along = TI(t, 20);
+    double logodds = PyFloat_AsDouble(TI(a, 2)), t0 = PyFloat_AsDouble(TI(a, 3)), range_t = PyFloat_AsDouble(TI(a, 10));
+    double off = PyFloat_AsDouble(TI(t, 14)), p_thr = PyFloat_AsDouble(TI(t, 18));
+    int on = TI(t, 16) == Py_True, sure_in = TI(t, 17) == Py_True;
+    if (PyErr_Occurred())
+        return NULL;
+    PyObject *d = NULL, *flags = NULL, *fl = NULL, *tmp = NULL, *Tobj = NULL;
+    int stationary = PyObject_RichCompareBool(verdict, rkey[RK_STATIONARY], Py_EQ);
+    if (stationary < 0 || (flags = PySet_New(TI(a, 8))) == NULL || (Tobj = PyFloat_FromDouble(T)) == NULL)
+        goto fail;
+    if (on && PySet_Add(flags, rkey[RK_ON_PATH]) < 0)
+        goto fail;
+    /* "it stands in the way": inside the corridor beyond the place's own uncertainty, and stayed there */
+    PyObject *hold = PyDict_GetItemWithError(hin, id);
+    if (hold == NULL && PyErr_Occurred())
+        goto fail;
+    if (stationary && sure_in) {
+        double hv = T;
+        if (hold == NULL) {
+            if (PyDict_SetItem(hin, id, Tobj) < 0)
+                goto fail;
+        } else
+            hv = PyFloat_AsDouble(hold);
+        if (T - hv >= fc[0] && PySet_Add(flags, rkey[RK_IN_PATH]) < 0)
+            goto fail;
+    } else if (hold != NULL && PyDict_DelItem(hin, id) < 0)
+        goto fail;
+    /* a threat is not started on an object whose distance has lately come from cut boxes only */
+    PyObject *th0 = PyDict_GetItemWithError(hthr, id);
+    if (th0 == NULL && PyErr_Occurred())
+        goto fail;
+    if (p_thr >= fc[1] && (th0 != NULL || T - range_t <= fc[2])) {
+        double tv = T;
+        if (th0 == NULL) {
+            if (PyDict_SetItem(hthr, id, Tobj) < 0)
+                goto fail;
+        } else
+            tv = PyFloat_AsDouble(th0);
+        if (T - tv >= fc[3] && PySet_Add(flags, rkey[RK_THREAT]) < 0)
+            goto fail;
+    } else if (th0 != NULL && PyDict_DelItem(hthr, id) < 0)
+        goto fail;
+    if (stationary && !on && fabs(off) > fc[4]) {
+        int person = 0;
+        for (int k = RK_HUMAN; k <= RK_MOTORBIKE && !person; k++) {
+            int e = PyObject_RichCompareBool(label, rkey[k], Py_EQ);
+            if (e < 0)
+                goto fail;
+            person = e;
+        }
+        if (!person && PySet_Add(flags, rkey[RK_PARKED]) < 0)
+            goto fail;
+    }
+    if (along != Py_None && PySet_Add(flags, rkey[RK_WITH]) < 0)
+        goto fail;
+    if ((fl = sorted_list(flags)) == NULL || (d = PyDict_New()) == NULL)
+        goto fail;
+    if (dput(d, RK_ID, id) < 0 || dput(d, RK_STATE, TI(a, 1)) < 0)
+        goto fail;
+    tmp = round_obj(1.0 / (1.0 + exp(-logodds)), 3);
+    if (dput(d, RK_EXIST, tmp) < 0)
+        goto fail;
+    Py_CLEAR(tmp);
+    tmp = round_obj(T - t0, 2);
+    if (dput(d, RK_AGE, tmp) < 0 || dput(d, RK_HITS, TI(a, 4)) < 0)
+        goto fail;
+    Py_CLEAR(tmp);
+    tmp = sorted_list(TI(a, 5));
+    if (dput(d, RK_SOURCES, tmp) < 0)
+        goto fail;
+    Py_CLEAR(tmp);
+    {
+        PyObject *seen = PyDict_New(), *k, *v;
+        Py_ssize_t pos = 0;
+        if (seen == NULL)
+            goto fail;
+        tmp = seen;
+        while (PyDict_Next(TI(a, 6), &pos, &k, &v)) {
+            double tv = PyFloat_AsDouble(v);
+            if (tv == -1.0 && PyErr_Occurred())
+                goto fail;
+            PyObject *r = round_obj(pymax(0.0, T - tv), 3);
+            if (r == NULL || PyDict_SetItem(seen, k, r) < 0) {
+                Py_XDECREF(r);
+                goto fail;
+            }
+            Py_DECREF(r);
+        }
+        if (dput(d, RK_SEEN, seen) < 0)
+            goto fail;
+        Py_CLEAR(tmp);
+    }
+    static const int num_keys[9] = {RK_XM, RK_YM, RK_VX, RK_VY, RK_AX, RK_AY, RK_SPEED, RK_HEADING, RK_VREL};
+    for (int k = 0; k < 9; k++)
+        if (dput(d, num_keys[k], TI(t, k)) < 0)
+            goto fail;
+    if (dput(d, RK_STD, TI(t, 9)) < 0 || dput(d, RK_MOTION, verdict) < 0 || dput(d, RK_PST, TI(t, 11)) < 0 ||
+        dput(d, RK_MODELS, TI(t, 10)) < 0)
+        goto fail;
+    if (cls == Py_None) {
+        if (dput(d, RK_CLASS, Py_None) < 0)
+            goto fail;
+    } else {
+        PyObject *c = PyDict_New();
+        if (c == NULL)
+            goto fail;
+        tmp = c;
+        for (int k = RK_LABEL; k <= RK_VOTES; k++) {
+            PyObject *v = PyObject_GetItem(cls, rkey[k]);
+            if (v == NULL || PyDict_SetItem(c, rkey[k], v) < 0) {
+                Py_XDECREF(v);
+                goto fail;
+            }
+            Py_DECREF(v);
+        }
+        if (dput(d, RK_CLASS, c) < 0)
+            goto fail;
+        Py_CLEAR(tmp);
+    }
+    if (dput(d, RK_FLAGS, fl) < 0 || dput(d, RK_POFF, TI(t, 15)) < 0 || dput(d, RK_TTC, TI(t, 19)) < 0)
+        goto fail;
+    tmp = round_obj(p_thr, 3);
+    if (dput(d, RK_PTHR, tmp) < 0)
+        goto fail;
+    Py_CLEAR(tmp);
+    tmp = round_or_none(TI(a, 11), 2);
+    if (dput(d, RK_CONS, tmp) < 0)
+        goto fail;
+    Py_CLEAR(tmp);
+    tmp = round_or_none(TI(a, 12), 2);
+    if (dput(d, RK_PERR, tmp) < 0)
+        goto fail;
+    Py_CLEAR(tmp);
+    if (dput(d, RK_ANG, TI(t, 12)) < 0 || dput(d, RK_PRED, TI(t, 13)) < 0 || dput(d, RK_PPATH, along) < 0)
+        goto fail;
+#undef TI
+    Py_DECREF(flags);
+    Py_DECREF(fl);
+    Py_DECREF(Tobj);
+    return d;
+fail:
+    Py_XDECREF(d);
+    Py_XDECREF(flags);
+    Py_XDECREF(fl);
+    Py_XDECREF(tmp);
+    Py_XDECREF(Tobj);
+    return NULL;
+}
+
 #define RFCFG 12                 /* corridor_m, corridor_rel, path_max_m, ttc_min_closing, in_path_sigma,
                                     in_path_slack_m, threat_ttc_s, threat_min_mps, with_heading_deg, with_speed
                                     (low, high), with_min_mps */
 
-/* radar_frame(S, rows, dt, kin, par, pose, ego, cfg, horizons, path_x | None, path_y | None, listed, v_still)
+/* radar_frame(S, rows, dt, kin, par, pose, ego, cfg, horizons, path_x | None, path_y | None, listed, v_still
+ *             [, attrs, in_since, threat_since, T, flag_cfg])
  *   -> [(x_m, y_m, vx_mps, vy_mps, ax_mps2, ay_mps2, speed_mps, heading_rad, v_rel_mps, std, models,
  *        p_stationary, angle_offset_deg, predict, offset, path_offset_m, on, sure_in, p_threat, ttc_s, along)]
  *   dt: (B, 1 + H) the time from each object's own to the message's and to each horizon after it;
  *   pose: (X, Y, psi) of the car at the message's time; ego: (v, w); horizons: H numbers (predict_s);
  *   listed: per object 1 if it is not tentative (a threat is judged for those only).
- * Rounded as the message carries them; `offset` and `p_threat` also as they are (the flags' hysteresis needs them). */
+ * Rounded as the message carries them; `offset` and `p_threat` also as they are (the flags' hysteresis needs them).
+ * With attrs (one tuple of RATTR per object) the message's objects themselves, flags and all (r_obj_dict). */
 static PyObject *n_radar_frame(PyObject *self, PyObject *args)
 {
     PyObject *oS, *orows, *odt, *okin, *opar, *opose, *oego, *ocfg, *ohz, *opx, *opy, *olst, *ov0;
-    if (!PyArg_ParseTuple(args, "OOOOOOOOOOOOO", &oS, &orows, &odt, &okin, &opar, &opose, &oego, &ocfg, &ohz, &opx,
-                          &opy, &olst, &ov0))
+    PyObject *oattr = Py_None, *ohin = Py_None, *ohthr = Py_None, *ofc = Py_None;
+    double Tm = 0.0, fc[RFLAGS];
+    if (!PyArg_ParseTuple(args, "OOOOOOOOOOOOO|OOOdO", &oS, &orows, &odt, &okin, &opar, &opose, &oego, &ocfg, &ohz,
+                          &opx, &opy, &olst, &ov0, &oattr, &ohin, &ohthr, &Tm, &ofc))
         return NULL;
     PyObject *res = NULL;
     View vS, vpx, vpy;
@@ -4295,6 +4500,14 @@ static PyObject *n_radar_frame(PyObject *self, PyObject *args)
     if (rows_get(odt, B, (int)(1 + H), dts, "dt") < 0 || rows_get(okin, B, 4, kin, "kin") < 0 ||
         rows_get(olst, B, 1, lst, "listed") < 0 || rows_get(ov0, B, 1, v0, "v_still") < 0)
         goto done;
+    if (oattr != Py_None) {
+        if (!PyList_Check(oattr) || PyList_Size(oattr) != B || !PyDict_Check(ohin) || !PyDict_Check(ohthr)) {
+            PyErr_SetString(PyExc_TypeError, "radar_frame: attributes (a list, one per object) and two dicts");
+            goto done;
+        }
+        if (nums_get(ofc, RFLAGS, fc, "flag cfg") < 0)
+            goto done;
+    }
     res = PyList_New(B);
     if (res == NULL)
         goto done;
@@ -4456,6 +4669,13 @@ static PyObject *n_radar_frame(PyObject *self, PyObject *args)
         }
         if (bad)
             goto obj_fail;
+        if (oattr != Py_None) {
+            PyObject *od = r_obj_dict(t, PyList_GetItem(oattr, b), ohin, ohthr, Tm, fc);
+            Py_DECREF(t);
+            t = od;
+            if (t == NULL)
+                goto obj_fail;
+        }
         PyList_SetItem(res, b, t);
         continue;
     obj_fail:
