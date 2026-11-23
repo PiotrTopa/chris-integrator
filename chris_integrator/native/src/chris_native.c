@@ -11117,6 +11117,64 @@ done:
     return res;
 }
 
+/* One Gaussian (x, P) of a row: the prior of lh exchanged, in information form: Lambda += a e e^T, eta += b e (e the lh
+ * axis). Sherman-Morrison: P' = P - a P e e^T P / (1 + a p), x' = x + P e (b - a x_lh) / (1 + a p), p = P[lh, lh].
+ * a < 0 takes information out (a wider prior); it is held so that lh's variance grows at most fivefold (1 + a p
+ * >= 0.2, a and b scaled together: the same target mean). */
+static void r_lh_swap(double *x, double *P, double a, double b)
+{
+    double p = P[R_LH * RN + R_LH], d = 1.0 + a * p;
+    if (!(p > 0.0) || !isfinite(d))
+        return;
+    if (d < 0.2) {
+        double f = -0.8 / (a * p);
+        a *= f;
+        b *= f;
+        d = 0.2;
+    }
+    double Pe[RN], g = (b - a * x[R_LH]) / d;
+    for (int i = 0; i < RN; i++)
+        Pe[i] = P[i * RN + R_LH];
+    for (int i = 0; i < RN; i++) {
+        x[i] += Pe[i] * g;
+        for (int j = 0; j < RN; j++)
+            P[i * RN + j] -= a * Pe[i] * Pe[j] / d;
+    }
+}
+
+/* radar_lh_prior(S, rows, a, b) -> None
+ * The prior of an object's height (lh) its rows hold, exchanged for another (tracker.py `_size`): in every motion
+ * hypothesis and the free estimate of every row, the old prior's information out and the new one's in (a =
+ * 1/v1 - 1/v0, b = m1/v1 - m0/v0); the combination after. A standing hypothesis keeps no speed. */
+static PyObject *n_radar_lh_prior(PyObject *self, PyObject *args)
+{
+    PyObject *oS, *orows;
+    double a, b;
+    if (!PyArg_ParseTuple(args, "OOdd", &oS, &orows, &a, &b))
+        return NULL;
+    View vS;
+    vS.held = 0;
+    Py_ssize_t cap, n = 0, *rows = NULL;
+    PyObject *res = NULL;
+    if (store_get(oS, &vS, &cap) < 0 || (rows = idx_get(orows, cap, &n)) == NULL)
+        goto done;
+    for (Py_ssize_t k = 0; k < n; k++) {
+        double *row = (double *)vS.b.buf + rows[k] * RROW;
+        for (int j = 0; j < 3; j++)
+            r_lh_swap(row + RO_XS + j * RN, row + RO_PS + j * RNN, a, b);
+        for (int q = R_VX; q <= R_AY; q++)
+            row[RO_XS + R_STAND * RN + q] = 0.0;
+        r_lh_swap(row + RO_XF, row + RO_PF, a, b);
+        r_combine(row + RO_XS, row + RO_PS, row + RO_MU, row + RO_X, row + RO_P);
+    }
+    res = Py_None;
+    Py_INCREF(res);
+done:
+    PyMem_Free(rows);
+    view_drop(&vS);
+    return res;
+}
+
 /* radar_kbest(cost (n, m), k) -> [(cost, [column of each row])]: the k cheapest assignments of n rows to m >= n
  * columns in order (the hypotheses' ranked assignment, for tests and tools); a pair that may not be: >= 1e17 */
 static PyObject *n_radar_kbest(PyObject *self, PyObject *args)
@@ -11205,6 +11263,7 @@ static PyMethodDef methods[] = {
     {"radar_cells", n_radar_cells, METH_VARARGS, "an extended sensor's returns grouped into cells"},
     {"radar_groups", n_radar_groups, METH_VARARGS, "rows, queues and platoons among the objects"},
     {"radar_group_support", n_radar_group_support, METH_VARARGS, "what a standing row says about one member"},
+    {"radar_lh_prior", n_radar_lh_prior, METH_VARARGS, "an object's height prior exchanged in all its rows"},
     {"radar_kbest", n_radar_kbest, METH_VARARGS, "the k cheapest assignments in order (Murty)"},
     {"radar_frame", n_radar_frame, METH_VARARGS, "the output's per-object numbers (box.py Radar.frame)"},
     {"radar_life", n_radar_life, METH_VARARGS, "Tracker.manage's numbers: stillness, finiteness, out-of-view place"},

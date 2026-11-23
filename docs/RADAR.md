@@ -203,6 +203,15 @@ whole of what both sensors measure.
 * **Birth** (`r_extent_birth`): the kind's size (a car 4.5 x 1.8 m, 22 % and 10 %; a person 0.6 m; not known:
   as a car, wide open); the heading along the car's own for a vehicle, across it when the box shows it side-on,
   as sure as the box's aspect says which; no direction for a person.
+* **Height** (state `lh`, the box height's range): born with the height of the first box's label (`KIN`: a car
+  1.6 m +- 20 %, a truck 3.2 m +- 25 %, not known 1.7 m +- 35 %); from then on the prior follows the class vote
+  (`Tracker._size`, `models.size_prior`): the mixture of the kinds by their tallies, as one Gaussian with the spread
+  between the kinds, exchanged for the old one in every story of the object (`radar_lh_prior`: the old prior's
+  information out, the new one's in). The detector calls a van `truck` in two boxes of three and `car` in the
+  third; born from a `car` box it kept a car's height and, the box height being the strongest range beyond 40 m,
+  was read at the range a car of its box height would have: 0.6 of the truth, with a stated spread of a fifth of
+  the error (curve_parked: a parked van at 44 m for 75 m; parked_street 44 m for 68 m; adjacent: the overtaken
+  truck at 35-50 m for 120 m, then "moving on the path"). A car whose boxes are all `car` keeps its prior.
 * **Heading and motion** (`r_extent_step`): a leaf that moves (speed over 2.5 m/s, "it stands" under one half)
   takes its direction of travel as a measurement of its heading, as good as the velocity's direction is known;
   the first time, that also says which end is the front. A leaf that stands gets no such measurement and next to

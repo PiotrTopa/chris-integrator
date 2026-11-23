@@ -709,6 +709,28 @@ class Seeing(unittest.TestCase):
         self.assertLess(abs(end["wid"] - 1.8), 0.4)                        # its width is what the box shows
 
 
+class Sizes(unittest.TestCase):
+    def test_a_van_called_car_then_truck_is_ranged_by_the_mixture_of_the_two_heights(self):
+        """A van (2.1 x 2.6 m) standing 55 m ahead, its first box called `car`, then `truck` in two boxes of three
+        (the detector's confusion): the object is born with a car's height and would be read at the range a car of
+        that box height has (0.6 of the truth, the box height being the strongest range there: 37.6 m, 6.5 m
+        stated, 2.7 sigma off). The height prior follows the vote (tracker._size): within its stated uncertainty."""
+        rd = Radar()
+        cls = ["car", "truck", "truck", "car", "truck", "truck", "truck", "car", "truck", "truck"] * 3
+        k, m = 0, None
+        for i in range(120):
+            t = 20 + i * 0.05
+            rd.on_ego({"ts_mono_ns": int(t * NS), "speed_mps": 0.0, "yaw_rate_rps": 0.0})
+            if i % 4 == 0:
+                rd.on_road_users(cam_boxes(t, {"van": (55.0, 1.0, 2.1, 2.6, cls[k])}))
+                k += 1
+            m = rd.frame(int(t * NS))
+        (o,) = m["objects"]
+        self.assertEqual(o["class"]["label"], "truck")
+        self.assertLess(abs(o["x_m"] - 55.0), 1.5 * o["std"][0])
+        self.assertGreater(o["x_m"], 42.0)
+
+
 class PastAndStructure(unittest.TestCase):
     def test_the_past_is_smoothed_and_the_present_is_not_delayed(self):
         """A car ahead brakes from 14 to 6 m/s (microwave radar, noisy range rate). The smoothed velocity `vs` is of

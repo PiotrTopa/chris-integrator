@@ -225,7 +225,8 @@ class Obj:
     __slots__ = ("id", "h", "slot", "_xs", "_Ps", "_mu", "_xf", "_Pf", "_x", "_P", "_e", "_Pe", "_st", "_m", "t0", "state",
                  "sources", "last_seen", "vote", "history", "checks", "consistency", "pred_err", "n_checks", "nis",
                  "verdict", "coast_s", "velocity_seen", "merge_t", "flags", "last_cover", "dp0", "scores", "cls", "kin",
-                 "store", "pe", "pp", "nleaf", "in_map", "label_code", "hidden_t", "vs", "fs", "ps_lag", "grp", "grp_kind", "hist_t")
+                 "store", "pe", "pp", "nleaf", "in_map", "label_code", "hidden_t", "vs", "fs", "ps_lag", "grp", "grp_kind", "hist_t",
+                 "lhp")
     xs, Ps, mu, xf, Pf, x, P, e, Pe, st, m = (_view(k) for k, _ in _LAY)
     t = _meta(M_T)                   # the time its numbers are of
     logodds = _meta(M_L)             # that it exists, in the primary's story (`exist`: over all stories)
@@ -269,6 +270,7 @@ class Obj:
         self.hist_t = -1e18          # when its trajectory was last smoothed as a whole
         self.grp = None              # the group it is of (id), and the group's kind: row | queue | platoon
         self.grp_kind = None
+        self.lhp = None              # the prior of its height (lh) its numbers hold: (mean, variance) (Tracker._size)
 
     def bind(self, store, slot=None):
         """Point the object's arrays at its (primary) row of the state array."""
@@ -523,6 +525,8 @@ class Tracker:
             if sc is not None:
                 o.scores.append((src, sc))
             o.velocity_seen = sensor.velocity
+            kb = M.kinb(classvote.norm_label((d.get("attrs") or {}).get("class")))
+            o.lhp = (math.log(kb[7]), kb[8] * kb[8])     # the height prior it was born with (chris_native.c r_birth)
             self._vote(o, d, src, t)
             o.history.append((t, float(o._x[PX]), float(o._x[PY]), 0.0, 0.0))
             kb = (d.get("kind") or "").rstrip("s")
@@ -600,6 +604,26 @@ class Tracker:
             o.kin = M._KIN4.get(o.label) or M._KIN4[None]
             la = o.label
             o.label_code = 0.0 if la is None else (1.0 if la in M.VEHICLES else -1.0)
+            self._size(o)
+
+    def _size(self, o):
+        """The prior of the object's height follows what the class detector says of it (models.size_prior of the
+        vote's tallies). An object is born with the prior of its first box's label; when the boxes that follow
+        say another kind (a van is a `truck` in two boxes of three and a `car` in the third), the prior its numbers
+        hold is replaced by the new one in every story of it: the exact Gaussian exchange (the old prior's
+        information out, the new one's in) on lh, which moves the place through what lh and the place share (the
+        box height's range). Without it a van born from a `car` box was read at the range a car of its box height
+        would have: 0.6 of the truth, the box height being the strongest range beyond 40 m (docs/RADAR.md, section 4)."""
+        if o.lhp is None or not o.vote or not o.vote.get("w"):
+            return
+        m1, v1 = M.size_prior(o.vote["w"])
+        m0, v0 = o.lhp
+        if abs(m1 - m0) < 0.02 and abs(math.log(v1 / v0)) < 0.05:
+            return
+        a, b = 1.0 / v1 - 1.0 / v0, m1 / v1 - m0 / v0
+        rows = self.hyp.rows(o.h)
+        _NR.radar_lh_prior(self.store.a, rows, a, b)
+        o.lhp = (m1, v1)
 
     def _after_update(self, o, d, sensor, src, t):
         """What a detection does to an object besides its numbers (those, its existence and its sightings are the
