@@ -212,7 +212,23 @@ RADAR_CFG = dict(
     stale_s=1.0,                 # a radar message older than this draws nothing (the old builder takes over)
     lead_halfwidth_m=1.2, lead_range_rel=0.25, lead_range_m=4.0,
     alert_states=("confirmed", "coast"),
+    # `view.around`: every object all round the car for a plan display (radar scope), the lead included
+    around=True,
+    around_range_m=85.0,         # in every direction (the MFD radar view's largest range is 80 m)
+    around_max=20,
+    around_states=("confirmed", "coast", "memory"),
 )
+
+# a class label is passed in `around` only from this confidence on (the MFD's own rule for `objects`; a screen
+# draws the generic vehicle below it)
+AROUND_MIN_CONF = 0.5
+AROUND_MIN_CONF_VRU = 0.35
+_VRU_LABELS = ("human", "bike", "motorbike")
+
+
+def _r1(v):
+    v = round(float(v), 1)
+    return 0.0 if v == 0 else v                 # no "-0.0"
 
 
 class RadarDisplay:
@@ -236,6 +252,7 @@ class RadarDisplay:
     def reset(self):
         self.msg = None
         self.seen = {}               # radar id -> {"t0", "t", "o"}: first and last time listed, last object
+        self.ar = {}                 # the same for `around` (remembered objects too)
 
     def update(self, msg):
         ts = msg.get("ts_mono_ns")
@@ -245,6 +262,20 @@ class RadarDisplay:
         if self.msg is not None and t < self.msg["ts_mono_ns"] / NS - 2.0:
             self.reset()             # a new time axis
         self.msg = msg
+        if self.cfg["around"]:
+            listed = set()
+            for o in msg.get("objects") or ():
+                if o.get("state") not in self.cfg["around_states"]:
+                    continue
+                s = self.ar.get(o["id"])
+                if s is None:
+                    s = self.ar[o["id"]] = {"t0": t}
+                s["t"], s["o"] = t, o
+                s.pop("lost", None)
+                listed.add(o["id"])
+            for oid, s in self.ar.items():
+                if oid not in listed:
+                    s.setdefault("lost", t)
         listed = set()
         for o in msg.get("objects") or ():
             if o.get("state") not in ("confirmed", "coast"):
@@ -341,3 +372,122 @@ class RadarDisplay:
                         "box": None})
         out.sort(key=lambda q: q["x"])
         return out[:c["max_objects"]], alert
+
+    @staticmethod
+    def _label(cls):
+        if not isinstance(cls, dict) or not isinstance(cls.get("label"), str):
+            return None
+        conf = cls.get("confidence")
+        need = AROUND_MIN_CONF_VRU if cls["label"] in _VRU_LABELS else AROUND_MIN_CONF
+        if isinstance(conf, (int, float)) and conf < need:
+            return None
+        return cls["label"]
+
+    def around(self, ts_ns, lead=None):
+        """`view.around` at a frame time (ns): every object the radar lists all round the car, out to
+        `around_range_m` in every direction, remembered ones (state `memory`: out of every sensor's field, carried
+        on by their motion) included and marked, and the lead in place of the radar's own objects on it. Compact
+        (it goes to a small screen at 10 Hz): see docs/TOPICS.md, `view.around`. lead: the view's lead object."""
+        c = self.cfg
+        T = ts_ns / NS
+        v_ego = float(((self.msg or {}).get("ego") or {}).get("speed_mps") or 0.0)
+        R = c["around_range_m"]
+        place = {}
+        for oid in list(self.ar):
+            s = self.ar[oid]
+            o = s["o"]
+            gone = T - s["lost"] if "lost" in s else None
+            if (gone is not None and gone > c["fade_s"]) or T - s["t"] > c["stale_s"]:
+                del self.ar[oid]
+                continue
+            dt = max(0.0, min(T - s["t"], 1.0))
+            place[oid] = (float(o["x_m"]) + (float(o["vx_mps"]) - v_ego) * dt,
+                          -(float(o["y_m"]) + float(o["vy_mps"]) * dt), gone)
+        # the radar's objects on the lead (the nearest in range among those in its place, and what it holds twice
+        # there): the lead stands for them
+        lead_ids, lead_obj = set(), None
+        if lead is not None:
+            near = [(abs(x - float(lead["x"])), oid) for oid, (x, y, gone) in place.items()
+                    if gone is None and self.ar[oid]["o"].get("state") != "memory"
+                    and self._same_as_lead(x, y, lead, float((self.ar[oid]["o"].get("std") or [0.0])[0]))]
+            if near:
+                first = min(near)[1]
+                lead_obj = self.ar[first]["o"]
+                for _, oid in near:
+                    sx = float((self.ar[oid]["o"].get("std") or [0.0])[0])
+                    if abs(place[oid][0] - place[first][0]) <= max(3.0, 2.0 * sx):
+                        lead_ids.add(oid)
+        rows = []
+        for oid, (x, y, gone) in place.items():
+            if oid in lead_ids or math.hypot(x, y) > R:
+                continue
+            s = self.ar[oid]
+            o = s["o"]
+            fl = o.get("flags") or ()
+            st = o.get("state")
+            label = self._label(o.get("class"))
+            raw = (o.get("class") or {}).get("label") if isinstance(o.get("class"), dict) else None
+            if raw in ("bike", "motorbike") and o.get("motion") != "moving" and "on_path" not in fl:
+                continue                                 # a riderless two-wheeler beside the road
+            e = {"id": "ru:%d" % oid, "x": _r1(x), "y": _r1(y)}
+            gx, gy = float(o.get("vx_mps") or 0.0), -float(o.get("vy_mps") or 0.0)
+            if math.hypot(gx, gy) >= 0.5:
+                e["gx"], e["gy"] = _r1(gx), _r1(gy)
+            sd = o.get("std") or (0.0, 0.0)
+            e["sd"] = _r1(max(float(sd[0]), float(sd[1])))
+            if st != "confirmed":
+                e["st"] = st
+                e["ago"] = _r1(min((o.get("seen") or {"": 0.0}).values()) + max(T - s["t"], 0.0))
+            if label:
+                e["k"] = label
+            mv = {"stationary": "s", "moving": "m"}.get(o.get("motion"))
+            if mv:
+                e["mv"] = mv
+            # a remembered object is never an obstacle or a threat: nothing sees it
+            f = "".join(ch for ch, key in (("t", "threat"), ("o", "in_path"), ("p", "parked"), ("w", "with_traffic"))
+                        if key in fl and not (st == "memory" and ch in "to"))
+            if f:
+                e["fl"] = f
+            if ("t" in f or "o" in f) and isinstance(o.get("ttc_s"), (int, float)):
+                e["ttc"] = _r1(o["ttc_s"])
+            if gone is not None:
+                a = max(0.0, 1.0 - max(gone, 0.0) / c["fade_s"])
+            else:
+                a = min(1.0, max(0.0, (T - s.setdefault("d0", T)) / c["fade_s"]))
+            if a < 1.0:
+                e["a"] = round(a, 2)
+            rows.append(e)
+        if lead is not None:
+            at = lead.get("attrs") or {}
+            e = {"id": lead.get("id") or "lead", "x": _r1(lead["x"]), "y": _r1(lead["y"])}
+            gx = float(lead.get("vx") or 0.0) + v_ego
+            if abs(gx) >= 0.5:
+                e["gx"], e["gy"] = _r1(gx), 0.0
+            sd = at.get("dist_std_m") if isinstance(at.get("dist_std_m"), (int, float)) else lead.get("sx")
+            if isinstance(sd, (int, float)):
+                e["sd"] = _r1(sd)
+            if lead.get("phase") == "coast":
+                e["st"] = "coast"
+                e["ago"] = _r1(lead.get("meas_age_s") or 0.0)
+            label = self._label(lead.get("cls"))
+            if label:
+                e["k"] = label
+            lfl = (lead_obj or {}).get("flags") or ()
+            mv = {"stationary": "s", "moving": "m"}.get((lead_obj or {}).get("motion"))
+            if mv is None and isinstance(at.get("standing"), bool):
+                mv = "s" if at["standing"] else "m"
+            if mv:
+                e["mv"] = mv
+            e["fl"] = "L" + "".join(ch for ch, key in (("t", "threat"), ("o", "in_path"), ("w", "with_traffic"))
+                                    if key in lfl)
+            ttc = at.get("ttc_s") if isinstance(at.get("ttc_s"), (int, float)) else (lead_obj or {}).get("ttc_s")
+            if ("t" in e["fl"] or "o" in e["fl"]) and isinstance(ttc, (int, float)):
+                e["ttc"] = _r1(ttc)
+            a = lead.get("alpha")
+            if isinstance(a, (int, float)) and a < 1.0:
+                e["a"] = round(a, 2)
+            rows.append(e)
+        rows.sort(key=lambda e: (0 if any(ch in e.get("fl", "") for ch in "toL") else 1, math.hypot(e["x"], e["y"])))
+        rows = rows[:c["around_max"]]
+        rows.sort(key=lambda e: math.hypot(e["x"], e["y"]))
+        return rows

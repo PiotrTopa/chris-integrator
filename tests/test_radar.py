@@ -326,6 +326,70 @@ class Tracking(unittest.TestCase):
         self.assertIsNone(alert)
         self.assertEqual(rd.objects(12 * NS, lead=None), ([], None))
 
+    def test_around_lists_every_object_all_round_marks_the_remembered_ones_and_keeps_objects_as_they_were(self):
+        import copy
+        import json
+        from chris_integrator.trackers.roadusers_view import RadarDisplay
+
+        def obj(i, x, y, flags, motion="stationary", state="confirmed", vx=0.0, vy=0.0, label="car", sd=(2.0, 0.3),
+                seen=0.1, conf=0.8):
+            return {"id": i, "state": state, "x_m": x, "y_m": y, "vx_mps": vx, "vy_mps": vy, "v_rel_mps": vx - 15.0,
+                    "std": [sd[0], sd[1], 1.0, 0.3], "age_s": 3.0, "seen": {"cam": seen}, "motion": motion,
+                    "flags": flags, "ttc_s": 2.4 if ("threat" in flags or "in_path" in flags) else None,
+                    "class": {"label": label, "confidence": conf, "source": "cam", "votes": 5}}
+
+        objects = [
+            obj(1, 20.0, -3.5, ["parked"]), obj(2, 40.0, 0.2, ["in_path", "on_path"]),
+            obj(3, 30.0, 3.0, ["with_traffic"], motion="moving", vx=14.0),
+            obj(4, 25.0, -4.0, [], label="bike"),                                    # riderless, beside the road
+            obj(5, 60.0, 0.0, ["threat", "on_path"], motion="unknown"),
+            obj(6, -12.0, 3.4, ["parked", "in_path", "threat"], state="memory", sd=(3.5, 1.0), seen=6.0),   # passed
+            obj(7, 50.0, -0.1, ["on_path"], motion="moving", vx=15.0),             # the lead
+            obj(8, 8.0, 30.0, [], motion="moving", vy=-9.0, state="coast", label="van", conf=0.3),   # crossing
+            obj(9, -120.0, 0.0, ["parked"], state="memory")]                       # beyond the largest range
+        msg = {"type": "radar", "ts_mono_ns": 10 * NS, "ego": {"speed_mps": 15.0}, "objects": objects}
+        lead = {"id": "lead:3", "kind": "vehicle", "role": "lead", "x": 50.0, "y": 0.0, "vx": 0.0, "sx": 0.6,
+                "phase": "steady", "alpha": 1.0, "attrs": {"dist_std_m": 0.6, "ttc_s": None, "standing": False},
+                "cls": {"label": "truck", "confidence": 0.9}}
+        T = 10 * NS + NS // 10
+        plain = RadarDisplay({"around": False})
+        plain.update(copy.deepcopy(msg))
+        want = plain.objects(T, lead=lead)
+        rd = RadarDisplay()
+        rd.update(msg)
+        self.assertEqual(rd.objects(T, lead=lead), want)        # the road view's objects do not change
+        ar = rd.around(T, lead)
+        by = {e["id"]: e for e in ar}
+        self.assertEqual(sorted(by), ["lead:3", "ru:1", "ru:2", "ru:3", "ru:5", "ru:6", "ru:8"])
+        self.assertEqual(by["lead:3"]["fl"], "L")               # the lead stands for the radar's object 7
+        self.assertEqual((by["lead:3"]["k"], by["lead:3"]["mv"], by["lead:3"]["gx"]), ("truck", "m", 15.0))
+        m = by["ru:6"]                                          # passed, remembered: behind, never a threat
+        self.assertEqual((m["st"], m["fl"], m["sd"]), ("memory", "p", 3.5))
+        self.assertNotIn("ttc", m)
+        self.assertAlmostEqual(m["x"], -12.0 - 1.5)              # carried to the frame's time
+        self.assertAlmostEqual(m["ago"], 6.1)
+        self.assertEqual((by["ru:5"]["fl"], by["ru:5"]["ttc"]), ("t", 2.4))
+        self.assertEqual((by["ru:2"]["fl"], by["ru:2"]["ttc"]), ("o", 2.4))
+        self.assertEqual(by["ru:3"]["fl"], "w")
+        self.assertEqual(by["ru:3"]["gx"], 14.0)                # over the ground
+        self.assertNotIn("gx", by["ru:1"])                       # a standing object sends no velocity
+        c = by["ru:8"]
+        self.assertEqual((c["st"], c["y"], c["gy"]), ("coast", -29.1, 9.0))     # view frame: y right
+        self.assertNotIn("k", c)                                 # the class below its confidence is not sent
+        self.assertEqual([e["id"] for e in ar][0], "ru:6")       # nearest first (all round)
+        self.assertTrue(all(e.get("a") == 0.0 for e in ar if e["id"] != "lead:3"))   # they fade in
+        size = len(json.dumps(ar, separators=(",", ":")))
+        self.assertLess(size / len(ar), 100)                     # bytes per object
+        # the cap keeps threats, obstacles and the lead first, then the nearest
+        rd2 = RadarDisplay({"around_max": 3})
+        rd2.update(msg)
+        self.assertEqual(sorted(e["id"] for e in rd2.around(T, lead)), ["lead:3", "ru:2", "ru:5"])
+        # it leaves the radar: fades out where it was
+        rd.update(dict(msg, ts_mono_ns=10 * NS + NS // 5, objects=[]))
+        ar = rd.around(10 * NS + 3 * NS // 10, None)
+        self.assertTrue(ar and all(0.0 <= e["a"] < 1.0 for e in ar))
+        self.assertEqual(rd.around(12 * NS, None), [])
+
     def test_one_box_is_not_an_object(self):
         rd = Radar()
         for i in range(40):

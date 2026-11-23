@@ -15,7 +15,9 @@ vehicle standing beside the path: a screen draws it dimmed), `attrs.obstacle` (i
 `attrs.threat` (reached within seconds at the present speeds), `attrs.with_traffic`, `attrs.ttc_s`; and `view`
 has `alert`: `null` or `{"level": "threat" | "obstacle", "id", "x", "y", "ttc_s", "lead"}`, the one thing ahead
 to shout about (`lead: true` when it is the object the lead is drawn from). `{"view": {"radar_objects": false}}`
-keeps the detector's boxes as the only source. Paths in the moved text are those of the chris-roadsense repository at the time
+keeps the detector's boxes as the only source. While the radar speaks `view` also has `around`: every object
+all round the car for a plan display (a radar scope), remembered ones included and marked, the lead included
+(`view.around` below; `objects` is unchanged by it). Paths in the moved text are those of the chris-roadsense repository at the time
 ([`docs/VEHICLE_API.md`](https://github.com/PiotrTopa/roadsense/blob/main/docs/VEHICLE_API.md), `chris_integrator/...`, "section Calibration" of its ARCHITECTURE.md).
 
 Ports in a deployment: the consolidated API on 8090, the camera instance's debug face on 8091 (`docs/INSTALL.md`).
@@ -589,7 +591,8 @@ Derived from the measurement topics, never fed back into them; nothing in it bel
 "lines_scale": null,                                      // factor applied to the display lane source's metres (null: no source)
 "road_model": "vision",                                   // the road model of the frame
 "path": {"y": [..]},                                      // the model's planned path at x, as measured
-"road": {...}                                             // the road as one picture (below)
+"road": {...},                                            // the road as one picture (below)
+"around": [ {...} ]                                       // while the radar speaks: every object all round (below)
 ```
 `seq`, `ts_mono_ns`, `ts_real_ns` are those of the `road` message; every position refers to that frame time.
 
@@ -606,6 +609,40 @@ that pop on or off without a fade 106 -> 2; the lead's step per frame after its 
 a lane line's step per frame at 30 m 0.089 -> 0.068 m rms, steps over 0.3 m 119 -> 72 (the reference consumer,
 which moves the lines with their own rate between two messages, draws 6 such steps on that drive).
 Cost: 0.15-0.18 ms per frame on the laptop without the road picture.
+
+**`view.around`: every object all round the car** (`RadarDisplay.around`, `chris_integrator/trackers/roadusers_view.py`;
+added 2026-11-23 for the MFD's 360-degree radar view). `objects` holds what a picture of the road AHEAD draws (0.5 to
+70 m ahead, 12 m to the side, the lead left out: it is drawn from the `lead` topic) and is not changed by this key.
+`around` is a second, compact list for a plan display with the car in the centre: every object the radar lists
+(states `confirmed`, `coast` and `memory`) within `around_range_m` (85 m) in every direction, ahead, beside and
+behind, and the lead in place of the radar's own objects on it (the same match as `objects` uses). Only while the
+radar speaks (the same freshness as `objects` from the radar); `{"view": {"radar": {"around": false}}}` leaves it out.
+
+```
+"around": [ {"id": "ru:12" | "lead:3",          // the ids of `objects` (ru:<radar id>) and of the lead object
+             "x": -14.2, "y": 3.3,              // car frame of the frame time (x forward, y RIGHT), m, 0.1 m
+             "gx": 13.6, "gy": 0.0,             // velocity OVER THE GROUND, car axes, m/s (y right); absent below
+                                                //   0.5 m/s: relative motion is (gx - ego.speed_mps, gy)
+             "sd": 3.5,                         // 1 sigma of the place, the larger axis, m
+             "st": "coast" | "memory",          // absent: seen now. coast: in a sensor's field, not seen for 0.3 s;
+                                                //   memory: out of every sensor's field, carried on by its motion
+                                                //   and the car's (kept by the radar up to 45 s while sd <= 10 m)
+             "ago": 6.1,                        // with st: seconds since a sensor last saw it
+             "k": "car",                        // class label, only from confidence 0.5 (0.35 human / bike /
+                                                //   motorbike); absent: unknown (a screen draws a generic vehicle)
+             "mv": "s" | "m",                   // the radar's motion verdict: stationary / moving; absent: unknown
+             "fl": "Ltopw",                     // flags, any of: L the lead, t threat, o obstacle (stands on the
+                                                //   path), p parked, w drives with the traffic; absent: none
+             "ttc": 2.4,                        // with t or o: time to reach it, s
+             "a": 0.4} ]                        // fade 0..1, only while < 1 (in 0.3 s when listed, out 0.3 s when dropped)
+```
+
+Rules: a remembered object (`st: "memory"`) is never `t` or `o` (nothing sees it; its place is a prediction);
+`alert` is taken as before, from seen objects only. A riderless two-wheeler beside the road is left out as in
+`objects`. At most `around_max` (20): threats, obstacles and the lead first, then the nearest all round; sent
+nearest first. With today's single forward camera everything behind and far beside the car is `memory`.
+Size: about 90 bytes per object (compact JSON: 87 a moving car, 93 a remembered parked car), so 1.0-1.8 kB more
+per `view` message with 12-20 objects around (the message is 1.5 kB without a map, 3-4 kB with the road picture).
 
 **`view.road`: the road as one picture** (`chris_integrator/trackers/roadview.py`). Everything a consumer needs to
 draw the road and what lies ahead on it, from one message of one frame; each part says where it comes from

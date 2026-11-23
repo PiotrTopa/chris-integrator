@@ -83,6 +83,7 @@ def strip(msgs):
         m.pop("class", None)
         m.pop("sensors", None)
         m.pop("alert", None)                 # the view's alert comes from the road users (the radar)
+        m.pop("around", None)                # ... and so does view.around (every object all round)
         for tr in m.get("tracks") or []:
             tr.pop("class", None)
         if "objects" in m:
