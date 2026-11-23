@@ -1245,3 +1245,170 @@ def test_radar_prediction_peeks_are_the_full_evolution():
         out = np.empty((B, 6))
         C.radar_peek_pos(st.a, rows, dts, kin, par, out)
         assert np.array_equal(out[:, :2], x[:, :2]) and np.array_equal(out[:, 2:], P[:, :2, :2].reshape(B, 4)), it
+
+
+def _golden():
+    z = np.load(os.path.join(HERE, "tests", "data", "radar_golden.npz"))
+    cases = json.loads(bytes(z["index"]).decode())
+
+    def dec(v):
+        if isinstance(v, dict) and "array" in v:
+            return z[v["array"]].copy()
+        if isinstance(v, list):
+            return [dec(x) for x in v]
+        if isinstance(v, dict):
+            return {k: dec(x) for k, x in v.items()}
+        return v
+    return [dict(c, args=dec(c["args"]), ref=dec(c["ref"]), rows=dec(c.get("rows"))) for c in cases]
+
+
+def _rel(a, b):
+    a, b = np.asarray(a, float), np.asarray(b, float)
+    return float(np.max(np.abs(a - b) / np.maximum(np.abs(b), 1.0), initial=0.0))
+
+
+def _rows_rel(a, b):
+    """Rows of objects: the largest difference relative to each block's largest magnitude."""
+    from chris_integrator.radar import tracker as T
+    worst = 0.0
+    for name, lo, hi, sh in T._OFF:
+        u, v = a[:, lo:hi], b[:, lo:hi]
+        if name in ("_xs", "_Ps"):
+            u, v = u.reshape(len(a) * 3, -1), v.reshape(len(b) * 3, -1)
+        scale = np.maximum(np.abs(v).max(axis=1, keepdims=True), 1.0)
+        worst = max(worst, float((np.abs(u - v) / scale).max(initial=0.0)))
+    return worst
+
+
+@needs_native
+def test_radar_golden():
+    """The native radar functions against what the Python reference gave for the same inputs (frozen in
+    tests/data/radar_golden.npz by tests/make_radar_golden.py while the reference existed): measurement functions,
+    marginals and assignment the same bits; association, update, advance, peeks, upkeep, merge geometry, checks,
+    registration, the common pitch and the message's numbers: the same discrete results, numbers to rounding."""
+    seen = {}
+    for c in _golden():
+        fn, a, ref = c["fn"], list(c["args"]), c["ref"]
+        seen[fn] = seen.get(fn, 0) + 1
+        S = c["rows"]
+        if S is not None:
+            a[0] = S
+        if fn == "radar_h":
+            z, H = np.empty(4), np.empty((4, 8))
+            m = C.radar_h(a[0], a[1], a[2], a[3], a[4], z, H)
+            assert np.array_equal(z[:m], ref[0]) and np.array_equal(H[:m], np.reshape(ref[1], (m, 8)))
+        elif fn == "radar_marginals":
+            L = np.reshape(a[0], c["shape"])
+            out = np.empty(L.shape)
+            C.radar_marginals(np.ascontiguousarray(L), out)
+            assert np.array_equal(out, np.reshape(ref, L.shape))
+        elif fn == "radar_assign":
+            assert C.radar_assign(np.ascontiguousarray(np.reshape(a[0], c["shape"]))) == [tuple(p) for p in ref]
+        elif fn == "radar_scan":
+            nt = len(a[1])
+            pd, cov = np.empty(nt), np.empty(nt)
+            D = np.reshape(a[5], (-1, 13)) if len(a[5]) else np.zeros((0, 13))
+            pairs = C.radar_scan(S, a[1], a[2], a[3], a[4], D, a[6], a[7], a[8], pd, cov, None, None, None)
+            assert [(p[0], p[1]) for p in pairs] == [(int(p[0]), int(p[1])) for p in ref[0]]
+            for p, q in zip(pairs, ref[0]):
+                assert _rel(p[2:], q[2:]) < 1e-9, (p, q)
+            assert _rel(pd, ref[1]) < 1e-12 and _rel(cov, ref[2]) < 1e-12
+        elif fn == "radar_update":
+            out = C.radar_update(S, a[1], a[2], a[3], np.reshape(a[4], (-1, 13)), a[5], a[6])
+            assert _rel(out, ref["out"]) < 1e-9
+            assert _rows_rel(S[a[1]], np.reshape(ref["after"], (len(a[1]), -1))) < 1e-7
+        elif fn == "radar_advance":
+            C.radar_advance(S, a[1], a[2], a[3], a[4], a[5], a[6])
+            assert _rows_rel(S[a[1]], np.reshape(ref["after"], (len(a[1]), -1))) < 1e-9
+        elif fn == "radar_peek_pos":
+            out = np.empty((len(a[1]), 6))
+            C.radar_peek_pos(S, a[1], a[2], a[3], a[4], out)
+            assert _rel(out, ref) < 1e-9
+        elif fn == "radar_life":
+            out = C.radar_life(S, *a[1:])
+            for u, v in zip(out, ref):
+                assert u[1] == v[1] and (u[2] is None) == (v[2] is None)
+                assert _rel([x for x in u if x is not None and not isinstance(x, bool)],
+                            [x for x in v if x is not None and not isinstance(x, bool)]) < 1e-9
+        elif fn == "radar_merge":
+            assert [tuple(r) for r in C.radar_merge(S, *a[1:])] == [tuple(r) for r in ref]
+        elif fn == "radar_frame":
+            out = C.radar_frame(S, *a[1:])
+            for u, v in zip(out, ref):
+                for k, (x, y) in enumerate(zip(u, v)):
+                    if k in (14, 18):                     # the offset and the threat probability as they are
+                        assert _rel(x, y) < 1e-9
+                        continue
+                    d = []
+                    _msg_diffs(y, x, "", d)
+                    for item in d:
+                        assert len(item) == 3 and abs(item[1] - item[2]) <= 1.01 * _last_digit(item[1], item[2]), (k, item)
+        elif fn == "radar_check":
+            out = C.radar_check(S, *a[1:])
+            assert (out is None) == (ref is None) and (out is None or _rel(out, ref) < 1e-9)
+        elif fn == "radar_register":
+            out = C.radar_register(S, *a[1:])
+            assert _rel(out, ref["out"]) < 1e-9
+            rows = sorted(set(a[1]) | set(a[3]))
+            assert _rows_rel(S[rows], np.reshape(ref["after"], (len(rows), -1))) < 1e-9
+        elif fn == "radar_common":
+            assert _rel(C.radar_common(S, *a[1:]), ref) < 1e-9
+        else:
+            raise AssertionError("a golden case of an unknown function: " + fn)
+    assert all(seen.get(k, 0) >= 3 for k in ("radar_h", "radar_marginals", "radar_assign", "radar_scan", "radar_update",
+                                             "radar_advance", "radar_peek_pos", "radar_life", "radar_merge",
+                                             "radar_frame", "radar_check", "radar_register", "radar_common")), seen
+
+
+RADAR_DIGEST_RUNS = (("parked_street", 1, True, False), ("adjacent", 1, False, False), ("junction", 1, False, True))
+# sha256 of the radar messages of RADAR_DIGEST_RUNS (json.dumps of the list) on the development machine (x86-64);
+# made when the radar's Python reference still existed, from the native core then (whose messages agree with the
+# reference's to a last printed digit: test_radar_messages_native_against_reference had both). They change when
+# anything upstream of the radar changes its output on purpose: then write them anew (RADAR_DIGESTS=print shows them).
+RADAR_DIGESTS = {"parked_street:1:1:0": "951cac781ef48e369501918b4603cd6720e7bef0f0036d485e423305cdfd68b2",
+                 "adjacent:1:0:0": "c9103ca895e5bf8dffd9feb4a130e9ce79622fcb3800d9e9a6dae05002f625a1",
+                 "junction:1:0:1": "f6eb08c0c2ef1810df74413a83a58d3e7ecf40c75c7aab28ac5229723513d5dc"}
+
+
+def _radar_digests():
+    import hashlib
+    from chris_integrator.mixer import MessageClock
+    from chris_integrator.sim import default_sensors
+    from chris_integrator.sim import roaduser_sim as rs
+    from chris_integrator.stack import build
+    SC = {"px": 0.08, "rel": 0.002, "p": 0.78, "min_dt": 0.2, "max_dt": 1.0, "max_std": 0.06}
+    out = {}
+    for name, seed, night, scale in RADAR_DIGEST_RUNS:
+        w = rs.scenario(name, seed=seed, night=night)
+        det = rs.DetectorSim(seed=1000 + seed, night=night, params={"scale_rate": SC} if scale else None)
+        sensors = default_sensors(vehicle={"seed": 11 + 97 * seed}, vision={"seed": 21 + 97 * seed, "leads": True},
+                                  gnss={"seed": 31 + 97 * seed}, map={"seed": 41 + 97 * seed})
+        sensors.append(det)
+        st = build(cfg={"estimator": {"sources": [{"kind": "road_users", "id": "*"}]}}, mapper=None, clock=MessageClock())
+        box = st.mixer.slots["radar"].plugin.box
+        msgs, frame = [], box.frame
+
+        def grab(ts, frame=frame, msgs=msgs):
+            m = frame(ts)
+            if m is not None:
+                msgs.append(m)
+            return m
+        box.frame = grab
+        sent = False
+        for _, m in w.messages(sensors):
+            if not sent:
+                st.deliver(det.calib_msg(m["ts_mono_ns"]))
+                sent = True
+            st.deliver(m)
+        out["%s:%d:%d:%d" % (name, seed, night, scale)] = hashlib.sha256(json.dumps(msgs).encode()).hexdigest()
+    return out
+
+
+@needs_radar
+@pytest.mark.skipif(os.uname().machine != "x86_64", reason="the digests are of the development machine's arithmetic")
+def test_radar_messages_digests():
+    """The radar's messages on simulated drives, byte for byte as they were when the Python reference existed."""
+    got = _radar_digests()
+    if os.environ.get("RADAR_DIGESTS") == "print":
+        print(json.dumps(got, indent=1))
+    assert got == RADAR_DIGESTS

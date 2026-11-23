@@ -7,7 +7,7 @@ compiled to one module, `chris_integrator/native/_chris_native.abi3.so`. Where t
 it is used; where it is not, the same functions run in Python. Nothing else in the package knows which.
 
     python -m chris_integrator.native      which implementation runs here + a self-test against the reference
-    GET /v2/health  ->  "native": {"active": true, "implementation": "native", "parts": [...], "version": 3}
+    GET /v2/health  ->  "native": {"active": true, "implementation": "native", "parts": [...], "version": 4}
     the daemon's first log lines: "hot path NATIVE (json, round, interp, ekf, lanes, radar)"  |  "hot path pure Python: <why>"
 
 ## What is native, and what "the same" means for each part
@@ -25,6 +25,11 @@ it is used; where it is not, the same functions run in Python. Nothing else in t
 | `ekf` | `ekf_rts` (one smoother step) | `np.linalg.solve` + products in `core/ekf.py` | to rounding |
 | `radar` | `radar_evolve` (stillness, switching, interaction with the free estimate's hand-over, prediction with the speed bound; optionally the combination and the free estimate's prediction: `Tracker._evolve` + `combine_b` in one call for B objects) | `radar/models.py`: `_evolve_py` = `still_b`, `transition_b`, `mix_b`, `predict_b`, `combine_b` | to rounding (tests: 1e-12 of each block's largest magnitude); on the development machine the same bits |
 | `radar` | `radar_combine`, `radar_p_still` | `combine_b`, `Tracker.p_still_many`'s numpy | to rounding |
+| `radar` | `radar_h` (the sensors' measurement functions: camera kinds b, rb, rbh, bt with and without the scale-rate row, microwave radar) | `CameraBoxes.h_py`, `MicrowaveRadar.h_py` | the same bits (`math.hypot` as CPython computes it) |
+| `radar` | `radar_scan` (one scan's association: p_detect, coverage, the map's density, gate, likelihoods of the hypotheses, the box feature, `radar_marginals`, `radar_assign`) | `Tracker._associate`, `tracker.marginals`, `tracker.assign` | pairs and assignment the same; gains and probabilities to rounding; marginals and assignment alone the same bits |
+| `radar` | `radar_update` (every pair of a scan: hypotheses, free estimate, NIS, model probabilities, existence increment, combination), `radar_common` (the scan's common pitch), `radar_check`, `radar_register` | `Tracker._update`, `_common`, `_check`, `_register` | to rounding |
+| `radar` | `radar_advance`, `radar_peek`, `radar_peek_pos`, `radar_still`, `radar_life`, `radar_merge` (on the objects' rows of the tracker's state array) | `Tracker._advance_all`, `peek_many`, `p_still_many`, `_life`, `_merge` | to rounding; `radar_peek_pos` the same bits as `radar_peek` for what it computes |
+| `radar` | `radar_frame` (every listed object's numbers of a message, and with the objects' attributes the message's objects themselves, flags and their hysteresis included) | `Radar._numbers` + the dict assembly in `Radar.frame` | to rounding (printed digits: the same except a last digit now and then) |
 
 The `lanes` part is exact because the tracker's arithmetic is elementwise (numpy computes those with plain
 IEEE operations, one element at a time), and its two means over the gate points are added in the order numpy

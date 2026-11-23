@@ -812,7 +812,6 @@ class Tracker:
         c = self.cfg
         if not getattr(sensor, "has_bias", False) or len(pairs) < c["common_min"]:
             return False
-        v, w = [], []
         if _NR is not None and hasattr(sensor, "native"):
             sel = [(objs[i].slot, (kind_code(dets[j].get("kind")), float(dets[j].get("sdt") or 0.0), float(dets[j]["z"][0]),
                                    float(Rs[j][0] if isinstance(Rs[j], list) else Rs[j][0, 0])))
@@ -823,23 +822,28 @@ class Tracker:
                 return False
             m, ws = _NR.radar_common(self.store.a, [q[0] for q in sel], sensor.native(), pose, [q[1] for q in sel])
             return self._common_take(sensor, src, dets, Rs, m, 1.57 / ws)
-        for i, j, _, pr, _ in pairs:
-            o, d = objs[i], dets[j]
-            if (d.get("kind") or "").rstrip("s") not in ("rb", "rbh") or o.state not in ("confirmed", "coast") or o.hits < 4 \
-                    or pr < c["common_pair"]:
-                continue
+        sel = [(objs[i], dets[j], Rs[j]) for i, j, _, pr, _ in pairs
+               if (dets[j].get("kind") or "").rstrip("s") in ("rb", "rbh") and objs[i].state in ("confirmed", "coast")
+               and objs[i].hits >= 4 and pr >= c["common_pair"]]
+        if len(sel) < c["common_min"]:
+            return False
+        m, ws = self._common_numbers(sensor, pose, sel)
+        return self._common_take(sensor, src, dets, Rs, m, 1.57 / ws)    # 1.57 / ws: the variance of a weighted median
+
+    @staticmethod
+    def _common_numbers(sensor, pose, sel):
+        """The weighted median of the settled pairs' angle innovations [(object, detection, R)] and the sum of
+        their weights."""
+        v, w = [], []
+        for o, d, R in sel:
             zp, H = sensor.h(o.x, pose, d)
-            s00 = float(H[0] @ o.P @ H[0]) + float(Rs[j][0] if isinstance(Rs[j], list) else Rs[j][0, 0])
+            s00 = float(H[0] @ o.P @ H[0]) + float(R[0] if isinstance(R, list) else R[0, 0])
             v.append(float(d["z"][0]) - float(zp[0]))
             w.append(1.0 / s00)
-        if len(v) < c["common_min"]:
-            return False
         v, w = np.array(v), np.array(w)
         k = np.argsort(v)
         cw = np.cumsum(w[k])
-        m = float(v[k][int(np.searchsorted(cw, 0.5 * cw[-1]))])
-        var_m = 1.57 / float(w.sum())                    # of a weighted median
-        return self._common_take(sensor, src, dets, Rs, m, var_m)
+        return float(v[k][int(np.searchsorted(cw, 0.5 * cw[-1]))]), float(w.sum())
 
     def _common_take(self, sensor, src, dets, Rs, m, var_m):
         """The scan's common angle m (of variance var_m): the slow part into the sensor's bias, the rest out of
@@ -911,6 +915,10 @@ class Tracker:
             o.kin = M._KIN4.get(o.label) or M._KIN4[None]
 
     def _update(self, o, d, R, sensor, pose, src, t, pd=None, lam=None, pair=None):
+        n, dl = self._update_numbers(o, d, R, sensor, pose, pd, lam, pair)
+        self._after_update(o, d, sensor, src, t, n, dl)
+
+    def _update_numbers(self, o, d, R, sensor, pose, pd=None, lam=None, pair=None):
         """One detection into one object. Each hypothesis takes it only as far as it can be this object's at
         all under that hypothesis: against the other story (the object was missed, the detection is something
         else: probability 1 - beta). A hypothesis the detection does not fit is neither dragged to it nor
@@ -994,7 +1002,7 @@ class Tracker:
         like_all = max(tot, 1e-30)
         dl = min(max(math.log(max(sensor.p_d * like_all / sensor.density(d), 1e-9)), math.log(1.5)), math.log(20.0))
         o.x, o.P = M.combine(o.xs, o.Ps, o.mu)
-        self._after_update(o, d, sensor, src, t, n, dl)
+        return n, dl
 
     def _after_update(self, o, d, sensor, src, t, n, dl):
         """What a detection does to an object besides its numbers: its record (NIS n), its existence (dl: what the
@@ -1040,13 +1048,10 @@ class Tracker:
                     continue
                 m2, e = r
             else:
-                ex, ey = o.x[PX] - o.x[VX] * back - px, o.x[PY] - o.x[VY] * back - py
-                S = np.reshape(Pp, (2, 2)) + o.P[:2, :2] + np.eye(2) * 0.05
-                try:
-                    m2 = float(np.array([ex, ey]) @ np.linalg.solve(S, np.array([ex, ey]))) / 2.0
-                except np.linalg.LinAlgError:
+                r = self._check_numbers(o, back, px, py, Pp)
+                if r is None:
                     continue
-                e = math.hypot(ex, ey)
+                m2, e = r
             o.n_checks += 1
             o.consistency = m2 if o.consistency is None else o.consistency + 0.25 * (m2 - o.consistency)
             o.pred_err = e if o.pred_err is None else o.pred_err + 0.25 * (e - o.pred_err)
@@ -1059,6 +1064,18 @@ class Tracker:
             o.Pf = o.Pf * c["inflate"]
             o.x, o.P = M.combine(o.xs, o.Ps, o.mu)
             o.consistency = 0.5 * (o.consistency + 1.0)
+
+    @staticmethod
+    def _check_numbers(o, back, px, py, Pp):
+        """(half the squared distance in both uncertainties, the distance) of the present estimate taken back by
+        `back` from where the object said it would be; None: singular."""
+        ex, ey = o.x[PX] - o.x[VX] * back - px, o.x[PY] - o.x[VY] * back - py
+        S = np.reshape(Pp, (2, 2)) + o.P[:2, :2] + np.eye(2) * 0.05
+        try:
+            m2 = float(np.array([ex, ey]) @ np.linalg.solve(S, np.array([ex, ey]))) / 2.0
+        except np.linalg.LinAlgError:
+            return None
+        return m2, math.hypot(ex, ey)
 
     # ---- life ---------------------------------------------------------------------------------------------
     def manage(self, T):
@@ -1142,6 +1159,29 @@ class Tracker:
             out.append((still[k], True, float(mu[STAND]), sd, rng))
         return out
 
+    def _merge_geometry(self, obs, e):
+        """The pairs (i < j) worth a look and whether each is one place moving alike: [(i, j, same)]."""
+        c = self.cfg
+        xy = np.array([o.x[:2] for o in obs])
+        tt = np.array([o.t for o in obs])
+        sp = np.array([math.hypot(o.x[VX], o.x[VY]) for o in obs])
+        gap = np.hypot(xy[:, None, 0] - xy[None, :, 0], xy[:, None, 1] - xy[None, :, 1])
+        far = np.hypot(xy[:, 0] - e[0], xy[:, 1] - e[1]) + 10.0     # the car has not moved more than this since
+        room = c["merge_m"] + c["merge_rel"] * far[:, None] + np.abs(tt[:, None] - tt[None, :]) * (sp[None, :] + 30.0) * 2.0
+        near = np.triu(gap <= room, 1)
+        out = []
+        for i, j in zip(*np.nonzero(near)):
+            a, b = obs[i], obs[j]
+            ta, tb = a.t, b.t
+            xb = b.x if abs(ta - tb) < 1e-6 else self.peek(b, ta)[0]
+            d = xb[:2] - a.x[:2]
+            r = math.hypot(*(a.x[:2] - np.array(self.ego.pose_at(ta)[:2])))
+            lim = c["merge_m"] + c["merge_rel"] * r
+            dv = float(np.hypot(*(xb[VX:VY + 1] - a.x[VX:VY + 1])))
+            sv = math.sqrt(max(float(np.trace(a.P[VX:VY + 1, VX:VY + 1]) + np.trace(b.P[VX:VY + 1, VX:VY + 1])), 0.0))
+            out.append((int(i), int(j), not (math.hypot(d[0], d[1]) > lim or dv > c["merge_dv"] + 2.0 * sv)))
+        return out
+
     def _register(self, T):
         """Sensor registration: what the objects of one sensor agree on in their angle offsets is not theirs but
         the sensor's (a camera's pitch error). The ripe objects (the ones whose own history has pinned their
@@ -1168,23 +1208,29 @@ class Tracker:
                 b[0] += a * m
                 b[1] = max((1.0 - a) * b[1] + a / ws, math.radians(cc["bias_floor_deg"]) ** 2)
                 continue
-            w = np.array([1.0 / (o.P[M.DP, M.DP] + sen.dp_obj_var) for o in ripe])
-            v = np.array([o.x[M.DP] for o in ripe])
-            if len(ripe) >= 3:                           # the middle one by weight: one wrong object does not steer it
-                k = np.argsort(v)
-                cw = np.cumsum(w[k])
-                m = float(v[k][int(np.searchsorted(cw, 0.5 * cw[-1]))])
-            else:
-                m = float((w * v).sum() / w.sum())
-            shift = a * m
-            b[0] += shift
-            b[1] = max((1.0 - a) * b[1] + a / float(w.sum()), math.radians(cc["bias_floor_deg"]) ** 2)
-            for o in self.objects:
-                if src in o.sources:
-                    for j in range(len(M.MODELS)):
-                        o.xs[j][M.DP] -= shift
-                    o.x[M.DP] -= shift
-                    o.xf[M.DP] -= shift
+            m, ws = self._register_numbers(ripe, sen.dp_obj_var, [o for o in self.objects if src in o.sources], a)
+            b[0] += a * m
+            b[1] = max((1.0 - a) * b[1] + a / ws, math.radians(cc["bias_floor_deg"]) ** 2)
+
+    @staticmethod
+    def _register_numbers(ripe, dp_var, objs, a):
+        """What the ripe objects agree on in their angle offsets (m) and the sum of their weights; a * m taken out
+        of the offset of every object of objs."""
+        w = np.array([1.0 / (o.P[M.DP, M.DP] + dp_var) for o in ripe])
+        v = np.array([o.x[M.DP] for o in ripe])
+        if len(ripe) >= 3:                               # the middle one by weight: one wrong object does not steer it
+            k = np.argsort(v)
+            cw = np.cumsum(w[k])
+            m = float(v[k][int(np.searchsorted(cw, 0.5 * cw[-1]))])
+        else:
+            m = float((w * v).sum() / w.sum())
+        shift = a * m
+        for o in objs:
+            for j in range(len(M.MODELS)):
+                o.xs[j][M.DP] -= shift
+            o.x[M.DP] -= shift
+            o.xf[M.DP] -= shift
+        return m, float(w.sum())
 
     def _judge(self, o, T, p=None):
         """"stationary" | "moving" | "unknown" from how much the standing hypothesis is believed, with hysteresis;
@@ -1217,8 +1263,8 @@ class Tracker:
         if n < 2:
             return
         # the pairs worth a look: nearer than the limit can be at any range in reach, with room for what a
-        # difference of the two objects' times may have moved one of them; with the native core also whether each
-        # is at one place and moves alike (else that is judged below)
+        # difference of the two objects' times may have moved one of them; and whether each is at one place and
+        # moves alike
         nearj, nearset = {}, set()
         e = self.ego.pose_at(T)
         if _NR is not None:
@@ -1233,16 +1279,9 @@ class Tracker:
                 nearj.setdefault(i, []).append((j, same))
                 nearset.add((i, j))
         else:
-            xy = np.array([o.x[:2] for o in obs])
-            tt = np.array([o.t for o in obs])
-            sp = np.array([math.hypot(o.x[VX], o.x[VY]) for o in obs])
-            gap = np.hypot(xy[:, None, 0] - xy[None, :, 0], xy[:, None, 1] - xy[None, :, 1])
-            far = np.hypot(xy[:, 0] - e[0], xy[:, 1] - e[1]) + 10.0     # the car has not moved more than this since
-            room = c["merge_m"] + c["merge_rel"] * far[:, None] + np.abs(tt[:, None] - tt[None, :]) * (sp[None, :] + 30.0) * 2.0
-            near = np.triu(gap <= room, 1)
-            for i, j in zip(*np.nonzero(near)):
-                nearj.setdefault(int(i), []).append((int(j), None))
-                nearset.add((int(i), int(j)))
+            for i, j, same in self._merge_geometry(obs, e):
+                nearj.setdefault(i, []).append((j, same))
+                nearset.add((i, j))
         index = {o.id: k for k, o in enumerate(obs)}
         for i in range(n):
             mt = obs[i].merge_t
@@ -1255,15 +1294,6 @@ class Tracker:
                 a, b = obs[i], obs[j]
                 if a.id in dead or b.id in dead:
                     continue
-                if same is None:
-                    ta, tb = a.t, b.t
-                    xb = b.x if abs(ta - tb) < 1e-6 else self.peek(b, ta)[0]
-                    d = xb[:2] - a.x[:2]
-                    r = math.hypot(*(a.x[:2] - np.array(self.ego.pose_at(ta)[:2])))
-                    lim = c["merge_m"] + c["merge_rel"] * r
-                    dv = float(np.hypot(*(xb[VX:VY + 1] - a.x[VX:VY + 1])))
-                    sv = math.sqrt(max(float(np.trace(a.P[VX:VY + 1, VX:VY + 1]) + np.trace(b.P[VX:VY + 1, VX:VY + 1])), 0.0))
-                    same = not (math.hypot(d[0], d[1]) > lim or dv > c["merge_dv"] + 2.0 * sv)
                 la, lb = a.label, b.label
                 same_kind = la is None or lb is None or (la in M.VEHICLES) == (lb in M.VEHICLES)
                 key = b.id
