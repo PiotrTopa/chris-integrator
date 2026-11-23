@@ -1,14 +1,14 @@
 # The native core
 
 On a slow core (the reference deployment runs chris-integrator on a phone's little core) the price of Python
-is the budget, so the arithmetic and the text work of the per-message hot path are written in C: one file,
-`chris_integrator/native/src/chris_native.c`, compiled to one module, `chris_integrator/native/_chris_native.abi3.so`.
+is the budget, so the arithmetic and the text work of the per-message hot path are written in C: one translation
+unit, `chris_integrator/native/src/chris_native.c` (it includes `decide.c`, the decision layer's part), compiled to one module, `chris_integrator/native/_chris_native.abi3.so`.
 The module is part of the package: it is required, and every function in it exists once. There is no second,
 pure-Python implementation of what is native, and no switch between two.
 
     python -m chris_integrator.native      the module in use, and its self-test on this machine
-    GET /v2/health  ->  "native": {"active": true, "implementation": "native", "parts": [...], "version": 7, "module": "..."}
-    the daemon's first log lines: "native core version 7 (_chris_native.abi3.so; json, round, interp, ekf, lanes, radar)"
+    GET /v2/health  ->  "native": {"active": true, "implementation": "native", "parts": [...], "version": 8, "module": "..."}
+    the daemon's first log lines: "native core version 8 (_chris_native.abi3.so; json, round, interp, ekf, lanes, radar, decide)"
 
 A package without the module (or with one of another version) does not import: the error says that the native
 core is not built, does not load, or is of the wrong version, and how to build it (below).
@@ -70,6 +70,11 @@ gave the frozen results) adds them in an order of its own, with fused multiply-a
 the last bit or two of a double. After the monitors and trackers, on recorded drives, that shows as a handful of
 messages per drive in which a number that rounds to zero carries the other sign (`-0.0` / `0.0`) and, rarely, a
 last printed digit; lane report L50 has the counts.
+
+| `decide` | `decide_eval` (decide/threat.py), `decide_inst_prob`, `decide_draws` (`native/src/decide.c`, included by chris_native.c) | per object, mode and car mode: collision probability over the horizon (quasi-Monte Carlo on fixed Halton draws, or the exact Gaussian over the footprints' Minkowski sum per time), required braking / steering / combined demand, threat numbers, time-to-brake / -steer, time to collision, headway, levels | closed forms (required deceleration v^2 / 2d, latest onset), the exact integral against products of normal distributions and against sampling; golden `tests/data/decide_golden.npz` (`python3 tests/data/make_decide_golden.py`): to rounding, bisected demands and times within their tolerances (0.06), Monte Carlo shares within 0.01 |
+
+The decision layer was written native from the start (no Python reference was removed): what holds it are the
+closed forms and the independent references of `tests/test_decide_native.py`, and its golden data freeze it.
 
 ### The radar: native only
 
