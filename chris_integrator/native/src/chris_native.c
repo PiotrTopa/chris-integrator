@@ -4133,6 +4133,509 @@ done:
     return res;
 }
 
+/* ---- the output (box.py `Radar.frame`): every listed object's numbers in the car frame of the message ---- */
+/* builtins.round(x, n) as a float object (the native `round`) */
+static PyObject *round_obj(double x, int n)
+{
+    int ok;
+    double r = round_fast(x, n, &ok);
+    if (ok && isfinite(x))
+        return PyFloat_FromDouble(r);
+    PyObject *f = PyFloat_FromDouble(x);
+    if (f == NULL)
+        return NULL;
+    PyObject *res = PyObject_CallFunction(builtin_round, "Oi", f, n);
+    Py_DECREF(f);
+    return res;
+}
+
+/* np.interp(q, xs, ys) for one point (xs not decreasing) */
+static double np_interp1(double q, const double *xs, const double *ys, Py_ssize_t n)
+{
+    if (isnan(q))
+        return q;
+    if (q < xs[0])
+        return ys[0];
+    if (q >= xs[n - 1])
+        return q > xs[n - 1] ? ys[n - 1] : ys[n - 1];
+    Py_ssize_t lo = 0, hi = n - 1;                  /* xs[lo] <= q < xs[hi] */
+    while (hi - lo > 1) {
+        Py_ssize_t mid = (lo + hi) / 2;
+        if (xs[mid] <= q)
+            lo = mid;
+        else
+            hi = mid;
+    }
+    double slope = (ys[lo + 1] - ys[lo]) / (xs[lo + 1] - xs[lo]);
+    double r = slope * (q - xs[lo]) + ys[lo];
+    if (isnan(r)) {
+        r = slope * (q - xs[lo + 1]) + ys[lo + 1];
+        if (isnan(r) && ys[lo] == ys[lo + 1])
+            r = ys[lo];
+    }
+    return r;
+}
+
+typedef struct {
+    const double *xs, *ys;
+    Py_ssize_t n;
+    double v, w;
+} RPath;
+
+/* Radar._offset: the lateral offset of a car-frame point from the path */
+static double r_offset(const RPath *p, double x, double y)
+{
+    if (p->n && x <= p->xs[p->n - 1] + 5.0)
+        return y - np_interp1(x, p->xs, p->ys, p->n);
+    double k = p->v > 2.0 ? p->w / p->v : 0.0;
+    return y - 0.5 * k * x * x;
+}
+
+/* Radar._path_point: (x, y, direction) of the path at distance s ahead */
+static void r_path_point(const RPath *p, double s, double *out)
+{
+    if (p->n && s <= p->xs[p->n - 1]) {
+        double y = np_interp1(s, p->xs, p->ys, p->n), d = 1.0;
+        out[0] = s;
+        out[1] = y;
+        out[2] = atan2(np_interp1(s + d, p->xs, p->ys, p->n) - np_interp1(s - d, p->xs, p->ys, p->n), 2.0 * d);
+        return;
+    }
+    double k = p->v > 2.0 ? p->w / p->v : 0.0;
+    if (fabs(k) < 1e-6) {
+        out[0] = s;
+        out[1] = 0.0;
+        out[2] = 0.0;
+        return;
+    }
+    out[0] = sin(k * s) / k;
+    out[1] = (1.0 - cos(k * s)) / k;
+    out[2] = k * s;
+}
+
+static PyObject *rkey[12];
+static const char *const RKEYS[12] = {"t_s", "x_m", "y_m", "std_m", "stand", "cv", "ca", NULL};
+
+static int rkeys_init(void)
+{
+    for (int k = 0; RKEYS[k]; k++)
+        if (rkey[k] == NULL && (rkey[k] = PyUnicode_InternFromString(RKEYS[k])) == NULL)
+            return -1;
+    return 0;
+}
+
+/* d[key] = value (stolen); -1 on error */
+static int dset(PyObject *d, int key, PyObject *v)
+{
+    if (v == NULL)
+        return -1;
+    int r = PyDict_SetItem(d, rkey[key], v);
+    Py_DECREF(v);
+    return r;
+}
+
+#define RFCFG 12                 /* corridor_m, corridor_rel, path_max_m, ttc_min_closing, in_path_sigma,
+                                    in_path_slack_m, threat_ttc_s, threat_min_mps, with_heading_deg, with_speed
+                                    (low, high), with_min_mps */
+
+/* radar_frame(S, rows, dt, kin, par, pose, ego, cfg, horizons, path_x | None, path_y | None, listed, v_still)
+ *   -> [(x_m, y_m, vx_mps, vy_mps, ax_mps2, ay_mps2, speed_mps, heading_rad, v_rel_mps, std, models,
+ *        p_stationary, angle_offset_deg, predict, offset, path_offset_m, on, sure_in, p_threat, ttc_s, along)]
+ *   dt: (B, 1 + H) the time from each object's own to the message's and to each horizon after it;
+ *   pose: (X, Y, psi) of the car at the message's time; ego: (v, w); horizons: H numbers (predict_s);
+ *   listed: per object 1 if it is not tentative (a threat is judged for those only).
+ * Rounded as the message carries them; `offset` and `p_threat` also as they are (the flags' hysteresis needs them). */
+static PyObject *n_radar_frame(PyObject *self, PyObject *args)
+{
+    PyObject *oS, *orows, *odt, *okin, *opar, *opose, *oego, *ocfg, *ohz, *opx, *opy, *olst, *ov0;
+    if (!PyArg_ParseTuple(args, "OOOOOOOOOOOOO", &oS, &orows, &odt, &okin, &opar, &opose, &oego, &ocfg, &ohz, &opx,
+                          &opy, &olst, &ov0))
+        return NULL;
+    PyObject *res = NULL;
+    View vS, vpx, vpy;
+    vS.held = vpx.held = vpy.held = 0;
+    Py_ssize_t cap, B = 0, H, *rows = NULL;
+    double *buf = NULL, pose[3], ego[2], cfg[RFCFG], hz[8];
+    RPar par;
+    RPath path = {NULL, NULL, 0, 0.0, 0.0};
+    if (rkeys_init() < 0 || store_get(oS, &vS, &cap) < 0 || (rows = idx_get(orows, cap, &B)) == NULL ||
+        rpar_get(opar, &par) < 0 || nums_get(opose, 3, pose, "pose") < 0 || nums_get(oego, 2, ego, "ego") < 0 ||
+        nums_get(ocfg, RFCFG, cfg, "cfg") < 0)
+        goto done;
+    if (!PyList_Check(ohz) && !PyTuple_Check(ohz)) {
+        PyErr_SetString(PyExc_TypeError, "radar_frame: the horizons must be a list or tuple");
+        goto done;
+    }
+    H = batch_len(ohz);
+    if (H > 8) {
+        PyErr_SetString(PyExc_ValueError, "radar_frame: at most 8 horizons");
+        goto done;
+    }
+    if (nums_get(ohz, H, hz, "horizons") < 0)
+        goto done;
+    if (opx != Py_None) {
+        if (view_get(opx, &vpx, 0, 'd', 1, "path_x") < 0 || view_get(opy, &vpy, 0, 'd', 1, "path_y") < 0)
+            goto done;
+        if (vpx.b.shape[0] != vpy.b.shape[0] || vpx.b.shape[0] < 2) {
+            PyErr_SetString(PyExc_ValueError, "radar_frame: a path of at least two points, x and y alike");
+            goto done;
+        }
+        path.xs = DATA(vpx);
+        path.ys = DATA(vpy);
+        path.n = vpx.b.shape[0];
+    }
+    path.v = ego[0];
+    path.w = ego[1];
+    buf = (double *)PyMem_Malloc((size_t)(B ? B : 1) * (size_t)(1 + H + 4 + 1 + 1) * sizeof(double));
+    if (buf == NULL) {
+        PyErr_NoMemory();
+        goto done;
+    }
+    double *dts = buf, *kin = dts + B * (1 + H), *lst = kin + 4 * B, *v0 = lst + B;
+    if (rows_get(odt, B, (int)(1 + H), dts, "dt") < 0 || rows_get(okin, B, 4, kin, "kin") < 0 ||
+        rows_get(olst, B, 1, lst, "listed") < 0 || rows_get(ov0, B, 1, v0, "v_still") < 0)
+        goto done;
+    res = PyList_New(B);
+    if (res == NULL)
+        goto done;
+    double *A = (double *)vS.b.buf;
+    double X = pose[0], Y = pose[1], ch = cos(pose[2]), sh = sin(pose[2]), v_ego = ego[0];
+    for (Py_ssize_t b = 0; b < B; b++) {
+        const double *row = A + rows[b] * RROW;
+        double x[RN], P[RNN], mu[3], xp[8][RN], Pq[8][RNN];
+        for (Py_ssize_t h = 0; h <= H; h++) {          /* now and ahead (Tracker.peek_many) */
+            double dt = dts[b * (1 + H) + h], *xo = h ? xp[h - 1] : x, *Po = h ? Pq[h - 1] : P, mm[3];
+            if (fabs(dt) < 1e-6) {
+                memcpy(xo, row + RO_X, sizeof(double) * RN);
+                memcpy(Po, row + RO_P, sizeof(double) * RNN);
+                memcpy(mm, row + RO_MU, sizeof(mm));
+            } else {
+                double xs1[3 * RN], Ps1[3 * RNN];
+                r_evolve_row(row, dt, kin + 4 * b, &par, xs1, Ps1, mm, NULL, NULL);
+                r_combine(xs1, Ps1, mm, xo, Po);
+            }
+            if (h == 0)
+                memcpy(mu, mm, sizeof(mm));
+        }
+        /* ground -> car axes */
+        double dx = x[R_PX] - X, dy = x[R_PY] - Y;
+        double pc0 = ch * dx + sh * dy, pc1 = -sh * dx + ch * dy;
+        double vc0 = ch * x[R_VX] + sh * x[R_VY], vc1 = -sh * x[R_VX] + ch * x[R_VY];
+        double ac0 = ch * x[R_AX] + sh * x[R_AY], ac1 = -sh * x[R_AX] + ch * x[R_AY];
+        double Pp[4], Pv[4];
+        for (int blk = 0; blk < 2; blk++) {             /* Rm @ P[blk] @ Rm.T */
+            int o = 2 * blk;
+            double a = P[o * RN + o], bb = P[o * RN + o + 1], c = P[(o + 1) * RN + o], d = P[(o + 1) * RN + o + 1];
+            double m00 = ch * a + sh * c, m01 = ch * bb + sh * d, m10 = -sh * a + ch * c, m11 = -sh * bb + ch * d;
+            double *out = blk ? Pv : Pp;
+            out[0] = m00 * ch + m01 * sh;
+            out[1] = m00 * -sh + m01 * ch;
+            out[2] = m10 * ch + m11 * sh;
+            out[3] = m10 * -sh + m11 * ch;
+        }
+        double speed = py_hypot(vc0, vc1);
+        double off = r_offset(&path, pc0, pc1);
+        double lim = cfg[0] + cfg[1] * pc0;
+        int on = 0.3 < pc0 && pc0 <= cfg[2] && fabs(off) <= lim;
+        double sy = sqrt(pymax(Pp[3], 0.0));
+        int sure_in = on && fabs(off) + cfg[4] * sy <= lim + cfg[5];
+        /* reached within threat_ttc_s at the present speeds, over every hypothesis (the object's own, at its time) */
+        double p_thr = 0.0;
+        if (sure_in && v_ego >= cfg[7] && lst[b] != 0.0) {
+            double Tt = cfg[6], u[RN] = {0};
+            u[R_PX] = ch;
+            u[R_PY] = sh;
+            u[R_VX] = Tt * ch;
+            u[R_VY] = Tt * sh;
+            for (int m = 0; m < 3; m++) {
+                const double *xm = row + RO_XS + m * RN, *Pm = row + RO_PS + m * RNN;
+                double g = ch * (xm[R_PX] - X) + sh * (xm[R_PY] - Y) + Tt * (ch * xm[R_VX] + sh * xm[R_VY]) - Tt * v_ego;
+                double uPu = 0.0;
+                for (int i = 0; i < RN; i++) {
+                    double acc = 0.0;
+                    for (int k = 0; k < RN; k++)
+                        acc = k ? acc + u[k] * Pm[k * RN + i] : u[k] * Pm[k * RN + i];
+                    uPu = i ? uPu + acc * u[i] : acc * u[i];
+                }
+                double sg = sqrt(pymax(uPu, 0.0) + 0.09 * Tt * Tt);
+                p_thr += row[RO_MU + m] * 0.5 * (1.0 + erf(-g / (sg * 1.4142)));
+            }
+        }
+        double v_rel = vc0 - v_ego;
+        int has_ttc = on && v_rel < -cfg[3];
+        double still;
+        {
+            const double *Xs = row + RO_XS, *Ps = row + RO_PS, *m = row + RO_MU;
+            double q0 = r_still(Xs + RN, Ps + RNN, v0[b]), q1 = r_still(Xs + 2 * RN, Ps + 2 * RNN, v0[b]);
+            double s = (m[0] + m[1] * q0) + m[2] * q1;
+            still = s > 1.0 ? 1.0 : s;
+        }
+        PyObject *t = PyTuple_New(21), *pred = PyList_New(H), *std = PyList_New(4), *models = PyDict_New(), *along = NULL;
+        if (t == NULL || pred == NULL || std == NULL || models == NULL)
+            goto obj_fail;
+        for (Py_ssize_t h = 0; h < H; h++) {
+            double qx = xp[h][R_PX] - X, qy = xp[h][R_PY] - Y;
+            double q0 = ch * qx + sh * qy, q1 = -sh * qx + ch * qy;
+            PyObject *d = PyDict_New();
+            if (d == NULL)
+                goto obj_fail;
+            PyList_SetItem(pred, h, d);
+            PyObject *th = seq_item(ohz, PyList_Check(ohz), h);
+            Py_INCREF(th);
+            if (dset(d, 0, th) < 0 || dset(d, 1, round_obj(q0, 2)) < 0 ||
+                dset(d, 2, round_obj(q1, 2)) < 0 ||
+                dset(d, 3, round_obj(sqrt(pymax(Pq[h][0] + Pq[h][RN + 1], 0.0)), 2)) < 0)
+                goto obj_fail;
+        }
+        {
+            double sd[4] = {Pp[0], Pp[3], Pv[0], Pv[3]};
+            for (int k = 0; k < 4; k++) {
+                PyObject *f = round_obj(sqrt(pymax(sd[k], 0.0)), 2);
+                if (f == NULL)
+                    goto obj_fail;
+                PyList_SetItem(std, k, f);
+            }
+        }
+        for (int m = 0; m < 3; m++)
+            if (dset(models, 4 + m, round_obj(mu[m], 3)) < 0)
+                goto obj_fail;
+        /* the same object if it keeps following the road as the car does */
+        if (speed >= cfg[11] && v_ego >= cfg[11] && pc0 > 0.0 && cfg[9] <= speed / v_ego && speed / v_ego <= cfg[10]) {
+            double pp[3];
+            r_path_point(&path, pc0, pp);
+            double dh = wrap_pi(atan2(vc1, vc0) - pp[2]);
+            if (fabs(dh) <= cfg[8] * (PI / 180.0)) {
+                along = PyList_New(H);
+                if (along == NULL)
+                    goto obj_fail;
+                for (Py_ssize_t h = 0; h < H; h++) {
+                    r_path_point(&path, pc0 + speed * hz[h], pp);
+                    PyObject *d = PyDict_New();
+                    if (d == NULL)
+                        goto obj_fail;
+                    PyList_SetItem(along, h, d);
+                    PyObject *th = seq_item(ohz, PyList_Check(ohz), h);
+                    Py_INCREF(th);
+                    if (dset(d, 0, th) < 0 || dset(d, 1, round_obj(pp[0] - off * sin(pp[2]), 2)) < 0 ||
+                        dset(d, 2, round_obj(pp[1] + off * cos(pp[2]), 2)) < 0)
+                        goto obj_fail;
+                }
+            }
+        }
+        PyObject *items[21] = {
+            round_obj(pc0, 2), round_obj(pc1, 2), round_obj(vc0, 2), round_obj(vc1, 2), round_obj(ac0, 2),
+            round_obj(ac1, 2), round_obj(speed, 2), NULL, round_obj(v_rel, 2), std, models, round_obj(still, 3),
+            round_obj(x[R_DP] * (180.0 / PI), 3), pred, PyFloat_FromDouble(off), round_obj(off, 2),
+            PyBool_FromLong(on), PyBool_FromLong(sure_in), PyFloat_FromDouble(p_thr), NULL, NULL};
+        std = models = pred = NULL;
+        if (speed >= 1.0)
+            items[7] = round_obj(atan2(vc1, vc0), 3);
+        else {
+            items[7] = Py_None;
+            Py_INCREF(Py_None);
+        }
+        if (has_ttc)
+            items[19] = round_obj(pc0 / -v_rel, 2);
+        else {
+            items[19] = Py_None;
+            Py_INCREF(Py_None);
+        }
+        if (along)
+            items[20] = along;
+        else {
+            items[20] = Py_None;
+            Py_INCREF(Py_None);
+        }
+        along = NULL;
+        int bad = 0;
+        for (int k = 0; k < 21; k++) {
+            if (items[k] == NULL)
+                bad = 1;
+            else
+                PyTuple_SetItem(t, k, items[k]);
+        }
+        if (bad)
+            goto obj_fail;
+        PyList_SetItem(res, b, t);
+        continue;
+    obj_fail:
+        Py_XDECREF(t);
+        Py_XDECREF(pred);
+        Py_XDECREF(std);
+        Py_XDECREF(models);
+        Py_XDECREF(along);
+        Py_CLEAR(res);
+        goto done;
+    }
+done:
+    PyMem_Free(rows);
+    PyMem_Free(buf);
+    view_drop(&vS); view_drop(&vpx); view_drop(&vpy);
+    return res;
+}
+
+/* ---- the objects' life (Tracker.manage, Tracker._merge) ---- */
+/* the larger eigenvalue of a symmetric 2 x 2 matrix from its lower triangle (np.linalg.eigvalsh(.)[-1]) */
+static double r_eig2(double a, double b, double d)
+{
+    return 0.5 * (a + d) + hypot(0.5 * (a - d), b);
+}
+
+/* radar_life(S, rows, v_still, away, dt, kin, par, pose, stand_drift2) -> [(p_still, finite, mu_stand, sd, range)]
+ * For every object: how still it is (p_still), whether its combined state is finite; for one that is out of
+ * view (away: 1) and finite, where it will be at the message's time (dt from its own, kin, par: radar_peek):
+ * the probability that it stands, how well its place is known (1 sigma of the larger axis; a standing one's
+ * as it stands, with the standing drift over dt), its range from the car (pose: (X, Y) or None: 0). Others:
+ * (p_still, finite, None, None, None). */
+static PyObject *n_radar_life(PyObject *self, PyObject *args)
+{
+    PyObject *oS, *orows, *ov0, *oaway, *odt, *okin, *opar, *opose;
+    double sd2;
+    if (!PyArg_ParseTuple(args, "OOOOOOOOd", &oS, &orows, &ov0, &oaway, &odt, &okin, &opar, &opose, &sd2))
+        return NULL;
+    PyObject *res = NULL;
+    View vS;
+    vS.held = 0;
+    Py_ssize_t cap, B = 0, *rows = NULL;
+    double *buf = NULL, pose[2] = {0.0, 0.0};
+    int has_pose = opose != Py_None;
+    RPar par;
+    if (store_get(oS, &vS, &cap) < 0 || (rows = idx_get(orows, cap, &B)) == NULL || rpar_get(opar, &par) < 0 ||
+        (has_pose && nums_get(opose, 2, pose, "pose") < 0))
+        goto done;
+    buf = (double *)PyMem_Malloc((size_t)(B ? B : 1) * 7 * sizeof(double));
+    if (buf == NULL) {
+        PyErr_NoMemory();
+        goto done;
+    }
+    double *v0 = buf, *away = v0 + B, *dts = away + B, *kin = dts + B;
+    if (rows_get(ov0, B, 1, v0, "v_still") < 0 || rows_get(oaway, B, 1, away, "away") < 0 ||
+        rows_get(odt, B, 1, dts, "dt") < 0 || rows_get(okin, B, 4, kin, "kin") < 0)
+        goto done;
+    res = PyList_New(B);
+    if (res == NULL)
+        goto done;
+    double *A = (double *)vS.b.buf;
+    for (Py_ssize_t b = 0; b < B; b++) {
+        const double *row = A + rows[b] * RROW;
+        const double *Xs = row + RO_XS, *Ps = row + RO_PS, *m = row + RO_MU;
+        double q0 = r_still(Xs + RN, Ps + RNN, v0[b]), q1 = r_still(Xs + 2 * RN, Ps + 2 * RNN, v0[b]);
+        double s = (m[0] + m[1] * q0) + m[2] * q1;
+        int fin = all_finite(row + RO_X, RN);
+        PyObject *t;
+        if (away[b] != 0.0 && fin) {
+            double x[RN], P[RNN], mm[3], dt = dts[b];
+            if (fabs(dt) < 1e-6) {
+                memcpy(x, row + RO_X, sizeof(x));
+                memcpy(P, row + RO_P, sizeof(P));
+                memcpy(mm, row + RO_MU, sizeof(mm));
+            } else {
+                double xs1[3 * RN], Ps1[3 * RNN];
+                r_evolve_row(row, dt, kin + 4 * b, &par, xs1, Ps1, mm, NULL, NULL);
+                r_combine(xs1, Ps1, mm, x, P);
+            }
+            double lam;
+            if (mm[R_STAND] >= 0.5) {
+                /* believed standing: where it stands is known as well as ever */
+                const double *Pst = row + RO_PS;           /* the standing hypothesis, at the object's own time */
+                double grow = sd2 * pymax(dt, 0.0);
+                lam = r_eig2(Pst[0] + grow, Pst[RN], Pst[RN + 1] + grow);
+            } else
+                lam = r_eig2(P[0], P[RN], P[RN + 1]);
+            double sd = sqrt(pymax(lam, 0.0));
+            double rng = has_pose ? py_hypot(x[R_PX] - pose[0], x[R_PY] - pose[1]) : 0.0;
+            t = Py_BuildValue("(dOddd)", s > 1.0 ? 1.0 : s, Py_True, mm[R_STAND], sd, rng);
+        } else
+            t = Py_BuildValue("(dOOOO)", s > 1.0 ? 1.0 : s, fin ? Py_True : Py_False, Py_None, Py_None, Py_None);
+        if (t == NULL) {
+            Py_CLEAR(res);
+            goto done;
+        }
+        PyList_SetItem(res, b, t);
+    }
+done:
+    PyMem_Free(rows);
+    PyMem_Free(buf);
+    view_drop(&vS);
+    return res;
+}
+
+#define RMCFG 3                  /* merge_m, merge_rel, merge_dv */
+
+/* radar_merge(S, rows, times, kin, par, here, ego, cfg) -> [(i, j, same_place)]
+ * Tracker._merge's geometry: the pairs (i < j) worth a look (nearer than the limit can be at any range in reach,
+ * with room for what the difference of their times may have moved one of them), and for each whether the two
+ * are at one place within the limit at that range and move alike (the second taken to the first one's time).
+ *   times: each object's own time;  here: (B, 2) the car's place at each object's time;  ego: (X, Y) now. */
+static PyObject *n_radar_merge(PyObject *self, PyObject *args)
+{
+    PyObject *oS, *orows, *otm, *okin, *opar, *ohere, *oego, *ocfg;
+    if (!PyArg_ParseTuple(args, "OOOOOOOO", &oS, &orows, &otm, &okin, &opar, &ohere, &oego, &ocfg))
+        return NULL;
+    PyObject *res = NULL;
+    View vS;
+    vS.held = 0;
+    Py_ssize_t cap, B = 0, *rows = NULL;
+    double *buf = NULL, ego[2], cfg[RMCFG];
+    RPar par;
+    if (store_get(oS, &vS, &cap) < 0 || (rows = idx_get(orows, cap, &B)) == NULL || rpar_get(opar, &par) < 0 ||
+        nums_get(oego, 2, ego, "ego") < 0 || nums_get(ocfg, RMCFG, cfg, "cfg") < 0)
+        goto done;
+    buf = (double *)PyMem_Malloc((size_t)(B ? B : 1) * 9 * sizeof(double));
+    if (buf == NULL) {
+        PyErr_NoMemory();
+        goto done;
+    }
+    double *tm = buf, *kin = tm + B, *here = kin + 4 * B, *sp = here + 2 * B, *far = sp + B;
+    if (rows_get(otm, B, 1, tm, "times") < 0 || rows_get(okin, B, 4, kin, "kin") < 0 ||
+        rows_get(ohere, B, 2, here, "here") < 0)
+        goto done;
+    res = PyList_New(0);
+    if (res == NULL)
+        goto done;
+    double *A = (double *)vS.b.buf;
+    for (Py_ssize_t i = 0; i < B; i++) {
+        const double *x = A + rows[i] * RROW + RO_X;
+        sp[i] = py_hypot(x[R_VX], x[R_VY]);
+        far[i] = hypot(x[R_PX] - ego[0], x[R_PY] - ego[1]) + 10.0;    /* the car has not moved more than this */
+    }
+    for (Py_ssize_t i = 0; i < B; i++) {
+        const double *ra = A + rows[i] * RROW, *xa = ra + RO_X, *Pa = ra + RO_P;
+        for (Py_ssize_t j = i + 1; j < B; j++) {
+            const double *rb = A + rows[j] * RROW, *xb0 = rb + RO_X, *Pb = rb + RO_P;
+            double gap = hypot(xa[R_PX] - xb0[R_PX], xa[R_PY] - xb0[R_PY]);
+            double room = cfg[0] + cfg[1] * far[i] + fabs(tm[i] - tm[j]) * (sp[j] + 30.0) * 2.0;
+            if (!(gap <= room))
+                continue;
+            double xb[RN];
+            if (fabs(tm[i] - tm[j]) < 1e-6)
+                memcpy(xb, xb0, sizeof(xb));
+            else {
+                double xs1[3 * RN], Ps1[3 * RNN], mm[3], Pp[RNN];
+                r_evolve_row(rb, tm[i] - tm[j], kin + 4 * j, &par, xs1, Ps1, mm, NULL, NULL);
+                r_combine(xs1, Ps1, mm, xb, Pp);
+            }
+            double r = py_hypot(xa[R_PX] - here[2 * i], xa[R_PY] - here[2 * i + 1]);
+            double lim = cfg[0] + cfg[1] * r;
+            double dv = hypot(xb[R_VX] - xa[R_VX], xb[R_VY] - xa[R_VY]);
+            double sv = sqrt(pymax((Pa[R_VX * RN + R_VX] + Pa[R_VY * RN + R_VY]) + (Pb[R_VX * RN + R_VX] + Pb[R_VY * RN + R_VY]), 0.0));
+            int same = !(py_hypot(xb[R_PX] - xa[R_PX], xb[R_PY] - xa[R_PY]) > lim) && !(dv > cfg[2] + 2.0 * sv);
+            PyObject *t = Py_BuildValue("(nnO)", i, j, same ? Py_True : Py_False);
+            if (t == NULL || PyList_Append(res, t) < 0) {
+                Py_XDECREF(t);
+                Py_CLEAR(res);
+                goto done;
+            }
+            Py_DECREF(t);
+        }
+    }
+done:
+    PyMem_Free(rows);
+    PyMem_Free(buf);
+    view_drop(&vS);
+    return res;
+}
+
 /* ==================================================================================================== */
 static PyMethodDef methods[] = {
     {"dumps", n_dumps, METH_O, "json.dumps(obj, separators=(',', ':')); raises Fallback where json must decide"},
@@ -4162,6 +4665,9 @@ static PyMethodDef methods[] = {
     {"radar_assign", n_radar_assign, METH_O, "tracker.assign"},
     {"radar_scan", n_radar_scan, METH_VARARGS, "one scan's association (Tracker.process): pairs, p_detect, coverage"},
     {"radar_update", n_radar_update, METH_VARARGS, "the update of a scan's pairs (Tracker._update's arithmetic)"},
+    {"radar_frame", n_radar_frame, METH_VARARGS, "the output's per-object numbers (box.py Radar.frame)"},
+    {"radar_life", n_radar_life, METH_VARARGS, "Tracker.manage's numbers: stillness, finiteness, out-of-view place"},
+    {"radar_merge", n_radar_merge, METH_VARARGS, "Tracker._merge's geometry: the near pairs and their test"},
     {NULL, NULL, 0, NULL}};
 
 static struct PyModuleDef moduledef = {PyModuleDef_HEAD_INIT, "_chris_native",

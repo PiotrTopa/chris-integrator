@@ -214,7 +214,7 @@ class Obj:
     __slots__ = ("id", "slot", "_xs", "_Ps", "_mu", "_xf", "_Pf", "_x", "_P", "t", "t0", "logodds", "hits", "state",
                  "sources", "last_seen", "vote", "history", "checks", "consistency", "pred_err", "n_checks", "nis",
                  "verdict", "coast_s", "velocity_seen", "merge_t", "flags", "last_cover", "dp0", "gain", "last_box",
-                 "scores", "range_t")
+                 "scores", "range_t", "cls")
     xs, Ps, mu, xf, Pf, x, P = (_view(k) for k, _ in _LAY)
 
     def __init__(self, oid, x0, P0, mu, t, src, exist, coast_s, store=None, live=()):
@@ -253,6 +253,7 @@ class Obj:
         self.last_box = None         # (time, sensor, angular width) of its last box
         self.scores = []             # (sensor, score) of its boxes while it is not confirmed
         self.range_t = t             # the last time a detection said how far it is (not a bearing alone)
+        self.cls = None              # classvote.result of `vote` without its age (box.py), until the next vote
         self.x, self.P = M.combine(self.xs, self.Ps, self.mu)
 
     def bind(self, store):
@@ -843,6 +844,7 @@ class Tracker:
         at = d.get("attrs") or {}
         if at.get("class") is not None:
             classvote.vote(o.vote, at.get("class"), at.get("class_conf", at.get("prob")), src, t, at.get("weight", 1.0))
+            o.cls = None
 
     def _update(self, o, d, R, sensor, pose, src, t, pd=None, lam=None, pair=None):
         """One detection into one object. Each hypothesis takes it only as far as it can be this object's at
@@ -993,16 +995,13 @@ class Tracker:
         c = self.cfg
         keep = []
         pose = self.ego.pose_at(T)
-        still = dict(zip((o.id for o in self.objects), self.p_still_many(self.objects)))
         # "out of view" is what scans say that came and did not cover the object's place; while no scan comes
         # at all (frames dropped, the detector shed by the load governor) nothing has left any field
         scan = T if self.t is None else min(T, self.t)
-        away = [o for o in self.objects if o.state != "tentative" and scan - o.last_cover > c["view_gap_s"]
-                and np.all(np.isfinite(o.x))]
-        there = dict(zip((o.id for o in away), self.peek_many(away, [T] * len(away))))
-        for o in self.objects:
+        life = self._life(T, pose, scan)
+        for o, (p_st, finite, _, sd, rng) in zip(self.objects, life):
             last = max(o.last_seen.values())
-            if o.exist < c["delete_exist"] or not np.all(np.isfinite(o.x)):
+            if o.exist < c["delete_exist"] or not finite:
                 continue
             if scan - o.last_cover <= c["view_gap_s"]:
                 # a sensor is looking at where it should be: it lives by being seen
@@ -1022,19 +1021,10 @@ class Tracker:
                     if scan - o.last_cover > c["memory_tentative_s"]:
                         continue
                 else:
-                    x, P, mu = there[o.id]
-                    if mu[STAND] >= 0.5:
-                        # believed standing: where it stands is known as well as ever (that it MAY have driven
-                        # off since is in its probabilities, not a blur of its place)
-                        Ps = o.Ps[STAND][:2, :2] + np.eye(2) * (self.mcfg["stand_drift"] ** 2) * max(T - o.t, 0.0)
-                        sd = math.sqrt(max(float(np.linalg.eigvalsh(Ps)[-1]), 0.0))
-                    else:
-                        sd = math.sqrt(max(float(np.linalg.eigvalsh(P[:2, :2])[-1]), 0.0))
-                    rng = math.hypot(x[PX] - pose[0], x[PY] - pose[1]) if pose else 0.0
                     if T - o.last_cover > c["memory_s"] or sd > c["memory_std_m"] or rng > c["memory_range_m"]:
                         continue
                     o.state = "memory"
-            self._judge(o, T, still[o.id])
+            self._judge(o, T, p_st)
             keep.append(o)
         kept = {o.id for o in keep}
         for o in self.objects:                           # never confirmed and gone: its boxes were false ones
@@ -1048,6 +1038,39 @@ class Tracker:
             self.real_ids = {o.id for o in keep if o.state != "tentative"}
         self._merge(T)
         self._register(T)
+
+    def _life(self, T, pose, scan):
+        """Per object: (p_still, its combined state finite, and for one out of every field (not tentative) where
+        it will be at T: the probability that it stands, 1 sigma of its place (larger axis), its range; else
+        None x 3)."""
+        c = self.cfg
+        objs = self.objects
+        if _NR is not None:
+            kin = [M._KIN4.get(o.label) or M._KIN4[None] for o in objs]
+            return _NR.radar_life(self.store.a, [o.slot for o in objs], [k[3] for k in kin],
+                                  [1.0 if o.state != "tentative" and scan - o.last_cover > c["view_gap_s"] else 0.0 for o in objs],
+                                  [T - o.t for o in objs], kin, M._native_par(self.mcfg), pose[:2] if pose else None,
+                                  self.mcfg["stand_drift"] ** 2)
+        still = self.p_still_many(objs)
+        away = [o for o in objs if o.state != "tentative" and scan - o.last_cover > c["view_gap_s"]
+                and np.all(np.isfinite(o.x))]
+        there = dict(zip((o.id for o in away), self.peek_many(away, [T] * len(away))))
+        out = []
+        for k, o in enumerate(objs):
+            if o.id not in there:
+                out.append((still[k], bool(np.all(np.isfinite(o.x))), None, None, None))
+                continue
+            x, P, mu = there[o.id]
+            if mu[STAND] >= 0.5:
+                # believed standing: where it stands is known as well as ever (that it MAY have driven
+                # off since is in its probabilities, not a blur of its place)
+                Ps = o.Ps[STAND][:2, :2] + np.eye(2) * (self.mcfg["stand_drift"] ** 2) * max(T - o.t, 0.0)
+                sd = math.sqrt(max(float(np.linalg.eigvalsh(Ps)[-1]), 0.0))
+            else:
+                sd = math.sqrt(max(float(np.linalg.eigvalsh(P[:2, :2])[-1]), 0.0))
+            rng = math.hypot(x[PX] - pose[0], x[PY] - pose[1]) if pose else 0.0
+            out.append((still[k], True, float(mu[STAND]), sd, rng))
+        return out
 
     def _register(self, T):
         """Sensor registration: what the objects of one sensor agree on in their angle offsets is not theirs but
@@ -1118,35 +1141,54 @@ class Tracker:
         if n < 2:
             return
         # the pairs worth a look: nearer than the limit can be at any range in reach, with room for what a
-        # difference of the two objects' times may have moved one of them
-        xy = np.array([o.x[:2] for o in obs])
-        tt = np.array([o.t for o in obs])
-        sp = np.array([math.hypot(o.x[VX], o.x[VY]) for o in obs])
-        gap = np.hypot(xy[:, None, 0] - xy[None, :, 0], xy[:, None, 1] - xy[None, :, 1])
+        # difference of the two objects' times may have moved one of them; with the native core also whether each
+        # is at one place and moves alike (else that is judged below)
+        nearj, nearset = {}, set()
         e = self.ego.pose_at(T)
-        far = np.hypot(xy[:, 0] - e[0], xy[:, 1] - e[1]) + 10.0     # the car has not moved more than this since
-        room = c["merge_m"] + c["merge_rel"] * far[:, None] + np.abs(tt[:, None] - tt[None, :]) * (sp[None, :] + 30.0) * 2.0
-        near = np.triu(gap <= room, 1)
+        if _NR is not None:
+            here, poses = [], {}
+            for o in obs:
+                if o.t not in poses:
+                    poses[o.t] = self.ego.pose_at(o.t)[:2]
+                here.append(poses[o.t])
+            for i, j, same in _NR.radar_merge(self.store.a, [o.slot for o in obs], [o.t for o in obs],
+                                              [M._KIN4.get(o.label) or M._KIN4[None] for o in obs],
+                                              M._native_par(self.mcfg), here, e[:2], (c["merge_m"], c["merge_rel"], c["merge_dv"])):
+                nearj.setdefault(i, []).append((j, same))
+                nearset.add((i, j))
+        else:
+            xy = np.array([o.x[:2] for o in obs])
+            tt = np.array([o.t for o in obs])
+            sp = np.array([math.hypot(o.x[VX], o.x[VY]) for o in obs])
+            gap = np.hypot(xy[:, None, 0] - xy[None, :, 0], xy[:, None, 1] - xy[None, :, 1])
+            far = np.hypot(xy[:, 0] - e[0], xy[:, 1] - e[1]) + 10.0     # the car has not moved more than this since
+            room = c["merge_m"] + c["merge_rel"] * far[:, None] + np.abs(tt[:, None] - tt[None, :]) * (sp[None, :] + 30.0) * 2.0
+            near = np.triu(gap <= room, 1)
+            for i, j in zip(*np.nonzero(near)):
+                nearj.setdefault(int(i), []).append((int(j), None))
+                nearset.add((int(i), int(j)))
         for i in range(n):
             if obs[i].merge_t:                           # a pair that is no longer near stops counting
                 for j in range(i + 1, n):
-                    if not near[i, j] and obs[j].id not in dead and obs[i].id not in dead:
+                    if (i, j) not in nearset and obs[j].id not in dead and obs[i].id not in dead:
                         obs[i].merge_t.pop(obs[j].id, None)
-            for j in np.nonzero(near[i])[0]:
+            for j, same in nearj.get(i, ()):
                 a, b = obs[i], obs[j]
                 if a.id in dead or b.id in dead:
                     continue
-                ta, tb = a.t, b.t
-                xb = b.x if abs(ta - tb) < 1e-6 else self.peek(b, ta)[0]
-                d = xb[:2] - a.x[:2]
-                r = math.hypot(*(a.x[:2] - np.array(self.ego.pose_at(ta)[:2])))
-                lim = c["merge_m"] + c["merge_rel"] * r
+                if same is None:
+                    ta, tb = a.t, b.t
+                    xb = b.x if abs(ta - tb) < 1e-6 else self.peek(b, ta)[0]
+                    d = xb[:2] - a.x[:2]
+                    r = math.hypot(*(a.x[:2] - np.array(self.ego.pose_at(ta)[:2])))
+                    lim = c["merge_m"] + c["merge_rel"] * r
+                    dv = float(np.hypot(*(xb[VX:VY + 1] - a.x[VX:VY + 1])))
+                    sv = math.sqrt(max(float(np.trace(a.P[VX:VY + 1, VX:VY + 1]) + np.trace(b.P[VX:VY + 1, VX:VY + 1])), 0.0))
+                    same = not (math.hypot(d[0], d[1]) > lim or dv > c["merge_dv"] + 2.0 * sv)
                 la, lb = a.label, b.label
                 same_kind = la is None or lb is None or (la in M.VEHICLES) == (lb in M.VEHICLES)
                 key = b.id
-                dv = float(np.hypot(*(xb[VX:VY + 1] - a.x[VX:VY + 1])))
-                sv = math.sqrt(max(float(np.trace(a.P[VX:VY + 1, VX:VY + 1]) + np.trace(b.P[VX:VY + 1, VX:VY + 1])), 0.0))
-                if math.hypot(d[0], d[1]) > lim or not same_kind or dv > c["merge_dv"] + 2.0 * sv:
+                if not same or not same_kind:
                     a.merge_t.pop(key, None)
                     continue
                 t0 = a.merge_t.setdefault(key, T)
