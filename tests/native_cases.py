@@ -28,8 +28,8 @@ def _canon(o, out):
         out.append(b"n")
     elif o is True or o is False:
         out.append(b"b1" if o else b"b0")
-    elif type(o) is float:
-        out.append(b"f" + struct.pack("<d", o))
+    elif type(o) is float:                             # (a NaN as one: its sign and payload are the CPU's)
+        out.append(b"fNaN" if o != o else b"f" + struct.pack("<d", o))
     elif type(o) is int:
         out.append(b"i%d;" % o)
     elif type(o) is str:
@@ -39,6 +39,8 @@ def _canon(o, out):
         out.append(b"y%d:" % len(o) + o)
     elif isinstance(o, np.ndarray):
         a = np.ascontiguousarray(o)
+        if a.dtype.kind == "f" and np.isnan(a).any():
+            a = np.where(np.isnan(a), np.nan, a)        # every NaN the same bits
         out.append(b"A" + a.dtype.str.encode() + repr(a.shape).encode() + a.tobytes())
     elif isinstance(o, np.generic):
         out.append(b"S" + type(o).__name__.encode() + o.tobytes())
@@ -58,7 +60,7 @@ def _canon(o, out):
 
 
 def digest(o):
-    """16 hex digits of sha256 over the value's canonical bytes: equal digests = equal types and bits."""
+    """16 hex digits of sha256 over the value's canonical bytes: equal digests = equal types and bits (NaN: any)."""
     out = []
     _canon(o, out)
     return hashlib.sha256(b"".join(out)).hexdigest()[:16]
