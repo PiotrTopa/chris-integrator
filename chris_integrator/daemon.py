@@ -21,6 +21,7 @@ JSON lines over Unix stream sockets (the stack's convention). A slow client is c
 """
 import argparse
 import asyncio
+import gc
 import json
 import logging
 import os
@@ -227,6 +228,11 @@ class Daemon:
                 loop.add_reader(pl.fileno(), pl.pump)
         log.info("chris-integrator: %d source sockets, %d plug-ins (%s), state size %d, http %s", len(tasks) - 1,
                  len(self.mixer.order), ", ".join(s.name for s in self.mixer.order), self.integ.model.n, self.http)
+        # what start-up built lives as long as the process: out of the collector's sight from here on. A collection
+        # of the older generations otherwise walks all of it, and stalls a frame by tens of milliseconds on a
+        # phone's little core (tools/cost_bench.py --gc freeze); what is made from now on is collected as before
+        gc.collect()
+        gc.freeze()
         nat = native.status()
         log.info("chris-integrator: hot path %s%s", "NATIVE (%s)" % ", ".join(nat["parts"]) if nat["active"] else "pure Python",
                  ": " + nat["reason"] if nat.get("reason") else "")
