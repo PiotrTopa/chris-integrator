@@ -27,6 +27,7 @@ number outside its exact path) says so (`Fallback`) and the reference runs for t
 (`json,round,interp,lanes,ekf,radar`) = those parts only (for comparisons). `status()` is what `/v2/health` shows.
 """
 import builtins
+import functools
 import json
 import os
 
@@ -72,6 +73,7 @@ ROUNDED = False
 if "json" in ACTIVE:
     _nd, _nl = _n.dumps, _n.loads
     _n.set_rounded_type(Rounded)
+    _n.set_json_dumps(functools.partial(_dumps_py, separators=_SEP))
     ROUNDED = True
 
     def dumps(obj):

@@ -272,6 +272,47 @@ static inline double round_fast(double x, int n, int *ok)
     return r / POW10[n];
 }
 
+/* round(x, n) written as float.__repr__ writes it, from the integer rint(x * 10^n) itself: the text of that
+ * integer with n decimals, trailing zeros dropped, is the shortest decimal of the rounded double (15 significant
+ * digits or fewer: see put_float). 1 when written; 0 where round_fast is not certain or repr takes another form
+ * (an exponent below 1e-4), and nothing is written. */
+static int put_round_fast(Buf *b, double x, int n, int *err)
+{
+    double y = x * POW10[n];
+    double r = rint(y);
+    *err = 0;
+    if (!((fabs(y - r) < 0.5 - 1e-6) && (fabs(y) < 1e9)))
+        return 0;
+    if (r == 0.0) {
+        *err = buf_put(b, signbit(r) ? "-0.0" : "0.0", signbit(r) ? 4 : 3);
+        return 1;
+    }
+    if (fabs(r / POW10[n]) < 1e-4)
+        return 0;
+    uint64_t k = (uint64_t)fabs(r);
+    while (n > 0 && k % 10 == 0) {
+        k /= 10;
+        n--;
+    }
+    char t[48];
+    int i = 48;
+    if (n == 0)
+        t[--i] = '0';
+    for (int d = 0; d < n; d++) {
+        t[--i] = (char)('0' + k % 10);
+        k /= 10;
+    }
+    t[--i] = '.';
+    do {
+        t[--i] = (char)('0' + k % 10);
+        k /= 10;
+    } while (k);
+    if (r < 0.0)
+        t[--i] = '-';
+    *err = buf_put(b, t + i, (size_t)(48 - i));
+    return 1;
+}
+
 static int put_rounded(Buf *b, PyObject *o, int depth)
 {
     PyObject *vals = PyTuple_GetItem(o, 0), *nd = PyTuple_GetItem(o, 1);
@@ -294,10 +335,9 @@ static int put_rounded(Buf *b, PyObject *o, int depth)
         if (i && buf_ch(b, ',') < 0)
             return -1;
         if (PyFloat_CheckExact(v)) {
-            int ok;
-            double r = round_fast(PyFloat_AsDouble(v), (int)n, &ok);
-            if (ok) {
-                if (put_float(b, r) < 0)
+            int err;
+            if (put_round_fast(b, PyFloat_AsDouble(v), (int)n, &err)) {
+                if (err < 0)
                     return -1;
                 continue;
             }
@@ -421,6 +461,279 @@ static PyObject *n_set_rounded_type(PyObject *self, PyObject *t)
     Py_INCREF(t);
     Py_XDECREF(rounded_type);
     rounded_type = t;
+    Py_RETURN_NONE;
+}
+
+/* ====================================================================================================
+ * The recorder's reduced `road` (io/recorder.py `slim_road_line`; names follow `_slim` there)
+ * ==================================================================================================== */
+static PyObject *json_dumps_compact;   /* functools.partial(json.dumps, separators=(",", ":")): set by the package */
+
+/* a value json.dumps writes: the native writer, or json.dumps itself for what that one leaves to json */
+static int slim_put(Buf *b, PyObject *v)
+{
+    size_t mark = b->n;
+    if (put_value(b, v, 1) == 0)
+        return 0;
+    if (!PyErr_ExceptionMatches(Fallback) || json_dumps_compact == NULL)
+        return -1;
+    PyErr_Clear();
+    b->n = mark;
+    PyObject *t = PyObject_CallFunctionObjArgs(json_dumps_compact, v, NULL);
+    if (t == NULL)
+        return -1;
+    Py_ssize_t n;
+    const char *s = PyUnicode_AsUTF8AndSize(t, &n);
+    int rc = s == NULL ? -1 : buf_put(b, s, (size_t)n);
+    Py_DECREF(t);
+    return rc;
+}
+
+/* round(v, n) written as json.dumps writes it */
+static int slim_round(Buf *b, PyObject *v, int n)
+{
+    if (PyFloat_CheckExact(v)) {
+        int err;
+        if (put_round_fast(b, PyFloat_AsDouble(v), n, &err))
+            return err;
+    } else if (PyLong_CheckExact(v))
+        return put_int(b, v);
+    PyObject *r = PyObject_CallFunction(builtin_round, "Oi", v, n);
+    if (r == NULL)
+        return -1;
+    int rc = slim_put(b, r);
+    Py_DECREF(r);
+    return rc;
+}
+
+/* `put`: a list written with every number rounded to n digits (None as null), anything else as it is */
+static int slim_member(Buf *b, PyObject *v, int n)
+{
+    if (!PyList_Check(v))
+        return slim_put(b, v);
+    Py_INCREF(v);                                  /* (a __round__ of an odd item is Python code) */
+    int rc = buf_ch(b, '[');
+    for (Py_ssize_t i = 0; rc == 0 && i < PyList_Size(v); i++) {
+        PyObject *x = PyList_GetItem(v, i);
+        Py_INCREF(x);
+        if (i)
+            rc = buf_ch(b, ',');
+        if (rc == 0)
+            rc = x == Py_None ? buf_put(b, "null", 4) : slim_round(b, x, n);
+        Py_DECREF(x);
+    }
+    if (rc == 0)
+        rc = buf_ch(b, ']');
+    Py_DECREF(v);
+    return rc;
+}
+
+/* `"key":` with a comma before it unless it is the first member */
+static int slim_key(Buf *b, const char *key, int *first)
+{
+    if (!*first && buf_ch(b, ',') < 0)
+        return -1;
+    *first = 0;
+    if (buf_ch(b, '"') < 0 || buf_put(b, key, strlen(key)) < 0 || buf_ch(b, '"') < 0)
+        return -1;
+    return buf_ch(b, ':');
+}
+
+/* d.get(key) as a new reference, NULL (no error) when absent */
+static PyObject *slim_get(PyObject *d, const char *key, int *err)
+{
+    PyObject *v = PyDict_GetItemString(d, key);
+    if (v == NULL) {
+        if (PyErr_Occurred())
+            *err = 1;
+        return NULL;
+    }
+    Py_INCREF(v);
+    return v;
+}
+
+static const char *SLIM_KEYS[] = {"type", "seq", "ts_mono_ns", "ts_real_ns", "model_ms", "v_ego", "valid", "frames_skipped",
+                                  "pair_dt_ms", "road_model", "road_model_fallback", "policy_hz", "frame_seq_prev",
+                                  "camera", NULL};
+
+static int slim_write(Buf *b, PyObject *road)
+{
+    int first = 1, err = 0;
+    PyObject *v;
+    if (buf_ch(b, '{') < 0)
+        return -1;
+    for (int k = 0; SLIM_KEYS[k]; k++) {
+        if ((v = slim_get(road, SLIM_KEYS[k], &err)) == NULL) {
+            if (err)
+                return -1;
+            continue;
+        }
+        int rc = slim_key(b, SLIM_KEYS[k], &first) < 0 ? -1 : slim_put(b, v);
+        Py_DECREF(v);
+        if (rc < 0)
+            return -1;
+    }
+    if ((v = slim_get(road, "pose", &err)) != NULL && PyDict_Check(v)) {      /* numbers to 4 digits */
+        int rc = slim_key(b, "pose", &first) < 0 || buf_ch(b, '{') < 0 ? -1 : 0;
+        PyObject *items = rc == 0 ? PyDict_Items(v) : NULL;
+        if (items == NULL)
+            rc = -1;
+        for (Py_ssize_t i = 0; rc == 0 && i < PyList_Size(items); i++) {
+            PyObject *kv = PyList_GetItem(items, i), *k = PyTuple_GetItem(kv, 0), *x = PyTuple_GetItem(kv, 1);
+            if (i)
+                rc = buf_ch(b, ',');
+            if (rc == 0) {
+                if (!PyUnicode_Check(k)) {                 /* json converts other keys: the caller's pure path */
+                    PyErr_SetNone(Fallback);
+                    rc = -1;
+                } else
+                    rc = put_str(b, k) < 0 || buf_ch(b, ':') < 0 ? -1 : 0;
+            }
+            if (rc == 0)
+                rc = PyFloat_Check(x) ? slim_round(b, x, 4) : slim_put(b, x);
+        }
+        Py_XDECREF(items);
+        if (rc == 0)
+            rc = buf_ch(b, '}');
+        Py_DECREF(v);
+        if (rc < 0)
+            return -1;
+    } else {
+        Py_XDECREF(v);
+        if (err)
+            return -1;
+    }
+    static const char *LINES[] = {"lane_lines", "road_edges"};
+    for (int L = 0; L < 2; L++) {
+        if ((v = slim_get(road, LINES[L], &err)) == NULL) {
+            if (err)
+                return -1;
+            continue;
+        }
+        if (!PyList_Check(v)) {
+            Py_DECREF(v);
+            continue;
+        }
+        int rc = slim_key(b, LINES[L], &first) < 0 || buf_ch(b, '[') < 0 ? -1 : 0;
+        int fl = 1;
+        for (Py_ssize_t i = 0; rc == 0 && i < PyList_Size(v); i++) {
+            PyObject *ln = PyList_GetItem(v, i);
+            if (!PyDict_Check(ln))
+                continue;
+            Py_INCREF(ln);
+            if (!fl)
+                rc = buf_ch(b, ',');
+            fl = 0;
+            int f2 = 1;
+            if (rc == 0)
+                rc = buf_ch(b, '{');
+            static const char *M[] = {"x", "y", "y_std"};
+            static const int D[] = {2, 3, 3};
+            for (int m = 0; rc == 0 && m < 3; m++) {
+                PyObject *x = slim_get(ln, M[m], &err);
+                if (err)
+                    rc = -1;
+                else
+                    rc = slim_key(b, M[m], &f2) < 0 ? -1 : (x == NULL ? buf_put(b, "null", 4) : slim_member(b, x, D[m]));
+                Py_XDECREF(x);
+            }
+            if (rc == 0) {
+                PyObject *p = slim_get(ln, "prob", &err);
+                if (err)
+                    rc = -1;
+                else if (p != NULL && (PyLong_Check(p) || PyFloat_Check(p)))      /* isinstance(p, (int, float)) */
+                    rc = slim_key(b, "prob", &f2) < 0 ? -1 : slim_round(b, p, 4);
+                Py_XDECREF(p);
+            }
+            if (rc == 0)
+                rc = buf_ch(b, '}');
+            Py_DECREF(ln);
+        }
+        if (rc == 0)
+            rc = buf_ch(b, ']');
+        Py_DECREF(v);
+        if (rc < 0)
+            return -1;
+    }
+    if ((v = slim_get(road, "leads", &err)) != NULL && PyList_Check(v) && PyList_Size(v) > 0 &&
+        PyDict_Check(PyList_GetItem(v, 0))) {
+        PyObject *ld = PyList_GetItem(v, 0);
+        Py_INCREF(ld);
+        int rc = slim_key(b, "leads", &first) < 0 || buf_put(b, "[{", 2) < 0 ? -1 : 0;
+        PyObject *items = rc == 0 ? PyDict_Items(ld) : NULL;
+        if (items == NULL)
+            rc = -1;
+        for (Py_ssize_t i = 0; rc == 0 && i < PyList_Size(items); i++) {
+            PyObject *kv = PyList_GetItem(items, i), *k = PyTuple_GetItem(kv, 0), *x = PyTuple_GetItem(kv, 1);
+            if (i)
+                rc = buf_ch(b, ',');
+            if (rc == 0 && !PyUnicode_Check(k)) {
+                PyErr_SetNone(Fallback);
+                rc = -1;
+            }
+            if (rc == 0)
+                rc = put_str(b, k) < 0 || buf_ch(b, ':') < 0 ? -1 : slim_member(b, x, 3);
+        }
+        Py_XDECREF(items);
+        Py_DECREF(ld);
+        if (rc == 0)
+            rc = buf_put(b, "}]", 2);
+        Py_DECREF(v);
+        if (rc < 0)
+            return -1;
+    } else {
+        Py_XDECREF(v);
+        if (err)
+            return -1;
+    }
+    if ((v = slim_get(road, "plan", &err)) != NULL && PyDict_Check(v)) {
+        int rc = slim_key(b, "plan", &first) < 0 || buf_ch(b, '{') < 0 ? -1 : 0;
+        int f2 = 1;
+        static const char *P[] = {"x", "y", "z", "held", "age_ms"};
+        for (int m = 0; rc == 0 && m < 5; m++) {
+            PyObject *x = slim_get(v, P[m], &err);
+            if (err) {
+                rc = -1;
+                break;
+            }
+            if (x == NULL)
+                continue;
+            rc = slim_key(b, P[m], &f2) < 0 ? -1 : (m < 3 ? slim_member(b, x, 2) : slim_put(b, x));
+            Py_DECREF(x);
+        }
+        if (rc == 0)
+            rc = buf_ch(b, '}');
+        Py_DECREF(v);
+        if (rc < 0)
+            return -1;
+    } else {
+        Py_XDECREF(v);
+        if (err)
+            return -1;
+    }
+    return buf_ch(b, '}');
+}
+
+/* slim_road_line(road) -> str: json.dumps(_slim(road) with every list rounded, separators=(",", ":")) */
+static PyObject *n_slim_road_line(PyObject *self, PyObject *road)
+{
+    if (!PyDict_Check(road)) {
+        PyErr_SetString(PyExc_TypeError, "slim_road_line: a dict is needed");
+        return NULL;
+    }
+    Buf b = {NULL, 0, 0};
+    PyObject *res = NULL;
+    if (slim_write(&b, road) == 0)
+        res = PyUnicode_FromStringAndSize(b.p, (Py_ssize_t)b.n);
+    PyMem_Free(b.p);
+    return res;
+}
+
+static PyObject *n_set_json_dumps(PyObject *self, PyObject *f)
+{
+    Py_INCREF(f);
+    Py_XDECREF(json_dumps_compact);
+    json_dumps_compact = f;
     Py_RETURN_NONE;
 }
 
@@ -3086,6 +3399,8 @@ static PyMethodDef methods[] = {
     {"loads", n_loads, METH_O, "json.loads(bytes | str); raises Fallback where json must decide"},
     {"trim_road", n_trim_road, METH_VARARGS, "fastjson.trim_road with its patterns: the same bytes"},
     {"set_rounded_type", n_set_rounded_type, METH_O, "the tuple subclass (values, digits) dumps writes rounded"},
+    {"slim_road_line", n_slim_road_line, METH_O, "the recorder's reduced road message, written"},
+    {"set_json_dumps", n_set_json_dumps, METH_O, "json.dumps with the stack's separators, for what the writer leaves to json"},
     {"round", n_round, METH_VARARGS, "builtins.round"},
     {"round_list", n_round_list, METH_VARARGS, "[v if v is None else round(v, n) for v in values]"},
     {"interp_all", n_interp_all, METH_VARARGS, "trackers.view._interp_all for lists of floats"},

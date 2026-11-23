@@ -389,6 +389,49 @@ def test_trim_road_is_the_python_cut():
     assert F.trim_road(b"") == b"" and F.trim_road(base[0]) is not base[0]
 
 
+@needs_json
+def test_slim_road_line_is_the_reduced_road():
+    """The recorder's reduced `road` written by the native core (`slim_road_line`) against
+    json.dumps(slim_road(road)): the same text for the stack's layout, numbers next to decimal ties, below 1e-4,
+    negative zero, ints, bools, None in the lists, numpy scalars, odd members and missing parts."""
+    from chris_integrator.io import recorder as R
+    rng = random.Random(31)
+
+    def num():
+        return rng.choice([rng.uniform(-60, 60), rng.randrange(-5, 99), round(rng.uniform(-3, 3), rng.randrange(1, 6)),
+                           rng.randrange(-999, 999) / 1000 + 0.0005, rng.uniform(-1, 1) * 1e-5, -0.0, 0.0, 1e300,
+                           float("nan"), float("inf")] + ([None, True, np.float64(1.23456)] if rng.random() < 0.05 else []))
+
+    def arr():
+        return [num() for _ in range(rng.randrange(0, 34))]
+
+    def road():
+        m = {"type": "road", "seq": rng.randrange(10 ** 6), "ts_mono_ns": rng.randrange(10 ** 15), "v_ego": num(),
+             "valid": rng.choice([True, False]), "road_model": rng.choice(["supercombo", "vision", None]), "x": 5,
+             "camera": rng.choice(["road", "wide", "é\n"]), "frame_seq_prev": rng.choice([None, 4, [1, 2]]),
+             "pose": {"trans": arr(), "speed": num(), "w": rng.uniform(-1, 1), "s": "x", "n": None},
+             "lane_lines": [{"x": arr(), "y": arr(), "y_std": arr(), "z": arr(),
+                             "prob": rng.choice([rng.random(), True, 1, None, "p"])} for _ in range(4)] + ["odd"],
+             "road_edges": [{"x": arr(), "y": rng.choice([arr(), None, 3]), "y_std": arr()} for _ in range(2)],
+             "leads": [{"x": arr(), "prob": rng.random(), "t": rng.choice([arr(), 1.23456, "s"])}, {"x": [1]}],
+             "plan": {"x": arr(), "y": arr(), "z": arr(), "vx": arr(), "held": rng.choice([True, None]), "age_ms": 30}}
+        for k in list(m):
+            if k != "type" and rng.random() < 0.08:
+                del m[k]
+        if rng.random() < 0.05:
+            m["leads"] = rng.choice([[], None, ["x"]])
+        if rng.random() < 0.05:
+            m["plan"] = rng.choice([None, [1], {"held": False}])
+        return m
+
+    for _ in range(4000):
+        m = road()
+        assert R.slim_road_line(m) == json.dumps(R.slim_road(m), separators=SEP)
+    m = road()
+    m["pose"] = {1: 2.5}                           # a key json converts: the pure path
+    assert R.slim_road_line(m) == json.dumps(R.slim_road(m), separators=SEP)
+
+
 # ---- round, interpolation ----------------------------------------------------------------------------------
 @needs_native
 def test_round_is_builtin_round():

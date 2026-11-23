@@ -137,9 +137,9 @@ def slim_road_line(road):
     """json.dumps(slim_road(road), separators=(",", ":")), made without writing each float: the skeleton goes
     through json.dumps with a marker for every list, the lists' texts come from fastround's tables. With the
     native core the lists are rounded and written by its `dumps` in one pass (`native.Rounded`)."""
-    if native.ROUNDED:
+    if native.json_n is not None:
         try:
-            return native._nd(_slim(road, native.Rounded)[0])
+            return native.json_n.slim_road_line(road)
         except native.Fallback:            # something the native writer leaves to json: the pure path below
             pass
     out, parts, digits, slots = _slim(road)
