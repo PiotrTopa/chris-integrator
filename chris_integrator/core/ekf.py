@@ -12,12 +12,15 @@ alone is followed, never locked out). No knowledge of what the state means lives
 """
 import bisect
 import math
+import os
 
 import numpy as np
 
 from ..native import core as _C
 
-T_NU = 4.0                      # degrees of freedom of the robust rows' Student-t
+T_NU = 4.0                      # degrees of freedom of the robust rows' Student-t (also chris_native.c T_NU)
+# (lane estimator-native, temporary: CHRIS_EKF_PY=1 runs the Python pass and monitors, for the equivalence runs)
+PY_PASS = os.environ.get("CHRIS_EKF_PY") == "1"
 
 
 class Row:
@@ -102,8 +105,22 @@ class Filter:
         self.rejected = {}                 # src -> rows not applied (hard gate)
         self.stat = None                   # callable(row, d2, t): first-pass normalised innovation of a row
         self.stat_nu = None                # callable(row, nu, s, t): ... its signed innovation and variance
+        # the first-pass monitors of the native pass (`watch`)
+        self.nis = self.trends = None
+        self.nis_new = self.nis_note = self.trend_new = self.trend_note = None
+        self.trend_skip = ""
         self.reruns = 0                    # entries re-processed because of late rows (cost accounting)
         self.reset()
+
+    def watch(self, nis, nis_new, nis_note, trends, trend_new, trend_note, trend_skip):
+        """The first look at every row (once, in its first pass): its normalised innovation squared into the
+        window of its class, `nis[(group, q)]` (a monitors.NisMonitor; `nis_new(key)` makes and enters a missing
+        one), and `nis_note(key, monitor, t, changed)` called when the window's verdict changed or holds; its
+        signed innovation over its standard deviation into `trends[(group, q)]` (an fdi Trend; `trend_new(key)`),
+        unless q starts with `trend_skip`, and `trend_note(key, trend, t)` called while the trend's verdict holds
+        or when it ends."""
+        self.nis, self.nis_new, self.nis_note = nis, nis_new, nis_note
+        self.trends, self.trend_new, self.trend_note, self.trend_skip = trends, trend_new, trend_note, trend_skip
 
     def reset(self, x=None, P=None):
         if x is not None:
@@ -185,6 +202,25 @@ class Filter:
 
     # ---- filter --------------------------------------------------------------------------------------
     def _run(self, i):
+        """The pass over the entries from i on (the native core: chris_native.c `ekf_run`): each entry predicted
+        from the one before, its rows applied in order (a robust row beyond the gate while an exact row of its
+        quantity anchors it is rejected; a row of a disabled group or a quarantined class is not applied), every
+        row's first innovation shown to the monitors (`watch`) and to its own callback."""
+        if PY_PASS:
+            return self._run_py(i)
+        if self.base is None:
+            return
+        if i == 0:
+            t, x, P = self.base
+            anchor = {}
+        else:
+            e = self.entries[i - 1]
+            t, x, P = e.t, e.x, e.P
+            anchor = dict(e.anchor)
+        par = getattr(self.model, "native_par", None)
+        _C.ekf_run(self, i, t, x, P, anchor, None if par is None else par())
+
+    def _run_py(self, i):
         if self.base is None:
             return
         if i == 0:

@@ -414,3 +414,236 @@ def cases_rts():
         m = ego_model(rng, 17)
         x, P = ego_state(rng, m)
         yield x, P, rng.choice([0.01, 0.05, 0.1, 0.4]), _normal_array(rng, (m.n,), 0.01), (2,) if i % 4 == 0 else ()
+
+
+# ---- the estimator's filter pass and its innovation monitors ------------------------------------------------
+NIS_CFG = dict(window_s=8.0, max_n=80, min_n=8, fire=6.0, recover=3.0)
+TREND_CFG = dict(trend_tau_s=20.0, trend_fire=6.0, trend_clear=3.0, trend_min_n=60, trend_corr=10.0)
+
+
+def cases_nis():
+    """(cfg, [(t, d2)], reset_at) for monitors.NisMonitor: NaN, inf, zeros of both signs, repeated values, time
+    going back, gaps beyond the window, more samples than the window holds."""
+    rng = random.Random(50)
+    for i in range(400):
+        cfg = dict(NIS_CFG)
+        if i % 3:
+            cfg.update(max_n=rng.choice([80, 12, 3, 1]), window_s=rng.choice([8.0, 1.0, 0.35]), min_n=rng.choice([8, 1, 3]),
+                       fire=rng.choice([6.0, 1.5]), recover=rng.choice([3.0, 0.8]))
+        t, offers, prev = 100.0, [], 1.0
+        for _ in range(rng.randrange(1, 300)):
+            t += rng.choice([0.05, 0.05, 0.05, 0.1, 0.0, -0.3, 0.25, 2.0, 9.0]) if rng.random() < 0.97 else -20.0
+            k = rng.random()
+            if k < 0.03:
+                d2 = float("nan")
+            elif k < 0.04:
+                d2 = float("inf")
+            elif k < 0.06:
+                d2 = rng.choice([0.0, -0.0])
+            elif k < 0.15:
+                d2 = prev
+            else:
+                d2 = normal(rng) ** 2 * rng.choice([1.0, 1.0, 4.0, 20.0])
+            prev = d2
+            offers.append((t, d2))
+        yield cfg, offers, rng.randrange(len(offers) + 1)
+
+
+def cases_trend():
+    """(cfg, [(t, z)]) for fdi's Trend: clipped samples, NaN, time going back, the hysteresis."""
+    rng = random.Random(51)
+    for i in range(300):
+        cfg = dict(TREND_CFG)
+        if i % 2:
+            cfg.update(trend_min_n=rng.choice([60, 5, 1]), trend_fire=rng.choice([6.0, 1.0]), trend_clear=rng.choice([3.0, 0.5]),
+                       trend_corr=rng.choice([10.0, 1.0, 0.01]), trend_tau_s=rng.choice([20.0, 0.5]))
+        t, offers, bias = 50.0, [], rng.choice([0.0, 0.5, 2.0, -3.0])
+        for _ in range(rng.randrange(1, 400)):
+            t += rng.choice([0.05, 0.1, 0.0, -0.2, 3.0])
+            z = float("nan") if rng.random() < 0.02 else bias + normal(rng) * rng.choice([1.0, 1.0, 10.0])
+            offers.append((t, z))
+            if rng.random() < 0.01:
+                bias = -bias
+        yield cfg, offers
+
+
+class ArithModel:
+    """A process model of three states [p, v, b] in plain float arithmetic, element by element (no libm, no BLAS):
+    the filter pass over it gives the same bits on every machine. b is a random walk; p, v constant velocity."""
+
+    def predict(self, x, P, dt):
+        F = [[1.0, dt, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+        q = [[0.25 * dt * dt * dt, 0.5 * dt * dt, 0.0], [0.5 * dt * dt, dt, 0.0], [0.0, 0.0, 0.01 * dt]]
+        x1 = np.array([x[0] + dt * x[1], x[1], x[2]])
+        FP = [[sum(F[i][k] * P[k][j] for k in range(3)) for j in range(3)] for i in range(3)]
+        P1 = np.array([[sum(FP[i][k] * F[j][k] for k in range(3)) + q[i][j] for j in range(3)] for i in range(3)])
+        return x1, P1, None
+
+
+def _row_model(kind, rng):
+    """h(x) of a row: (prediction, indices, coefficients), in the forms the stack's sources return them."""
+    if kind == 0:
+        idx, one = np.array([0], dtype=np.intp), np.array([1.0])
+        return lambda x: (float(x[0]), idx, one)
+    if kind == 1:
+        idx, one = np.array([1], dtype=np.intp), np.array([1.0])
+        return lambda x: (x[1], idx, one)                                      # a numpy scalar prediction
+    if kind == 2:
+        c = rng.uniform(0.5, 2.0)
+        return lambda x: (x[0] + c * x[2], [0, 2], [1.0, c])                   # lists
+    idx = np.array([0, 1, 2], dtype=np.intp)
+    return lambda x: (x[0] - 0.5 * x[1] + x[2], idx, np.array([1.0, -0.5, 1.0])[::1])
+
+
+def cases_filter_pass():
+    """Scripts of filter operations: (n_states, [op]) with ops ("row", t, q, z, var, kind, src, group, robust, wrap,
+    freeze, cb), ("flush",), ("disable", groups), ("prune", now). Rows arrive late and out of order (re-runs), robust
+    rows are gated against exact rows of the same class, row classes go into quarantine from the monitors' hook."""
+    rng = random.Random(52)
+    for i in range(60):
+        ego = i % 4 == 3                              # the native process model (EgoModel): to rounding
+        ops, t = [], 10.0
+        for k in range(rng.randrange(20, 160)):
+            t += rng.choice([0.05, 0.05, 0.1, 0.0, 0.5, 1e-7])
+            tr = t - (rng.uniform(0.0, 1.5) if rng.random() < 0.15 else 0.0)
+            q = rng.choice(["p", "v", "s", "a", "standstill", "wrapped"])
+            robust = rng.random() < 0.5
+            z = normal(rng, 2.0) + (rng.choice([0.0, 0.0, 30.0]) if robust else 0.0)
+            if i % 10 == 9 and k > 15 and rng.random() < 0.05:             # (a NaN poisons the state: late, rare)
+                z = float("nan")
+            ops.append(("row", tr, q, z, rng.choice([0.04, 1.0, 1e-6]), rng.randrange(4), rng.choice("abc"),
+                        rng.choice(["g1", "g2", "g3"]), robust, q == "wrapped",
+                        None if rng.random() < 0.8 else rng.choice([[2], np.array([1, 2], dtype=np.intp)]),
+                        rng.random() < 0.1))
+            r = rng.random()
+            if r < 0.15:
+                ops.append(("flush",))
+            elif r < 0.17:
+                ops.append(("disable", rng.choice([[], ["g2"], [("g1", "p")], ["g3", ("g1", "v")]])))
+            elif r < 0.19:
+                ops.append(("prune", t))
+        yield ego, ops
+
+
+def filter_pass(ego, ops, Filter, Row, NisMonitor, Trend, native):
+    """Runs a script of cases_filter_pass through a Filter with the integrator's monitor wiring (`native`: the
+    filter's `watch`; else the reference's per-row callbacks, mirrored), and returns what it observed: the hooks'
+    log, the monitors after every flush, the entries' states, the rows' flags."""
+    import math
+    if ego:
+        from chris_integrator.core import ego as E
+        model = ego_model(None, 7)
+        x0, P0 = model.initial()
+        hk = {0: E.V, 1: E.A, 2: 12, 3: E.W}
+    else:
+        model = ArithModel()
+        x0, P0 = np.zeros(3), np.diag([100.0, 25.0, 1.0])
+        hk = None
+    f = Filter(model, x0, P0, horizon_s=3.0, gate_chi2=23.9)
+    nis, trends, log, snaps = {}, {}, [], []
+
+    def nis_new(key):
+        m = nis[key] = NisMonitor(key[0], key[1], NIS_CFG)
+        return m
+
+    def nis_note(key, m, t, changed):
+        log.append(("nis", key, t, bool(changed), bool(m.high)))      # (numpy bools in the Python, of numpy scalars)
+        if changed:
+            f.set_quarantine(k for k, n in nis.items() if n.high and k[1] != "v")
+
+    def trend_new(key):
+        tr = trends[key] = Trend(dict(TREND_CFG, trend_min_n=5, trend_fire=1.5, trend_clear=1.0))     # (verdicts come)
+        return tr
+
+    def trend_note(key, tr, t):
+        log.append(("trend", key, t, bool(tr.high), float(tr.score)))
+
+    if native:
+        f.watch(nis, nis_new, nis_note, trends, trend_new, trend_note, "standstill")
+    else:
+        def stat(row, d2, t):
+            key = (row.group, row.q)
+            m = nis.get(key) or nis_new(key)
+            ch = m.offer(t, d2)
+            if ch or m.high:
+                nis_note(key, m, t, ch)
+
+        def stat_nu(row, nu, s, t):
+            if row.q.startswith("standstill") or s <= 0.0:
+                return
+            key = (row.group, row.q)
+            tr = trends.get(key) or trend_new(key)
+            was = tr.high
+            if tr.offer(t, nu / math.sqrt(s)) or was:
+                trend_note(key, tr, t)
+        f.stat, f.stat_nu = stat, stat_nu
+    rng = random.Random(len(ops))
+    rows = []
+    for op in ops:
+        if op[0] == "row":
+            _, t, q, z, var, kind, src, group, robust, wrap, freeze, cb = op
+            h = _row_model(kind, rng)
+            if hk is not None:                         # the same forms over the native model's states
+                i = hk[kind]
+                idx, one = np.array([i], dtype=np.intp), np.array([1.0])
+                h = (lambda i, idx, one: lambda x: (x[i], idx, one))(i, idx, one) if kind != 2 else \
+                    (lambda i: lambda x: (float(x[i] + x[3]), [i, 3], [1.0, 1.0]))(i)
+            cbf = (lambda nu, s0, tt: log.append(("cb", float(nu), float(s0), tt))) if cb else None
+            r = Row(q, z, var, h, src, group, robust=robust, wrap=wrap, cb=cbf, freeze=freeze)
+            rows.append(r)
+            if not f.insert(t, r):
+                log.append(("late", t))
+        elif op[0] == "flush":
+            f.flush()
+            # (as floats: the Python monitors kept a numpy scalar where a row's model returned one, the native
+            # ones a float of the same value)
+            snaps.append([(k, None if m.value is None else float(m.value), bool(m.high), float(m.peak)) for k, m in nis.items()] +
+                         [(k, float(tr.m), float(tr.w), float(tr.score), bool(tr.high)) for k, tr in trends.items()])
+        elif op[0] == "disable":
+            f.set_disabled(op[1])
+        else:
+            f.prune(op[1])
+    f.flush()
+    states = [(e.t, e.x, e.P, e.xp, e.usedq, e.anchor) for e in f.entries]
+    flags = [(r.used, r.rejected, r.counted) for r in rows]
+    return log, snaps, states, flags, dict(f.rejected), sorted(f.quarantine), f.reruns
+
+
+def nis_run(NisMonitor, cfg, offers, reset_at):
+    """Every offer's (changed, value, high, peak, samples in the window); the window forgotten at `reset_at`."""
+    m = NisMonitor("g", "q", cfg)
+    out = []
+    for i, (t, d2) in enumerate(offers):
+        if i == reset_at:
+            m.reset_data()
+        ch = m.offer(t, d2)
+        out.append((ch, m.value, m.high, m.peak, m.n if hasattr(m, "n") else len(m.q)))
+    return out
+
+
+def trend_run(Trend, cfg, offers):
+    """(every offer's verdict, [m, w, score] after every tenth offer and the last): the verdicts exact, the sums to
+    rounding (exp of the C library)."""
+    tr = Trend(cfg)
+    highs, values = [], []
+    for i, (t, z) in enumerate(offers):
+        highs.append(tr.offer(t, z))
+        if i % 10 == 9 or i == len(offers) - 1:
+            values.append([tr.m, tr.w, tr.score, tr.n])
+    tr.clear()
+    highs.append((tr.high, tr.n, tr.t))
+    return highs, values
+
+
+def filter_pass_split(ego, res):
+    """(exact part, values to rounding) of what filter_pass observed: over the arithmetic model everything is
+    exact; over the native model (sin, cos, exp of the C library) the states and the monitors' numbers are values,
+    the decisions (flags, hooks, rejections, quarantine) exact."""
+    if not ego:
+        return res, None
+    log, snaps, states, flags, rejected, quarantine, reruns = res
+    exact = ([(e[0], e[1], e[3] if e[0] in ("nis", "trend") else None) for e in log],
+             [[s[0] for s in snap] for snap in snaps], [(s[0], s[4], s[5]) for s in states], flags, rejected,
+             quarantine, reruns)
+    values = [[s[1].tolist(), s[2].tolist()] for s in states]
+    return exact, values

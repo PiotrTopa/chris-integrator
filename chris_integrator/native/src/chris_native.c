@@ -1420,13 +1420,16 @@ static void fc_cols(const double *Fc, double *M, Py_ssize_t n)
  *       (index, tau, sigma) of every Gauss-Markov state ...]   (EgoModel._native_par)
  * rho_out: with Gauss-Markov states, the array that receives their decay over dt (1 for every other state):
  * the diagonal part of the transition, which the smoother needs. */
+static int predict_check(const double *c, Py_ssize_t npar, Py_ssize_t n, int has_rho);
+static int predict_core(const double *xi, const double *Pi, Py_ssize_t n, double dt, const double *c, double *rr,
+                        double *xn, double *Pn, double *Fc);
+
 static PyObject *n_ekf_predict(PyObject *self, PyObject *args)
 {
     PyObject *ox, *oP, *opar, *orr, *oxo, *oPo, *oF;
     double dt;
     View x, P, par, rr, xo, Po, F;
     x.held = P.held = par.held = rr.held = xo.held = Po.held = F.held = 0;
-    double *gq = NULL;
     PyObject *res = NULL;
     if (!PyArg_ParseTuple(args, "OOdOOOOO", &ox, &oP, &dt, &opar, &orr, &oxo, &oPo, &oF))
         return NULL;
@@ -1445,20 +1448,44 @@ static PyObject *n_ekf_predict(PyObject *self, PyObject *args)
         PyErr_SetString(PyExc_ValueError, "ekf_predict: shapes");
         goto done;
     }
-    const double *c = DATA(par);
-    Py_ssize_t nclamp = (Py_ssize_t)c[11], ngm = (Py_ssize_t)c[12];
-    if (nclamp < 0 || ngm < 0 || npar != PAR0 + (n - NCORE) + 3 * nclamp + 3 * ngm || has_rho != (ngm > 0)) {
-        PyErr_SetString(PyExc_ValueError, "ekf_predict: parameter block");
+    if (predict_check(DATA(par), npar, n, has_rho) < 0 ||
+        predict_core(DATA(x), DATA(P), n, dt, DATA(par), has_rho ? DATA(rr) : NULL, DATA(xo), DATA(Po), DATA(F)) < 0)
         goto done;
+    res = Py_None;
+    Py_INCREF(res);
+done:
+    view_drop(&x); view_drop(&P); view_drop(&par); view_drop(&rr);
+    view_drop(&xo); view_drop(&Po); view_drop(&F);
+    return res;
+}
+
+/* the parameter block fits a state of n (and has Gauss-Markov states exactly when a decay array is given) */
+static int predict_check(const double *c, Py_ssize_t npar, Py_ssize_t n, int has_rho)
+{
+    Py_ssize_t nclamp = npar >= PAR0 ? (Py_ssize_t)c[11] : 0, ngm = npar >= PAR0 ? (Py_ssize_t)c[12] : 0;
+    if (npar < PAR0 || nclamp < 0 || ngm < 0 || npar != PAR0 + (n - NCORE) + 3 * nclamp + 3 * ngm ||
+        has_rho != (ngm > 0)) {
+        PyErr_SetString(PyExc_ValueError, "ekf_predict: parameter block");
+        return -1;
     }
+    return 0;
+}
+
+/* the process model on raw arrays (rr: the decay of the Gauss-Markov states, or NULL without them) */
+static int predict_core(const double *xi, const double *Pi, Py_ssize_t n, double dt, const double *c, double *rr,
+                        double *xn, double *Pn, double *Fc)
+{
+    Py_ssize_t nclamp = (Py_ssize_t)c[11], ngm = (Py_ssize_t)c[12];
     const double *psd = c + PAR0, *clamp = c + PAR0 + (n - NCORE), *gm = clamp + 3 * nclamp;
+    int has_rho = (rr != NULL);
+    double *gq = NULL;
     if (has_rho) {
         /* Gauss-Markov states: decay r = exp(-dt / tau), added variance q = sigma^2 (1 - exp(-2 dt / tau)) */
-        double *r = DATA(rr);
+        double *r = rr;
         gq = (double *)PyMem_Calloc((size_t)n, sizeof(double));
         if (gq == NULL) {
             PyErr_NoMemory();
-            goto done;
+            return -1;
         }
         for (Py_ssize_t i = 0; i < n; i++)
             r[i] = 1.0;
@@ -1467,14 +1494,13 @@ static PyObject *n_ekf_predict(PyObject *self, PyObject *args)
             double tau = gm[3 * q + 1], sig = gm[3 * q + 2];
             if (i < 0 || i >= n) {
                 PyErr_SetString(PyExc_ValueError, "ekf_predict: Gauss-Markov index");
-                goto done;
+                PyMem_Free(gq);
+                return -1;
             }
             r[i] = exp(-dt / tau);
             gq[i] = sig * sig * (1.0 - exp(-2.0 * dt / tau));
         }
     }
-    const double *xi = DATA(x);
-    double *xn = DATA(xo), *Pn = DATA(Po), *Fc = DATA(F);
 
     memcpy(xn, xi, (size_t)n * sizeof(double));
     double v = xi[V], a = xi[A], w = xi[W], al = xi[AL], psi = xi[PSI], th = xi[TH];
@@ -1506,15 +1532,15 @@ static PyObject *n_ekf_predict(PyObject *self, PyObject *args)
     FC(7, 3) = dt * sth * g; FC(7, 4) = 0.5 * dt2 * sth * g; FC(7, 8) = ds * cth; FC(7, 9) = -ds * g * sth;
 #undef FC
     if (has_rho) {
-        const double *r = DATA(rr);
+        const double *r = rr;
         for (Py_ssize_t i = 0; i < n; i++)
             xn[i] *= r[i];
     }
-    fc_rows(Fc, DATA(P), Pn, n);
+    fc_rows(Fc, Pi, Pn, n);
     fc_cols(Fc, Pn, n);
 #define PP(i, j) Pn[(Py_ssize_t)(i) * n + (j)]
     if (has_rho) {
-        const double *r = DATA(rr);
+        const double *r = rr;
         for (Py_ssize_t i = 0; i < n; i++)
             for (Py_ssize_t j = 0; j < n; j++)
                 PP(i, j) *= r[i];
@@ -1573,13 +1599,67 @@ static PyObject *n_ekf_predict(PyObject *self, PyObject *args)
         else if (hi == hi && xn[i] > hi)
             xn[i] = hi;
     }
-    res = Py_None;
-    Py_INCREF(res);
-done:
     PyMem_Free(gq);
-    view_drop(&x); view_drop(&P); view_drop(&par); view_drop(&rr);
-    view_drop(&xo); view_drop(&Po); view_drop(&F);
-    return res;
+    return 0;
+}
+
+/* ph = P[:, idx] @ coef (into o); returns s0 = coef @ ph[idx]. Indices checked by the caller, m >= 1 */
+static double project_core(const double *p, Py_ssize_t n, const int64_t *ix, const double *cf, Py_ssize_t m, double *o)
+{
+    for (Py_ssize_t i = 0; i < n; i++) {
+        const double *row = p + i * n;
+        double acc = row[ix[0]] * cf[0];
+        for (Py_ssize_t j = 1; j < m; j++)
+            acc += row[ix[j]] * cf[j];
+        o[i] = acc;
+    }
+    double s0 = cf[0] * o[ix[0]];
+    for (Py_ssize_t j = 1; j < m; j++)
+        s0 += cf[j] * o[ix[j]];
+    return s0;
+}
+
+/* the row's correction of x and P in place (the doc of ekf_update); k: work of n. Freeze indices checked by
+ * the caller */
+static void update_core(double *xx, double *p, const double *h, Py_ssize_t n, double s, double nu, const int64_t *f,
+                        Py_ssize_t nf, int frozen, double *k)
+{
+    for (Py_ssize_t i = 0; i < n; i++)
+        k[i] = h[i] / s;
+    if (frozen)
+        for (Py_ssize_t j = 0; j < nf; j++)
+            k[f[j]] = 0.0;
+    for (Py_ssize_t i = 0; i < n; i++)
+        xx[i] += k[i] * nu;
+    if (!frozen) {
+        for (Py_ssize_t i = 0; i < n; i++) {
+            double ki = k[i];
+            double *row = p + i * n;
+            for (Py_ssize_t j = 0; j < n; j++)
+                row[j] = row[j] - ki * h[j];
+        }
+    } else {
+        /* ((P - kp) - kp.T) + s * (k k^T), then the symmetric part; pairs (i, j), (j, i) are taken together
+         * so that the in-place result is the one of the out-of-place expression */
+        for (Py_ssize_t i = 0; i < n; i++) {
+            for (Py_ssize_t j = i; j < n; j++) {
+                double a = ((p[i * n + j] - k[i] * h[j]) - k[j] * h[i]) + s * (k[i] * k[j]);
+                double b = ((p[j * n + i] - k[j] * h[i]) - k[i] * h[j]) + s * (k[j] * k[i]);
+                p[i * n + j] = 0.5 * (a + b);
+                p[j * n + i] = 0.5 * (b + a);
+            }
+        }
+    }
+}
+
+static void sym_core(double *p, Py_ssize_t n)
+{
+    for (Py_ssize_t i = 0; i < n; i++)
+        for (Py_ssize_t j = i; j < n; j++) {
+            double a = p[i * n + j], b = p[j * n + i];
+            p[i * n + j] = 0.5 * (a + b);
+            p[j * n + i] = 0.5 * (b + a);
+        }
 }
 
 /* ekf_project(P, idx, coef, ph_out) -> s0:   ph = P[:, idx] @ coef;  s0 = coef @ ph[idx] */
@@ -1605,19 +1685,7 @@ static PyObject *n_ekf_project(PyObject *self, PyObject *args)
             PyErr_SetString(PyExc_IndexError, "ekf_project: an index beyond the state");
             goto done;
         }
-    const double *p = DATA(P), *cf = DATA(coef);
-    double *o = DATA(ph);
-    for (Py_ssize_t i = 0; i < n; i++) {
-        const double *row = p + i * n;
-        double acc = row[ix[0]] * cf[0];
-        for (Py_ssize_t j = 1; j < m; j++)
-            acc += row[ix[j]] * cf[j];
-        o[i] = acc;
-    }
-    double s0 = cf[0] * o[ix[0]];
-    for (Py_ssize_t j = 1; j < m; j++)
-        s0 += cf[j] * o[ix[j]];
-    res = PyFloat_FromDouble(s0);
+    res = PyFloat_FromDouble(project_core(DATA(P), n, ix, DATA(coef), m, DATA(ph)));
 done:
     view_drop(&P); view_drop(&idx); view_drop(&coef); view_drop(&ph);
     return res;
@@ -1653,43 +1721,15 @@ static PyObject *n_ekf_update(PyObject *self, PyObject *args)
         PyErr_NoMemory();
         goto done;
     }
-    const double *h = DATA(ph);
-    double *xx = DATA(x), *p = DATA(P);
-    for (Py_ssize_t i = 0; i < n; i++)
-        k[i] = h[i] / s;
-    if (frozen) {
-        const int64_t *f = (const int64_t *)fz.b.buf;
-        Py_ssize_t m = fz.b.shape[0];
-        for (Py_ssize_t j = 0; j < m; j++) {
-            if (f[j] < 0 || f[j] >= n) {
-                PyErr_SetString(PyExc_ValueError, "ekf_update: freeze index");
-                goto done;
-            }
-        }
-        for (Py_ssize_t j = 0; j < m; j++)
-            k[f[j]] = 0.0;
-    }
-    for (Py_ssize_t i = 0; i < n; i++)
-        xx[i] += k[i] * nu;
-    if (!frozen) {
-        for (Py_ssize_t i = 0; i < n; i++) {
-            double ki = k[i];
-            double *row = p + i * n;
-            for (Py_ssize_t j = 0; j < n; j++)
-                row[j] = row[j] - ki * h[j];
-        }
-    } else {
-        /* ((P - kp) - kp.T) + s * (k k^T), then the symmetric part; pairs (i, j), (j, i) are taken together
-         * so that the in-place result is the one of the out-of-place expression */
-        for (Py_ssize_t i = 0; i < n; i++) {
-            for (Py_ssize_t j = i; j < n; j++) {
-                double a = ((p[i * n + j] - k[i] * h[j]) - k[j] * h[i]) + s * (k[i] * k[j]);
-                double b = ((p[j * n + i] - k[j] * h[i]) - k[i] * h[j]) + s * (k[j] * k[i]);
-                p[i * n + j] = 0.5 * (a + b);
-                p[j * n + i] = 0.5 * (b + a);
-            }
+    const int64_t *f = frozen ? (const int64_t *)fz.b.buf : NULL;
+    Py_ssize_t nf = frozen ? fz.b.shape[0] : 0;
+    for (Py_ssize_t j = 0; j < nf; j++) {
+        if (f[j] < 0 || f[j] >= n) {
+            PyErr_SetString(PyExc_ValueError, "ekf_update: freeze index");
+            goto done;
         }
     }
+    update_core(DATA(x), DATA(P), DATA(ph), n, s, nu, f, nf, frozen, k);
     res = Py_None;
     Py_INCREF(res);
 done:
@@ -1710,13 +1750,7 @@ static PyObject *n_ekf_sym(PyObject *self, PyObject *oP)
         PyErr_SetString(PyExc_ValueError, "ekf_sym: shape");
         return NULL;
     }
-    double *p = DATA(P);
-    for (Py_ssize_t i = 0; i < n; i++)
-        for (Py_ssize_t j = i; j < n; j++) {
-            double a = p[i * n + j], b = p[j * n + i];
-            p[i * n + j] = 0.5 * (a + b);
-            p[j * n + i] = 0.5 * (b + a);
-        }
+    sym_core(DATA(P), n);
     view_drop(&P);
     Py_RETURN_NONE;
 }
@@ -1892,6 +1926,1050 @@ done:
     PyMem_Free(piv);
     view_drop(&Pp); view_drop(&F); view_drop(&rho); view_drop(&Pa); view_drop(&xa); view_drop(&xp);
     view_drop(&xs); view_drop(&Ps); view_drop(&xo); view_drop(&Po);
+    return res;
+}
+
+/* ====================================================================================================
+ * The estimator's filter pass and its innovation monitors (core/ekf.py `Filter._run`, core/monitors.py
+ * `NisMonitor`, core/fdi.py `Trend`): the loop over the queued entries and their rows, with the first-pass
+ * monitoring of every row, in one call. Python is called for what is not arithmetic: a row's model h(x), a
+ * generic model's prediction, a row's own callback, and the integrator's hooks when a monitor's verdict
+ * holds or changes.
+ * ==================================================================================================== */
+static PyObject *np_empty, *np_contig, *np_intp, *np_double, *stat_median;
+
+static int np_ready(void)
+{
+    if (np_empty != NULL)
+        return 0;
+    PyObject *np = PyImport_ImportModule("numpy");
+    if (np == NULL)
+        return -1;
+    PyObject *st = PyImport_ImportModule("statistics");
+    if (st == NULL) {
+        Py_DECREF(np);
+        return -1;
+    }
+    np_contig = PyObject_GetAttrString(np, "ascontiguousarray");
+    np_intp = PyObject_GetAttrString(np, "intp");
+    np_double = PyObject_GetAttrString(np, "float64");
+    stat_median = PyObject_GetAttrString(st, "median");
+    np_empty = PyObject_GetAttrString(np, "empty");
+    Py_DECREF(np);
+    Py_DECREF(st);
+    if (np_contig == NULL || np_intp == NULL || np_double == NULL || stat_median == NULL || np_empty == NULL) {
+        Py_CLEAR(np_contig); Py_CLEAR(np_intp); Py_CLEAR(np_double); Py_CLEAR(stat_median); Py_CLEAR(np_empty);
+        return -1;
+    }
+    return 0;
+}
+
+/* a new float64 array of shape (a,) or (a, b) */
+static PyObject *np_new(Py_ssize_t a, Py_ssize_t b)
+{
+    PyObject *shape = b < 0 ? Py_BuildValue("(n)", a) : Py_BuildValue("(nn)", a, b);
+    if (shape == NULL)
+        return NULL;
+    PyObject *r = PyObject_CallFunctionObjArgs(np_empty, shape, NULL);
+    Py_DECREF(shape);
+    return r;
+}
+
+/* a view of o as a C-contiguous array of `kind` ('d' float64, 'i' intp); what the buffer protocol does not give
+ * as such (a list, a view, another dtype) is made one first, as np.ascontiguousarray(o, dtype=...) does (*conv
+ * holds the made array) */
+static int view_conv(PyObject *o, View *v, char kind, int ndim, const char *what, PyObject **conv)
+{
+    *conv = NULL;
+    if (view_get(o, v, 0, kind, ndim, what) == 0)
+        return 0;
+    if (!PyErr_ExceptionMatches(PyExc_TypeError) && !PyErr_ExceptionMatches(PyExc_ValueError) &&
+        !PyErr_ExceptionMatches(PyExc_BufferError))
+        return -1;
+    PyErr_Clear();
+    PyObject *kw = Py_BuildValue("{sO}", "dtype", kind == 'd' ? np_double : np_intp), *a = PyTuple_Pack(1, o);
+    if (kw == NULL || a == NULL) {
+        Py_XDECREF(kw);
+        Py_XDECREF(a);
+        return -1;
+    }
+    *conv = PyObject_Call(np_contig, a, kw);
+    Py_DECREF(kw);
+    Py_DECREF(a);
+    if (*conv == NULL)
+        return -1;
+    if (view_get(*conv, v, 0, kind, ndim, what) < 0) {
+        Py_CLEAR(*conv);
+        return -1;
+    }
+    return 0;
+}
+
+/* ---- the innovation window of one row class (monitors.NisMonitor's arithmetic) ---------------------------
+ * The window holds (t, d2) over `window_s`, at most `max_n` of them; the median of its d2 is kept from an
+ * ordered copy maintained as samples come and go (bisect's insort and the leftmost equal value removed, as the
+ * Python had it); a window that holds or held a NaN is sorted afresh, and statistics.median decides while a
+ * NaN is in it. The verdict is evaluated at most five times a second. */
+typedef struct {
+    PyObject_HEAD
+    double window_s, min_n, fire, recover, med;
+    Py_ssize_t maxn;
+    double *qt, *qd, *srt;          /* the window (a ring, oldest at head), the ordered values */
+    Py_ssize_t head, len, ns;
+    int plain, high, has_value;
+    double value, t_eval, peak;
+    long long n_total;
+} NisWin;
+
+static PyObject *NisWinType;
+
+static PyObject *niswin_new(PyTypeObject *tp, PyObject *args, PyObject *kw)
+{
+    allocfunc alloc = (allocfunc)PyType_GetSlot(tp, Py_tp_alloc);
+    NisWin *m = (NisWin *)alloc(tp, 0);
+    if (m == NULL)
+        return NULL;
+    m->plain = 1;
+    m->t_eval = -1e18;
+    return (PyObject *)m;
+}
+
+static void niswin_free(NisWin *m)
+{
+    PyMem_Free(m->qt);
+    PyMem_Free(m->qd);
+    PyMem_Free(m->srt);
+    m->qt = m->qd = m->srt = NULL;
+}
+
+/* NisWindow(max_n, window_s, min_n, fire, recover, med): med is the median of the statistic when the stated
+ * uncertainty is right (chi-square, 1 dof) */
+static int niswin_init(PyObject *self, PyObject *args, PyObject *kw)
+{
+    NisWin *m = (NisWin *)self;
+    Py_ssize_t maxn;
+    double window_s, min_n, fire, recover, med;
+    if (!PyArg_ParseTuple(args, "nddddd", &maxn, &window_s, &min_n, &fire, &recover, &med) || np_ready() < 0)
+        return -1;
+    if (maxn < 1) {
+        PyErr_SetString(PyExc_ValueError, "NisWindow: max_n must be at least 1");
+        return -1;
+    }
+    niswin_free(m);
+    m->qt = (double *)PyMem_Malloc((size_t)maxn * sizeof(double));
+    m->qd = (double *)PyMem_Malloc((size_t)maxn * sizeof(double));
+    m->srt = (double *)PyMem_Malloc((size_t)(maxn + 1) * sizeof(double));
+    if (m->qt == NULL || m->qd == NULL || m->srt == NULL) {
+        niswin_free(m);
+        PyErr_NoMemory();
+        return -1;
+    }
+    m->maxn = maxn;
+    m->window_s = window_s, m->min_n = min_n, m->fire = fire, m->recover = recover, m->med = med;
+    m->head = m->len = m->ns = 0;
+    m->plain = 1, m->high = 0, m->has_value = 0;
+    m->value = 0.0, m->t_eval = -1e18, m->peak = 0.0;
+    m->n_total = 0;
+    return 0;
+}
+
+static void niswin_dealloc(PyObject *self)
+{
+    PyTypeObject *tp = Py_TYPE(self);
+    niswin_free((NisWin *)self);
+    freefunc f = (freefunc)PyType_GetSlot(tp, Py_tp_free);
+    f(self);
+    Py_DECREF(tp);
+}
+
+static void nis_insort(NisWin *m, double d)
+{
+    Py_ssize_t lo = 0, hi = m->ns;                  /* bisect.insort: after the equal values */
+    while (lo < hi) {
+        Py_ssize_t mid = (lo + hi) / 2;
+        if (d < m->srt[mid])
+            hi = mid;
+        else
+            lo = mid + 1;
+    }
+    memmove(m->srt + lo + 1, m->srt + lo, (size_t)(m->ns - lo) * sizeof(double));
+    m->srt[lo] = d;
+    m->ns++;
+}
+
+static void nis_drop(NisWin *m, double d)
+{
+    Py_ssize_t lo = 0, hi = m->ns;                  /* bisect_left: the leftmost equal value */
+    while (lo < hi) {
+        Py_ssize_t mid = (lo + hi) / 2;
+        if (m->srt[mid] < d)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    if (lo < m->ns && m->srt[lo] == d) {
+        memmove(m->srt + lo, m->srt + lo + 1, (size_t)(m->ns - lo - 1) * sizeof(double));
+        m->ns--;
+    } else                                          /* not there: the copy is not in order (a NaN went through) */
+        m->plain = 0;
+}
+
+static int nis_median(NisWin *m, double *out)
+{
+    Py_ssize_t n = m->len;
+    if (!m->plain || m->ns != n) {
+        int nan = 0;
+        for (Py_ssize_t i = 0; i < n; i++)
+            if (m->qd[(m->head + i) % m->maxn] != m->qd[(m->head + i) % m->maxn])
+                nan = 1;
+        if (nan || n == 0) {                        /* statistics.median decides (and says what an empty one is) */
+            PyObject *l = PyList_New(n);
+            if (l == NULL)
+                return -1;
+            for (Py_ssize_t i = 0; i < n; i++) {
+                PyObject *f = PyFloat_FromDouble(m->qd[(m->head + i) % m->maxn]);
+                if (f == NULL) {
+                    Py_DECREF(l);
+                    return -1;
+                }
+                PyList_SetItem(l, i, f);
+            }
+            PyObject *r = PyObject_CallFunctionObjArgs(stat_median, l, NULL);
+            Py_DECREF(l);
+            if (r == NULL)
+                return -1;
+            *out = PyFloat_AsDouble(r);
+            Py_DECREF(r);
+            return (*out == -1.0 && PyErr_Occurred()) ? -1 : 0;
+        }
+        /* the value that did not order has left the window: sorted afresh (stable, as sorted() is) */
+        for (Py_ssize_t i = 0; i < n; i++) {
+            double v = m->qd[(m->head + i) % m->maxn];
+            Py_ssize_t j = i;
+            while (j > 0 && v < m->srt[j - 1]) {
+                m->srt[j] = m->srt[j - 1];
+                j--;
+            }
+            m->srt[j] = v;
+        }
+        m->ns = n;
+        m->plain = 1;
+    }
+    const double *s = m->srt;
+    *out = (n % 2) ? s[n / 2] : (s[n / 2 - 1] + s[n / 2]) / 2;
+    return 0;
+}
+
+/* one sample; *changed: the verdict changed */
+static int nis_offer(NisWin *m, double t, double d2, int *changed)
+{
+    *changed = 0;
+    if (m->plain) {
+        if (m->len == m->maxn)                      /* the oldest sample leaves with this one */
+            nis_drop(m, m->qd[m->head]);
+        if (d2 == d2)
+            nis_insort(m, d2);
+        else
+            m->plain = 0;
+    }
+    if (m->len == m->maxn) {
+        m->head = (m->head + 1) % m->maxn;
+        m->len--;
+    }
+    Py_ssize_t k = (m->head + m->len) % m->maxn;
+    m->qt[k] = t;
+    m->qd[k] = d2;
+    m->len++;
+    while (m->len && m->qt[m->head] < t - m->window_s) {
+        if (m->plain)
+            nis_drop(m, m->qd[m->head]);
+        m->head = (m->head + 1) % m->maxn;
+        m->len--;
+    }
+    m->n_total++;
+    if ((double)m->len >= m->min_n && (t - m->t_eval >= 0.2 || t < m->t_eval)) {     /* the median: 5 Hz */
+        double med;
+        m->t_eval = t;
+        if (nis_median(m, &med) < 0)
+            return -1;
+        m->value = med / m->med;
+        m->has_value = 1;
+        double r = m->value / m->fire;
+        if (r > m->peak)
+            m->peak = r;
+        int old = m->high;
+        m->high = m->value > (old ? m->recover : m->fire);
+        *changed = m->high != old;
+    }
+    return 0;
+}
+
+static PyObject *niswin_offer(PyObject *self, PyObject *args)
+{
+    double t, d2;
+    int ch;
+    if (!PyArg_ParseTuple(args, "dd", &t, &d2))
+        return NULL;
+    if (((NisWin *)self)->qt == NULL) {
+        PyErr_SetString(PyExc_ValueError, "NisWindow: not initialised");
+        return NULL;
+    }
+    if (nis_offer((NisWin *)self, t, d2, &ch) < 0)
+        return NULL;
+    return PyBool_FromLong(ch);
+}
+
+static PyObject *niswin_reset(PyObject *self, PyObject *unused)
+{
+    NisWin *m = (NisWin *)self;
+    m->head = m->len = m->ns = 0;
+    m->plain = 1, m->has_value = 0, m->high = 0;
+    Py_RETURN_NONE;
+}
+
+static PyObject *niswin_value(PyObject *self, void *c)
+{
+    NisWin *m = (NisWin *)self;
+    if (!m->has_value)
+        Py_RETURN_NONE;
+    return PyFloat_FromDouble(m->value);
+}
+static PyObject *niswin_high(PyObject *self, void *c) { return PyBool_FromLong(((NisWin *)self)->high); }
+static PyObject *niswin_peak(PyObject *self, void *c) { return PyFloat_FromDouble(((NisWin *)self)->peak); }
+static PyObject *niswin_n(PyObject *self, void *c) { return PyLong_FromSsize_t(((NisWin *)self)->len); }
+static PyObject *niswin_ntotal(PyObject *self, void *c) { return PyLong_FromLongLong(((NisWin *)self)->n_total); }
+
+static PyMethodDef niswin_methods[] = {
+    {"offer", niswin_offer, METH_VARARGS, "offer(t, d2) -> True when the verdict changed"},
+    {"reset_data", niswin_reset, METH_NOARGS, "forget the window and the verdict (the peak stays)"},
+    {NULL, NULL, 0, NULL}};
+static PyGetSetDef niswin_getset[] = {
+    {"value", niswin_value, NULL, "the window's median over its expected value (None before the first evaluation)", NULL},
+    {"high", niswin_high, NULL, "the verdict: innovations beyond the stated uncertainty", NULL},
+    {"peak", niswin_peak, NULL, "the largest value over the firing level", NULL},
+    {"n", niswin_n, NULL, "samples in the window", NULL},
+    {"n_total", niswin_ntotal, NULL, "samples ever offered", NULL},
+    {NULL, NULL, NULL, NULL, NULL}};
+static PyType_Slot niswin_slots[] = {
+    {Py_tp_new, niswin_new}, {Py_tp_init, niswin_init}, {Py_tp_dealloc, niswin_dealloc},
+    {Py_tp_methods, niswin_methods}, {Py_tp_getset, niswin_getset},
+    {Py_tp_doc, "The innovation window of one row class (core/monitors.py NisMonitor subclasses it)"}, {0, NULL}};
+static PyType_Spec niswin_spec = {"chris_integrator.native._chris_native.NisWindow", sizeof(NisWin), 0,
+                                  Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE, niswin_slots};
+
+/* ---- the trend of one row class's signed innovations (fdi.Trend) --------------------------------------- */
+typedef struct {
+    PyObject_HEAD
+    double tau, fire, clear, min_n, corr;
+    double m, w, t, score;
+    int has_t, high;
+    long long n;
+} Trend;
+
+static PyObject *TrendType;
+
+static PyObject *trend_new(PyTypeObject *tp, PyObject *args, PyObject *kw)
+{
+    double tau, fire, clear, min_n, corr;
+    if (!PyArg_ParseTuple(args, "ddddd", &tau, &fire, &clear, &min_n, &corr))
+        return NULL;
+    allocfunc alloc = (allocfunc)PyType_GetSlot(tp, Py_tp_alloc);
+    Trend *tr = (Trend *)alloc(tp, 0);
+    if (tr == NULL)
+        return NULL;
+    tr->tau = tau, tr->fire = fire, tr->clear = clear, tr->min_n = min_n, tr->corr = corr;
+    return (PyObject *)tr;
+}
+
+static void trend_dealloc(PyObject *self)
+{
+    PyTypeObject *tp = Py_TYPE(self);
+    freefunc f = (freefunc)PyType_GetSlot(tp, Py_tp_free);
+    f(self);
+    Py_DECREF(tp);
+}
+
+/* the exponential mean of the clipped z, its score, the verdict with hysteresis once min_n samples are in */
+static int trend_offer(Trend *tr, double t, double z)
+{
+    double dt = 0.0;
+    if (tr->has_t) {
+        dt = t - tr->t;
+        if (0.0 > dt)                               /* max(t - self.t, 0.0) */
+            dt = 0.0;
+    }
+    tr->t = t;
+    tr->has_t = 1;
+    double a = exp(-dt / tr->tau);
+    double zc = (z < 4.0) ? z : 4.0;                /* max(-4.0, min(4.0, z)): a wild sample is not a trend */
+    zc = (zc > -4.0) ? zc : -4.0;
+    tr->m = a * tr->m + zc;
+    tr->w = a * tr->w + 1.0;
+    tr->n++;
+    double q = tr->w * tr->corr;
+    if (1.0 > q)                                    /* max(w * corr, 1.0) */
+        q = 1.0;
+    tr->score = tr->m / sqrt(q);
+    if ((double)tr->n >= tr->min_n)
+        tr->high = fabs(tr->score) > (tr->high ? tr->clear : tr->fire);
+    return tr->high;
+}
+
+static PyObject *trend_offer_py(PyObject *self, PyObject *args)
+{
+    double t, z;
+    if (!PyArg_ParseTuple(args, "dd", &t, &z))
+        return NULL;
+    return PyBool_FromLong(trend_offer((Trend *)self, t, z));
+}
+
+static PyObject *trend_clear(PyObject *self, PyObject *unused)
+{
+    Trend *tr = (Trend *)self;
+    tr->m = tr->w = 0.0;
+    tr->has_t = 0;
+    tr->n = 0;
+    tr->high = 0;
+    Py_RETURN_NONE;
+}
+
+static PyObject *trend_get_t(PyObject *self, void *c)
+{
+    Trend *tr = (Trend *)self;
+    if (!tr->has_t)
+        Py_RETURN_NONE;
+    return PyFloat_FromDouble(tr->t);
+}
+static PyObject *trend_get_m(PyObject *self, void *c) { return PyFloat_FromDouble(((Trend *)self)->m); }
+static PyObject *trend_get_w(PyObject *self, void *c) { return PyFloat_FromDouble(((Trend *)self)->w); }
+static PyObject *trend_get_n(PyObject *self, void *c) { return PyLong_FromLongLong(((Trend *)self)->n); }
+static PyObject *trend_get_high(PyObject *self, void *c) { return PyBool_FromLong(((Trend *)self)->high); }
+static PyObject *trend_get_score(PyObject *self, void *c) { return PyFloat_FromDouble(((Trend *)self)->score); }
+
+static PyMethodDef trend_methods[] = {
+    {"offer", trend_offer_py, METH_VARARGS, "offer(t, z) -> the verdict"},
+    {"clear", trend_clear, METH_NOARGS, "forget (a new epoch)"},
+    {NULL, NULL, 0, NULL}};
+static PyGetSetDef trend_getset[] = {
+    {"t", trend_get_t, NULL, "time of the last sample (None before the first)", NULL},
+    {"m", trend_get_m, NULL, "exponential sum of the clipped z", NULL},
+    {"w", trend_get_w, NULL, "exponential sum of the weights", NULL},
+    {"n", trend_get_n, NULL, "samples", NULL},
+    {"high", trend_get_high, NULL, "the verdict", NULL},
+    {"score", trend_get_score, NULL, "m / sqrt(max(w corr, 1))", NULL},
+    {NULL, NULL, NULL, NULL, NULL}};
+static PyType_Slot trend_slots[] = {
+    {Py_tp_new, trend_new}, {Py_tp_dealloc, trend_dealloc}, {Py_tp_methods, trend_methods},
+    {Py_tp_getset, trend_getset},
+    {Py_tp_doc, "Trend(tau_s, fire, clear, min_n, corr): a signed, normalised innovation averaged over time"},
+    {0, NULL}};
+static PyType_Spec trend_spec = {"chris_integrator.native._chris_native.Trend", sizeof(Trend), 0, Py_TPFLAGS_DEFAULT,
+                                 trend_slots};
+
+/* ---- the filter pass ------------------------------------------------------------------------------------ */
+enum {
+    A_t, A_rows, A_xp, A_Pp, A_F, A_x, A_P, A_anchor, A_usedq,
+    A_rejected, A_used, A_group, A_q, A_h, A_z, A_wrap, A_var, A_nis, A_counted, A_cb, A_robust, A_weight,
+    A_freeze, A_src,
+    A_entries, A_disabled, A_gate, A_anchor_s, A_quarantine, A_model, A_predict, A_nis_new, A_nis_note,
+    A_trends, A_trend_new, A_trend_note, A_trend_skip,
+    A_N
+};
+static const char *const ANAMES[A_N] = {
+    "t", "rows", "xp", "Pp", "F", "x", "P", "anchor", "usedq",
+    "rejected", "used", "group", "q", "h", "z", "wrap", "var", "nis", "counted", "cb", "robust", "weight",
+    "freeze", "src",
+    "entries", "disabled", "gate", "anchor_s", "quarantine", "model", "predict", "nis_new", "nis_note",
+    "trends", "trend_new", "trend_note", "trend_skip"};
+static PyObject *AN[A_N];
+
+static int names_ready(void)
+{
+    if (AN[0] != NULL)
+        return 0;
+    for (int i = 0; i < A_N; i++)
+        if ((AN[i] = PyUnicode_InternFromString(ANAMES[i])) == NULL)
+            return -1;
+    return 0;
+}
+
+#define T_NU 4.0                 /* degrees of freedom of the robust rows' Student-t (core/ekf.py T_NU) */
+
+static double attr_double(PyObject *o, int a, int *err)
+{
+    PyObject *v = PyObject_GetAttr(o, AN[a]);
+    if (v == NULL) {
+        *err = 1;
+        return 0.0;
+    }
+    double d = PyFloat_AsDouble(v);
+    Py_DECREF(v);
+    if (d == -1.0 && PyErr_Occurred())
+        *err = 1;
+    return d;
+}
+
+static int attr_true(PyObject *o, int a)
+{
+    PyObject *v = PyObject_GetAttr(o, AN[a]);
+    if (v == NULL)
+        return -1;
+    int r = PyObject_IsTrue(v);
+    Py_DECREF(v);
+    return r;
+}
+
+static int set_attr(PyObject *o, int a, PyObject *v)
+{
+    return PyObject_SetAttr(o, AN[a], v);
+}
+
+static int set_attr_double(PyObject *o, int a, double d)
+{
+    PyObject *v = PyFloat_FromDouble(d);
+    if (v == NULL)
+        return -1;
+    int r = PyObject_SetAttr(o, AN[a], v);
+    Py_DECREF(v);
+    return r;
+}
+
+/* the three items of what h(x) returned (an iterable of three, as `pred, idx, coef = r.h(x)` takes it) */
+static int unpack3(PyObject *o, PyObject **a, PyObject **b, PyObject **c)
+{
+    *a = *b = *c = NULL;
+    PyObject *it = PyObject_GetIter(o);
+    if (it == NULL)
+        return -1;
+    PyObject **dst[3] = {a, b, c};
+    for (int i = 0; i < 3; i++) {
+        *dst[i] = PyIter_Next(it);
+        if (*dst[i] == NULL) {
+            if (!PyErr_Occurred())
+                PyErr_Format(PyExc_ValueError, "not enough values to unpack (expected 3, got %d)", i);
+            goto fail;
+        }
+    }
+    PyObject *extra = PyIter_Next(it);
+    if (extra != NULL) {
+        Py_DECREF(extra);
+        PyErr_SetString(PyExc_ValueError, "too many values to unpack (expected 3)");
+        goto fail;
+    }
+    if (PyErr_Occurred())
+        goto fail;
+    Py_DECREF(it);
+    return 0;
+fail:
+    Py_DECREF(it);
+    Py_CLEAR(*a);
+    Py_CLEAR(*b);
+    Py_CLEAR(*c);
+    return -1;
+}
+
+/* the filter's settings and the monitors' hooks, read from the Filter at the start of a pass */
+typedef struct {
+    PyObject *disabled, *quarantine, *rejected, *nis, *nis_new, *nis_note, *trends, *trend_new, *trend_note, *skip;
+    double gate, anchor_s;
+} Pass;
+
+static void pass_drop(Pass *p)
+{
+    Py_CLEAR(p->disabled); Py_CLEAR(p->quarantine); Py_CLEAR(p->rejected); Py_CLEAR(p->nis); Py_CLEAR(p->nis_new);
+    Py_CLEAR(p->nis_note); Py_CLEAR(p->trends); Py_CLEAR(p->trend_new); Py_CLEAR(p->trend_note); Py_CLEAR(p->skip);
+}
+
+/* a monitor of the key from its dict, made by the factory when there is none */
+static PyObject *monitor_of(PyObject *dict, PyObject *factory, PyObject *key, PyObject *type)
+{
+    PyObject *m = PyDict_GetItemWithError(dict, key);
+    if (m != NULL)
+        Py_INCREF(m);
+    else if (PyErr_Occurred())
+        return NULL;
+    else if ((m = PyObject_CallFunctionObjArgs(factory, key, NULL)) == NULL)
+        return NULL;
+    if (!PyObject_TypeCheck(m, (PyTypeObject *)type)) {
+        Py_DECREF(m);
+        PyErr_SetString(PyExc_TypeError, "ekf_run: a monitor of the wrong type");
+        return NULL;
+    }
+    return m;
+}
+
+/* the first look at a row: its innovation window (the integrator's hook when the verdict changed or holds), its
+ * trend (the hook while it holds or held), its own callback */
+static int first_look(Pass *p, PyObject *flt, PyObject *row, PyObject *key, PyObject *q, PyObject *et_o, double et,
+                      double nu, double s0, double var, double d2)
+{
+    if (p->nis != Py_None) {
+        PyObject *m = monitor_of(p->nis, p->nis_new, key, NisWinType);
+        if (m == NULL)
+            return -1;
+        if (((NisWin *)m)->qt == NULL) {
+            Py_DECREF(m);
+            PyErr_SetString(PyExc_ValueError, "NisWindow: not initialised");
+            return -1;
+        }
+        int ch;
+        if (nis_offer((NisWin *)m, et, d2, &ch) < 0) {
+            Py_DECREF(m);
+            return -1;
+        }
+        if (ch || ((NisWin *)m)->high) {
+            PyObject *r = PyObject_CallFunctionObjArgs(p->nis_note, key, m, et_o, ch ? Py_True : Py_False, NULL);
+            if (r == NULL) {
+                Py_DECREF(m);
+                return -1;
+            }
+            Py_DECREF(r);
+        }
+        Py_DECREF(m);
+    }
+    if (p->trends != Py_None) {
+        Py_ssize_t pre = PyUnicode_Tailmatch(q, p->skip, 0, PY_SSIZE_T_MAX, -1);
+        if (pre < 0)
+            return -1;
+        double s = s0 + var;
+        if (!pre && !(s <= 0.0)) {
+            PyObject *tr = monitor_of(p->trends, p->trend_new, key, TrendType);
+            if (tr == NULL)
+                return -1;
+            int was = ((Trend *)tr)->high;
+            int high = trend_offer((Trend *)tr, et, nu / sqrt(s));
+            if (high || was) {
+                PyObject *r = PyObject_CallFunctionObjArgs(p->trend_note, key, tr, et_o, NULL);
+                if (r == NULL) {
+                    Py_DECREF(tr);
+                    return -1;
+                }
+                Py_DECREF(r);
+            }
+            Py_DECREF(tr);
+        }
+    }
+    PyObject *cb = PyObject_GetAttr(row, AN[A_cb]);
+    if (cb == NULL)
+        return -1;
+    if (cb != Py_None) {
+        PyObject *r = PyObject_CallFunction(cb, "ddO", nu, s0, et_o);
+        if (r == NULL) {
+            Py_DECREF(cb);
+            return -1;
+        }
+        Py_DECREF(r);
+    }
+    Py_DECREF(cb);
+    /* (a hook may have set row classes aside: read again, as the Python read the attribute at every row) */
+    Py_CLEAR(p->quarantine);
+    if ((p->quarantine = PyObject_GetAttr(flt, AN[A_quarantine])) == NULL)
+        return -1;
+    Py_CLEAR(p->rejected);
+    if ((p->rejected = PyObject_GetAttr(flt, AN[A_rejected])) == NULL)
+        return -1;
+    return 0;
+}
+
+/* a copy of the array held by *o (n values) into a new float64 array of the same shape: *o and *v are replaced */
+static int take_copy(PyObject **o, View *v, Py_ssize_t a, Py_ssize_t b)
+{
+    PyObject *c = np_new(a, b);
+    if (c == NULL)
+        return -1;
+    View cv;
+    if (view_get(c, &cv, 1, 'd', b < 0 ? 1 : 2, "copy") < 0) {
+        Py_DECREF(c);
+        return -1;
+    }
+    memcpy(cv.b.buf, v->b.buf, (size_t)(a * (b < 0 ? 1 : b)) * sizeof(double));
+    view_drop(v);
+    *v = cv;
+    Py_DECREF(*o);
+    *o = c;
+    return 0;
+}
+
+/* ekf_run(filter, i, t, x, P, anchor, par | None): Filter._run from entry i on, starting from the state (t, x, P)
+ * and the anchors of the entry before i. par: the native model's parameter block (EgoModel), or None (the
+ * model's own predict is called). Every entry gets xp, Pp, F, x, P, anchor, usedq; every row used, rejected,
+ * counted, nis, weight, as the Python pass gave them. */
+static PyObject *n_ekf_run(PyObject *self, PyObject *args)
+{
+    PyObject *flt, *x0, *P0, *anchor, *opar;
+    Py_ssize_t i0;
+    double t;
+    if (!PyArg_ParseTuple(args, "OndOOO!O", &flt, &i0, &t, &x0, &P0, &PyDict_Type, &anchor, &opar))
+        return NULL;
+    if (names_ready() < 0 || np_ready() < 0)
+        return NULL;
+    Pass p;
+    memset(&p, 0, sizeof(p));
+    PyObject *slice = NULL, *x = x0, *P = P0, *predict = NULL, *xc = NULL, *Pc = NULL, *res = NULL;
+    View par, xv, Pv;
+    par.held = xv.held = Pv.held = 0;
+    double *ph = NULL, *k = NULL;
+    Py_INCREF(x);
+    Py_INCREF(P);
+    int err = 0;
+    PyObject *entries = PyObject_GetAttr(flt, AN[A_entries]);
+    if (entries == NULL)
+        goto done;
+    slice = PySequence_GetSlice(entries, i0, PY_SSIZE_T_MAX);
+    Py_DECREF(entries);
+    if (slice == NULL || !PyList_Check(slice)) {
+        if (slice != NULL)
+            PyErr_SetString(PyExc_TypeError, "ekf_run: the entries must be a list");
+        goto done;
+    }
+    if ((p.disabled = PyObject_GetAttr(flt, AN[A_disabled])) == NULL ||
+        (p.quarantine = PyObject_GetAttr(flt, AN[A_quarantine])) == NULL ||
+        (p.rejected = PyObject_GetAttr(flt, AN[A_rejected])) == NULL ||
+        (p.nis = PyObject_GetAttr(flt, AN[A_nis])) == NULL || (p.trends = PyObject_GetAttr(flt, AN[A_trends])) == NULL)
+        goto done;
+    p.gate = attr_double(flt, A_gate, &err);
+    p.anchor_s = attr_double(flt, A_anchor_s, &err);
+    if (err)
+        goto done;
+    if (p.nis != Py_None && (!PyDict_Check(p.nis) || (p.nis_new = PyObject_GetAttr(flt, AN[A_nis_new])) == NULL ||
+                             (p.nis_note = PyObject_GetAttr(flt, AN[A_nis_note])) == NULL)) {
+        if (!PyErr_Occurred())
+            PyErr_SetString(PyExc_TypeError, "ekf_run: the monitors must be a dict");
+        goto done;
+    }
+    if (p.trends != Py_None && (!PyDict_Check(p.trends) || (p.trend_new = PyObject_GetAttr(flt, AN[A_trend_new])) == NULL ||
+                                (p.trend_note = PyObject_GetAttr(flt, AN[A_trend_note])) == NULL ||
+                                (p.skip = PyObject_GetAttr(flt, AN[A_trend_skip])) == NULL)) {
+        if (!PyErr_Occurred())
+            PyErr_SetString(PyExc_TypeError, "ekf_run: the trends must be a dict");
+        goto done;
+    }
+    if (view_conv(x, &xv, 'd', 1, "x", &xc) < 0)
+        goto done;
+    Py_ssize_t n = xv.b.shape[0];
+    int has_rho = 0;
+    if (opar != Py_None) {
+        if (view_get(opar, &par, 0, 'd', 1, "par") < 0)
+            goto done;
+        if (n < NCORE) {
+            PyErr_Format(PyExc_ValueError, "predict: a state of %zd", n);
+            goto done;
+        }
+        has_rho = par.b.shape[0] >= PAR0 && DATA(par)[12] > 0;
+        if (predict_check(DATA(par), par.b.shape[0], n, has_rho) < 0)
+            goto done;
+    } else {
+        PyObject *model = PyObject_GetAttr(flt, AN[A_model]);
+        if (model == NULL)
+            goto done;
+        predict = PyObject_GetAttr(model, AN[A_predict]);
+        Py_DECREF(model);
+        if (predict == NULL)
+            goto done;
+    }
+    ph = (double *)PyMem_Malloc((size_t)(n ? n : 1) * sizeof(double));
+    k = (double *)PyMem_Malloc((size_t)(n ? n : 1) * sizeof(double));
+    if (ph == NULL || k == NULL) {
+        PyErr_NoMemory();
+        goto done;
+    }
+    Py_ssize_t ne = PyList_Size(slice);
+    for (Py_ssize_t ei = 0; ei < ne; ei++) {
+        PyObject *e = PyList_GetItem(slice, ei);              /* (held by the slice) */
+        PyObject *et_o = PyObject_GetAttr(e, AN[A_t]);
+        if (et_o == NULL)
+            goto done;
+        double et = PyFloat_AsDouble(et_o);
+        if (et == -1.0 && PyErr_Occurred()) {
+            Py_DECREF(et_o);
+            goto done;
+        }
+        double dt = et - t;
+        PyObject *F;
+        /* the state to predict from: a view of x (made contiguous first when it is not) */
+        if (dt > 0.0) {
+            if (opar != Py_None) {
+                if (!Pv.held && view_conv(P, &Pv, 'd', 2, "P", &Pc) < 0)
+                    goto fail_e;
+                if (Pv.b.shape[0] != n || Pv.b.shape[1] != n || xv.b.shape[0] != n) {
+                    PyErr_SetString(PyExc_ValueError, "ekf_predict: shapes");
+                    goto fail_e;
+                }
+                PyObject *x1 = np_new(n, -1), *P1 = np_new(n, n), *Fc = np_new(NCORE, NCORE);
+                PyObject *rho = has_rho ? np_new(n, -1) : (Py_INCREF(Py_None), Py_None);
+                View x1v, P1v, Fv, rv;
+                x1v.held = P1v.held = Fv.held = rv.held = 0;
+                int bad = (x1 == NULL || P1 == NULL || Fc == NULL || rho == NULL ||
+                           view_get(x1, &x1v, 1, 'd', 1, "x") < 0 || view_get(P1, &P1v, 1, 'd', 2, "P") < 0 ||
+                           view_get(Fc, &Fv, 1, 'd', 2, "Fc") < 0 || (has_rho && view_get(rho, &rv, 1, 'd', 1, "rho") < 0) ||
+                           predict_core(DATA(xv), DATA(Pv), n, dt, DATA(par), has_rho ? DATA(rv) : NULL, DATA(x1v),
+                                        DATA(P1v), DATA(Fv)) < 0);
+                view_drop(&Fv);
+                view_drop(&rv);
+                F = bad ? NULL : PyTuple_Pack(2, Fc, rho);
+                Py_XDECREF(Fc);
+                Py_XDECREF(rho);
+                if (F == NULL) {
+                    view_drop(&x1v);
+                    view_drop(&P1v);
+                    Py_XDECREF(x1);
+                    Py_XDECREF(P1);
+                    goto fail_e;
+                }
+                view_drop(&xv); view_drop(&Pv);
+                Py_CLEAR(xc); Py_CLEAR(Pc);
+                Py_DECREF(x);
+                Py_DECREF(P);
+                x = x1, P = P1;
+                xv = x1v, Pv = P1v;
+            } else {
+                PyObject *r = PyObject_CallFunction(predict, "OOd", x, P, dt), *a, *b;
+                if (r == NULL)
+                    goto fail_e;
+                int u = unpack3(r, &a, &b, &F);
+                Py_DECREF(r);
+                if (u < 0)
+                    goto fail_e;
+                view_drop(&xv); view_drop(&Pv);
+                Py_CLEAR(xc); Py_CLEAR(Pc);
+                Py_DECREF(x);
+                Py_DECREF(P);
+                x = a, P = b;
+                if (view_conv(x, &xv, 'd', 1, "x", &xc) < 0) {
+                    Py_DECREF(F);
+                    goto fail_e;
+                }
+            }
+        } else {
+            F = Py_None;
+            Py_INCREF(F);
+        }
+        int bad = set_attr(e, A_xp, x) < 0 || set_attr(e, A_Pp, P) < 0 || set_attr(e, A_F, F) < 0;
+        Py_DECREF(F);
+        if (bad)
+            goto fail_e;
+        int own = 0, pown = 0, dirty = 0;
+        PyObject *rows = PyObject_GetAttr(e, AN[A_rows]);
+        if (rows == NULL)
+            goto fail_e;
+        if (!PyList_Check(rows)) {
+            Py_DECREF(rows);
+            PyErr_SetString(PyExc_TypeError, "ekf_run: an entry's rows must be a list");
+            goto fail_e;
+        }
+        for (Py_ssize_t ri = 0; ri < PyList_Size(rows); ri++) {
+            PyObject *r = PyList_GetItem(rows, ri);
+            PyObject *group = NULL, *q = NULL, *key = NULL, *h = NULL, *hr = NULL, *pred = NULL, *idx = NULL,
+                     *coef = NULL, *ic = NULL, *cc = NULL, *fz = NULL, *fc = NULL;
+            View iv, cv, fv;
+            iv.held = cv.held = fv.held = 0;
+            int ok = 0;
+            Py_INCREF(r);
+            int was = attr_true(r, A_rejected);
+            if (was < 0 || set_attr(r, A_used, Py_False) < 0 || set_attr(r, A_rejected, Py_False) < 0)
+                goto row_done;
+            if ((group = PyObject_GetAttr(r, AN[A_group])) == NULL || (q = PyObject_GetAttr(r, AN[A_q])) == NULL ||
+                (key = PyTuple_Pack(2, group, q)) == NULL)
+                goto row_done;
+            int c = PySequence_Contains(p.disabled, group);
+            if (c == 0)
+                c = PySequence_Contains(p.disabled, key);
+            if (c < 0)
+                goto row_done;
+            if (c) {
+                ok = 1;
+                goto row_done;
+            }
+            if ((h = PyObject_GetAttr(r, AN[A_h])) == NULL || (hr = PyObject_CallFunctionObjArgs(h, x, NULL)) == NULL ||
+                unpack3(hr, &pred, &idx, &coef) < 0)
+                goto row_done;
+            if (!Pv.held && view_conv(P, &Pv, 'd', 2, "P", &Pc) < 0)
+                goto row_done;
+            if (view_conv(idx, &iv, 'i', 1, "idx", &ic) < 0 || view_conv(coef, &cv, 'd', 1, "coef", &cc) < 0)
+                goto row_done;
+            Py_ssize_t m = iv.b.shape[0];
+            const int64_t *ix = (const int64_t *)iv.b.buf;
+            if (Pv.b.shape[0] != n || Pv.b.shape[1] != n || cv.b.shape[0] != m || m < 1) {
+                PyErr_SetString(PyExc_ValueError, "ekf_project: shapes");
+                goto row_done;
+            }
+            for (Py_ssize_t j = 0; j < m; j++)
+                if (ix[j] < 0 || ix[j] >= n) {
+                    PyErr_SetString(PyExc_IndexError, "ekf_project: an index beyond the state");
+                    goto row_done;
+                }
+            double s0 = project_core(DATA(Pv), n, ix, DATA(cv), m, ph);
+            double pr = PyFloat_AsDouble(pred);
+            if (pr == -1.0 && PyErr_Occurred())
+                goto row_done;
+            double z = attr_double(r, A_z, &err);
+            double var = attr_double(r, A_var, &err);
+            if (err)
+                goto row_done;
+            double nu = z - pr;
+            int wr = attr_true(r, A_wrap);
+            if (wr < 0)
+                goto row_done;
+            if (wr)
+                nu = wrap_pi(nu);
+            double d2 = nu * nu / (s0 + var);
+            if (set_attr_double(r, A_nis, d2) < 0)
+                goto row_done;
+            int counted = attr_true(r, A_counted);
+            if (counted < 0)
+                goto row_done;
+            if (!counted) {
+                if (set_attr(r, A_counted, Py_True) < 0 || first_look(&p, flt, r, key, q, et_o, et, nu, s0, var, d2) < 0)
+                    goto row_done;
+            }
+            if ((c = PyObject_IsTrue(p.quarantine)) < 0 || (c && (c = PySequence_Contains(p.quarantine, key)) < 0))
+                goto row_done;
+            if (c) {
+                ok = 1;
+                goto row_done;
+            }
+            int robust = attr_true(r, A_robust);
+            if (robust < 0)
+                goto row_done;
+            if (robust) {
+                if (d2 > p.gate) {
+                    PyObject *at = PyDict_GetItemWithError(anchor, q);
+                    double ta = -1e18;
+                    if (at == NULL && PyErr_Occurred())
+                        goto row_done;
+                    if (at != NULL && (ta = PyFloat_AsDouble(at)) == -1.0 && PyErr_Occurred())
+                        goto row_done;
+                    if (et - ta <= p.anchor_s) {
+                        if (set_attr(r, A_rejected, Py_True) < 0)
+                            goto row_done;
+                        if (!was) {
+                            PyObject *src = PyObject_GetAttr(r, AN[A_src]), *cnt, *one = PyLong_FromLong(1), *nw = NULL;
+                            if (src == NULL || one == NULL) {
+                                Py_XDECREF(src);
+                                Py_XDECREF(one);
+                                goto row_done;
+                            }
+                            cnt = PyObject_CallMethod(p.rejected, "get", "Oi", src, 0);
+                            if (cnt != NULL)
+                                nw = PyNumber_Add(cnt, one);
+                            int sbad = nw == NULL || PyObject_SetItem(p.rejected, src, nw) < 0;
+                            Py_XDECREF(cnt);
+                            Py_XDECREF(nw);
+                            Py_DECREF(one);
+                            Py_DECREF(src);
+                            if (sbad)
+                                goto row_done;
+                        }
+                        ok = 1;
+                        goto row_done;
+                    }
+                }
+                /* Student-t weight on the innovation: the whole innovation variance is inflated */
+                double w = (T_NU + 1.0) / (T_NU + d2);
+                if (w < 1.0)
+                    var = (s0 + var) / w - s0;
+                if (set_attr_double(r, A_weight, (1.0 < w) ? 1.0 : w) < 0)
+                    goto row_done;
+            } else if (PyDict_SetItem(anchor, q, et_o) < 0)
+                goto row_done;
+            double s = s0 + var;
+            if (!own) {                                   /* (the predicted state is kept in the entry) */
+                if (take_copy(&x, &xv, n, -1) < 0)
+                    goto row_done;
+                Py_CLEAR(xc);
+                own = 1;
+            }
+            if (!pown) {
+                if (take_copy(&P, &Pv, n, n) < 0)
+                    goto row_done;
+                Py_CLEAR(Pc);
+                pown = 1;
+            }
+            if ((fz = PyObject_GetAttr(r, AN[A_freeze])) == NULL)
+                goto row_done;
+            int frozen = fz != Py_None;
+            if (frozen && view_conv(fz, &fv, 'i', 1, "freeze", &fc) < 0)
+                goto row_done;
+            const int64_t *f = frozen ? (const int64_t *)fv.b.buf : NULL;
+            Py_ssize_t nf = frozen ? fv.b.shape[0] : 0;
+            for (Py_ssize_t j = 0; j < nf; j++)
+                if (f[j] < 0 || f[j] >= n) {
+                    PyErr_SetString(PyExc_ValueError, "ekf_update: freeze index");
+                    goto row_done;
+                }
+            update_core(DATA(xv), DATA(Pv), ph, n, s, nu, f, nf, frozen, k);
+            if (set_attr(r, A_used, Py_True) < 0)
+                goto row_done;
+            dirty = 1;
+            ok = 1;
+        row_done:
+            view_drop(&iv); view_drop(&cv); view_drop(&fv);
+            Py_XDECREF(group); Py_XDECREF(q); Py_XDECREF(key); Py_XDECREF(h); Py_XDECREF(hr); Py_XDECREF(pred);
+            Py_XDECREF(idx); Py_XDECREF(coef); Py_XDECREF(ic); Py_XDECREF(cc); Py_XDECREF(fz); Py_XDECREF(fc);
+            Py_DECREF(r);
+            if (!ok) {
+                Py_DECREF(rows);
+                goto fail_e;
+            }
+        }
+        PyObject *usedq;
+        if (dirty) {
+            sym_core(DATA(Pv), n);
+            usedq = PyList_New(0);
+            for (Py_ssize_t ri = 0; usedq != NULL && ri < PyList_Size(rows); ri++) {
+                PyObject *r = PyList_GetItem(rows, ri);
+                int u = attr_true(r, A_used);
+                if (u < 0) {
+                    Py_CLEAR(usedq);
+                    break;
+                }
+                if (!u)
+                    continue;
+                PyObject *q = PyObject_GetAttr(r, AN[A_q]), *src = q ? PyObject_GetAttr(r, AN[A_src]) : NULL;
+                PyObject *pair = (q && src) ? PyTuple_Pack(2, q, src) : NULL;
+                Py_XDECREF(q);
+                Py_XDECREF(src);
+                if (pair == NULL || PyList_Append(usedq, pair) < 0) {
+                    Py_XDECREF(pair);
+                    Py_CLEAR(usedq);
+                    break;
+                }
+                Py_DECREF(pair);
+            }
+            if (usedq != NULL) {
+                PyObject *tu = PyList_AsTuple(usedq);
+                Py_DECREF(usedq);
+                usedq = tu;
+            }
+        } else
+            usedq = PyTuple_New(0);
+        Py_DECREF(rows);
+        PyObject *an = usedq ? PyDict_Copy(anchor) : NULL;
+        bad = usedq == NULL || an == NULL || set_attr(e, A_usedq, usedq) < 0 || set_attr(e, A_x, x) < 0 ||
+              set_attr(e, A_P, P) < 0 || set_attr(e, A_anchor, an) < 0;
+        Py_XDECREF(usedq);
+        Py_XDECREF(an);
+        if (bad)
+            goto fail_e;
+        t = et;
+        Py_DECREF(et_o);
+        continue;
+    fail_e:
+        Py_DECREF(et_o);
+        goto done;
+    }
+    res = Py_None;
+    Py_INCREF(res);
+done:
+    view_drop(&par); view_drop(&xv); view_drop(&Pv);
+    Py_XDECREF(xc); Py_XDECREF(Pc);
+    PyMem_Free(ph);
+    PyMem_Free(k);
+    Py_XDECREF(slice);
+    Py_XDECREF(predict);
+    Py_DECREF(x);
+    Py_DECREF(P);
+    pass_drop(&p);
     return res;
 }
 
@@ -3484,6 +4562,7 @@ static PyMethodDef methods[] = {
     {"ekf_update", n_ekf_update, METH_VARARGS, "one scalar row applied to x and P in place"},
     {"ekf_sym", n_ekf_sym, METH_O, "P = 0.5 * (P + P.T) in place"},
     {"ekf_rts", n_ekf_rts, METH_VARARGS, "one smoother step back over a prediction"},
+    {"ekf_run", n_ekf_run, METH_VARARGS, "Filter._run: the pass over the queued entries and their rows"},
     {"lanes_measure", n_lanes_measure, METH_VARARGS, "the lane tracker's measurement arrays from a road message's lines"},
     {"lanes_predict", n_lanes_predict, METH_VARARGS, "the lane tracker's process noise, in place"},
     {"lanes_fit", n_lanes_fit, METH_VARARGS, "measurement noise, gate, innovation and fit of every line"},
@@ -3515,6 +4594,12 @@ PyMODINIT_FUNC PyInit__chris_native(void)
         goto fail;
     Py_INCREF(Fallback);
     if (PyModule_AddObject(m, "Fallback", Fallback) < 0 || PyModule_AddIntConstant(m, "VERSION", NATIVE_VERSION) < 0)
+        goto fail;
+    if ((NisWinType = PyType_FromSpec(&niswin_spec)) == NULL || (TrendType = PyType_FromSpec(&trend_spec)) == NULL)
+        goto fail;
+    Py_INCREF(NisWinType);
+    Py_INCREF(TrendType);
+    if (PyModule_AddObject(m, "NisWindow", NisWinType) < 0 || PyModule_AddObject(m, "Trend", TrendType) < 0)
         goto fail;
 #ifdef __FP_FAST_FMA
     /* informational: the target has a fused multiply-add; the build must not contract (see the Makefile) */

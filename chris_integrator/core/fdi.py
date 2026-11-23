@@ -21,7 +21,9 @@ import collections
 import math
 import statistics
 
+from ..native import core as _C
 from ..native import round                  # builtins.round (its results; the native core)
+from .ekf import PY_PASS
 
 DEFAULT_CFG = dict(
     stuck_s=1.5, stuck_n=10,          # identical non-zero values for this long and this many samples: stuck
@@ -171,7 +173,7 @@ class Clock:
         self.shift = 0.0
 
 
-class Trend:
+class _TrendPy:
     """A signed, normalised innovation averaged over time (exponential window): |mean| x sqrt(effective n) is
     about N(0, 1) for a consistent row class, and grows without bound for a bias the filter's states do not
     explain (a slow drift, a calibration that moved)."""
@@ -204,6 +206,17 @@ class Trend:
         self.t = None
         self.n = 0
         self.high = False
+
+
+def _trend_native(cfg):
+    """A signed, normalised innovation averaged over time (exponential window): |mean| x sqrt(effective n) is
+    about N(0, 1) for a consistent row class, and grows without bound for a bias the filter's states do not
+    explain (a slow drift, a calibration that moved). The native core's (chris_native.c `Trend`); the filter
+    pass offers every row's first innovation to it directly."""
+    return _C.Trend(cfg["trend_tau_s"], cfg["trend_fire"], cfg["trend_clear"], cfg["trend_min_n"], cfg["trend_corr"])
+
+
+Trend = _TrendPy if PY_PASS else _trend_native
 
 
 def describe_pair(samples):
@@ -301,6 +314,20 @@ class Diagnostics:
             self._set(group, quantity, "trend", "warn", t,
                       "innovations keep one sign (%+.1f sigma of the mean): a bias or drift the model does not explain" % tr.score)
         elif was:
+            self.findings.pop((group, quantity, "trend"), None)
+
+    def trend_new(self, key):
+        """The trend of a row class (group, quantity), made and entered (the filter pass asks for it)."""
+        tr = self.trends[key] = Trend(self.c)
+        return tr
+
+    def trend_note(self, key, tr, t):
+        """A row class's trend holds (its finding is set or renewed), or has just ended (its finding goes)."""
+        group, quantity = key
+        if tr.high:
+            self._set(group, quantity, "trend", "warn", t,
+                      "innovations keep one sign (%+.1f sigma of the mean): a bias or drift the model does not explain" % tr.score)
+        else:
             self.findings.pop((group, quantity, "trend"), None)
 
     def event(self, source, kind, t, text, **more):

@@ -436,6 +436,41 @@ def test_golden_filter():
 
 
 # ---- round, interpolation ----------------------------------------------------------------------------------
+def test_golden_innovation_monitors():
+    """The native innovation window (NisWindow) and trend (Trend) against what the Python monitors gave: the window
+    exact; the trend's verdicts exact, its sums to rounding (exp of the C library)."""
+    from chris_integrator.core import fdi as FD
+    from chris_integrator.core import monitors as MO
+    _held("nis", K.cases_nis(), lambda *c: K.nis_run(MO.NisMonitor, *c))
+    cases = list(K.cases_trend())
+    g = GOLD["trend"]
+    assert K.digest(cases) == g["inputs"]
+    for i, c in enumerate(cases):
+        highs, values = K.trend_run(FD.Trend, *c)
+        assert K.digest(highs) == g["out"][i], i
+        np.testing.assert_allclose(np.array(values, float), np.array(g["values"][i], float), rtol=1e-12, atol=1e-12)
+
+
+def test_golden_filter_pass():
+    """The native filter pass (ekf_run with the monitors) against the Python pass over scripts of late rows,
+    re-runs, robust gating, disabled groups, quarantine from the hooks: over the arithmetic model every observed
+    bit; over the native model the decisions exactly and the states to rounding."""
+    from chris_integrator.core import ekf as KF
+    from chris_integrator.core import fdi as FD
+    from chris_integrator.core import monitors as MO
+    cases = list(K.cases_filter_pass())
+    g = GOLD["filter_pass"]
+    assert K.digest(cases) == g["inputs"]
+    for i, (ego, ops) in enumerate(cases):
+        res = K.filter_pass(ego, ops, KF.Filter, KF.Row, MO.NisMonitor, FD.Trend, native=True)
+        exact, values = K.filter_pass_split(ego, res)
+        assert K.digest(exact) == g["out"][i], i
+        if values is not None:
+            for (x, P), (xr, Pr) in zip(values, g["values"][i]):
+                np.testing.assert_allclose(np.array(x), np.array(xr), rtol=1e-9, atol=1e-9)
+                np.testing.assert_allclose(np.array(P), np.array(Pr), rtol=1e-9, atol=1e-9)
+
+
 @needs_native
 def test_round_is_builtin_round():
     rng = random.Random(8)

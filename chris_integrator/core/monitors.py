@@ -7,7 +7,9 @@ import collections
 import math
 import statistics
 
+from ..native import core as _C
 from ..native import round                  # builtins.round (its results; the native core)
+from .ekf import PY_PASS
 
 
 class Series:
@@ -351,7 +353,7 @@ class SelfCheck:
         self.win.clear()
 
 
-class NisMonitor:
+class _NisMonitorPy:
     """Innovation consistency of one (group, quantity): the scaled median of the normalised innovations squared
     over a window of time (1 when the filter's stated uncertainty is right; the median, not the mean, so a
     heavy-tailed source is judged by its bulk)."""
@@ -427,3 +429,29 @@ class NisMonitor:
         self._sorted, self._plain = [], True
         self.value = None
         self.high = False
+
+
+class _NisMonitorNative(_C.NisWindow):
+    """Innovation consistency of one (group, quantity): the scaled median of the normalised innovations squared
+    over a window of time (1 when the filter's stated uncertainty is right; the median, not the mean, so a
+    heavy-tailed source is judged by its bulk). The window and its verdict are the native core's
+    (chris_native.c `NisWindow`: `offer`, `value`, `high`, `peak`, `n`, `reset_data`); the filter pass offers
+    every row's first innovation to it directly."""
+
+    kind = "nis"
+    MED = 0.4549                      # median of chi-square with 1 degree of freedom
+
+    def __init__(self, group, quantity, cfg):
+        super().__init__(cfg["max_n"], cfg["window_s"], cfg["min_n"], cfg["fire"], cfg["recover"], self.MED)
+        self.group, self.quantity, self.c = group, quantity, cfg
+
+    def report(self):
+        return {"kind": "nis", "a": self.group, "quantity": self.quantity,
+                "verdict": "unknown" if self.value is None else "high" if self.high else "ok",
+                "n": self.n, "ratio": None if self.value is None else round(self.value, 2), "peak": round(self.peak, 2)}
+
+    def describe(self):
+        return "%s innovations %.1fx the stated uncertainty" % (self.quantity, self.value or 0.0)
+
+
+NisMonitor = _NisMonitorPy if PY_PASS else _NisMonitorNative

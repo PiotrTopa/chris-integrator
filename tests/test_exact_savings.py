@@ -74,13 +74,15 @@ def test_near_is_the_walk_over_every_row():
 
 
 def test_innovation_monitor_median_is_the_sorted_median():
+    """The window's value, at every evaluation (five times a second), is statistics.median of the window over the
+    expected median: from the ordered copy kept as samples come and go, from statistics.median while a NaN is in."""
     cfg = dict(window_s=8.0, max_n=80, min_n=8, fire=6.0, recover=3.0)
     rng = random.Random(1)
     evaluated = 0
     for _ in range(200):
         m = NisMonitor("g", "q", cfg)
         ref = collections.deque(maxlen=80)
-        t = 0.0
+        t, t_eval = 0.0, -1e18
         for _ in range(1500):
             t += rng.choice([0.01, 0.05, 0.2, 1.0, 3.0, 9.0]) if rng.random() < 0.9 else 0.0
             d = rng.choice([rng.random() * 5, 0.0, float("nan") if rng.random() < 0.02 else 1.0, rng.random()])
@@ -88,15 +90,16 @@ def test_innovation_monitor_median_is_the_sorted_median():
             ref.append((t, d))
             while ref and ref[0][0] < t - 8.0:
                 ref.popleft()
-            assert len(m.q) == len(ref)
-            if len(ref) >= 8:
-                a, b = m._median(), statistics.median(d for _, d in ref)
+            assert (m.n if hasattr(m, "n") else len(m.q)) == len(ref)
+            if len(ref) >= 8 and (t - t_eval >= 0.2 or t < t_eval):
+                t_eval = t
+                a, b = m.value, statistics.median(d for _, d in ref) / m.MED
                 assert a == b or (a != a and b != b)
                 evaluated += 1
             if rng.random() < 0.001:
                 m.reset_data()
                 ref.clear()
-    assert evaluated > 50000
+    assert evaluated > 15000
 
 
 def test_turn_window_extremes_are_max_and_min_of_the_window():

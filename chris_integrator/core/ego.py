@@ -124,6 +124,10 @@ class EgoModel:
         self._par = np.array(par, dtype=float)
         return self._par
 
+    def native_par(self):
+        """The parameter block of the native process model (the filter pass predicts with it)."""
+        return self._par if self._par is not None else self._native_par()
+
     def predict(self, x, P, dt):
         """(x, P, F) after dt (the native core: chris_native.c `ekf_predict`): the kinematic states moved over dt
         (speed by the acceleration, heading by the yaw rate and its rate, position along the mean heading and

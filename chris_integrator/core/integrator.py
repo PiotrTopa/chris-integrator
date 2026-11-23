@@ -6,7 +6,7 @@ import math
 import numpy as np
 
 from . import ego as E
-from .ekf import Filter, Row, wrap_pi
+from .ekf import PY_PASS, Filter, Row, wrap_pi
 from .fdi import Diagnostics
 from .monitors import NisMonitor, Pair, SelfCheck, Series
 from .registry import NS, Ctx, Meas, lin
@@ -201,8 +201,12 @@ class Integrator:
         c = self.cfg
         self._foreign_ix = {}
         self.ekf = Filter(self.model, x, P, c["horizon_s"], c["gate_chi2"])
-        self.ekf.stat = self._nis_stat
-        self.ekf.stat_nu = self._innovation
+        if PY_PASS:
+            self.ekf.stat = self._nis_stat
+            self.ekf.stat_nu = self._innovation
+        else:
+            self.ekf.watch(self.nis, self._nis_new, self._nis_note, self.fdi.trends, self.fdi.trend_new,
+                           self.fdi.trend_note, "standstill")
         if keep and old is not None and old.latest() is not None:
             self.ekf.rebase(t, x, P)
         if not keep:
@@ -527,6 +531,21 @@ class Integrator:
             if row.q == "pos":
                 self._pos_high_t = t if m.high else None
         if row.q == "pos" and m.high and self._pos_high_t is not None and t - self._pos_high_t > self.cfg["reanchor_s"]:
+            self._lost = True              # acted on after this filter pass (on_message)
+
+    def _nis_new(self, key):
+        m = self.nis[key] = NisMonitor(key[0], key[1], self.cfg["nis"])
+        return m
+
+    def _nis_note(self, key, m, t, changed):
+        """A row class's innovation window changed its verdict (`changed`) or holds it (high)."""
+        q = key[1]
+        if changed and q in self.cfg["quarantine"]:
+            if self.gates("innovation"):
+                self.ekf.set_quarantine(k for k, n in self.nis.items() if n.high and k[1] in self.cfg["quarantine"])
+            if q == "pos":
+                self._pos_high_t = t if m.high else None
+        if q == "pos" and m.high and self._pos_high_t is not None and t - self._pos_high_t > self.cfg["reanchor_s"]:
             self._lost = True              # acted on after this filter pass (on_message)
 
     def _innovation(self, row, nu, s, t):
