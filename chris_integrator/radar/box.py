@@ -400,7 +400,7 @@ class Radar:
         if _NR is not None:
             # the objects of the message in one native call: numbers, flags with their hysteresis, the dicts
             hz = (0.0,) + tuple(c["predict_s"])
-            kin = [M._KIN4.get(o.label) or M._KIN4[None] for o in shown]
+            kin = [o.kin for o in shown]
             out = _NR.radar_frame(tr.store.a, [o.slot for o in shown], [[T + h - o.t for h in hz] for o in shown], kin,
                                   M._native_par(tr.mcfg), (X, Y, psi), (v_ego, w_ego), self._ncfg(),
                                   tuple(c["predict_s"]), self.path[0] if self.path is not None else None,

@@ -5090,6 +5090,27 @@ done:
     return res;
 }
 
+/* the middle one by weight of v (n >= 1): argsort (stable, as numpy's for small arrays), cumulative weights, the
+ * first whose cumulative weight reaches half of the total (np.searchsorted) */
+static double r_wmedian(const double *v, const double *w, Py_ssize_t n, Py_ssize_t *k, double *cw)
+{
+    for (Py_ssize_t i = 0; i < n; i++) {
+        Py_ssize_t j = i;
+        while (j > 0 && v[k[j - 1]] > v[i]) {
+            k[j] = k[j - 1];
+            j--;
+        }
+        k[j] = i;
+    }
+    for (Py_ssize_t i = 0; i < n; i++)
+        cw[i] = i ? cw[i - 1] + w[k[i]] : w[k[i]];
+    double half = 0.5 * cw[n - 1];
+    Py_ssize_t idx = 0;
+    while (idx < n - 1 && cw[idx] < half)
+        idx++;
+    return v[k[idx]];
+}
+
 /* radar_check(S, row, back, px, py, Pp) -> (m2, e) | None. Tracker._check for one expectation: the object's
  * present estimate taken back by `back` seconds against where it said it would be then (px, py; Pp: the 2 x 2
  * covariance it gave): half the squared distance in both uncertainties (+ 0.05 m2 each way), and the distance.
@@ -5168,23 +5189,7 @@ static PyObject *n_radar_register(PyObject *self, PyObject *args)
                 PyErr_NoMemory();
                 goto done;
             }
-            for (Py_ssize_t i = 0; i < n; i++) {         /* argsort, stable (numpy's for small arrays) */
-                Py_ssize_t j = i;
-                while (j > 0 && v[k[j - 1]] > v[i]) {
-                    k[j] = k[j - 1];
-                    j--;
-                }
-                k[j] = i;
-            }
-            for (Py_ssize_t i = 0; i < n; i++)
-                cw[i] = i ? cw[i - 1] + w[k[i]] : w[k[i]];
-            double half = 0.5 * cw[n - 1];
-            Py_ssize_t idx = 0;
-            while (idx < n && cw[idx] < half)            /* np.searchsorted(cw, half): the first cw >= half */
-                idx++;
-            if (idx >= n)
-                idx = n - 1;
-            m = v[k[idx]];
+            m = r_wmedian(v, w, n, k, cw);
             PyMem_Free(k);
         } else {
             for (Py_ssize_t i = 0; i < n; i++)
@@ -5205,6 +5210,62 @@ done:
     PyMem_Free(ripe);
     PyMem_Free(rows);
     PyMem_Free(w);
+    view_drop(&vS);
+    return res;
+}
+
+/* radar_common(S, rows, sensor, pose, items) -> (m, sum of weights). Tracker._common's numbers: for each settled
+ * pair (its object's row; item: kind, sdt, the detection's first row z0 and its variance R00) the angle
+ * innovation of the object as a whole and its weight 1 / (H0 P H0 + R00); the middle one by weight. */
+static PyObject *n_radar_common(PyObject *self, PyObject *args)
+{
+    PyObject *oS, *orows, *osen, *opose, *oit;
+    if (!PyArg_ParseTuple(args, "OOOOO", &oS, &orows, &osen, &opose, &oit))
+        return NULL;
+    View vS;
+    vS.held = 0;
+    PyObject *res = NULL;
+    Py_ssize_t cap, n = 0, *rows = NULL, *k = NULL;
+    double *buf = NULL, pose[6];
+    RSens sen;
+    if (store_get(oS, &vS, &cap) < 0 || (rows = idx_get(orows, cap, &n)) == NULL || sens_get(osen, &sen) < 0 ||
+        nums_get(opose, 6, pose, "pose") < 0)
+        goto done;
+    if (n == 0) {
+        PyErr_SetString(PyExc_ValueError, "radar_common: no pairs");
+        goto done;
+    }
+    buf = (double *)PyMem_Malloc((size_t)(7 * n) * sizeof(double));
+    k = (Py_ssize_t *)PyMem_Malloc((size_t)n * sizeof(Py_ssize_t));
+    if (buf == NULL || k == NULL) {
+        PyErr_NoMemory();
+        goto done;
+    }
+    double *it = buf, *v = it + 4 * n, *w = v + n, *cw = w + n;
+    if (rows_get(oit, n, 4, it, "items") < 0)
+        goto done;
+    double *A = (double *)vS.b.buf;
+    for (Py_ssize_t q = 0; q < n; q++) {
+        const double *row = A + rows[q] * RROW, *P = row + RO_P;
+        double z[4], H[4 * RN];
+        r_h(&sen, (int)it[4 * q], it[4 * q + 1], row + RO_X, pose, z, H);
+        double s00 = 0.0;
+        for (int j = 0; j < RN; j++) {
+            double t = 0.0;
+            for (int i = 0; i < RN; i++)
+                t = i ? t + H[i] * P[i * RN + j] : H[i] * P[i * RN + j];
+            s00 = j ? s00 + t * H[j] : t * H[j];
+        }
+        s00 = s00 + it[4 * q + 3];
+        v[q] = it[4 * q + 2] - z[0];
+        w[q] = 1.0 / s00;
+    }
+    double m = r_wmedian(v, w, n, k, cw);
+    res = Py_BuildValue("(dd)", m, np_sum(w, n, 1));
+done:
+    PyMem_Free(rows);
+    PyMem_Free(buf);
+    PyMem_Free(k);
     view_drop(&vS);
     return res;
 }
@@ -5244,6 +5305,7 @@ static PyMethodDef methods[] = {
     {"radar_merge", n_radar_merge, METH_VARARGS, "Tracker._merge's geometry: the near pairs and their test"},
     {"radar_check", n_radar_check, METH_VARARGS, "Tracker._check for one expectation"},
     {"radar_register", n_radar_register, METH_VARARGS, "Tracker._register for one sensor: the shared offset, taken out"},
+    {"radar_common", n_radar_common, METH_VARARGS, "Tracker._common's numbers: the scan's angle innovations, their weighted median"},
     {NULL, NULL, 0, NULL}};
 
 static struct PyModuleDef moduledef = {PyModuleDef_HEAD_INIT, "_chris_native",

@@ -96,6 +96,30 @@ CFG = dict(
 )
 
 
+def _npsum(a):
+    """sum(a) added up as numpy adds a contiguous array (pairwise, eight at a time): the same float."""
+    n = len(a)
+    if n < 8:
+        r = 0.0
+        for v in a:
+            r += v
+        return r
+    if n <= 128:
+        r = list(a[:8])
+        i = 8
+        while i < n - n % 8:
+            for k in range(8):
+                r[k] += a[i + k]
+            i += 8
+        res = ((r[0] + r[1]) + (r[2] + r[3])) + ((r[4] + r[5]) + (r[6] + r[7]))
+        for v in a[i:]:
+            res += v
+        return 0.0 + res
+    n2 = n // 2
+    n2 -= n2 % 8
+    return _npsum(a[:n2]) + _npsum(a[n2:])
+
+
 def assign(gain):
     """The pairs (object, detection) of the largest total gain; a pair is optional (gain -inf: not allowed).
     Settled per group of objects and detections that compete with one another."""
@@ -214,7 +238,7 @@ class Obj:
     __slots__ = ("id", "slot", "_xs", "_Ps", "_mu", "_xf", "_Pf", "_x", "_P", "t", "t0", "logodds", "hits", "state",
                  "sources", "last_seen", "vote", "history", "checks", "consistency", "pred_err", "n_checks", "nis",
                  "verdict", "coast_s", "velocity_seen", "merge_t", "flags", "last_cover", "dp0", "gain", "last_box",
-                 "scores", "range_t", "cls")
+                 "scores", "range_t", "cls", "kin")
     xs, Ps, mu, xf, Pf, x, P = (_view(k) for k, _ in _LAY)
 
     def __init__(self, oid, x0, P0, mu, t, src, exist, coast_s, store=None, live=()):
@@ -254,6 +278,7 @@ class Obj:
         self.scores = []             # (sensor, score) of its boxes while it is not confirmed
         self.range_t = t             # the last time a detection said how far it is (not a bearing alone)
         self.cls = None              # classvote.result of `vote` without its age (box.py), until the next vote
+        self.kin = M._KIN4[None]     # what its kind can do (models._KIN4 of `label`), set with every vote
         self.x, self.P = M.combine(self.xs, self.Ps, self.mu)
 
     def bind(self, store):
@@ -323,7 +348,7 @@ class Tracker:
                 nz.append(noise[o.t])
             pose = self.ego.pose_at(t) if any(a > 0.0 or b > 0.0 for a, b in nz) else (0.0, 0.0, 0.0)
             _NR.radar_advance(self.store.a, [o.slot for o in objs], [float(t) - o.t for o in objs],
-                              [M._KIN4.get(o.label) or M._KIN4[None] for o in objs], M._native_par(self.mcfg), nz, pose)
+                              [o.kin for o in objs], M._native_par(self.mcfg), nz, pose)
             for o in objs:
                 o.t = t
             return
@@ -363,7 +388,7 @@ class Tracker:
             B = len(objs)
             x, P, mu = np.empty((B, N)), np.empty((B, N, N)), np.empty((B, 3))
             _NR.radar_peek(self.store.a, [o.slot for o in objs], [float(tm) - o.t for tm, o in zip(times, objs)],
-                           [M._KIN4.get(o.label) or M._KIN4[None] for o in objs], M._native_par(self.mcfg), x, P, mu)
+                           [o.kin for o in objs], M._native_par(self.mcfg), x, P, mu)
             return [(x[k], P[k], mu[k]) for k in range(B)]
         xs, Ps, mu, dt, x, P = self._evolve(objs, times, combine=True)
         return [(o.x, o.P, o.mu) if abs(dt[k]) < 1e-6 else (x[k], P[k], mu[k]) for k, o in enumerate(objs)]
@@ -427,7 +452,7 @@ class Tracker:
         if not objs:
             return []
         if _NR is not None:
-            return _NR.radar_still(self.store.a, [o.slot for o in objs], [(M._KIN4.get(o.label) or M._KIN4[None])[3] for o in objs])
+            return _NR.radar_still(self.store.a, [o.slot for o in objs], [o.kin[3] for o in objs])
         return M.p_still_many([o.xs for o in objs], [o.Ps for o in objs], [o.mu for o in objs], [o.label for o in objs])
 
     def _pose(self, t):
@@ -452,7 +477,7 @@ class Tracker:
             mid = (np.arange(n) + 0.5) / n
             (mt, st), (mf, sf), wgt = c["score_prior"]
             ht, hf = np.exp(-0.5 * ((mid - mt) / st) ** 2), np.exp(-0.5 * ((mid - mf) / sf) ** 2)
-            h = self.score_hist[src] = [wgt * ht / ht.sum(), wgt * hf / hf.sum()]
+            h = self.score_hist[src] = [(wgt * ht / ht.sum()).tolist(), (wgt * hf / hf.sum()).tolist()]
         return h
 
     def _score_odds(self, src, sc):
@@ -468,7 +493,7 @@ class Tracker:
         v = tab[b]
         if v is None:
             ht, hf = self._hist(src)
-            r = math.log(((ht[b] + 0.5) / (ht.sum() + 0.5 * len(ht))) / ((hf[b] + 0.5) / (hf.sum() + 0.5 * len(hf))))
+            r = math.log(((ht[b] + 0.5) / (_npsum(ht) + 0.5 * len(ht))) / ((hf[b] + 0.5) / (_npsum(hf) + 0.5 * len(hf))))
             v = tab[b] = c["score_gain"] * max(-c["score_max"], min(c["score_max"], r))
         return v
 
@@ -478,8 +503,8 @@ class Tracker:
             self.score_odds.pop(src, None)
             h = self._hist(src)[0 if real else 1]
             h[min(int(sc * c["score_bins"]), c["score_bins"] - 1)] += 1.0
-            if h.sum() > c["score_keep"]:
-                h *= 0.5
+            if _npsum(h) > c["score_keep"]:
+                h[:] = [v * 0.5 for v in h]
 
     # ---- one scan -----------------------------------------------------------------------------------------
     def process(self, src, t, sensor, dets):
@@ -539,7 +564,7 @@ class Tracker:
             if _NR is not None:                          # the place is all that is asked: (x, y, P00, P01, P10, P11)
                 ahead = np.empty((len(who) * len(hz), 6))
                 _NR.radar_peek_pos(self.store.a, [o.slot for o in who for _ in hz], [t + h - o.t for o in who for h in hz],
-                                   [M._KIN4.get(o.label) or M._KIN4[None] for o in who for _ in hz],
+                                   [o.kin for o in who for _ in hz],
                                    M._native_par(self.mcfg), ahead)
                 for k, r in enumerate(ahead.tolist()):
                     who[k // len(hz)].checks.append((t + hz[k % len(hz)], r[0], r[1], r[2:]))
@@ -788,6 +813,16 @@ class Tracker:
         if not getattr(sensor, "has_bias", False) or len(pairs) < c["common_min"]:
             return False
         v, w = [], []
+        if _NR is not None and hasattr(sensor, "native"):
+            sel = [(objs[i].slot, (kind_code(dets[j].get("kind")), float(dets[j].get("sdt") or 0.0), float(dets[j]["z"][0]),
+                                   float(Rs[j][0] if isinstance(Rs[j], list) else Rs[j][0, 0])))
+                   for i, j, _, pr, _ in pairs
+                   if (dets[j].get("kind") or "").rstrip("s") in ("rb", "rbh") and objs[i].state in ("confirmed", "coast")
+                   and objs[i].hits >= 4 and pr >= c["common_pair"]]
+            if len(sel) < c["common_min"]:
+                return False
+            m, ws = _NR.radar_common(self.store.a, [q[0] for q in sel], sensor.native(), pose, [q[1] for q in sel])
+            return self._common_take(sensor, src, dets, Rs, m, 1.57 / ws)
         for i, j, _, pr, _ in pairs:
             o, d = objs[i], dets[j]
             if (d.get("kind") or "").rstrip("s") not in ("rb", "rbh") or o.state not in ("confirmed", "coast") or o.hits < 4 \
@@ -804,6 +839,11 @@ class Tracker:
         cw = np.cumsum(w[k])
         m = float(v[k][int(np.searchsorted(cw, 0.5 * cw[-1]))])
         var_m = 1.57 / float(w.sum())                    # of a weighted median
+        return self._common_take(sensor, src, dets, Rs, m, var_m)
+
+    def _common_take(self, sensor, src, dets, Rs, m, var_m):
+        """The scan's common angle m (of variance var_m): the slow part into the sensor's bias, the rest out of
+        the scan's angles."""
         jit = math.radians(sensor.cfg["pitch_jitter_deg"]) ** 2
         b = self.bias[src]
         tot = b[1] + jit + var_m
@@ -868,6 +908,7 @@ class Tracker:
         if at.get("class") is not None:
             classvote.vote(o.vote, at.get("class"), at.get("class_conf", at.get("prob")), src, t, at.get("weight", 1.0))
             o.cls = None
+            o.kin = M._KIN4.get(o.label) or M._KIN4[None]
 
     def _update(self, o, d, R, sensor, pose, src, t, pd=None, lam=None, pair=None):
         """One detection into one object. Each hypothesis takes it only as far as it can be this object's at
@@ -1075,7 +1116,7 @@ class Tracker:
         c = self.cfg
         objs = self.objects
         if _NR is not None:
-            kin = [M._KIN4.get(o.label) or M._KIN4[None] for o in objs]
+            kin = [o.kin for o in objs]
             return _NR.radar_life(self.store.a, [o.slot for o in objs], [k[3] for k in kin],
                                   [1.0 if o.state != "tentative" and scan - o.last_cover > c["view_gap_s"] else 0.0 for o in objs],
                                   [T - o.t for o in objs], kin, M._native_par(self.mcfg), pose[:2] if pose else None,
@@ -1187,7 +1228,7 @@ class Tracker:
                     poses[o.t] = self.ego.pose_at(o.t)[:2]
                 here.append(poses[o.t])
             for i, j, same in _NR.radar_merge(self.store.a, [o.slot for o in obs], [o.t for o in obs],
-                                              [M._KIN4.get(o.label) or M._KIN4[None] for o in obs],
+                                              [o.kin for o in obs],
                                               M._native_par(self.mcfg), here, e[:2], (c["merge_m"], c["merge_rel"], c["merge_dv"])):
                 nearj.setdefault(i, []).append((j, same))
                 nearset.add((i, j))
