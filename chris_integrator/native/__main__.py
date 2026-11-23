@@ -87,6 +87,8 @@ def selftest(n=20000, seed=1):
     _n.radar_marginals(np.array(L), out)
     if not close(out, ref):
         bad.append("radar_marginals differs from the reference")
+    from ._predict_selftest import check as predict_check          # the predictor on a fixed scene
+    bad.extend(predict_check())
     return bad
 
 

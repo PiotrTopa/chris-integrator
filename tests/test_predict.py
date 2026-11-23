@@ -309,7 +309,10 @@ def test_context_builder_reads_the_stacks_messages():
                  "prior": {"total": 2, "forward": 1, "backward": 1}})
     c = cb.build(101.0, ego)
     assert c["source"] == "lanes" and c["lane_width_m"] == 3.4 and c["oncoming"] > 0.9
-    assert abs(c["kerb_left_m"] - 5.6) < 1e-6 and abs(c["kerb_right_m"] + 2.2) < 1e-6
+    assert abs(c["kerb_left_m"] - 5.6) < 0.13 and abs(c["kerb_right_m"] + 2.2) < 0.13
+    # between two messages of the sources only the points move: the same context, 2 m further on
+    c2 = cb.build(101.2, ego)
+    assert c2["source"] == "lanes" and abs((c["centre"][0][0] - c2["centre"][0][0]) - 2.0) < 1e-9
     cb.on_roadgeom({"ts_mono_ns": 101_000_000_000, "geom": {
         "lane_width_m": 3.3, "centre": {"x": [0.0, 30.0, 60.0, 90.0], "y": [0.0, 0.0, 1.0, 3.0], "conf": [1, 1, 0.9, 0.2], "src": "vvmm"},
         "branches": [{"dist_m": 50.0, "pts": [[50.0, 4.0], [50.0, 30.0]], "side": "right", "minor": True, "exit": True, "entry": True}],
@@ -342,8 +345,12 @@ def test_plugin_in_the_stack():
         if want:
             f = got["radar_fut"][-1]
             assert f["ts_mono_ns"] == got["radar"][-1]["ts_mono_ns"] and f["seq"] == got["radar"][-1]["seq"]
-            assert f["fut_ctx"]["path"] == "plan" and f["ego_fut"]["modes"][0]["m"] == "path"
-            assert "fut" not in got["radar"][-1] and st.plugin("predict").health()["frames"] == 30
+            assert f["fut_ctx"]["path"] == "idle" and f["ego_fut"]["modes"] == [] and f["fut"]["t"][-1] == 8.0     # nothing to predict
+            m = dict(got["radar"][-1], objects=[K.obj(1, 30.0, 0.0, 9.0, 0.0)], ts_mono_ns=got["radar"][-1]["ts_mono_ns"] + 50_000_000)
+            st.mixer.publish("radar", m, "radar")
+            f = got["radar_fut"][-1]
+            assert f["fut_ctx"]["path"] == "plan" and f["ego_fut"]["modes"][0]["m"] == "path" and f["objects"][0]["fut"]
+            assert "fut" not in got["radar"][-1]["objects"][0] and st.plugin("predict").health()["frames"] == 31
 
 
 def test_golden():

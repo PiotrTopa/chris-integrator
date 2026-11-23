@@ -26,6 +26,8 @@ DEFAULT_CFG = dict(
     centre_step_m=4.0,           # the centre line is thinned to about this spacing
     centre_conf=0.3,             # a geometry point below this confidence ends the centre line
     kerb_x_m=(8.0, 30.0),        # the road edges are read over this stretch ahead
+    min_interval_s=0.0,          # the sources are read anew at most this often (in between: the kept context, moved);
+                                 # a cost knob: the default reads every new message
 )
 
 
@@ -40,6 +42,7 @@ class ContextBuilder:
 
     def reset(self, reason=None):
         self.geom = self.lanes = self.plan = self.egolane = self.map = None
+        self._kept = None
         self.turn_signal = None
 
     # ---- inputs (each keeps the newest message and its time) ------------------------------------------------
@@ -75,9 +78,28 @@ class ContextBuilder:
         return e is not None and -0.5 <= T - e[0] <= self.cfg["max_age_s"]
 
     def build(self, T, ego):
-        """The context dict for time T (s); ego: the predictor's EgoTrack (moves a source's frame to T's)."""
+        """The context dict for time T (s); ego: the predictor's EgoTrack (moves a source's frame to T's).
+
+        The sources are read when one of them has a new message (not more often than `min_interval_s`; at least
+        every 0.5 s: one may have grown stale); the result is kept in the frame of that moment, and for each T in
+        between only its points are moved."""
+        src = (self.geom, self.lanes, self.plan, self.egolane, self.map)
+        k = self._kept
+        if k is None or T - k[0] > 0.5 or T < k[0] or (T - k[0] >= self.cfg["min_interval_s"]
+                                                       and any(a is not b for a, b in zip(src, k[1]))):
+            k = self._kept = (T, src, self._assemble(T, ego))
+        T0, _, base = k
+        out = dict(base, turn_signal=self.turn_signal)
+        if T != T0:
+            if "centre" in out:
+                out["centre"] = ego.move(out["centre"], T0, T)
+            if "arms" in out:
+                out["arms"] = [dict(a, pts=ego.move(a["pts"], T0, T)) for a in out["arms"]]
+        return out
+
+    def _assemble(self, T, ego):
         c = self.cfg
-        out = {"source": "kinematic", "turn_signal": self.turn_signal}
+        out = {"source": "kinematic"}
         centre = None
         if self._fresh(self.geom, T):
             t, g = self.geom
@@ -87,7 +109,10 @@ class ContextBuilder:
                 conf = ce.get("conf")
                 n = len(x)
                 if isinstance(conf, list) and len(conf) == n:
-                    low = np.flatnonzero(np.asarray([v if _fin(v) else 0.0 for v in conf]) < c["centre_conf"])
+                    try:
+                        low = np.flatnonzero(~(np.asarray(conf, float) >= c["centre_conf"]))
+                    except (TypeError, ValueError):
+                        low = np.zeros(1, int)
                     if len(low) and low[0] >= 2:
                         n = int(low[0])
                 centre = ego.move(np.stack([x[:n], y[:n]], axis=1), t, T)
@@ -105,7 +130,7 @@ class ContextBuilder:
                 p = np.asarray(pts, float)
                 p[:, 1] = -p[:, 1]
                 near = _fin(jd) and _fin(b.get("dist_m")) and abs(b["dist_m"] - jd) < 25.0
-                arms.append({"pts": ego.move(p, t, T).tolist(), "side": b.get("side"),
+                arms.append({"pts": ego.move(p, t, T), "side": b.get("side"),
                              "priority": -1 if b.get("minor") else 0, "entry": bool(b.get("entry", True)),
                              "exit": bool(b.get("exit", True)), "control": ctrl if near else None})
             if arms:
@@ -134,7 +159,7 @@ class ContextBuilder:
             if isinstance(pr, dict) and _fin(pr.get("forward")) and _fin(pr.get("backward")):
                 out["_count"] = (int(pr["forward"]), int(pr["backward"]))
             edges = ln.get("edges") or ()
-            if isinstance(xs, list) and len(edges) == 2:
+            if isinstance(xs, list) and len(edges) == 2 and (edges[0].get("present") or edges[1].get("present")):
                 x = np.asarray(xs, float)
                 m = (x >= c["kerb_x_m"][0]) & (x <= c["kerb_x_m"][1])
                 cy = 0.0
@@ -142,7 +167,8 @@ class ContextBuilder:
                     cy = float(np.interp(0.5 * sum(c["kerb_x_m"]), centre[:, 0], centre[:, 1]))
                 for e, name in zip(edges, ("kerb_left_m", "kerb_right_m")):
                     if e.get("present") and isinstance(e.get("y"), list) and m.any():
-                        out[name] = float(-np.mean(np.asarray(e["y"], float)[m])) - cy
+                        # (to a quarter of a metre: the edge wanders by more from frame to frame)
+                        out[name] = round(4.0 * (float(-np.mean(np.asarray(e["y"], float)[m])) - cy)) / 4.0
         if centre is None and self._fresh(self.plan, T):
             t, plan = self.plan
             x, y = np.asarray(plan["x"], float), -np.asarray(plan["y"], float)
@@ -150,13 +176,14 @@ class ContextBuilder:
                 centre = ego.move(np.stack([x, y], axis=1), t, T)
                 out["source"], out["quality"] = "plan", 0.5
         if centre is not None and len(centre) >= 2:
-            # thinned; the stretch behind the car is the predictor's to extend
-            d = np.concatenate([[0.0], np.cumsum(np.hypot(np.diff(centre[:, 0]), np.diff(centre[:, 1])))])
-            keep = [0]
-            for i in range(1, len(d)):
-                if d[i] - d[keep[-1]] >= c["centre_step_m"] or i == len(d) - 1:
-                    keep.append(i)
-            out["centre"] = centre[keep]
+            # a long line is thinned; the stretch behind the car is the predictor's to extend
+            if len(centre) > 48:
+                d = np.concatenate([[0.0], np.cumsum(np.hypot(np.diff(centre[:, 0]), np.diff(centre[:, 1])))])
+                keep = np.unique(np.concatenate([np.searchsorted(d, np.arange(0.0, d[-1], c["centre_step_m"])), [len(d) - 1]]))
+                centre = centre[keep]
+            out["centre"] = centre
+        if "lane_width_m" in out:
+            out["lane_width_m"] = round(out["lane_width_m"], 1)
         # how many lanes run beside the car's own
         fwd = bwd = None
         if "_count" in out:
@@ -174,7 +201,7 @@ class ContextBuilder:
             est = self.egolane[1]
             pr = est.get("probs")
             if isinstance(pr, list) and pr:
-                right = list(pr) if est.get("probs_from") != "left" else list(reversed(pr))   # P(k lanes to the right)
+                right = [round(20.0 * v) / 20.0 for v in (pr if est.get("probs_from") != "left" else reversed(pr))]   # P(k lanes to the right)
         if fwd is not None:
             if right is not None and len(right) == fwd:
                 out["n_right"] = right[:3]
@@ -190,5 +217,4 @@ class ContextBuilder:
                 out["n_right"] = right[:3]
             else:
                 out["n_right"] = 0.85 if seen[1] else 0.15
-            out["_left_seen"] = seen[0]
         return out

@@ -29,6 +29,7 @@ from .. import native as _native
 _N = _native.predict
 HORIZONS = (1.0, 2.0, 3.0, 5.0, 8.0)
 GROUPS = ("vehicle", "cyclist", "pedestrian", "all")
+_COLS = [0, 1, 3, 4, 5]                   # of predict_score's row: min_ade, min_fde, top_fde, nll, maha2
 
 
 class SelfCheck:
@@ -37,6 +38,7 @@ class SelfCheck:
         self.cfg.update(cfg or {})
         self.times = np.asarray(times, dtype=float)
         self.hk = [int(np.argmin(np.abs(self.times - h))) for h in HORIZONS if h <= self.times[-1] + 1e-6]
+        self._grid = {int(round(t * 20.0)): k for k, t in enumerate(self.times)}
         self.reset()
 
     def reset(self):
@@ -50,39 +52,43 @@ class SelfCheck:
         self.scored = 0
 
     def update(self, T, pred, ego):
-        if not self.cfg["enabled"]:
+        """A frame: pred its prediction, or None for a frame without objects (kept batches still end)."""
+        if not self.cfg["enabled"] or (pred is None and not self.batches):
             return
         if self.batches and (T < self.batches[-1]["T"] or T - self.batches[-1]["T"] > 30.0):
             self.batches = []
             self._next = None
         times = self.times
-        index = None
+        index = ground = None
         keep = []
+        grid = self._grid
         for b in self.batches:
             dt = T - b["T"]
-            k = int(np.searchsorted(times, dt - 0.03))
-            if k < len(times) and abs(times[k] - dt) <= 0.03 and not b["done"][k]:
+            k = grid.get(int(dt * 20.0 + 0.5), -1) if dt < times[-1] + 0.1 else -1     # the sample this frame is (20 a second)
+            if k >= 0 and pred is not None and abs(times[k] - dt) <= 0.03 and not b["done"][k]:
                 if index is None:
                     index = {i: j for j, i in enumerate(pred.ids) if pred.seen[j]}
+                    ground = ego.to_ground(pred.xy, T)          # where the objects are now, on the ground
                 rows = [(r, index[i]) for r, i in enumerate(b["ids"]) if i in index]
                 if rows:
                     r, j = zip(*rows)
-                    b["actual"][list(r), k] = ego.move(pred.xy[list(j)], T, b["T"])
-                    b["valid"][list(r), k] = 1.0
+                    b["actual"][r, k] = ground[j, :]
+                    b["valid"][r, k] = 1.0
                 b["done"][k] = True
             if dt > times[-1] + 0.2:
+                b["actual"] = ego.from_ground(b["actual"], b["T"])     # into the frame the futures were given in
                 self._score(b)
             else:
                 keep.append(b)
         self.batches = keep
-        if (self._next is None or T >= self._next - 1e-6) and len(pred.ids):
+        if pred is not None and (self._next is None or T >= self._next - 1e-6) and len(pred.ids):
             self._next = T + self.cfg["every_s"]
             sel = np.flatnonzero(pred.seen)
             if len(sel):
                 nt = len(times)
                 self.batches.append({"T": T, "ids": [pred.ids[i] for i in sel], "kind": pred.kind[sel],
                                      "nm": pred.n_modes[sel], "p": pred.p[sel].copy(), "traj": pred.traj[sel].copy(),
-                                     "actual": np.full((len(sel), nt, 2), math.nan), "valid": np.zeros((len(sel), nt)),
+                                     "actual": np.zeros((len(sel), nt, 2)), "valid": np.zeros((len(sel), nt)),
                                      "done": [False] * nt})
 
     def _score(self, b):
@@ -102,12 +108,14 @@ class SelfCheck:
         """One scored prediction into the statistics (also the offline tool's entry, with the truth as `actual`)."""
         g = 2 if kind == 7 else 1 if kind == 6 else 0
         self.scored += 1
-        for h, k in enumerate(self.hk):
-            if val[k] > 0.5:
-                row = np.array([out[k, 0], out[k, 1], out[k, 3], out[k, 4], out[k, 5]])
-                for gg in (g, 3):
-                    self.n[gg, h] += 1
-                    self.sums[gg, h] += row
+        hk = self.hk
+        ok = val[hk] > 0.5
+        if ok.any():
+            rows = np.where(ok[:, None], out[hk][:, _COLS], 0.0)
+            self.n[g] += ok
+            self.n[3] += ok
+            self.sums[g] += rows
+            self.sums[3] += rows
         if len(p) >= 2 and win >= 0:
             ade = out[-2:].ravel()[:len(p)]
             best = ade[win]

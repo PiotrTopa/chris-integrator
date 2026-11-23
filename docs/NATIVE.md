@@ -7,8 +7,8 @@ The module is part of the package: it is required, and every function in it exis
 pure-Python implementation of what is native, and no switch between two.
 
     python -m chris_integrator.native      the module in use, and its self-test on this machine
-    GET /v2/health  ->  "native": {"active": true, "implementation": "native", "parts": [...], "version": 7, "module": "..."}
-    the daemon's first log lines: "native core version 7 (_chris_native.abi3.so; json, round, interp, ekf, lanes, radar)"
+    GET /v2/health  ->  "native": {"active": true, "implementation": "native", "parts": [...], "version": 8, "module": "..."}
+    the daemon's first log lines: "native core version 8 (_chris_native.abi3.so; json, round, interp, ekf, lanes, radar, predict)"
 
 A package without the module (or with one of another version) does not import: the error says that the native
 core is not built, does not load, or is of the wrong version, and how to build it (below).
@@ -60,6 +60,7 @@ not float64 is made a float64 copy; a stream's value beyond 2^53 is read as the 
 | `radar` | `radar_advance`, `radar_peek`, `radar_peek_pos`, `radar_life`, `radar_merge`, `radar_combine_rows` (radar/tracker, on the rows of the tracker's state array) | the motion model and the objects' upkeep | golden: to rounding |
 | `radar` | `radar_frame` (radar/box) | the message's objects: their numbers, flags with their hysteresis, the dicts | golden: to rounding (printed digits the same but for a last digit now and then); digests of three drives' messages (x86-64) |
 | `radar` | `radar_h` (radar/sensors: camera kinds b, rb, rbh, bt with and without the scale-rate row, microwave radar, position), `radar_marginals`, `radar_assign`, `radar_predict1`, `radar_still1`, `radar_transition1` (radar/models: one hypothesis) | measurement functions, pairings' probabilities, assignment, one hypothesis' step | golden: marginals and assignment the bits, measurement functions to the last bit of libm |
+| `predict` | `predict_frame` (chris_integrator/predict: one frame of the predictor: the road's curvilinear frame, every object's lane filter, manoeuvre filter, futures with their covariance, car following, the joint weights of interacting road users, the car's own futures), `predict_score` (a past prediction against what happened), `predict_cfg`, `predict_names` | the predictor's arithmetic; source file `native/src/predict.c`, included by `chris_native.c` | golden (`tests/data/predict_golden.json`, recorded from this code: there never was a Python implementation): to 2e-5 (sin, cos, exp, erfc of the C library); behaviour by `tests/test_predict.py` |
 
 The lane tracker's steps are exact because its arithmetic is elementwise, and its two means over the gate points
 are added in sequence, as numpy adds a masked selection. The road geometry's arc length is a sequential sum of
@@ -94,6 +95,18 @@ messages byte for byte on the development machine; `python -m chris_integrator.n
 reference's answers on a target (`native/_radar_selftest.py`). A state that is not finite is computed like any
 other (no hand-over to a reference any more): NaN and inf go where the arithmetic takes them, and the upkeep
 drops such an object as before.
+
+### The predictor: a second source file
+
+`chris_integrator/native/src/predict.c` holds the `predict` part. It is not a second module: `chris_native.c`
+includes it (one translation unit, one binary; the build scripts compile `chris_native.c` as before) just above
+its method table, where the macro `PREDICT_METHODS` adds the part's four functions. It uses that file's array
+helpers and nothing of the other parts; its names carry a `P` / `p_` / `pp_` prefix. Its constants are one list in
+the C file (`PCFG`: name and default), which Python reads (`predict_cfg()`) and hands back as an array: there is
+no second copy of a default. Its results were never a Python program's: the golden data
+(`python3 tests/data/make_predict_golden.py`) and the target's self-test
+(`python3 -m chris_integrator.native._predict_selftest record`) are recorded from the C code after a deliberate
+change, and what the code must DO is held by `tests/test_predict.py` and judged by `tools/predict_eval.py`.
 
 ### Inputs the C code takes, and what it does with others
 

@@ -44,6 +44,7 @@ cp chris_integrator/native/_chris_native.abi3.so /out/\$tag/
   echo \"python headers: \$(python3 -V 2>&1)\"
   echo \"numpy in the test run: \$(python3 -c 'import numpy; print(numpy.__version__)')\"
   echo \"source sha256: \$(sha256sum chris_integrator/native/src/chris_native.c | cut -d' ' -f1)\"
+  echo \"source sha256 (predict.c, included): \$(sha256sum chris_integrator/native/src/predict.c | cut -d' ' -f1)\"
   echo \"binary sha256: \$(sha256sum chris_integrator/native/_chris_native.abi3.so | cut -d' ' -f1)\"
 } > /out/\$tag/BUILD.txt
 st=0

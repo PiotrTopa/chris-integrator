@@ -73,6 +73,15 @@ def sample_times(cfg):
     return np.array(out[:64])
 
 
+_STD = (2.0, 1.0, 2.0, 1.0)
+_IDLE = {"path": "idle"}
+_NAN = math.nan
+
+
+def _D(v, d):
+    return d if v is None else v
+
+
 def _fin(v):
     return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
 
@@ -95,24 +104,27 @@ def _dist(v, n):
     return [x / s for x in p[:n]]
 
 
-def road_arrays(ctx, cfg, right_hand=True, learned=None):
-    """The road context (the dict documented in chris_integrator/predict/__init__.py) as the native core reads it:
-    (centre (m, 2), road (NR), bands (nb, NB), arm_meta (na, NA), arm_pts (np, 2), xing (nx, 2), has_path).
+def _lane_key(ctx, learned):
+    g = ctx.get
+    kl, kr = g("kerb_left_m"), g("kerb_right_m")
+    nl, nr = g("n_left"), g("n_right")
+    return (g("lane_width_m"), tuple(nl) if isinstance(nl, list) else nl, tuple(nr) if isinstance(nr, list) else nr,
+            g("oncoming"), g("n_oncoming"), g("park_left"), g("park_right"), kl, kr, g("quality"), g("speed_limit_mps"),
+            learned.get("oncoming"), learned.get("park_left"), learned.get("park_right"))
+
+
+def lane_arrays(ctx, cfg, right_hand=True, learned=None):
+    """The lanes of the road context as the native core reads them: (road (NR), bands (nb, NB)).
 
     The lanes beside the car's own are hypotheses: how many lanes run the car's way on its left and right, whether
     oncoming lanes follow, whether vehicles stand beside the outer lane. Each hypothesis puts bands at offsets from
     the centre line; a band carries the probability of the hypotheses that put it there. A measured road edge
     weighs the hypotheses by where each would have the edge."""
-    ctx = ctx or {}
     learned = learned or {}
     w = _num(ctx.get("lane_width_m"), cfg["lane_width_m"])
     if not 2.2 <= w <= 5.5:
         w = cfg["lane_width_m"]
-    centre = ctx.get("centre")
-    has_path = centre is not None and len(centre) >= 2
-    centre = np.ascontiguousarray(centre, dtype=float).reshape(-1, 2) if has_path else np.zeros((0, 2))
-    if len(centre) > 200:
-        centre = np.ascontiguousarray(centre[:: (len(centre) + 199) // 200])
+    has_path = ctx.get("centre") is not None and len(ctx["centre"]) >= 2
     q = _num(ctx.get("quality"), 0.6 if has_path else 0.15)
     pw = cfg["park_width_m"]
     # the side of the oncoming traffic: left where traffic keeps right
@@ -160,20 +172,46 @@ def road_arrays(ctx, cfg, right_hand=True, learned=None):
     road[R_W], road[R_Q] = w, min(1.0, max(0.0, q))
     road[R_KERBL], road[R_KERBR] = sides["left"][3], -sides["right"][3]
     road[R_VLIM] = _num(ctx.get("speed_limit_mps"))
+    return road, np.array(bands, dtype=float).reshape(-1, NB)
+
+
+_NONE2, _NONEA = np.zeros((0, 2)), np.zeros((0, NA))
+
+
+def path_arrays(ctx):
+    """The geometry of the road context as the native core reads it: (centre (m, 2), arm_meta (na, NA), arm_pts
+    (np, 2), xing (nx, 2), has_path)."""
+    centre = ctx.get("centre")
+    has_path = centre is not None and len(centre) >= 2
+    centre = np.ascontiguousarray(centre, dtype=float).reshape(-1, 2) if has_path else _NONE2
+    if len(centre) > 200:
+        centre = np.ascontiguousarray(centre[:: (len(centre) + 199) // 200])
+    arms, xs = ctx.get("arms"), ctx.get("crossings")
+    if not arms and not xs:
+        return centre, _NONEA, _NONE2, _NONE2, has_path
     meta, pts = [], []
-    for a in (ctx.get("arms") or ())[:32]:
+    for a in (arms or ())[:32]:
         p = a.get("pts") if isinstance(a, dict) else None
-        if not p or len(p) < 2:
+        if p is None or len(p) < 2:
             continue
         side = a.get("side")
         meta.append((len(pts), len(p), _num(a.get("s_m")), 1.0 if side == "left" or side == 1 else -1.0,
                      _num(a.get("priority"), 0.0), 1.0 if a.get("entry", True) else 0.0,
                      1.0 if a.get("exit", True) else 0.0, CONTROL.get(a.get("control"), 0.0)))
-        pts.extend((float(x), float(y)) for x, y in p)
-    xing = [(_num(x.get("s_m")), _num(x.get("half_m"), 2.0)) for x in (ctx.get("crossings") or ())
+        pts.extend(p.tolist() if isinstance(p, np.ndarray) else ((float(x), float(y)) for x, y in p))
+    xing = [(_num(x.get("s_m")), _num(x.get("half_m"), 2.0)) for x in (xs or ())
             if isinstance(x, dict) and _fin(x.get("s_m"))]
-    return (centre, road, np.array(bands, dtype=float).reshape(-1, NB), np.array(meta, dtype=float).reshape(-1, NA),
-            np.array(pts, dtype=float).reshape(-1, 2), np.array(xing, dtype=float).reshape(-1, 2), has_path)
+    return (centre, np.array(meta, dtype=float).reshape(-1, NA), np.array(pts, dtype=float).reshape(-1, 2),
+            np.array(xing, dtype=float).reshape(-1, 2), has_path)
+
+
+def road_arrays(ctx, cfg, right_hand=True, learned=None):
+    """The road context (the dict documented in chris_integrator/predict/__init__.py) as the native core reads it:
+    (centre (m, 2), road (NR), bands (nb, NB), arm_meta (na, NA), arm_pts (np, 2), xing (nx, 2), has_path)."""
+    ctx = ctx or {}
+    road, bands = lane_arrays(ctx, cfg, right_hand, learned)
+    centre, meta, pts, xing, has_path = path_arrays(ctx)
+    return centre, road, bands, meta, pts, xing, has_path
 
 
 class EgoTrack:
@@ -227,6 +265,25 @@ class EgoTrack:
         a, b = self.p[lo], self.p[hi]
         return a[0] + u * (b[0] - a[0]), a[1] + u * (b[1] - a[1]), a[2] + u * (b[2] - a[2])
 
+    def to_ground(self, xy, t):
+        """Points (n, 2) of the car frame of t, in the track's ground frame."""
+        X, Y, p = self.pose(t)
+        c, s = math.cos(p), math.sin(p)
+        out = np.empty_like(xy)
+        out[:, 0] = X + c * xy[:, 0] - s * xy[:, 1]
+        out[:, 1] = Y + s * xy[:, 0] + c * xy[:, 1]
+        return out
+
+    def from_ground(self, g, t):
+        """Ground points (..., 2) in the car frame of t."""
+        X, Y, p = self.pose(t)
+        c, s = math.cos(p), math.sin(p)
+        out = np.empty_like(g)
+        gx, gy = g[..., 0] - X, g[..., 1] - Y
+        out[..., 0] = c * gx + s * gy
+        out[..., 1] = -s * gx + c * gy
+        return out
+
     def move(self, xy, t_from, t_to):
         """Points (n, 2) given in the car frame of t_from, in the car frame of t_to."""
         xy = np.asarray(xy, dtype=float).reshape(-1, 2)
@@ -263,6 +320,7 @@ class Prediction:
 
     def __init__(self, ts, t, ids, modes, traj, lane, intent, feat, ego_n, ego_out, ego_traj, stats, dec, source):
         self.ts_mono_ns, self.t, self.ids = ts, t, ids
+        self._modes = modes
         self.n_modes = modes[:, 0, 0].astype(int)
         self.slot = modes[:, 1].astype(int)
         self.m = modes[:, 2].astype(int)
@@ -270,7 +328,7 @@ class Prediction:
         self.traj, self.lane, self.intent, self.feat = traj, lane, intent, feat
         self.ego_n, self.ego_p, self.ego_m, self.ego_traj = ego_n, ego_out[:, 0], ego_out[:, 1].astype(int), ego_traj
         self.stats, self._dec, self.source = stats, dec, source
-        self._index = None
+        self._index = self._f = self._lane = self._intent = None
 
     def index(self, oid):
         if self._index is None:
@@ -280,11 +338,15 @@ class Prediction:
     def intent_names(self, i):
         """{manoeuvre name: probability} of object i: the intent filter's slots under the names this object's
         futures are published with (a slot without a future keeps its slot name)."""
+        if self._intent is None:
+            self._intent = (np.round(self.intent, 3).tolist(), self.slot.tolist(), self.m.tolist(), self.n_modes.tolist())
+        rows, slot, mm, nm = self._intent
+        named = {slot[i][k]: NAMES[mm[i][k]] for k in range(nm[i])}
         out = {}
-        named = {int(s): NAMES[int(m)] for s, m in zip(self.slot[i, :self.n_modes[i]], self.m[i, :self.n_modes[i]])}
-        for s in np.flatnonzero(self.intent[i] > 0.0005):
-            k = named.get(int(s), SLOTS[int(s)])
-            out[k] = round(out.get(k, 0.0) + float(self.intent[i, s]), 3)
+        for s, v in enumerate(rows[i]):
+            if v > 0.0005:
+                k = named.get(s) or SLOTS[s]
+                out[k] = round(out[k] + v, 3) if k in out else v
         return out
 
     def fut(self, i):
@@ -292,38 +354,24 @@ class Prediction:
         return self._futs()[i]
 
     def _futs(self):
-        if getattr(self, "_f", None) is None:
-            n, dec = len(self.ids), self._dec
-            nm = self.n_modes
-            sel = np.arange(KMAX)[None, :] < nm[:, None]
-            tr = self.traj[sel]                                  # (M, N, 6)
-            cols = [round_lists(np.ascontiguousarray(tr[:, :, j]), dec, False) for j in range(6)] if len(tr) else [[]] * 6
-            pp = np.round(self.p[sel], 3).tolist()
-            p0 = np.round(self.p0[sel], 3).tolist()
-            mm = self.m[sel].tolist()
-            out, k = [], 0
-            for i in range(n):
-                row = []
-                for _ in range(nm[i]):
-                    row.append({"p": pp[k], "p0": p0[k], "m": NAMES[mm[k]], "x": cols[0][k], "y": cols[1][k],
-                                "sx": cols[2][k], "sy": cols[3][k], "rxy": cols[4][k], "v": cols[5][k]})
-                    k += 1
-                out.append(row)
-            self._f = out
+        if self._f is None:
+            self._f = _N.predict_futs(self.traj, self._modes, NAMES, self._dec)
         return self._f
 
     def ego_fut(self):
-        dec = self._dec
-        modes = []
-        for k in range(self.ego_n):
-            tr = self.ego_traj[k]
-            modes.append({"p": round(float(self.ego_p[k]), 3), "m": NAMES[self.ego_m[k]],
-                          "x": np.round(tr[:, 0], dec).tolist(), "y": np.round(tr[:, 1], dec).tolist(),
-                          "v": np.round(tr[:, 2], dec).tolist()})
-        return {"modes": modes}
+        n = self.ego_n
+        if not n:
+            return {"modes": []}
+        tr = self.ego_traj[:n]
+        flat = round_lists(np.ascontiguousarray(tr.transpose(0, 2, 1)).reshape(-1, tr.shape[1]), self._dec, False)
+        p = np.round(self.ego_p[:n], 3).tolist()
+        return {"modes": [{"p": p[k], "m": NAMES[self.ego_m[k]], "x": flat[3 * k], "y": flat[3 * k + 1], "v": flat[3 * k + 2]}
+                          for k in range(n)]}
 
     def lane_dict(self, i):
-        return dict(zip(LANES, np.round(self.lane[i], 3).tolist()))
+        if self._lane is None:
+            self._lane = np.round(self.lane, 3).tolist()
+        return dict(zip(LANES, self._lane[i]))
 
     def message(self, radar_msg):
         """`radar_fut`: the radar message of the same stamp with the prediction added. Top level `fut` {"t"},
@@ -366,6 +414,7 @@ class Predictor:
         self._cfg = np.array([nat[k] for k in _NAT_KEYS])
         self.right_hand = nat["right_hand"] >= 0.0
         self.times = sample_times(self.cfg)
+        self._times = self.times.tolist()
         self._kin = _kin_table()
         self.ego = EgoTrack()
         self.check = SelfCheck(self.times, dict(DEFAULT_CFG["selfcheck"], **(cfg.get("selfcheck") or {})))
@@ -377,9 +426,10 @@ class Predictor:
         self._free = list(range(63, -1, -1))
         self.ego.reset()
         self.check.reset()
-        self.frames = 0
+        self.frames = self.idle_frames = 0
         self.last = None
         self._learn = {"oncoming": None, "park_left": None, "park_right": None}
+        self._lane_key = self._lanes = self._lane_nopath = None
         self._ground = None
 
     # ---- the radar message's objects as the native core reads them ------------------------------------------
@@ -392,38 +442,30 @@ class Predictor:
         n = len(objs)
         a = np.full((n, NO), math.nan)
         ids = []
+        kind = _KIND
         for i, o in enumerate(objs):
-            r = a[i]
-            std = o.get("std") or (2.0, 1.0, 2.0, 1.0)
-            cls = o.get("class")
-            label = cls.get("label") if isinstance(cls, dict) else None
-            # ESTCORE's fields when the radar sends them: smoothed velocity, extent, body direction, visibility
-            vs = o.get("v_smooth")
-            vx, vy = (vs[0], vs[1]) if isinstance(vs, (list, tuple)) and len(vs) >= 2 else (o.get("vx_mps"), o.get("vy_mps"))
-            r[O_X], r[O_Y] = o["x_m"], o["y_m"]
-            r[O_VX], r[O_VY] = _num(vx, 0.0), _num(vy, 0.0)
-            r[O_AX], r[O_AY] = _num(o.get("ax_mps2"), 0.0), _num(o.get("ay_mps2"), 0.0)
-            r[O_SX], r[O_SY] = max(0.05, _num(std[0], 2.0)), max(0.05, _num(std[1], 1.0))
-            r[O_SVX], r[O_SVY] = max(0.05, _num(std[2], 2.0)), max(0.05, _num(std[3], 1.0))
-            r[O_KIND] = _KIND.get(label, 8)
-            r[O_PSTAT] = _num(o.get("p_stationary"), 0.5)
-            r[O_LEN], r[O_WID] = _num(o.get("len")), _num(o.get("wid"))
-            hd = o.get("hdg")
-            if isinstance(hd, (list, tuple)) and hd:                   # [value, std]
-                r[O_HDG], r[O_HDGSD] = _num(hd[0]), _num(hd[1] if len(hd) > 1 else None)
-            else:
-                r[O_HDG], r[O_HDGSD] = _num(hd), _num(o.get("hdg_std"))
-            r[O_EXIST] = _num(o.get("exist"), 1.0)
-            r[O_SEEN] = 0.0 if o.get("state") == "memory" else 1.0
-            ind = o.get("indicator")
-            r[O_IND] = 1.0 if ind == "left" else -1.0 if ind == "right" else 0.0 if ind in ("off", "none") else math.nan
-            br = o.get("brake_lights")
-            r[O_BRAKE] = math.nan if br is None else 1.0 if br else 0.0
-            r[O_PARKED] = 1.0 if "parked" in (o.get("flags") or ()) else 0.0
-            vis = o.get("vis")
-            r[O_VIS] = math.nan if vis is None else 0.0 if vis in ("occluded", "hidden", False) else 1.0
-            r[O_ID] = i
-            ids.append(o.get("id"))
+            g = o.get
+            std = g("std") or _STD
+            cls = g("class")
+            # the estimation core's fields when the radar sends them: extent, body direction, visibility
+            hd, hs = g("hdg"), g("hdg_std")
+            if hd.__class__ is list:                           # [value, std]
+                hd, hs = hd[0], hd[1] if len(hd) > 1 else None
+            ind, br, vis = g("indicator"), g("brake_lights"), g("vis")
+            a[i] = (o["x_m"], o["y_m"], g("vx_mps") or 0.0, g("vy_mps") or 0.0, g("ax_mps2") or 0.0, g("ay_mps2") or 0.0,
+                    std[0], std[1], std[2], std[3], kind.get(cls.get("label"), 8) if cls else 8,
+                    _D(g("p_stationary"), 0.5), _D(g("len"), _NAN), _D(g("wid"), _NAN), _D(hd, _NAN), _D(hs, _NAN),
+                    _D(g("exist"), 1.0), 0.0 if g("state") == "memory" else 1.0,
+                    _NAN if ind is None else 1.0 if ind == "left" else -1.0 if ind == "right" else 0.0,
+                    _NAN if br is None else 1.0 if br else 0.0, 1.0 if "parked" in (g("flags") or ()) else 0.0, i,
+                    _NAN if vis is None else 0.0 if vis in ("occluded", "hidden", False) else 1.0, 0.0)
+            ids.append(g("id"))
+        if n:
+            num = a[:, :12]
+            if not np.isfinite(num).all():                     # a number that is none: the object's row is made harmless
+                bad = ~np.isfinite(num).all(axis=1)
+                a[bad, 2:6], a[bad, 6:10], a[bad, 11] = 0.0, (2.0, 1.0, 2.0, 1.0), 0.5
+            np.maximum(a[:, 6:10], 0.05, out=a[:, 6:10])
         return a, ids, objs
 
     def _state(self, ids):
@@ -447,16 +489,16 @@ class Predictor:
         """What the objects themselves have shown of the road: oncoming traffic on the left, vehicles standing on a
         side. Slow counters, used only where the context does not say."""
         L = self._learn
-        if not self.cfg["learn"] or not len(a):
+        if not self.cfg["learn"] or not len(a) or self.frames % 10:
             return
         seen = a[:, O_SEEN] > 0.5
         sp = np.hypot(a[:, O_VX], a[:, O_VY])
         onc = seen & (sp > 3.0) & (np.abs(np.abs(feat[:, F_PSI]) - math.pi) < 0.5) & (np.abs(feat[:, F_D]) < 12.0)
-        L["oncoming"] = min(0.95, (L["oncoming"] or self.cfg["oncoming_prior"]) + 0.02) if onc.any() else L["oncoming"]
+        L["oncoming"] = min(0.95, (L["oncoming"] or self.cfg["oncoming_prior"]) + 0.2) if onc.any() else L["oncoming"]
         for name, sg in (("park_left", 1.0), ("park_right", -1.0)):
             st = seen & (a[:, O_PSTAT] > 0.7) & (a[:, O_KIND] < 6) & (sg * feat[:, F_D] > 2.0) & (sg * feat[:, F_D] < 9.0)
             if st.any():
-                L[name] = min(0.9, (L[name] or self.cfg["park_prior"]) + 0.01)
+                L[name] = min(0.9, (L[name] or self.cfg["park_prior"]) + 0.1)
 
     def learned(self):
         return {k: v for k, v in self._learn.items() if v is not None}
@@ -478,8 +520,15 @@ class Predictor:
         n = len(ids)
         idx = self._state(ids)
         st = np.ascontiguousarray(self._S[idx]) if n else np.zeros((0, NS_))
-        centre, road, bands, ameta, apts, xing, has_path = road_arrays(context, self.cfg, self.right_hand, self.learned())
-        sig = (context or {}).get("turn_signal")
+        context = context or {}
+        learned = self.learned()
+        key = _lane_key(context, learned)                 # the lanes change seldom: their arrays are kept
+        if key != self._lane_key or (context.get("centre") is None) != self._lane_nopath:
+            self._lane_key, self._lane_nopath = key, context.get("centre") is None
+            self._lanes = lane_arrays(context, self.cfg, self.right_hand, learned)
+        road, bands = self._lanes
+        centre, ameta, apts, xing, has_path = path_arrays(context)
+        sig = context.get("turn_signal")
         ego = np.array([v, w, acc, 1.0 if sig == "left" else -1.0 if sig == "right" else 0.0, 1.0 if has_path else 0.0,
                         0.0, 0.0, 0.0])
         nt = len(self.times)
@@ -491,7 +540,7 @@ class Predictor:
         if n:
             self._S[idx] = st
         self._learned(a, lane, feat)
-        src = {"path": (context or {}).get("source") or ("given" if has_path else "kinematic"),
+        src = {"path": context.get("source") or ("given" if has_path else "kinematic"),
                "quality": round(float(road[R_Q]), 2), "arms": len(ameta), "lane_width_m": round(float(road[R_W]), 2)}
         pred = Prediction(ts, self.times, ids, modes, traj, lane, intent, feat, ego_n, ego_out, ego_traj, stats,
                           self.cfg["decimals"], src)
@@ -503,8 +552,31 @@ class Predictor:
         self.last = pred
         return pred
 
+    def idle(self, radar_msg):
+        """A radar message without an object to predict: the car's pose is kept up, the objects' states are let go,
+        predictions kept for the self-check come due. Returns the `radar_fut` message of such a frame: no futures,
+        `ego_fut` without modes, `fut_ctx.path: "idle"`. (`update` gives the car's futures also then; this is the
+        cheap way, for a plug-in whose every call costs.)"""
+        ts = radar_msg.get("ts_mono_ns")
+        if not isinstance(ts, int) or not self.cfg["enabled"]:
+            return None
+        eg = radar_msg.get("ego") or {}
+        T = ts / 1e9
+        gf = eg.get("ground_frame")
+        if gf != self._ground:
+            if self._ground is not None:
+                self.reset()
+            self._ground = gf
+        self.ego.add(T, _num(eg.get("speed_mps"), 0.0), _num(eg.get("yaw_rate_rps"), 0.0))
+        if self._rows:
+            self._state(())
+        self.check.update(T, None, self.ego)
+        self.frames += 1
+        self.idle_frames += 1
+        return dict(radar_msg, type="radar_fut", fut={"t": self._times}, ego_fut={"modes": []}, fut_ctx=_IDLE)
+
     def health(self):
-        h = {"frames": self.frames, "objects": len(self._rows), "learned": {k: round(v, 2) for k, v in self.learned().items()}}
+        h = {"frames": self.frames, "idle_frames": self.idle_frames, "objects": len(self._rows), "learned": {k: round(v, 2) for k, v in self.learned().items()}}
         if self.last is not None:
             s = self.last.stats
             h.update(futures=int(s[6]), groups=int(s[1]), largest_group=int(s[2]), context=self.last.source)

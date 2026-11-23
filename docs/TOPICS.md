@@ -552,6 +552,139 @@ tracker and the fusion), roadsense [`tools/roadgeom_drive.py`](https://github.co
 synthetic drive over a made-up network or a pack with a synthetic camera, compared with the truth; the
 recording carries `view` messages).
 
+### consolidated topic (chris-integrator): `{"type":"radar_fut", ...}` (the radar's objects with their futures)
+`chris_integrator/predict` (plug-in `predict`; the design is in that package's docstring): for every object of the
+`radar` message several futures over 8 s, each a manoeuvre with a probability and a trajectory with its spread;
+the probability of each kind of lane the object may be in; the manoeuvre probabilities; the car's own futures.
+One message per `radar` message, **at the same `ts_mono_ns` and `seq`**: it is that radar message, every field
+as it was, with the fields below added. A companion message and not fields of `radar` itself because of its size
+(about 1.3 kB per future: 4-8 kB per object against 0.7 kB of the radar's own object): `radar` stays as it was for
+every consumer that does not want futures, and `radar_fut` is serialised only for a consumer that subscribes to
+it (neither is in the socket's default list nor recorded). `{"enabled": false}` in `predict.json` (or
+`{"disable": ["predict"]}` in `mixer.json`) leaves the box out; the `radar` message is the same either way.
+
+Frame: **the car frame of the message's time, held fixed on the ground** (x forward, y LEFT, metres; origin the
+reference camera: the frame of the radar's `x_m` / `y_m` and of its `predict`). The car's own further movement is
+not applied: `ego_fut` gives it, in the same frame.
+
+```
+"fut": {"t": [0.25, 0.5, ..., 3.0, 3.5, ..., 8.0]},     // N = 22 sample times (s from now), shared by all futures
+"ego_fut": {"modes": [ {"p": 0.42, "m": "path" | "follow" | "ctra",   // along the road's path at the present speed and
+                        "x": [N], "y": [N], "v": [N]} ]},             //   acceleration / the same behind the one ahead /
+                                                                      //   steady yaw rate and acceleration; of the frame's origin
+"fut_ctx": {"path": "roadgeom+map" | "roadgeom" | "lanes" | "plan" | "kinematic",   // what the road's centre line is made of
+            "quality": 0.9, "arms": 2, "lane_width_m": 3.4},
+"objects": [ {...the radar's object...,
+   "fut": [ {"p": 0.61,            // probability with the interaction among all road users AND the car's own futures
+             "p0": 0.74,           // the same without the car: nobody is taken to give way to it (what a threat measure uses)
+             "m": "cut_in",        // the manoeuvre (below)
+             "x": [N], "y": [N],   // the place at each sample time (m)
+             "sx": [N], "sy": [N], "rxy": [N],    // its 1 sigma along the frame's axes and their correlation
+             "v": [N]} ],          // speed (m/s)              (1 to 6 futures; p sums to 1, p0 sums to 1)
+   "lane": {"ego": 0.01, "left": 0.01, "right": 0.93, "onc": 0.01, "cross": 0.01, "park": 0.01, "off": 0.02},
+   "intent": {"keep": 0.25, "cut_in": 0.7, "free": 0.05} } ]   // the manoeuvre filter's probabilities (before interaction)
+```
+An object the predictor did not take (tentative; beyond `objects_max` = 48, the nearest are taken) is passed on
+without the three fields.
+
+Manoeuvres (`m`, keys of `intent`): vehicles `keep`, `follow` (behind the one ahead, by the car-following law),
+`lc_left` / `lc_right`, `cut_in` (a lane change into the car's lane ahead of the car), `cut_out` (out of it),
+`turn_left` / `turn_right` (at a junction's arm; without a known junction: the turn its yaw rate shows), `stop`
+(at a junction it has no priority at, behind a queue, before a marked crossing with someone at it), `pull_out`
+(from a parking strip), `parked`, `stopped` (standing in a traffic lane or on a side road), `move_off` (it will
+start again), `u_turn`, `onc_keep` / `onc_drift` / `onc_overtake` (oncoming: stays in its lane / wanders towards
+the car's / changes into it), `cross` (on a crossing road or across this one), `free` (its own motion carried on,
+no road: always kept as a possibility); pedestrians `walk`, `wait` (standing at the kerb), `stand`, `start_cross`
+(about to step into the road), `crossing`; cyclists `ride`, `swerve` (out round something standing in their way),
+and the vehicles' `turn_*`, `stop`, `cross`, `stopped`. `lane`: the car's own lane, a lane of its direction on
+its left / right, an oncoming lane, a crossing road (or crossing this one), a parking strip, off the road; in the
+road's curvilinear frame, so a parked car on the outside of a bend is `park`, not `ego`, although it stands
+straight ahead of the car.
+
+What it reads of the `radar` object: `id`, `state`, `x_m`, `y_m`, `vx_mps`, `vy_mps`, `ax_mps2`, `ay_mps2`, `std`,
+`p_stationary`, `exist`, `class.label`, `flags` (`parked`); and, when a radar sends them (the estimation core's
+additions), `len`, `wid` (m), `hdg` (rad, car frame; a number or `[value, std]`) with `hdg_std`, `vis`; also
+`indicator` (`"left"` / `"right"` / `"off"`) and `brake_lights` (bool) should a source ever give them. Without
+them: the class's usual size, the direction of the velocity, no light evidence. Of the message: `ts_mono_ns`,
+`ego.speed_mps`, `ego.yaw_rate_rps`, `ego.accel_mps2`, `ego.ground_frame` (a new ground frame starts the
+predictor empty).
+
+The road context comes from `roadgeom` (centre line, lane width, junction arms with their control), `lanes`
+(neighbouring lanes seen, road edges, the map's lane counts), `egolane`, `road` (the plan, where no line is
+tracked), `map` (one-way), each moved into the message's frame by the car's motion since its own time; what none
+of them says is a hypothesis with a prior (two-way road 0.6, a parking strip 0.5), raised by what the objects
+themselves show (oncoming traffic seen, vehicles standing on a side). With nothing at all the road is the arc of
+the car's own speed and yaw rate and the `free` futures carry more weight.
+
+In process: `chris_integrator.predict.Predictor(cfg).update(radar_msg, context)` returns a `Prediction` with the
+same content as arrays (`t` (N,), `ids`, `n_modes` (n,), `p` / `p0` (n, 8), `m` / `slot` (n, 8), `traj` (n, 8, N,
+6) = x, y, sx, sy, rxy, v, `lane` (n, 7), `intent` (n, 15), `ego_n`, `ego_p`, `ego_m`, `ego_traj` (3, N, 3) = x,
+y, v; names in `Prediction.names` / `.lanes` / `.slots`); `.message(radar_msg)` is the message above. `context`
+is the dict the package's docstring lists (`ContextBuilder` makes it from the stack's messages) or None.
+
+Self-check (`GET /v2/health` -> the `predict` box): every 0.5 s the futures are kept and scored when their
+horizon has passed against what the radar then says the object did: per kind of road user and horizon (1, 2, 3,
+5, 8 s) `min_ade`, `min_fde`, `top_fde` (the most probable future's), `nll`, `maha2` (2 = the stated spread is
+right), and the calibration of the probabilities (`calibration.bins`, `brier`).
+
+Constants: `<config dir>/predict.json`: `horizon_s` 8, `step_s` 0.25 up to `fine_to_s` 3 then `step_coarse_s` 0.5,
+`objects_max` 48, `rate_hz` 20 (every radar message), `selfcheck`, `context`, and `native`: the native core's
+constants (`python3 -c "from chris_integrator import native; print(native.predict.predict_cfg())"`), among them
+the cost knobs `modes_max` (6), `mode_p_min` (0.02), `interact` (1; 0: no car following, no joint weights),
+`joint` (1; 0: car following only), `clique_max` (8) and `joint_nodes` (20000) of the exact joint search.
+
+**Cost**, measured on the reference phone (Pocophone F1, one small core, `nice taskset -c 1`, the daemon stopped;
+`tools/predict_eval.py cost`, 2026-11-23; ms per radar message: `update` = context arrays + native frame +
+self-check, `message` = the dicts of `radar_fut`, `dumps` = its JSON text, paid only for a subscriber):
+
+| objects | update | message | dumps | futures | bytes |
+|---|---|---|---|---|---|
+| 1 | 1.4 | 0.35 | 0.11 | 1.0 | 2.5 k |
+| 2 | 1.7 | 0.43 | 0.16 | 2.1 | 3.7 k |
+| 6 | 2.8 | 0.84 | 0.46 | 8.2 | 9.4 k |
+| 12 | 7.0 | 2.3 | 1.2 | 18.6 | 19.2 k |
+
+plus, in the stack, the road context read from `roadgeom` / `lanes` for every frame that has an object (0.5 ms
+measured on made-up messages of their size; `{"context": {"min_interval_s": 0.25}}` reads it four times a second
+and moves it in between). A frame without objects costs 0.04 ms plus the plug-in's call (nothing is computed: no
+futures, `ego_fut` without modes, `fut_ctx.path: "idle"`; `{"idle_ego_fut": true}` computes the car's own
+futures also then, at the cost of a one-object frame). A recorded night drive replayed there
+(`tools/cost_bench.py run`, 3035 radar messages, 389 of them with an object): 0.73 ms per radar message for the
+box on average, which is about 5 ms for a frame with an object (more than the table's sum: new objects, the lane
+hypotheses rebuilt when a road edge moves) and next to nothing for the others; the radar itself costs 0.36 ms
+per call on that drive (its 5.4 ms is its dense scene). On the laptop the same replay costs 0.09 ms per message:
+the phone's Python is 10-15 times slower, and most of the box's time on the phone is Python glue (reading the
+objects, the context, the message's dicts); the native frame is a small part.
+
+The knobs' effect at 12 objects (update, ms): default 7.0; `joint: 0` 3.8; `interact: 0` 3.5; `modes_max: 1` 4.0;
+`modes_max: 3` 6.5; `horizon_s: 4` 4.9; `selfcheck.enabled: false` 5.9; `rate_hz: 10` halves everything. At one or
+two objects the knobs move little (the fixed part: 1.1-1.4 ms).
+
+**How good**, on the simulator's scenarios with the truth (`tools/predict_eval.py sim`, seven scenarios x three
+seeds; error of the predicted MOTION, the tracker's place error at the prediction's time taken out; metres at 1 /
+2 / 3 / 5 / 8 s):
+
+| objects from | context | best future (minFDE) | most probable future | velocity carried on (the radar's `predict`) |
+|---|---|---|---|---|
+| an ideal tracker (the truth with a small error) | the scenario's lanes and junctions | 0.08 / 0.19 / 0.33 / 0.70 / 1.56 | 0.09 / 0.21 / 0.37 / 0.84 / 2.00 | 0.27 / 0.64 / 1.11 / 2.35 / 4.97 |
+| today's radar (the camera's boxes) | the same | 1.26 / 2.56 / 3.88 / 6.65 / 10.5 | 1.38 / 2.83 / 4.33 / 7.57 / 12.6 | 1.56 / 3.20 / 4.87 / 8.61 / 14.8 |
+| today's radar | what the simulated stack gives (the plan only) | 1.28 / 2.61 / 3.96 / 6.80 / 10.9 | 1.42 / 2.90 / 4.41 / 7.71 / 12.9 | 1.56 / 3.20 / 4.87 / 8.61 / 14.8 |
+
+With an ideal tracker the manoeuvres are named (probability above one half) 1.4-1.6 s after a lane change begins
+(cut-in, cut-out; it lasts 4 s), 0.7-1.7 s into an oncoming car's drift, 0.75 s after a parked car starts to pull
+out, 1.9 s after a lead begins to brake for a queue, 1.6-2.8 s after a side-road car begins to brake for the
+junction, 0-0.5 s after a pedestrian steps out (`start_cross` holds 0.46 in the 1.5 s before, never one half), and
+late or not at all for turns (an oncoming left turn 0.3-0.37 on average, named after 2-3 s; a right turn out of a
+side road 0.2, named after 4 s). The lane is right in 99 % of the object frames or more for every kind. The stated
+spread is right up to 3 s (squared Mahalanobis distance to the best future 1.2-1.8 against 2) and too narrow
+beyond (4.6 at 5 s, 24 at 8 s: turns and stops that were not foreseen, at the junction and in the queue).
+Through today's radar the tracker's own errors rule: its place error is 3.4 m at 1 s in these scenarios and its
+stated spread too narrow (6.2 against 2), its velocities are too poor for lane changes, pull-outs, stops and turns
+to be recognised at all (pedestrians are: crossing named after 0.7-2.3 s), and the gain over the carried-on
+velocity is 20-30 %; the lane is right for 99 % (ego), 93-95 % (left, oncoming, parked) and 13 % (crossing road) of
+the frames. On the recorded night drive the self-check has too little to say (19 scored predictions, none seen
+longer than 2 s: best future 5.0 m at 1 s, 7.9 m at 2 s; stated spread right, 0.6-1.6 against 2).
+
 ### consolidated topic (chris-integrator): `{"type":"view", ...}` (display channel, roadsense 2.0)
 `chris_integrator/trackers/view.py` (objects, lines) and `roadview.py` (`road`): one message per road frame (10-14 per
 second), after `lead` and `lanes` of that frame; 1.5 kB without a map, 3-4 kB with the road picture; `/v2/view`.

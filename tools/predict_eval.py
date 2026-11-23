@@ -5,6 +5,7 @@ recorded captures against the tracker's own later word.
     tools/predict_eval.py sim [--scenario NAME ...] [--seeds 2] [--night] [--context sim|stack|none]
                               [--objects radar|truth] [--native KEY=VALUE ...] [--json OUT.json] [--trace ACTOR]
     tools/predict_eval.py capture CAPTURE.cap.gz [--limit N] [--pack PACK] [--json OUT.json]
+    tools/predict_eval.py cost [--objects 2 6 12 24] [--frames 300] [--json OUT.json]
 
 `sim`: each scenario (chris_integrator/sim/roaduser_sim.py; default: the predictor's own, PREDICT_SCENARIOS) runs
 through the whole stack with the detector simulator; every radar message goes through a Predictor (`--objects
@@ -36,6 +37,9 @@ frame of the prediction's time), every 0.5 s per object, for objects the radar h
 `capture`: a recorded drive (tools/cost_capture.py) through the daemon's stack with the predictor's plug-in: the
 self-check's running scores (the object's later estimate as what it did), the share of manoeuvres, cost.
 Real-drive captures never go into the repository.
+
+`cost`: the predictor alone on a made-up busy scene: ms per radar message by number of objects and by knob. Cost
+is the target's to state: run it there (a phone's small core is 10-16 times slower than a laptop).
 """
 import argparse
 import json
@@ -352,11 +356,13 @@ def _row(name, d, key):
     return "  %-11s %-8s " % (name, key) + " ".join("%7s" % ("-" if x is None else ("%.2f" % x)) for x in v) if v else None
 
 
-def print_stats(title, s):
+def print_stats(title, s, what="against the truth"):
     print("== %s" % title)
     for part in ("abs", "rel"):
         st = s[part]
-        print(" %s  (horizons %s s; scored %d)" % ("against the truth" if part == "abs" else "motion alone (tracker error at t0 taken out)",
+        if not st:
+            continue
+        print(" %s  (horizons %s s; scored %d)" % (what if part == "abs" else "motion alone (tracker error at t0 taken out)",
                                                     st.get("horizons_s"), st.get("scored", 0)))
         for g in ("vehicle", "cyclist", "pedestrian", "all"):
             if g not in st:
@@ -458,13 +464,85 @@ def cmd_capture(a):
                "ms_per_call_here": round(1e3 * slot.cpu / max(1, slot.calls), 4), "health": h}
         sc = h["selfcheck"]
         print(json.dumps({k: v for k, v in res.items() if k != "health"}, indent=1))
-        print_stats("self-check (against the tracker's later estimate)", {"abs": sc, "rel": {}, "cv_fde_rel": {}, "lane": {}, "manoeuvres": {}, "futures": {}})
+        print_stats("self-check", {"abs": sc, "rel": {}, "cv_fde_rel": {}, "lane": {}, "manoeuvres": {}, "futures": {}},
+                    what="against the radar's own later estimate of the object")
         print("context:", h.get("context"), "learned:", h.get("learned"))
         if a.json:
             with open(a.json, "w") as f:
                 json.dump(res, f, indent=1)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+def cost_scene(n, t):
+    """n objects in busy traffic at time t: chains of vehicles in the car's lane and the lane beside it (leaders and
+    followers), oncoming cars, a parked row, pedestrians at the kerb, a cyclist."""
+    def o(i, x, y, vx, vy, label="car", ps=0.02):
+        return {"id": i, "state": "confirmed", "exist": 1.0, "x_m": round(x, 2), "y_m": round(y, 2), "vx_mps": vx, "vy_mps": vy,
+                "ax_mps2": 0.0, "ay_mps2": 0.0, "std": [1.0 + 0.02 * abs(x), 0.3, 0.8, 0.3], "p_stationary": ps,
+                "class": {"label": label}, "flags": []}
+    out = []
+    for i in range(n):
+        k, j = i % 6, i // 6
+        if k == 0:
+            out.append(o(i, 18.0 + 16.0 * j - 0.5 * t, 0.0, 13.5 - 0.5 * j, 0.0))
+        elif k == 1:
+            out.append(o(i, 10.0 + 18.0 * j + 0.5 * t, -3.5 + (0.6 * t if j == 0 else 0.0), 14.5, 0.6 if j == 0 else 0.0))
+        elif k == 2:
+            out.append(o(i, 60.0 + 30.0 * j - 26.0 * t, 3.5, -12.0, 0.0))
+        elif k == 3:
+            out.append(o(i, 25.0 + 7.0 * j - 14.0 * t, -8.4, 0.0, 0.0, "car", 0.95))
+        elif k == 4:
+            out.append(o(i, 35.0 + 12.0 * j - 14.0 * t, -7.6 + (1.3 * t if j % 2 else 0.0), 0.0, 1.3 if j % 2 else 0.0, "human", 0.05 if j % 2 else 0.9))
+        else:
+            out.append(o(i, 28.0 + 25.0 * j - 9.0 * t, -1.5, 5.0, 0.0, "bike"))
+    return out
+
+
+def cmd_cost(a):
+    """Cost per radar message on this machine, by number of objects and by knob: the predictor alone on a made-up
+    busy scene (update: context arrays + native frame + self-check; message: the dicts; dumps: the JSON text)."""
+    from chris_integrator import native
+    from chris_integrator.predict import Predictor
+    ctx = {"centre": [[float(x), 0.0] for x in range(0, 125, 5)], "n_left": 0, "n_right": 1, "oncoming": 0.9, "park_right": 0.6,
+           "quality": 0.9, "arms": [{"pts": [[70.0, -7.0 - 5.0 * k] for k in range(9)], "side": "right", "priority": -1}]}
+    variants = [("full (default)", {}), ("modes_max 3", {"native": {"modes_max": 3}}), ("modes_max 1", {"native": {"modes_max": 1}}),
+                ("joint off", {"native": {"joint": 0}}), ("interact off", {"native": {"interact": 0}}),
+                ("horizon 4 s", {"horizon_s": 4.0}), ("selfcheck off", {"selfcheck": {"enabled": False}}),
+                ("rate 10 Hz (per radar message)", None)]
+    res = {}
+    for n in a.objects:
+        for name, cfg in variants:
+            if cfg is None:
+                r = res[(n, "full (default)")]
+                res[(n, name)] = dict(r, update=r["update"] / 2, message=r["message"] / 2, dumps=r["dumps"] / 2)
+                continue
+            P = Predictor(cfg)
+            tu = tm = td = 0.0
+            nb = fut = 0
+            F = a.frames
+            for f in range(F + 20):
+                t = (f % 60) * 0.05
+                m = {"type": "radar", "ts_mono_ns": int((100.0 + f * 0.05) * NS), "objects": cost_scene(n, t),
+                     "ego": {"speed_mps": 14.0, "yaw_rate_rps": 0.0, "accel_mps2": 0.0, "ground_frame": 0}}
+                t0 = time.perf_counter()
+                pred = P.update(m, ctx)
+                t1 = time.perf_counter()
+                out = pred.message(m)
+                t2 = time.perf_counter()
+                txt = native.dumps(out)
+                t3 = time.perf_counter()
+                if f >= 20:
+                    tu, tm, td = tu + t1 - t0, tm + t2 - t1, td + t3 - t2
+                    nb += len(txt)
+                    fut += int(pred.stats[6])
+            res[(n, name)] = {"update": 1e3 * tu / F, "message": 1e3 * tm / F, "dumps": 1e3 * td / F, "bytes": nb / F, "futures": fut / F}
+    print("ms per radar message (%d frames each)   update  message   dumps   | futures   bytes" % a.frames)
+    for (n, name), r in res.items():
+        print("  %2d objects  %-32s %6.3f  %6.3f  %6.3f   | %5.1f  %7.0f" % (n, name, r["update"], r["message"], r["dumps"], r["futures"], r["bytes"]))
+    if a.json:
+        with open(a.json, "w") as f:
+            json.dump({"%d %s" % k: v for k, v in res.items()}, f, indent=1)
 
 
 def main(argv=None):
@@ -487,6 +565,11 @@ def main(argv=None):
     c.add_argument("--pack")
     c.add_argument("--json")
     c.set_defaults(fn=cmd_capture)
+    k = sub.add_parser("cost")
+    k.add_argument("--objects", type=int, nargs="*", default=[2, 6, 12, 24])
+    k.add_argument("--frames", type=int, default=300)
+    k.add_argument("--json")
+    k.set_defaults(fn=cmd_cost)
     a = ap.parse_args(argv)
     a.fn(a)
 

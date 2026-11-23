@@ -11,6 +11,7 @@
  *   predict_names()                    (manoeuvre names by code, lane names, intent slot names)
  *   predict_frame(...)                 one frame: all objects, into given arrays
  *   predict_score(...)                 one matured prediction against the realised positions
+ *   predict_futs(...)                  the futures as the message carries them (lists of dicts, rounded)
  *
  * Frame: the car frame of the frame's time, held fixed on the ground: x forward, y LEFT, metres.
  *
@@ -2318,7 +2319,15 @@ static int pair_table(const PCtx *c, int a, int b, double *psi)
         for (int j = 0; j < B.nm; j++) {
             conf[i][j] = 0.0;
             const double *ba = A.bb[i], *bq = B.bb[j];
-            double m = 0.5 * (A.len + B.len) + 30.0 * c->cfg[PC_conflict_headway_s];
+            /* (the boxes hold three sigma of the places; what is added: the bodies and the gap the faster one keeps) */
+            const double *fa = A.traj + i * A.stride, *fb = B.traj + j * B.stride;
+            int last = 6 * (c->nt - 1) + 5;
+            double vm = fa[5] > fa[last] ? fa[5] : fa[last];
+            if (fb[5] > vm)
+                vm = fb[5];
+            if (fb[last] > vm)
+                vm = fb[last];
+            double m = 0.5 * (A.len + B.len) + vm * c->cfg[PC_conflict_headway_s] + 1.0;
             if (ba[0] > bq[2] + m || bq[0] > ba[2] + m || ba[1] > bq[3] + m || bq[1] > ba[3] + m)
                 continue;
             double now;
@@ -3018,8 +3027,95 @@ done:
     return res;
 }
 
+/* predict_futs(traj (n, P_KMAX, nt, 6), modes (n, 5, P_KMAX), names, decimals) -> [[future, ...] per object]
+ * The message form of the futures: {"p", "p0", "m", "x", "y", "sx", "sy", "rxy", "v"}, numbers rounded as
+ * round_lists rounds them (rint(v * 10^d) / 10^d; p and p0 to three decimals). */
+static PyObject *n_predict_futs(PyObject *self, PyObject *args)
+{
+    PyObject *ot, *om, *names, *res = NULL;
+    int dec;
+    View vt, vm;
+    Py_ssize_t rt, n;
+    static const char *const KEYS[6] = {"x", "y", "sx", "sy", "rxy", "v"};
+    vt.held = vm.held = 0;
+    if (!PyArg_ParseTuple(args, "OOO!i", &ot, &om, &PyTuple_Type, &names, &dec))
+        return NULL;
+    if (pview(ot, &vt, 0, 6, &rt, "traj") < 0 || pview(om, &vm, 0, 5 * P_KMAX, &n, "modes") < 0)
+        goto done;
+    if (dec < 0 || dec > 9 || (n > 0 && rt % (n * P_KMAX) != 0) || (n > 0 && rt / (n * P_KMAX) < 1)) {
+        PyErr_SetString(PyExc_ValueError, "predict_futs: array sizes do not fit together");
+        goto done;
+    }
+    Py_ssize_t nt = n > 0 ? rt / (n * P_KMAX) : 0, nn = PyTuple_Size(names);
+    const double *t = (const double *)vt.b.buf, *M = (const double *)vm.b.buf;
+    double sc = POW10[dec];
+    res = PyList_New(n);
+    if (res == NULL)
+        goto done;
+    for (Py_ssize_t i = 0; i < n; i++) {
+        const double *m = M + i * 5 * P_KMAX;
+        int nm = (int)m[0];
+        if (nm < 0 || nm > P_KMAX)
+            nm = 0;
+        PyObject *row = PyList_New(nm);
+        if (row == NULL)
+            goto fail;
+        PyList_SetItem(res, i, row);
+        for (int k = 0; k < nm; k++) {
+            PyObject *d = PyDict_New();
+            if (d == NULL)
+                goto fail;
+            PyList_SetItem(row, k, d);
+            int code = (int)m[2 * P_KMAX + k];
+            PyObject *v = PyFloat_FromDouble(rint(m[3 * P_KMAX + k] * 1000.0) / 1000.0);
+            if (v == NULL || PyDict_SetItemString(d, "p", v) < 0) {
+                Py_XDECREF(v);
+                goto fail;
+            }
+            Py_DECREF(v);
+            v = PyFloat_FromDouble(rint(m[4 * P_KMAX + k] * 1000.0) / 1000.0);
+            if (v == NULL || PyDict_SetItemString(d, "p0", v) < 0) {
+                Py_XDECREF(v);
+                goto fail;
+            }
+            Py_DECREF(v);
+            if (code < 0 || code >= nn || PyDict_SetItemString(d, "m", PyTuple_GetItem(names, code)) < 0) {
+                if (!PyErr_Occurred())
+                    PyErr_SetString(PyExc_ValueError, "predict_futs: a name code without a name");
+                goto fail;
+            }
+            const double *tr = t + ((size_t)i * P_KMAX + k) * nt * 6;
+            for (int q = 0; q < 6; q++) {
+                PyObject *l = PyList_New(nt);
+                if (l == NULL)
+                    goto fail;
+                for (Py_ssize_t j = 0; j < nt; j++) {
+                    PyObject *f = PyFloat_FromDouble(rint(tr[6 * j + q] * sc) / sc);
+                    if (f == NULL) {
+                        Py_DECREF(l);
+                        goto fail;
+                    }
+                    PyList_SetItem(l, j, f);
+                }
+                int rc = PyDict_SetItemString(d, KEYS[q], l);
+                Py_DECREF(l);
+                if (rc < 0)
+                    goto fail;
+            }
+        }
+    }
+    goto done;
+fail:
+    Py_CLEAR(res);
+done:
+    view_drop(&vt);
+    view_drop(&vm);
+    return res;
+}
+
 #define PREDICT_METHODS                                                                                                \
     {"predict_cfg", n_predict_cfg, METH_NOARGS, "the predictor's constants: {name: default}, in the array's order"},  \
     {"predict_names", n_predict_names, METH_NOARGS, "(manoeuvre names, lane names, intent slots, array widths)"},     \
     {"predict_frame", n_predict_frame, METH_VARARGS, "one frame of the predictor: lanes, intents, futures"},          \
+    {"predict_futs", n_predict_futs, METH_VARARGS, "the futures' message form: per object a list of dicts"},      \
     {"predict_score", n_predict_score, METH_VARARGS, "a past prediction against what the object did"},
