@@ -234,8 +234,7 @@ class Daemon:
         gc.collect()
         gc.freeze()
         nat = native.status()
-        log.info("chris-integrator: hot path %s%s", "NATIVE (%s)" % ", ".join(nat["parts"]) if nat["active"] else "pure Python",
-                 ": " + nat["reason"] if nat.get("reason") else "")
+        log.info("chris-integrator: native core version %d (%s; %s)", nat["version"], nat["module"], ", ".join(nat["parts"]))
         try:
             await asyncio.gather(*tasks) if tasks else await asyncio.Event().wait()
         finally:

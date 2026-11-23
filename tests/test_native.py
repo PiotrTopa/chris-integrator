@@ -1,20 +1,21 @@
-"""The native core against the pure-Python reference (chris_integrator/native).
+"""The native core (chris_integrator/native): every part held to known results.
 
-Every native function is compared with the Python it stands for: text and objects must be identical; the
-estimator's linear algebra is identical where the steps are elementwise and agrees to rounding where sums of
-products are involved. Where the native module is not built, the comparisons are skipped and the selection
-logic is still tested: the package is complete without a compiler.
+JSON and rounding against CPython's own json and round (they stay the reference: the native writer and
+reader hand to them what they do not take). The other parts against what their pure-Python references gave
+before those were removed (tests/native_cases.py, tests/data/native_golden.json.gz): exact results bit for
+bit, the filter's sums of products to rounding. The radar's motion model against its numpy reference.
 
-    python -m pytest tests/test_native.py                    with the native core, if built
-    CHRIS_NATIVE=0 python -m pytest tests                    the whole suite on the reference
+    python -m pytest tests/test_native.py
 """
 import json
 import math
 import os
 import random
+import shutil
 import struct
 import subprocess
 import sys
+import tempfile
 
 import numpy as np
 import pytest
@@ -23,16 +24,14 @@ HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, HERE)
 
 from chris_integrator import native as N  # noqa: E402
+from chris_integrator.native import _chris_native as C  # noqa: E402
 
-try:
-    from chris_integrator.native import _chris_native as C
-except ImportError:
-    C = None
 
-needs_native = pytest.mark.skipif(C is None, reason="the native core is not built (docs/NATIVE.md)")
-# comparisons that go through the package's own switch points need that part switched on in this process
-needs_json = pytest.mark.skipif(not N.ROUNDED, reason="the native JSON part is not in use in this process")
-needs_ekf = pytest.mark.skipif(N.ekf is None, reason="the native filter part is not in use in this process")
+def _always(f):
+    return f
+
+
+needs_native = needs_json = needs_ekf = _always          # (the native core is part of the package)
 SEP = (",", ":")
 
 
@@ -97,30 +96,37 @@ def _rand_obj(rng, depth=0):
     return {_rand_str(rng): _rand_obj(rng, depth + 1) for _ in range(rng.randrange(0, 6))}
 
 
-# ---- selection ---------------------------------------------------------------------------------------------
-def test_status_says_which_implementation_runs():
+# ---- the module ---------------------------------------------------------------------------------------------
+def test_status():
     st = N.status()
-    assert st["implementation"] in ("native", "python")
-    assert st["active"] == bool(st["parts"])
-    assert set(st["parts"]) <= set(N.PARTS)
-    if not st["active"]:
-        assert st.get("reason")
-    # the reference is always there
+    assert st["active"] and st["implementation"] == "native" and st["version"] == N.VERSION == C.VERSION
+    assert st["parts"] == list(N.PARTS)
     assert N.dumps({"a": [1, 2.5, None]}) == '{"a":[1,2.5,null]}'
     assert N.loads('{"a":[1,2.5,null]}') == {"a": [1, 2.5, None]}
     assert N.round(2.675, 2) == round(2.675, 2)
 
 
-@pytest.mark.parametrize("env,parts", [("0", []), ("json", ["json"]), ("ekf,round", ["round", "ekf"])])
-def test_selection_by_environment(env, parts):
-    code = "import json; from chris_integrator import native as N; print(json.dumps(N.status()))"
-    out = subprocess.run([sys.executable, "-c", code], cwd=HERE, env=dict(os.environ, CHRIS_NATIVE=env),
-                         capture_output=True, text=True, check=True).stdout
-    st = json.loads(out)
-    if C is None or env == "0":
-        assert st["parts"] == [] and st["implementation"] == "python" and st["reason"]
-    else:
-        assert st["parts"] == parts and st["implementation"] == "native"
+def test_a_package_without_the_module_says_how_to_build_it():
+    """Without the compiled module, or with one of another version, the package does not import, and the error
+    says what to do."""
+    tmp = tempfile.mkdtemp()
+    try:
+        pkg = os.path.join(tmp, "chris_integrator")
+        shutil.copytree(os.path.join(HERE, "chris_integrator"), pkg, ignore=shutil.ignore_patterns("*.so", "__pycache__"))
+        code = "import chris_integrator.stack"
+        r = subprocess.run([sys.executable, "-c", code], cwd=tmp, capture_output=True, text=True)
+        assert r.returncode != 0 and "ImportError" in r.stderr and "is not built" in r.stderr and "native/build.sh" in r.stderr
+        with open(os.path.join(pkg, "native", "_chris_native.py"), "w") as f:
+            f.write("VERSION = 1\nFallback = ValueError\n")
+        r = subprocess.run([sys.executable, "-c", code], cwd=tmp, capture_output=True, text=True)
+        assert r.returncode != 0 and "version 1, this package needs version %d" % N.VERSION in r.stderr
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_self_test_passes_here():
+    r = subprocess.run([sys.executable, "-m", "chris_integrator.native"], cwd=HERE, capture_output=True, text=True)
+    assert r.returncode == 0 and "self-test ok" in r.stdout, r.stdout + r.stderr
 
 
 # ---- JSON text ---------------------------------------------------------------------------------------------
@@ -188,54 +194,6 @@ def test_dumps_leaves_to_json_what_it_does_not_know():
     loop.append(loop)
     with pytest.raises(ValueError):
         N.dumps(loop)
-
-
-@needs_json
-def test_dumps_rounded_lists():
-    rng = random.Random(3)
-    for _ in range(3000):
-        nd = rng.randrange(0, 7)
-        vals = []
-        for _ in range(rng.randrange(0, 40)):
-            k = rng.randrange(10)
-            if k < 5:
-                vals.append(rng.uniform(-300.0, 300.0))
-            elif k == 5:
-                vals.append((rng.randrange(-10 ** 5, 10 ** 5) + 0.5) / 10.0 ** nd)      # on a decimal tie
-            elif k == 6:
-                vals.append(rng.randrange(-200, 200))                                   # an int stays an int
-            elif k == 7:
-                vals.append(rng.choice([None, 0.0, -0.0, -1e-9, 1e-9, True, 1e12, -1e300, 5e-324]))
-            elif k == 8:
-                vals.append(float(rng.randrange(-200, 200)))
-            else:
-                vals.append(_rand_double(rng))
-        vals = [v for v in vals if not (isinstance(v, float) and not math.isfinite(v))]
-        ref = _ref_dumps({"a": [v if v is None else round(v, nd) for v in vals], "b": 1})
-        if any(isinstance(v, bool) for v in vals):       # anything but float, int, None: left to the pure path
-            with pytest.raises(C.Fallback):
-                C.dumps({"a": N.Rounded((vals, nd)), "b": 1})
-            continue
-        assert C.dumps({"a": N.Rounded((vals, nd)), "b": 1}) == ref
-
-
-@needs_native
-def test_recorder_road_line_is_the_reference_line():
-    from chris_integrator.io import recorder as R
-    rng = random.Random(4)
-
-    def line(n):
-        return {"x": [float(i * 3) if rng.random() < 0.5 else i * 3 for i in range(n)],
-                "y": [rng.uniform(-5, 5) for _ in range(n)], "y_std": [rng.uniform(0, 2) for _ in range(n)],
-                "z": [0.0] * n, "prob": rng.random()}
-    for _ in range(200):
-        road = {"type": "road", "seq": rng.randrange(10 ** 6), "ts_mono_ns": rng.randrange(10 ** 15), "v_ego": rng.uniform(0, 40),
-                "valid": True, "pose": {"vx": rng.uniform(0, 40), "wz": rng.uniform(-1, 1), "n": 3},
-                "lane_lines": [line(33) for _ in range(4)], "road_edges": [line(33) for _ in range(2)],
-                "leads": [{"x": [rng.uniform(0, 100) for _ in range(6)], "prob": rng.random(), "note": "\x01"}],
-                "plan": {"x": [rng.uniform(0, 200) for _ in range(33)], "y": [rng.uniform(-9, 9) for _ in range(33)],
-                         "z": [rng.uniform(-2, 2) for _ in range(33)], "held": False, "age_ms": 3.25}}
-        assert R.slim_road_line(road) == _ref_dumps(R.slim_road(road))
 
 
 # ---- JSON parsing ------------------------------------------------------------------------------------------
@@ -354,84 +312,6 @@ def test_loads_survives_damaged_input():
             pass
 
 
-@needs_json
-def test_trim_road_is_the_python_cut():
-    """fastjson.trim_road in the native core against `_trim_road_py`: the same bytes, on the vision model's layout
-    (tests/data), cut, damaged and rearranged lines, and other layouts."""
-    from chris_integrator import fastjson as F
-    with open(os.path.join(HERE, "tests", "data", "road_raw_vision.jsonl"), "rb") as f:
-        base = [ln.strip() for ln in f if ln.strip()]
-    base.append(json.dumps({"type": "road", "plan": {"vx": [1], "x": [0, 1], "vy": [2], "vx2": [], "prob": None},
-                            "lane_lines": [{"z": [1], "x": [], "z ": [2]}, {"x": [1], "z": [3, [4]]}],
-                            "road_edges": [{"y": [], "z": []}]}, separators=SEP).encode())
-    rng = random.Random(29)
-    n_cut = 0
-    for _ in range(60000):
-        b = bytearray(rng.choice(base))
-        for _ in range(rng.randrange(0, 4)):
-            if not b:
-                break
-            i, k = rng.randrange(len(b)), rng.randrange(4)
-            if k == 0:
-                del b[i:]
-            elif k == 1:
-                b[i] = rng.choice(b'[]{},:"z0')
-            elif k == 2:
-                del b[i:i + rng.randrange(1, 40)]
-            else:
-                j = rng.randrange(len(b))
-                b[i:i] = b[j:j + rng.randrange(1, 60)]
-        b = bytes(b)
-        got, want = F.trim_road(b), F._trim_road_py(b)
-        assert got == want, b
-        n_cut += got is not b
-    assert n_cut > 20000
-    assert F.trim_road(b"") == b"" and F.trim_road(base[0]) is not base[0]
-
-
-@needs_json
-def test_slim_road_line_is_the_reduced_road():
-    """The recorder's reduced `road` written by the native core (`slim_road_line`) against
-    json.dumps(slim_road(road)): the same text for the stack's layout, numbers next to decimal ties, below 1e-4,
-    negative zero, ints, bools, None in the lists, numpy scalars, odd members and missing parts."""
-    from chris_integrator.io import recorder as R
-    rng = random.Random(31)
-
-    def num():
-        return rng.choice([rng.uniform(-60, 60), rng.randrange(-5, 99), round(rng.uniform(-3, 3), rng.randrange(1, 6)),
-                           rng.randrange(-999, 999) / 1000 + 0.0005, rng.uniform(-1, 1) * 1e-5, -0.0, 0.0, 1e300,
-                           float("nan"), float("inf")] + ([None, True, np.float64(1.23456)] if rng.random() < 0.05 else []))
-
-    def arr():
-        return [num() for _ in range(rng.randrange(0, 34))]
-
-    def road():
-        m = {"type": "road", "seq": rng.randrange(10 ** 6), "ts_mono_ns": rng.randrange(10 ** 15), "v_ego": num(),
-             "valid": rng.choice([True, False]), "road_model": rng.choice(["supercombo", "vision", None]), "x": 5,
-             "camera": rng.choice(["road", "wide", "é\n"]), "frame_seq_prev": rng.choice([None, 4, [1, 2]]),
-             "pose": {"trans": arr(), "speed": num(), "w": rng.uniform(-1, 1), "s": "x", "n": None},
-             "lane_lines": [{"x": arr(), "y": arr(), "y_std": arr(), "z": arr(),
-                             "prob": rng.choice([rng.random(), True, 1, None, "p"])} for _ in range(4)] + ["odd"],
-             "road_edges": [{"x": arr(), "y": rng.choice([arr(), None, 3]), "y_std": arr()} for _ in range(2)],
-             "leads": [{"x": arr(), "prob": rng.random(), "t": rng.choice([arr(), 1.23456, "s"])}, {"x": [1]}],
-             "plan": {"x": arr(), "y": arr(), "z": arr(), "vx": arr(), "held": rng.choice([True, None]), "age_ms": 30}}
-        for k in list(m):
-            if k != "type" and rng.random() < 0.08:
-                del m[k]
-        if rng.random() < 0.05:
-            m["leads"] = rng.choice([[], None, ["x"]])
-        if rng.random() < 0.05:
-            m["plan"] = rng.choice([None, [1], {"held": False}])
-        return m
-
-    for _ in range(4000):
-        m = road()
-        assert R.slim_road_line(m) == json.dumps(R.slim_road(m), separators=SEP)
-    m = road()
-    m["pose"] = {1: 2.5}                           # a key json converts: the pure path
-    assert R.slim_road_line(m) == json.dumps(R.slim_road(m), separators=SEP)
-
-
 # ---- held to what the references gave (tests/native_cases.py, tests/data/native_golden.json.gz) ---------------
 sys.path.insert(0, os.path.join(HERE, "tests"))
 import native_cases as K  # noqa: E402
@@ -517,7 +397,10 @@ def test_golden_filter():
     for i, (naux, x, P, dt) in enumerate(pc):
         m = K.ego_model(None, naux)
         xn, Pn, (Fn, rn) = m.predict(x, P, dt)
-        assert K.digest((xn, Fn, rn)) == g["out"][i], i                       # the state and transition: the bits
+        xr, Fr, rr = g["state"][i]                     # the state and transition: elementwise, with the C library's
+        np.testing.assert_allclose(xn, xr, rtol=1e-14, atol=1e-14)               # sin, cos, exp (the same bits
+        np.testing.assert_allclose(Fn, Fr, rtol=1e-14, atol=1e-14)               # with the same library)
+        assert (rr is None) == (rn is None) and (rr is None or np.allclose(rn, rr, rtol=1e-14, atol=0.0))
         Pr = np.array(g["values"][i])
         scale = np.sqrt(np.outer(np.diag(Pr), np.diag(Pr)))
         assert float(np.max(np.abs(Pr - Pn) / scale)) < 1e-12, i              # the covariance: to rounding
@@ -589,459 +472,48 @@ def test_round_is_builtin_round():
             C.round(*bad)
 
 
-@needs_native
-def test_interp_all_is_the_python_walk():
-    from chris_integrator.trackers import view as V
-    rng = random.Random(9)
-    ref = V._interp_all_py
-    for _ in range(20000):
-        n = rng.randrange(0, 20)
-        xs = [rng.uniform(0, 100) for _ in range(n)]
-        if rng.random() < 0.8:
-            xs.sort()
-        if n > 2 and rng.random() < 0.2:
-            xs[rng.randrange(1, n)] = xs[rng.randrange(0, n - 1)]                       # a zero-length segment
-        ys = [rng.choice([None, float("nan")]) if rng.random() < 0.05 else rng.uniform(-5, 5)
-              for _ in range(rng.randrange(max(n - 2, 0), n + 3))]
-        qs = [rng.choice([float("nan"), -1.0, 200.0]) if rng.random() < 0.05 else rng.uniform(-5, 105)
-              for _ in range(rng.randrange(0, 30))]
-        if rng.random() < 0.7:
-            qs.sort(key=lambda v: (v != v, v))
-        a, b = V._interp_all(xs, ys, qs), ref(xs, ys, qs)
-        assert len(a) == len(b)
-        for u, v in zip(a, b):
-            assert (u is None and v is None) or (u != u and v != v) or (u == v and type(u) is type(v)), (xs, ys, qs)
-    # ints among the floats (the model's fixed distances): the same values and types as the Python walk
-    for _ in range(20000):
-        n = rng.randrange(1, 12)
-        num = lambda: rng.choice([rng.randrange(-5, 120), float(rng.randrange(-5, 120)), rng.uniform(-5, 120)])  # noqa: E731
-        xs = sorted(num() for _ in range(n))
-        ys = [None if rng.random() < 0.05 else num() for _ in range(n)]
-        qs = sorted(num() for _ in range(rng.randrange(0, 12)))
-        if rng.random() < 0.5:
-            xs, ys, qs = rng.choice([xs, tuple(xs)]), rng.choice([ys, tuple(ys)]), tuple(qs)     # the view's `xs` is a tuple
-        a, b = V._interp_all(xs, ys, qs), ref(xs, ys, qs)
-        assert len(a) == len(b) and all(type(u) is type(v) and u == v for u, v in zip(a, b)), (xs, ys, qs)
-    assert V._interp_all([0, 2 ** 60], [0, 5], [5]) == ref([0, 2 ** 60], [0, 5], [5])     # big ints, other types:
-    assert V._interp_all([0.0, 10.0], [np.float64(0.0), 5.0], [5]) == ref([0.0, 10.0], [np.float64(0.0), 5.0], [5])   # the reference
-
-
-def _same(u, v):
-    if isinstance(u, (list, tuple)):
-        return isinstance(v, type(u)) and len(u) == len(v) and all(_same(a, b) for a, b in zip(u, v))
-    if isinstance(u, float) and isinstance(v, float):
-        return (u != u and v != v) or struct.pack("<d", u) == struct.pack("<d", v)
-    return type(u) is type(v) and u == v
-
-
-@needs_native
-def test_view_line_steps_are_the_python_ones():
-    """view_prep / view_blend (the view's drawn lines) against `_prep_py` / `_blend_py`: the same objects, bit
-    for bit, on random tables (Nones, NaN, ints, short and missing stds, both sides of the reach) and edges."""
-    from chris_integrator.trackers import view as V
-    rng = random.Random(17)
-    xs_v = V.DEFAULT_CFG["xs"]
-    seen_jump = seen_none = 0
-    for it in range(30000):
-        xs = xs_v if rng.random() < 0.7 else tuple(sorted(rng.choice([rng.uniform(-2, 130), float(rng.randrange(0, 130))])
-                                                         for _ in range(rng.randrange(2, 16))))
-        n = rng.randrange(0, 40)
-        gx = sorted(rng.uniform(-5, 150) for _ in range(n))
-        if n > 2 and rng.random() < 0.1:
-            gx[rng.randrange(1, n)] = gx[rng.randrange(0, n - 1)]
-        num = lambda: rng.choice([None, float("nan")]) if rng.random() < 0.03 else rng.uniform(-6, 6)  # noqa: E731
-        y = [num() for _ in range(rng.randrange(max(0, n - 3), n + 2))]
-        ys = rng.choice([[], [rng.uniform(0, 0.6) if rng.random() < 0.97 else None for _ in range(n)],
-                         [rng.uniform(0, 2.0) for _ in range(max(0, n - 5))]])
-        b = None if rng.random() < 0.3 else [rng.uniform(-6, 6) for _ in range(len(xs) - rng.choice([0, 0, 0, 1]))]
-        reach_std = rng.choice([0.3, 0.5, 1.0])
-        try:
-            want = V._prep_py(gx, y, ys, xs, reach_std, b)
-        except ZeroDivisionError:
-            with pytest.raises(ZeroDivisionError):
-                C.view_prep(gx, y, ys, xs, reach_std, b)
-            continue
-        got = C.view_prep(gx, y, ys, xs, reach_std, b)
-        assert _same(got, want), (gx, y, ys, xs, reach_std, b)
-        seen_none += want is None
-        seen_jump += want is not None and want[2] is not None
-        if want is None:
-            continue
-        nx = len(xs)
-        a0 = [rng.uniform(-6, 6) for _ in range(nx - rng.choice([0, 0, 1]))]
-        b0 = [rng.uniform(-6, 6) for _ in range(nx - rng.choice([0, 0, 1]))]
-        d0 = [rng.uniform(-3, 3) for _ in range(nx - rng.choice([0, 0, 1]))]
-        ks = rng.choice([[1.0 - math.exp(-0.05 / (0.2 + 0.01 * x)) for x in xs], [rng.random()] * nx, [1.0] * nx])
-        dt = rng.choice([0.0, -0.05, 0.05, rng.uniform(0.001, 0.2)])
-        sh = rng.random() < 0.2
-        assert _same(C.view_blend(a0, b0, d0, want[0], ks, dt, sh), V._blend_py(a0, b0, d0, want[0], ks, dt, sh))
-    assert seen_jump > 5000 and seen_none > 500
-    # ints in the table and the drawn line (a new line keeps an int from the table): both sides give the same
-    for args in (([0, 50, 100], [1, 2, 3], [], (0, 5, 20, 60), 0.5, None),
-                 ([0.0, 100.0], [1.0, 2.0], [0.1, 0.1], (0.0, 5.0, 20.0, 60.0), 0.5, [1, 1.0, 1.0, 1.0])):
-        try:
-            want = V._prep_py(*args)
-        except Exception as e:                         # noqa: BLE001
-            want = type(e)
-        try:
-            got = V._prep(*args)
-        except Exception as e:                         # noqa: BLE001
-            got = type(e)
-        assert _same(got, want)
-    assert _same(V._blend([1, 2], [1, 2], [0.0, 0.0], [2, 3], [0.5, 0.5], 0.05, False),
-                 V._blend_py([1, 2], [1, 2], [0.0, 0.0], [2, 3], [0.5, 0.5], 0.05, False))
-
-
-@needs_native
-def test_geom_centre_is_the_numpy_one():
-    """The road geometry's centre line (`geom_centre`) against `_centre_py` / `_centre_vision_py`: the same lists,
-    bit for bit; NaN deviations, a reach before every point (IndexError on both sides), ints elsewhere."""
-    from chris_integrator.trackers.roadgeom import RoadGeometryFusion as G
-    if N.geom is None:
-        pytest.skip("the native lanes part is not in use in this process")
-    rng = random.Random(37)
-    for _ in range(20000):
-        n = rng.randrange(1, 40)
-        x = np.sort(np.array([rng.uniform(-5, 150) for _ in range(n)]))
-        y = np.array([rng.uniform(-5, 5) for _ in range(n)])
-        sd = np.array([float("nan") if rng.random() < 0.05 else rng.uniform(0, 3) for _ in range(n)])
-        reach = rng.uniform(-10, 160)
-        try:
-            want = G._centre_vision_py(x, y, sd, reach)
-        except IndexError:
-            with pytest.raises(IndexError):
-                G._centre_vision(x, y, sd, reach)
-            continue
-        assert _same(list(G._centre_vision(x, y, sd, reach).items()), list(want.items()))
-        conf = np.array([rng.random() for _ in range(n)])
-        assert _same(list(G._centre(x, y, conf, "vb", reach, 3.0).items()), list(G._centre_py(x, y, conf, "vb", reach, 3.0).items()))
-    x = np.arange(5.0)
-    assert G._centre(x, x[::-1].copy(), [1, 1, 1, 1, 1], "v", 3, None) == G._centre_py(x, x[::-1].copy(), [1, 1, 1, 1, 1], "v", 3, None)
-    g = G()                                            # `_reach`: the same value and kind (a configured int stays one)
-    for _ in range(20000):
-        n = rng.randrange(1, 40)
-        x = np.sort(np.array([rng.uniform(-5, 150) for _ in range(n)]))
-        sd = np.array([float("nan") if rng.random() < 0.05 else rng.uniform(0, 2) for _ in range(n)])
-        g.cfg.update(reach_std_m=rng.choice([0.9, 1, 0.5]), reach_max_m=rng.choice([100.0, 100, 50, 1e9]),
-                     reach_min_m=rng.choice([15.0, 15, 200]))
-        a, b = g._reach(x, sd), g._reach_py(x, sd)
-        assert type(a) is type(b) and (a == b or a != a and b != b)
-
-
-# ---- the estimator's linear algebra ------------------------------------------------------------------------
-def _cov(rng, n):
-    a = rng.standard_normal((n, n))
-    return a @ a.T + np.diag(rng.uniform(0.01, 1.0, n))
-
-
-def _model(rng, naux=17):
-    from chris_integrator.core import ego as E
-    m = E.EgoModel()
-    for i in range(naux):
-        k = i % 3
-        if k == 0:
-            m.add_aux("s%d" % i, E.AuxState("a", 0.0, 0.1, psd=1e-6))
-        elif k == 1:
-            m.add_aux("s%d" % i, E.AuxState("a", 0.0, 0.05, tau_s=30.0 + i))
-        else:
-            m.add_aux("s%d" % i, E.AuxState("a", 0.0, 0.2, psd=1e-5, lo=-0.5, hi=0.5))
-    return m
-
-
-def _state(rng, m):
-    x = rng.standard_normal(m.n)
-    x[3] = rng.uniform(-5, 40)
-    x[9] = rng.uniform(-0.05, 0.05)
-    return x, _cov(rng, m.n)
-
-
-@needs_ekf
-@pytest.mark.parametrize("naux", [0, 1, 17])
-def test_predict_agrees_with_numpy(naux):
-    rng = np.random.default_rng(10 + naux)
-    m = _model(rng, naux)
-    worst = 0.0
-    for i in range(400):
-        x, P = _state(rng, m)
-        if i % 7 == 0:
-            x[10:] = rng.uniform(-2, 2, m.n - 10)                                       # beyond the clamps
-        dt = float(rng.choice([0.01, 0.02, 0.05, 0.1, 0.3, 0.7, 2.5]))
-        if i % 11 == 0:
-            P[3, 3] += 1e5                                                              # the caps of a long gap
-        xr, Pr, (Fr, rr) = m._predict_py(x.copy(), P.copy(), dt)
-        xn, Pn, (Fn, rn) = m.predict(x, P, dt)
-        assert xn is not x and Pn is not P
-        assert np.array_equal(xr, xn)                                                   # the state: the same steps
-        assert np.array_equal(Fr, Fn)
-        assert (rr is None and rn is None) or np.array_equal(rr, rn)
-        scale = np.sqrt(np.outer(np.diag(Pr), np.diag(Pr)))
-        worst = max(worst, float(np.max(np.abs(Pr - Pn) / scale)))
-    assert worst < 1e-12, worst                                                         # the covariance: to rounding
-
-
-@needs_ekf
-def test_row_update_is_numpy_bit_for_bit_on_single_index_rows():
-    from chris_integrator.core import ekf as K
-    rng = np.random.default_rng(20)
+# ---- the estimator's filter: what the row and smoother steps are given ------------------------------------------
+def test_filter_steps_take_lists_and_views():
+    """A row model may return lists, and an array may be a view: the steps make contiguous arrays of them and give
+    what they give for those; an index beyond the state is an error."""
+    from chris_integrator.core import ekf as KF
+    rng = random.Random(21)
     n = 27
-    for i in range(2000):
-        P = _cov(rng, n)
-        x = rng.standard_normal(n)
-        idx = np.array([rng.integers(0, n)], dtype=np.intp)
-        coef = np.array([rng.choice([1.0, -1.0, rng.uniform(-3, 3)])])
-        ph_r, s0_r = K._project_py(P, idx, coef)
-        ph_n, s0_n = K._project_native(P, idx, coef)
-        assert np.array_equal(ph_r, ph_n) and s0_r == s0_n
-        nu, var = float(rng.standard_normal()), float(rng.uniform(1e-4, 1.0))
-        freeze = None if i % 3 else np.array(sorted(set(rng.integers(0, n, 6).tolist())), dtype=np.intp)
-        xr, xn = x.copy(), x.copy()
-        Pr = K._apply_py(xr, P, ph_r, s0_r + var, nu, freeze, False)
-        Pn = K._apply_native(xn, P, ph_n, s0_n + var, nu, freeze, False)
-        assert Pn is not P
-        assert np.array_equal(xr, xn) and np.array_equal(Pr, Pn)
-        Pn2 = K._apply_native(xn, Pn, ph_n, s0_n + var, nu, freeze, True)               # in place on an own array
-        assert Pn2 is Pn
-        S = P + 1e-3 * rng.standard_normal((n, n))
-        Sr = K._sym_py(S, False)
-        Sn = K._sym_native(S.copy(), True)
-        assert np.array_equal(Sr, Sn)
-
-
-@needs_ekf
-def test_row_projection_agrees_with_numpy_on_wide_rows():
-    from chris_integrator.core import ekf as K
-    rng = np.random.default_rng(21)
-    n = 27
-    for _ in range(2000):
-        P = _cov(rng, n)
-        m = int(rng.integers(2, 7))
-        idx = rng.choice(n, m, replace=False).astype(np.intp)
-        coef = rng.standard_normal(m)
-        ph_r, s0_r = K._project_py(P, idx, coef)
-        ph_n, s0_n = K._project_native(P, idx, coef)
-        np.testing.assert_allclose(ph_n, ph_r, rtol=1e-12, atol=1e-12)
-        assert abs(s0_n - s0_r) <= 1e-12 * max(abs(s0_r), 1.0)
-    # what the native step does not take goes to numpy: lists, views, bad indices
-    P = _cov(rng, n)
-    ph, s0 = K._project_native(P, [3], [1.0])
+    P = K._cov(rng, n)
+    ph, s0 = KF._project(P, [3], [1.0])
     assert np.array_equal(ph, P[:, 3]) and s0 == P[3, 3]
-    ph, s0 = K._project_native(P[::-1], np.array([3], dtype=np.intp), np.array([1.0]))
-    assert np.array_equal(ph, P[::-1][:, 3])
+    V = P[::-1]
+    ph, s0 = KF._project(V, np.array([3], dtype=np.intp), np.array([1.0]))
+    assert np.array_equal(ph, V[:, 3])
     with pytest.raises(IndexError):
-        K._project_native(P, np.array([99], dtype=np.intp), np.array([1.0]))
+        KF._project(P, np.array([99], dtype=np.intp), np.array([1.0]))
+    x = np.arange(n, dtype=float)
+    P1 = KF._apply(x, V, ph, s0 + 1.0, 0.5, [1, 2], False)
+    x2 = np.arange(n, dtype=float)
+    P2 = KF._apply(x2, np.ascontiguousarray(V), ph, s0 + 1.0, 0.5, np.array([1, 2], dtype=np.intp), False)
+    assert np.array_equal(x, x2) and np.array_equal(P1, P2)
+    assert np.array_equal(KF._sym(V, False), 0.5 * (V + V.T))
 
 
-@needs_ekf
-def test_smoother_step_agrees_with_numpy():
-    rng = np.random.default_rng(30)
-    m = _model(rng)
+def test_smoother_step_singular_and_wrapped():
+    rng = random.Random(30)
+    m = K.ego_model(None, 17)
     n = m.n
-    for _ in range(300):
-        x, P = _state(rng, m)
-        dt = float(rng.choice([0.01, 0.05, 0.1, 0.4]))
-        xp, Pp, F = m._predict_py(x, P, dt)
-        xs = xp + 0.01 * rng.standard_normal(n)
-        Ps = Pp - 0.1 * np.diag(np.diag(Pp))
-        C_ = np.linalg.solve(Pp, m.apply_F(F, P)).T
-        xr, Pr = x + C_ @ (xs - xp), P + C_ @ (Ps - Pp) @ C_.T
-        xn, Pn = m.rts(Pp, F, P, x, xp, xs, Ps, ())
-        np.testing.assert_allclose(xn, xr, rtol=1e-9, atol=1e-9)
-        np.testing.assert_allclose(Pn, Pr, rtol=1e-8, atol=1e-9)
+    x, P = K.ego_state(rng, m)
+    xp, Pp, F = m.predict(x, P, 0.05)
+    xs = xp + 0.01
+    Ps = Pp - 0.1 * np.diag(np.diag(Pp))
+    xn, _ = m.rts(Pp, F, P, x, xp, xs, Ps, ())
     assert m.rts(np.zeros((n, n)), F, P, x, xp, xs, Ps, ()) is False                   # singular: the caller keeps the filtered state
     xw, _ = m.rts(Pp, F, P, x, xp, xs + np.eye(n)[2] * 2 * math.pi, Ps, (2,))          # a wrapped angle difference
     np.testing.assert_allclose(xw, xn, rtol=1e-9, atol=1e-9)
+    with pytest.raises(ValueError):
+        m.predict(x[:-1], P, 0.05)
 
 
-SIM = r"""
-import json, sys
-sys.path.insert(0, %r)
-from tests.simrun import Run
-from chris_integrator import native
-r = Run(seed=3, keep_tracks=True)
-out = {"impl": native.status()["implementation"], "es": r.es,
-       "rows": [[row.get(k) for k in ("dv", "dw", "de", "dn", "dpsi", "nees_pos")] for row in r.rows],
-       "leads": [ld for _, ld, _ in r.leads]}
-print(json.dumps(out))
-"""
-
-
-@needs_native
-def test_simulated_drive_native_against_reference():
-    """A simulated drive through the whole integrator on both implementations (two processes: the choice is
-    made at import). The estimate's errors against the truth agree far inside their own size; the published
-    messages agree to the last digit they print in all but a few values."""
-    res = {}
-    for env in ("0", "1"):
-        out = subprocess.run([sys.executable, "-c", SIM % HERE], cwd=HERE, env=dict(os.environ, CHRIS_NATIVE=env),
-                             capture_output=True, text=True, check=True).stdout
-        res[env] = json.loads(out)
-    assert res["0"]["impl"] == "python" and res["1"]["impl"] == "native"
-    a, b = res["0"]["rows"], res["1"]["rows"]
-    assert len(a) == len(b) and len(a) > 300
-    worst = 0.0
-    for ra, rb in zip(a, b):
-        for u, v in zip(ra, rb):
-            assert (u is None) == (v is None)
-            if u is not None:
-                worst = max(worst, abs(u - v) / max(abs(u), abs(v), 1e-3))
-    assert worst < 1e-6, worst
-    la, lb = res["0"]["leads"], res["1"]["leads"]
-    same = sum(1 for u, v in zip(la, lb) if u == v)
-    assert len(la) == len(lb) and same >= 0.99 * len(la), (same, len(la))
-    # the last ego state: every number equal to 1e-6 relative, every flag and string equal
-
-    def cmp(u, v, path=""):
-        assert type(u) is type(v) or {type(u), type(v)} <= {int, float}, path
-        if isinstance(u, dict):
-            assert list(u) == list(v), path
-            for k in u:
-                cmp(u[k], v[k], path + "." + k)
-        elif isinstance(u, list):
-            assert len(u) == len(v), path
-            for i, (x, y) in enumerate(zip(u, v)):
-                cmp(x, y, "%s[%d]" % (path, i))
-        elif isinstance(u, float):
-            assert abs(u - v) <= 1e-6 * max(abs(u), abs(v), 1.0), (path, u, v)
-        else:
-            assert u == v, (path, u, v)
-    cmp(res["0"]["es"], res["1"]["es"])
 
 
 # ---- the lane tracker's array steps ------------------------------------------------------------------------
-needs_lanes = pytest.mark.skipif(N.lanes is None, reason="the native lane part is not in use in this process")
-
-
-def _road_lines(rng, n=33, odd=0.0):
-    x = [0.0] + sorted(rng.uniform(1.0, 190.0) for _ in range(n - 1))
-
-    def line(edge):
-        d = {"x": list(x), "y": [rng.uniform(-8.0, 8.0) for _ in range(n)], "y_std": [rng.uniform(0.0, 3.0) for _ in range(n)]}
-        if not edge:
-            d["prob"] = rng.choice([rng.random(), 0, 1, True, None, 1.5, -0.2, float("nan")])
-        r = rng.random()
-        if r < odd:
-            k = rng.randrange(9)
-            if k == 0:
-                d["y"][rng.randrange(n)] = float("nan")
-            elif k == 1:
-                d["y_std"][rng.randrange(n)] = float("inf")
-            elif k == 2:
-                del d["y_std"]
-            elif k == 3:
-                d["y"] = d["y"][:-1]
-            elif k == 4:
-                d["y"][rng.randrange(n)] = 3                     # an int among the floats
-            elif k == 5:
-                d["y_std"][rng.randrange(n)] = 0.0               # below the floor
-            elif k == 6:
-                d["y"][rng.randrange(n)] = "1.5"
-            elif k == 7:
-                d["y_std"] = None
-            else:
-                d["prob"] = "x"
-        return d
-    return {"lane_lines": [line(False) for _ in range(rng.choice([4, 4, 4, 3]))],
-            "road_edges": [line(True) for _ in range(rng.choice([2, 2, 2, 1]))]}
-
-
-def _same_arrays(a, b):
-    return all(np.array_equal(u, v, equal_nan=True) and u.dtype == v.dtype for u, v in zip(a, b))
-
-
-@needs_lanes
-def test_lane_measure_fit_update_round_are_numpy_bit_for_bit(monkeypatch):
-    from chris_integrator.trackers import lanes as L
-    rng = random.Random(41)
-    g = np.random.default_rng(41)
-    tr = L.RoadGeometryTracker()
-    native = taken = 0
-    for i in range(3000):
-        road = _road_lines(rng, odd=0.3 if i % 2 else 0.0)
-        got = tr._measure(road)
-        with monkeypatch.context() as mp:
-            mp.setattr(L, "_NL", None)
-            try:
-                ref = tr._measure(road)
-            except (TypeError, ValueError) as e:                # what the reference refuses, the native path refuses
-                with pytest.raises(type(e)):
-                    tr._measure(road)
-                continue
-        assert (got is None) == (ref is None)
-        if ref is None:
-            continue
-        taken += 1
-        assert _same_arrays(got, ref), road
-        x, zy, zs, prob, ok = ref
-        n = len(x)
-        y, p = g.standard_normal((6, n)), np.abs(g.standard_normal((6, n))) + 1e-3
-        c = dict(tr.cfg)
-        if i % 5 == 0:
-            c["gate_x"] = (500.0, 600.0)                         # no point in the gate: all of them count
-        elif i % 7 == 0:
-            c["gate_x"] = (rng.uniform(0, 50), rng.uniform(50, 200))
-        a, b = L._fit_native(c, x, zs, zy, prob, y, p), L._fit_py(c, x, zs, zy, prob, y, p)
-        for name, u, v in zip(("r", "gate", "nu", "jumps", "nsigs"), a, b):
-            assert u.dtype == v.dtype and np.array_equal(u, v, equal_nan=True), (name, i, c["gate_x"])
-        r, gate, nu = b[0], b[1], b[2]
-        upd = sorted(rng.sample(range(6), rng.randrange(0, 7)))
-        y1, p1, y2, p2 = y.copy(), p.copy(), y.copy(), p.copy()
-        if upd:
-            L._update_native(y1, p1, r, nu, upd)
-            L._update_py(y2, p2, r, nu, upd)
-            assert np.array_equal(y1, y2) and np.array_equal(p1, p2)
-        p1[0, 0] = -1.0                                          # a negative variance: NaN from the root, as numpy
-        for arr, root in ((y1, False), (p1, True), (x, False)):
-            u, v = L._round2_native(arr, root), L._round2_py(arr, root)
-            assert json.dumps(u) == json.dumps(v)
-        q = (c["q0"] + c["q1"] * x) ** 2 * 0.07
-        pr = np.minimum(p2 + q, c["max_std"] ** 2)
-        C.lanes_predict(p2, x, c["q0"], c["q1"], 0.07, c["max_std"] ** 2)
-        assert np.array_equal(p2, pr)
-        native += 1
-    assert taken > 2500 and native > 2500
-
-
-@needs_lanes
-def test_lane_tracker_messages_native_against_numpy(monkeypatch):
-    """The whole tracker, frame by frame, on both implementations: every `lanes` message equal as text."""
-    from chris_integrator.trackers import lanes as L
-    rng = random.Random(42)
-    frames = []
-    ts = 10 ** 12
-    base = _road_lines(rng)
-    for i in range(1500):
-        ts += int(rng.choice([0.05, 0.066, 0.07, 0.2, 1.4]) * 1e9) if rng.random() < 0.97 else 0
-        if rng.random() < 0.05:
-            base = _road_lines(rng, odd=0.3)
-        road = {"type": "road", "seq": i, "ts_mono_ns": ts, "pose": {"vy": rng.uniform(-0.2, 0.2)}}
-        for key in ("lane_lines", "road_edges"):
-            road[key] = [dict(d, y=[v + rng.gauss(0, 0.05 if rng.random() < 0.9 else 2.0) if isinstance(v, float) else v
-                                    for v in d["y"]],
-                              **({"prob": min(1.0, max(0.0, rng.gauss(0.6, 0.3)))} if "prob" in d else {}))
-                         for d in base[key]]
-        es = {"speed": {"value": rng.uniform(0, 30), "valid": True, "sources": ["vehicle.speed"]},
-              "yaw_rate": {"value": rng.uniform(-0.1, 0.1), "valid": True}, "sources": {"vision": {"state": "ok"}}}
-        frames.append((road, es))
-
-    def run():
-        tr = L.RoadGeometryTracker()
-        out = []
-        for road, es in frames:
-            try:
-                out.append(json.dumps(tr.on_road(road, es)))
-            except (TypeError, ValueError) as e:
-                out.append("raised %s" % type(e).__name__)
-        return out
-    a = run()
-    with monkeypatch.context() as mp:
-        mp.setattr(L, "_NL", None)
-        mp.setattr(L, "_fit", L._fit_py)
-        mp.setattr(L, "_update", L._update_py)
-        mp.setattr(L, "_round2", L._round2_py)
-        b = run()
-    assert len(a) == len(b) == 1500
-    assert a == b
-    assert sum(1 for s in a if '"present": true' in s) > 500
 
 
 # ---- the radar's motion model ------------------------------------------------------------------------------
@@ -1178,12 +650,15 @@ def test_radar_leaves_what_is_not_finite_to_the_reference():
 RADAR = r"""
 import json, sys
 sys.path.insert(0, %r)
-from chris_integrator import native
+import os
 from chris_integrator.mixer import MessageClock
+if os.environ.get("RADAR_REF") == "1":                   # the radar's numpy reference
+    from chris_integrator.radar import models as _M
+    _M._NR = None
 from chris_integrator.sim import default_sensors
 from chris_integrator.sim import roaduser_sim as rs
 from chris_integrator.stack import build
-out = {"parts": native.status()["parts"], "runs": {}}
+out = {"radar_native": os.environ.get("RADAR_REF") != "1", "runs": {}}
 for name, seed, night in (("parked_street", 1, True), ("adjacent", 1, False), ("stopped_brake_25", 1, False)):
     w = rs.scenario(name, seed=seed, night=night)
     det = rs.DetectorSim(seed=1000 + seed, night=night)
@@ -1232,13 +707,12 @@ def test_radar_messages_native_against_reference():
     """Simulated drives through the whole stack with the radar part native and not (every other part the same):
     the radar's messages agree except, at most, in a last printed digit or the sign of a zero, in a handful of
     messages (none on the development machine)."""
-    others = ",".join(p for p in N.PARTS if p != "radar" and p in N.ACTIVE)
     res = {}
-    for env in (others or "none", others + ",radar" if others else "radar"):
-        out = subprocess.run([sys.executable, "-c", RADAR % HERE], cwd=HERE, env=dict(os.environ, CHRIS_NATIVE=env),
+    for ref in ("1", "0"):
+        out = subprocess.run([sys.executable, "-c", RADAR % HERE], cwd=HERE, env=dict(os.environ, RADAR_REF=ref),
                              capture_output=True, text=True, check=True).stdout
-        res["radar" in env.split(",")] = json.loads(out)
-    assert "radar" not in res[False]["parts"] and "radar" in res[True]["parts"]
+        res[ref == "0"] = json.loads(out)
+    assert not res[False]["radar_native"] and res[True]["radar_native"]
     for name, a in res[False]["runs"].items():
         b = res[True]["runs"][name]
         assert len(a) == len(b) and len(a) > 150, name
