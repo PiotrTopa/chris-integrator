@@ -1,6 +1,7 @@
 """Writes tests/data/native_golden.json.gz: what the pure-Python references gave for the cases of
 tests/native_cases.py. Ran once, with CHRIS_NATIVE=0, on the tree that still held the references (lane
-cost-rest, before they were removed); kept as the record of how the file was made.
+cost-rest, commit 43fc680 with this script and tests/native_cases.py as they are now); kept as the record of how
+the file was made. It does not run on a later tree: the references are gone.
 
     CHRIS_NATIVE=0 python3 tests/data/make_native_golden.py
 """
@@ -90,13 +91,13 @@ print("lane_messages", len(msgs))
 
 # the filter: exact parts as digests, sums of products as values
 pc = list(K.cases_predict())
-vals, outs = [], []
-for naux, x, P, dt in pc:
+vals, state = [], []
+for naux, x, P, dt in pc:                              # (sin, cos, exp of the C library: to the last bit or so)
     m = K.ego_model(None, naux)
     xr, Pr, (Fr, rr) = m._predict_py(x.copy(), P.copy(), dt)
-    outs.append(K.digest((xr, Fr, rr)))
+    state.append([xr.tolist(), Fr.tolist(), None if rr is None else rr.tolist()])
     vals.append(Pr.tolist())
-gold["predict"] = {"inputs": K.digest(pc), "out": outs, "values": vals}
+gold["predict"] = {"inputs": K.digest(pc), "state": state, "values": vals}
 print("predict", len(pc))
 
 rc = list(K.cases_rows())

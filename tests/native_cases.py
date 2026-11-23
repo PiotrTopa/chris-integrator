@@ -11,7 +11,6 @@ digest of the inputs, so a generator that changed is a test failure, not a silen
 """
 import hashlib
 import json
-import math
 import os
 import random
 import struct
@@ -79,14 +78,28 @@ def load_golden():
         return json.load(f)
 
 
-def _gauss_array(rng, shape, scale=1.0):
+# The inputs are made with additions and multiplications of random() only: no libm function (random.gauss uses
+# log and cos, whose last bit differs between C libraries) and no BLAS product (whose order of addition differs
+# between machines), so every machine makes the same inputs.
+def normal(rng, scale=1.0):
+    """About N(0, scale^2): the sum of twelve uniforms, less six."""
+    return scale * (sum(rng.random() for _ in range(12)) - 6.0)
+
+
+def _normal_array(rng, shape, scale=1.0):
     n = int(np.prod(shape))
-    return np.array([rng.gauss(0.0, scale) for _ in range(n)]).reshape(shape)
+    return np.array([normal(rng, scale) for _ in range(n)]).reshape(shape)
 
 
 def _cov(rng, n):
-    a = _gauss_array(rng, (n, n))
-    return a @ a.T + np.diag([rng.uniform(0.01, 1.0) for _ in range(n)])
+    """A symmetric positive definite matrix (diagonally dominant), with correlations of all signs."""
+    a = np.zeros((n, n))
+    for i in range(n):
+        for j in range(i):
+            a[i, j] = a[j, i] = rng.uniform(-1.0, 1.0) * rng.random()
+    for i in range(n):
+        a[i, i] = float(np.sum(np.abs(a[i]))) + rng.uniform(0.01, 1.0)
+    return a
 
 
 # ---- view: interpolation, a drawn line's points and smoothing ----------------------------------------------
@@ -151,7 +164,7 @@ def cases_view_blend():
 
         def row(cut=True):
             return [rng.uniform(-6, 6) for _ in range(nx - (rng.choice([0, 0, 1]) if cut else 0))]
-        ks = rng.choice([[1.0 - math.exp(-0.05 / (0.2 + 0.01 * x)) for x in xs], [rng.random()] * nx, [1.0] * nx])
+        ks = rng.choice([[0.05 / (0.25 + 0.01 * x) for x in xs], [rng.random()] * nx, [1.0] * nx])
         yield row(), row(), row(), row(False), ks, rng.choice([0.0, -0.05, 0.05, rng.uniform(0.001, 0.2)]), rng.random() < 0.2
     yield [1, 2], [1, 2], [0.0, 0.0], [2, 3], [0.5, 0.5], 0.05, False
 
@@ -259,7 +272,7 @@ def road_lines(rng, n=33, odd=0.0):
     x = [0.0] + [round(0.1875 * (i ** 2) * 192.0 / 1024.0, 4) for i in range(1, n)]
 
     def line(edge):
-        d = {"x": list(x), "y": [rng.gauss(0, 2) for _ in range(n)], "y_std": [abs(rng.gauss(0.2, 0.2)) for _ in range(n)]}
+        d = {"x": list(x), "y": [normal(rng, 2.0) for _ in range(n)], "y_std": [abs(0.2 + normal(rng, 0.2)) for _ in range(n)]}
         if not edge:
             d["prob"] = rng.choice([rng.random(), 0, 1, True, None, 1.5, -0.2, float("nan")])
         if rng.random() < odd:
@@ -303,9 +316,9 @@ def cases_lanes_arrays():
     for i in range(600):
         n = rng.choice([33, 33, 17, 5])
         x = np.array(sorted(rng.uniform(0, 190) for _ in range(n)))
-        zy, zs = _gauss_array(rng, (6, n), 2.0), np.abs(_gauss_array(rng, (6, n), 0.3)) + 1e-3
+        zy, zs = _normal_array(rng, (6, n), 2.0), np.abs(_normal_array(rng, (6, n), 0.3)) + 1e-3
         prob = np.array([rng.random() for _ in range(6)])
-        y, p = _gauss_array(rng, (6, n), 2.0), np.abs(_gauss_array(rng, (6, n))) + 1e-3
+        y, p = _normal_array(rng, (6, n), 2.0), np.abs(_normal_array(rng, (6, n))) + 1e-3
         c = {}
         if i % 5 == 0:
             c["gate_x"] = (500.0, 600.0)
@@ -327,9 +340,9 @@ def lane_frames():
             base = road_lines(rng, odd=0.3)
         road = {"type": "road", "seq": i, "ts_mono_ns": ts, "pose": {"vy": rng.uniform(-0.2, 0.2)}}
         for key in ("lane_lines", "road_edges"):
-            road[key] = [dict(d, y=[v + rng.gauss(0, 0.05 if rng.random() < 0.9 else 2.0) if isinstance(v, float) else v
+            road[key] = [dict(d, y=[v + normal(rng, 0.05 if rng.random() < 0.9 else 2.0) if isinstance(v, float) else v
                                     for v in d["y"]],
-                              **({"prob": min(1.0, max(0.0, rng.gauss(0.6, 0.3)))} if "prob" in d else {}))
+                              **({"prob": min(1.0, max(0.0, 0.6 + normal(rng, 0.3)))} if "prob" in d else {}))
                          for d in base[key]]
         es = {"speed": {"value": rng.uniform(0, 30), "valid": True, "sources": ["vehicle.speed"]},
               "yaw_rate": {"value": rng.uniform(-0.1, 0.1), "valid": True}, "sources": {"vision": {"state": "ok"}}}
@@ -353,7 +366,7 @@ def ego_model(rng, naux):
 
 
 def ego_state(rng, m):
-    x = _gauss_array(rng, (m.n,))
+    x = _normal_array(rng, (m.n,))
     x[3] = rng.uniform(-5, 40)
     x[9] = rng.uniform(-0.05, 0.05)
     return x, _cov(rng, m.n)
@@ -380,16 +393,16 @@ def cases_rows():
     n = 27
     for i in range(2000):
         P = _cov(rng, n)
-        x = _gauss_array(rng, (n,))
+        x = _normal_array(rng, (n,))
         if i < 1500:
             idx = np.array([rng.randrange(n)], dtype=np.intp)
             coef = np.array([rng.choice([1.0, -1.0, rng.uniform(-3, 3)])])
         else:
             m = rng.randrange(2, 7)
             idx = np.array(rng.sample(range(n), m), dtype=np.intp)
-            coef = _gauss_array(rng, (m,))
+            coef = _normal_array(rng, (m,))
         freeze = None if i % 3 else np.array(sorted(set(rng.randrange(n) for _ in range(6))), dtype=np.intp)
-        yield P, x, idx, coef, rng.gauss(0, 1), rng.uniform(1e-4, 1.0), freeze
+        yield P, x, idx, coef, normal(rng), rng.uniform(1e-4, 1.0), freeze
 
 
 def cases_rts():
@@ -398,4 +411,4 @@ def cases_rts():
     for i in range(40):
         m = ego_model(rng, 17)
         x, P = ego_state(rng, m)
-        yield x, P, rng.choice([0.01, 0.05, 0.1, 0.4]), _gauss_array(rng, (m.n,), 0.01), (2,) if i % 4 == 0 else ()
+        yield x, P, rng.choice([0.01, 0.05, 0.1, 0.4]), _normal_array(rng, (m.n,), 0.01), (2,) if i % 4 == 0 else ()
