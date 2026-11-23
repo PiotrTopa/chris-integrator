@@ -70,7 +70,7 @@ def selftest(n=20000, seed=1):
         a, b = np.asarray(a, float), np.asarray(b, float)
         return a.shape == b.shape and bool(np.all(np.abs(a - b) <= tol * np.maximum(np.abs(b), 1.0)))
     for row, dt, label, ref in RADAR_EVOLVE:
-        S = np.zeros((1, 406))                           # a row of the state array: the motion part recorded
+        S = np.zeros((1, _n.RADAR_ROW))                           # a row of the state array: the motion part recorded
         S[0, :len(row)] = row
         out = np.empty((1, 6))
         _n.radar_peek_pos(S, [0], [dt], [R._KIN4.get(label) or R._KIN4[None]], R._native_par(R.CFG), out)

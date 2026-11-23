@@ -704,3 +704,25 @@ Without mapd, without a pack or without a position `road` still carries the came
 `<config dir>/view.json` (keys of `view.DEFAULT_CFG`; the key `road` holds overrides of
 `roadview.DEFAULT_CFG`). Replay: roadsense [`tools/view_replay.py`](https://github.com/PiotrTopa/roadsense/blob/main/tools/view_replay.py)` SESSION [--map MAP.jsonl]` prints how often each part is
 given on a recorded drive.
+
+## `radar`: the objects' fields added by the estimation core (2026-11-23, native version 8)
+
+The `radar` message (`chris_integrator/radar/box.py` has the full list) is `api: 1` as before; fields were added,
+none renamed or removed. Per object:
+
+```jsonc
+"x_m": 31.2, "y_m": 0.3,          // as before: the object's NEAR FACE (the point of it nearest the car)
+"ctr": [33.4, 0.3],               // its centre (car frame)
+"len": 4.4, "wid": 1.8,           // m: the rectangle's length and width
+"hdg": 0.02,                      // rad, car frame, left positive: where its front points; held when it stands
+                                  //   (heading_rad stays the direction of travel, null below 1 m/s)
+"ext_std": [0.4, 0.1, 0.05],      // 1 sigma of len, wid (m), hdg (rad)
+"vis": 0.03,                      // 0..1: how much of it the sensor of its last scan could see
+"occ": "object",                  // null | "object" (hidden behind another object) | "edge" (cut by the edge of the
+                                  //   field) | "fov" (outside the field)
+"occ_by": 12,                     // the id of the object that hides it, or null
+```
+
+`state` keeps its four values; an object hidden behind another one is `coast` (inside a field, not reported for
+the moment), with `exist` not falling. `exist` is the probability over all hypotheses of the object's cluster
+(docs/RADAR.md, section 1).

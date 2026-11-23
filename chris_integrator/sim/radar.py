@@ -205,7 +205,7 @@ class RadarSim:
                     rr = (dx * -vsx + dy * -vsy) / r
                     dets.append((r + rng.gauss(0, sr), az + rng.gauss(0, sa), rr + rng.gauss(0, sv), -3))
                 rng.shuffle(dets)
-                msg = {"type": "objects", "sensor": self.sensor, "kind": "radar", "tracked": False,
+                msg = {"type": "objects", "sensor": self.sensor, "kind": "radar", "tracked": False, "extended": True,
                        "ts_mono_ns": int(round(t * NS)),
                        "objects": [{"range_m": round(r, 2), "azimuth_deg": round(math.degrees(az), 3),
                                     "range_rate_mps": round(rr, 3)} for r, az, rr, _ in dets]}

@@ -200,6 +200,7 @@ class MicrowaveRadar(Sensor):
     velocity = True
     p_d = 0.9
     coast_s = 1.0
+    extended = None              # (cell_m, cell_mps, margin) for a sensor that gives several returns per object
 
     def __init__(self, mount=(0.0, 0.0, 0.0), fov=math.radians(50.0), max_range=160.0, sigma=(0.25, math.radians(0.5), 0.15),
                  false_per_scan=2.0):
@@ -208,7 +209,8 @@ class MicrowaveRadar(Sensor):
         self.clutter = false_per_scan / (max_range * 2.0 * fov * 60.0)
 
     def native(self):
-        return (1.0, self.mx, self.my, self.yaw, self.fov, self.max_range, self.p_d, self.clutter) + (0.0,) * 22
+        return (1.0, self.mx, self.my, self.yaw, self.fov, self.max_range, self.p_d, self.clutter,
+                1.0 if self.extended else 0.0) + (0.0,) * 21
 
 
 class Position(Sensor):

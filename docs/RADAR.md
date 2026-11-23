@@ -105,7 +105,7 @@ that is gone).
 * `tests/test_radar.py::test_a_doubtful_pairing_is_decided_by_the_scans_that_follow`: one detection between two
   objects, read as A's at its scan, revised to B's four scans on; A is not dragged. With `hyp_n_scan=0` the
   first reading stands and A is.
-* `...::test_two_cars_swapping_sides_keep_their_ids_more_often_with_hypotheses_over_scans`: two cars swapping
+* `...::test_two_riders_swapping_sides_keep_their_ids_more_often_with_hypotheses_over_scans`: two riders swapping
   sides in a microwave radar with 0.8 m of azimuth noise, misses and clutter: of 200 identities, 182 kept with
   the defaults against 163 decided scan by scan (100 seeds).
 * The duplicate test: two cars side by side in a radar's view were merged into one object by the old rule (nearer
@@ -119,3 +119,108 @@ that is gone).
   bounded evidence above is what keeps existence honest without it.
 * Out-of-sequence scans beyond `oosm_max_s`: a late scan is applied to the leaves taken back to its time (a
   negative step), as before; an object too far ahead of the scan does not take part.
+
+## 2. The state: an object's centre, and what each sensor sees of it
+
+The state of every motion hypothesis is `[px, py, vx, vy, ax, ay, dp, lh]` in the ground frame
+(`radar/models.py`); since native version 8 **the place is the object's centre**. Before, it was "where the box
+stands on the road", the point of the object nearest the camera: not a point of the object at all (it slides
+from the rear bumper to the side as a parked car is passed, two metres of apparent motion of a thing that
+stands), and not the point a radar's returns average to. Each sensor's model now says what it sees of a
+rectangle (section 4) at that centre:
+
+* a camera's box stands on the road at the **near face**: the ground angle, the box height, the top edge and the
+  scale rate are predicted for the range of the centre less half the object's depth along the line of sight
+  (`r_h`, `r_half_depth`); what is not known of that depth (the extent's own covariance) is added to those rows'
+  variances (`r_reff`). The bearing is the centre's.
+* a microwave radar's returns lie on the sides that face it; their mean is nearer than the centre by what the
+  rectangle says (`r_scatter`, `r_cell_centre`), also for a single return.
+* a position sensor gives the centre.
+
+The message keeps `x_m`, `y_m` (and `predict`) as the near face, as they were (what is in the way is the face,
+not the centre: `on_path`, `in_path`, `ttc_s` use it); the centre goes out as `ctr`.
+
+**A floored hypothesis is re-seeded.** The motion hypotheses are weighed by how well each predicted a detection
+and none is ever ruled out (`mu_floor`). A hypothesis held at the floor used to keep its own old story: "it
+stands" of a car that has driven on for four seconds stood fifty metres back, and its share of the combination
+pulled the object's place and blew up its covariance (found on the hidden-car test). What the floor keeps open is
+that the object does so *from where it is now*: the share the floor adds is given the other hypotheses' state (for
+"it stands": their place, no speed) (`r_update_full`).
+
+## 3. What a sensor can see: occlusion, the edge of the field
+
+An object that is not reported loses existence by `ln(1 - pd)` per scan. `pd` is no longer a constant inside
+the field: it is the sensor's own probability (range, box size, a box cut at the bottom) times **how much of
+the object the sensor can see** (`r_visible`, record `M_VIS`):
+
+* **Behind another object.** The settled objects' primaries are occluders: an interval of bearings (the
+  rectangle's silhouette from the sensor), a range, and for a camera the rows of the picture its box covers (from
+  its height state). A leaf's own silhouette is sampled at five bearings; a sample is hidden as far as a nearer
+  occluder's interval holds it (softly: neither bearing is known exactly, but the softness is capped at a third
+  of the occluder's half width, because how far a hidden thing may have strayed while nobody saw it does not open
+  the view) and, for a camera, as far as the occluder's box reaches up the leaf's box. The chance of a report
+  falls linearly from `occl_from` (a quarter hidden) to its lowest, `occl_floor`, at `occl_full` (0.65 hidden;
+  the detector drops a box covered by 0.6). A microwave radar sees under and past vehicles: its floor is
+  `occl_floor_radar` 0.3.
+* **Cut by the edge of the field.** The part of the silhouette inside the field: all of it, no effect; under 0.4,
+  the floor (the detector rejects a box with less than half its width in the picture).
+* **Outside the field**: `pd = 0`, as before.
+
+What follows from it, with no further rule: a hidden object's existence does not fall; it is carried on by its
+motion hypotheses, its covariance grows, and its gate grows with it, so the detection that comes when it
+reappears is its own and it keeps its id. The upkeep counts the time an object was hidden as time in which
+nothing could be seen (state `coast`), and drops a hidden object only when its place is no longer worth knowing
+(`hidden_s` 12 s, `hidden_std_m` 30 m). The message says `vis` (0..1), `occ` (`"object"`, `"edge"`, `"fov"` or
+null) and `occ_by` (the occluder's id).
+
+`occlusion: false` (tracker configuration) switches the model off. Shown by `tests/test_radar.py::Seeing`: a car
+hidden behind a van for four seconds is one object throughout, with growing range uncertainty, confirmed again
+half a second after it reappears; without the model it is dropped while hidden and comes back as a new object.
+
+Not modelled: occluders that are not tracked objects (buildings, the road's crest), and the conditioning of a
+hidden object's place on the fact that it is hidden (its place density is not cut to the shadow).
+
+## 4. Extent and orientation
+
+Every leaf carries `e = [length, width, heading]` with a 3 x 3 covariance (`RO_E`, `RO_PE`), a Gaussian of its own
+beside the motion state (the two are taken as independent, as the random-matrix trackers factorise them). The
+shape is a **rectangle**: vehicles are rectangles, a camera box and a radar's returns both see a rectangle's
+sides, and a rectangle's parameters are what the consumers need (`len`, `wid`, `hdg`). A random-matrix ellipse
+was the alternative; it has a cheaper update, but no notion of "the side that faces the sensor", which is the
+whole of what both sensors measure.
+
+* **Birth** (`r_extent_birth`): the kind's size (a car 4.5 x 1.8 m, 22 % and 10 %; a person 0.6 m; not known:
+  as a car, wide open); the heading along the car's own for a vehicle, across it when the box shows it side-on,
+  as sure as the box's aspect says which; no direction for a person.
+* **Heading and motion** (`r_extent_step`): a leaf that moves (speed over 2.5 m/s, "it stands" under one half)
+  takes its direction of travel as a measurement of its heading, as good as the velocity's direction is known;
+  the first time, that also says which end is the front. A leaf that stands gets no such measurement and next to
+  no process noise: its heading is held.
+* **A camera box** (`r_extent_update`): a box with both sides in the picture measures the silhouette
+  `(L |sin a| + W |cos a|) / range` (a: heading against the line of sight), with the range's own uncertainty in
+  its variance.
+* **A microwave radar's returns** (the extended-object model): the returns of one scan are grouped into cells
+  (`radar_cells`: first the returns on a known object's rectangle, widened by a margin and by what is not known
+  of its place, with a fitting range rate; the rest by single linkage in place and range rate). A cell is one
+  detection: the mean, the number of returns, the scatter of their places. The model of a rectangle's returns
+  (`r_scatter`): they lie on the two sides that face the sensor, each side in proportion to its length (less at
+  a grazing angle, never nothing), three in ten at the corner between them. From it follow the mean's offset from
+  the centre (the motion update takes the cell as the centre: section 2) and the expected scatter matrix, whose
+  three entries are the measurement of (L, W, heading), with the sampling variance of a covariance of n points.
+  Held against the simulator's returns: scatter and offset agree to a few centimetres except exactly end-on.
+* **One object, not one per side.** Two objects whose places are both known and of which one's centre lies in the
+  other's rectangle are one (`radar_merge`); so are two that an extended sensor sees driving as one, end to end.
+
+The message: `len`, `wid` (m), `hdg` (rad, car frame, left positive: where the front points), `ext_std` [m, m, rad],
+`ctr` [x, y]. `heading_rad` stays what it was: the direction of travel, null below 1 m/s.
+
+Measured on the simulator (seed 1, day; median errors): camera alone, length 0.14 to 0.50 m, width 0.01 to 0.17 m,
+heading 0.03 to 0.12 rad; with the extended radar the place along the line of sight to 0.09 to 0.17 m (camera
+alone: 1.4 to 5.5 m), length 1.0 to 4 m (a truck is born as a car and its length is seen only where its side is),
+id switches per run 2 to 24 where the tracker before this lane had 40 to 150.
+
+Not built: a yaw rate state (the heading follows the velocity's direction; the range rate of a return off the
+centre does not use the body's turn); alternative partitions of the returns kept as hypotheses (one partition per
+scan: the objects' rectangles, then distance); the returns of the far sides and of the underbody. With the
+simulator's clutter (three static returns per scan beside the road) 30 to 110 false tracks a minute are still
+confirmed with the extended radar (before: 125 to 460); the camera-only rate is unchanged.

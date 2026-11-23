@@ -72,6 +72,11 @@ CFG = dict(
     hyp_n_scan=5, hyp_k_best=32, hyp_max_leaves=12, hyp_prune_ln=math.log(1e4), hyp_max_cluster=16,
     hyp_keep_steps=40, hyp_keep_s=2.0,   # each story's history kept this far back (the smoother's reach)
     rows=1024,                   # of the state array at the start (it grows as needed)
+    # what a sensor can see: an object behind another one, or cut by the edge of the field, is not expected to be
+    # reported (docs/RADAR.md, section 3). occlusion False: every object in the field counts as in the open. The
+    # chance of a report falls from `occl_from` of the silhouette hidden to its lowest at `occl_full`
+    occlusion=True, occl_from=0.25, occl_full=0.65, occl_floor=0.03, occl_floor_radar=0.3,
+    hidden_s=12.0, hidden_std_m=30.0,   # hidden behind another object: kept this long, while its place is known this well
     oosm_max_s=0.35,             # a scan older than an object's time by more than this does not touch it
     history_s=6.0, history_n=120,
     check_horizons=(0.5, 1.0),   # the object writes down where it will be this far ahead
@@ -145,7 +150,7 @@ def marginals(ratio):
 # Pe), the step that led into the node (st) and the node's own record (m: `M_*`). The object's attributes are
 # views of its PRIMARY row: its leaf in the best hypothesis of its cluster, which the native scan names.
 _LAY = (("xs", (3, N)), ("Ps", (3, N, N)), ("mu", (3,)), ("xf", (N,)), ("Pf", (N, N)), ("x", (N,)), ("P", (N, N)),
-        ("e", (3,)), ("Pe", (3, 3)), ("st", (13,)), ("m", (18,)))
+        ("e", (3,)), ("Pe", (3, 3)), ("st", (13,)), ("m", (20,)))
 _OFF = []
 _o = 0
 for _k, _sh in _LAY:
@@ -157,9 +162,11 @@ OFF = {k[1:]: (a, b) for k, a, b, _ in _OFF}
 # the last sighting's time, the last time a detection said how far it is, its last box (angular width, time,
 # sensor number), the last update's normalised innovation and existence gain, the detection it took at its
 # scan (-1: none), the scan's number, how much of it the sensor could see, its probability of being reported,
-# the scan's sensor, what hides it (0: nothing), the sensor's coverage at its place, the id of what hides it
+# the scan's sensor, what hides it (0: nothing, 1: another object, 2: the edge of the field, 3: outside the
+# field), the sensor's coverage at its place, the id of what hides it, 1 once its motion has shown which end is
+# the front
 (M_T, M_L, M_HITS, M_THIT, M_RANGE_T, M_BOXW, M_BOXT, M_BOXS, M_NIS, M_DL, M_DET, M_LEVEL, M_VIS, M_PD, M_SRC, M_OCC,
- M_COV, M_OCCBY) = range(18)
+ M_COV, M_OCCBY, M_SENSE, M_HOLD) = range(20)
 
 
 class State:
@@ -204,7 +211,7 @@ class Obj:
     __slots__ = ("id", "h", "slot", "_xs", "_Ps", "_mu", "_xf", "_Pf", "_x", "_P", "_e", "_Pe", "_st", "_m", "t0", "state",
                  "sources", "last_seen", "vote", "history", "checks", "consistency", "pred_err", "n_checks", "nis",
                  "verdict", "coast_s", "velocity_seen", "merge_t", "flags", "last_cover", "dp0", "scores", "cls", "kin",
-                 "store", "pe", "pp", "nleaf", "in_map", "label_code")
+                 "store", "pe", "pp", "nleaf", "in_map", "label_code", "hidden_t")
     xs, Ps, mu, xf, Pf, x, P, e, Pe, st, m = (_view(k) for k, _ in _LAY)
     t = _meta(M_T)                   # the time its numbers are of
     logodds = _meta(M_L)             # that it exists, in the primary's story (`exist`: over all stories)
@@ -241,6 +248,7 @@ class Obj:
         self.nleaf = 1               # its hypotheses
         self.in_map = True           # it is in the best hypothesis of its cluster
         self.label_code = 0.0
+        self.hidden_t = -1e18        # the last time a scan could not see it for another object or the field's edge
 
     def bind(self, store, slot=None):
         """Point the object's arrays at its (primary) row of the state array."""
@@ -370,7 +378,8 @@ class Tracker:
         c = self.cfg
         st = self.stats.setdefault(src, {"scans": 0, "dets": 0, "assigned": 0, "started": 0, "late": 0})
         st["scans"] += 1
-        st["dets"] += len(dets)
+        if not getattr(sensor, "extended", None):
+            st["dets"] += len(dets)
         self.sensors[src] = (sensor, t)
         b = None
         if getattr(sensor, "has_bias", False):
@@ -389,6 +398,9 @@ class Tracker:
         if getattr(sensor, "extraneous", None) is not None:
             sensor.extraneous = max(sensor.extraneous, self.new_rate.get(src, 0.0))
         code = self.src_code.setdefault(src, len(self.src_code) + 1)
+        if getattr(sensor, "extended", None):
+            dets = self._cells(sensor, pose, t, objs, dets)
+            st["dets"] += len(dets)
         D, KB = self._det_rows(src, dets)
         # what the car's own movement over the interval is not sure about goes into where each object is
         noise, info = {}, []
@@ -407,7 +419,8 @@ class Tracker:
             rows = [(len(zz), zz[0], zz[1], zz[2] if len(zz) > 2 else 0.0, oid) for (_, _, zz, oid) in mem if oid in real] or None
         g, bw = c["gate"], c["map_bw"]
         acfg = (g.get(1, 16.0), g.get(2, 16.0), g.get(3, 16.0), g.get(4, 16.0), c["feat_sigma"], c["feat_same"],
-                c["feat_span"], bw[0], bw[1], bw[2], c["feat_max_s"], c["common_min"], c["common_pair"])
+                c["feat_span"], bw[0], bw[1], bw[2], c["feat_max_s"], c["common_min"], c["common_pair"],
+                1.0 if c["occlusion"] else 0.0, c["occl_from"], c["occl_full"], c["occl_floor"], c["occl_floor_radar"])
         bcfg = (c["new_exist"], c["p_any_side"], c["side_m"], c["with_rel"], c["with_std"], self.mcfg["p_ca0"],
                 c["mu_floor"], max(0, c["max_objects"] - len(self.objects)))
         args = ([o.h for o in objs], info, float(t), pose, sensor.native(), code, D, KB, rows,
@@ -432,6 +445,8 @@ class Tracker:
             o.pe, o.pp, o.nleaf, o.in_map = pe, pp, nleaf, bool(in_map)
             if cover > 0.0:
                 o.last_cover = t
+            if o._m[M_OCC] in (1.0, 2.0):                # hidden by an object or cut by the edge in this scan
+                o.hidden_t = t
             j = int(o._m[M_DET])
             if j >= 0:
                 o.last_cover = t
@@ -483,6 +498,17 @@ class Tracker:
         r0 = self.new_rate.get(src, 0.0)
         self.new_rate[src] = r0 + c["new_rate_gain"] * (len(births) - r0)
 
+    def _cells(self, sensor, pose, t, objs, returns):
+        """The returns of a sensor that gives several per object, as detections: one per cell (radar_cells), the
+        returns that lie on a known object being that object's cell."""
+        eps_m, eps_v, margin = sensor.extended
+        sr, sa, sv = sensor.sigma
+        known = [o for o in objs if o.state != "tentative" or o.hits >= 2]
+        cells = _NR.radar_cells(returns, eps_m, eps_v, self.store.a, [o.slot for o in known], [t - o.t for o in known],
+                                sensor.native(), pose, margin) if returns else ()
+        return [{"z": np.array([r, az, rr]), "R": np.array([sr * sr / n, sa * sa / n, sv * sv / n]), "attrs": {},
+                 "cell": (float(n), sxx, sxy, syy)} for r, az, rr, n, sxx, sxy, syy in cells]
+
     def _det_rows(self, src, dets):
         """The scan's detections as the native core reads them (chris_native.c `RDET`: kind, scale-rate baseline,
         group (kind and baseline: what is predicted alike), vehicle (1) / person (-1) / not known (0), box width, z,
@@ -501,7 +527,8 @@ class Tracker:
             rows.append([kind_code(k), float(d.get("sdt") or 0.0), kinds.setdefault((k, d.get("sdt")), len(kinds)),
                          0 if lab is None else (1 if lab in M.VEHICLES else -1), float(d.get("w") or 0.0)]
                         + z + list(pad[len(z):]) + R + list(pad[len(R):])
-                        + [self._score_odds(src, self._score(d)), float(at.get("aspect") or 0.0), 1.0, 0.0, 0.0, 0.0, 0.0])
+                        + [self._score_odds(src, self._score(d)), float(at.get("aspect") or 0.0)]
+                        + list(d.get("cell") or (1.0, 0.0, 0.0, 0.0)) + [1.0 if d.get("wok") else 0.0])
             kb.append(M.kinb(lab))
         return np.array(rows, float).reshape(len(dets), 20), np.array(kb, float).reshape(len(dets), 12)
 
@@ -583,8 +610,12 @@ class Tracker:
                 continue
             if scan - o.last_cover <= c["view_gap_s"]:
                 # a sensor is looking at where it should be: it lives by being seen
-                if T - last > max(o.coast_s, c["seen_max_s"]):
+                # (the time it was hidden behind another object does not count: nothing was to be seen)
+                hid = o.hidden_t > last
+                if T - max(last, o.hidden_t) > max(o.coast_s, c["seen_max_s"]):
                     continue
+                if hid and (T - last > c["hidden_s"] or (sd is not None and sd > c["hidden_std_m"])):
+                    continue                             # hidden for too long: where it is is no longer known
                 if o.state == "tentative":
                     if o.exist >= c["confirm_exist"] and o.hits >= c["confirm_hits"] and o.in_map:
                         o.state = "confirmed"
@@ -637,7 +668,8 @@ class Tracker:
         objs = self.objects
         kin = [o.kin for o in objs]
         return _NR.radar_life(self.store.a, [o.slot for o in objs], [k[3] for k in kin],
-                              [1.0 if o.state != "tentative" and scan - o.last_cover > c["view_gap_s"] else 0.0 for o in objs],
+                              [1.0 if o.state != "tentative" and (scan - o.last_cover > c["view_gap_s"] or o.hidden_t > max(o.last_seen.values()))
+                               else 0.0 for o in objs],
                               [T - o.t for o in objs], kin, M._native_par(self.mcfg), pose[:2] if pose else None,
                               self.mcfg["stand_drift"] ** 2)
 

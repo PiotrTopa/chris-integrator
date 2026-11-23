@@ -469,8 +469,8 @@ class Tracking(unittest.TestCase):
         self.assertEqual((first[:3], a, b), ((0, -1, 1), 0, -1))           # decided at once, for good
         self.assertLess(ya, 0.68)
 
-    def test_two_cars_swapping_sides_keep_their_ids_more_often_with_hypotheses_over_scans(self):
-        """Two cars 45 m ahead swap sides (2.4 m apart, passing through each other's bearing) in a microwave radar
+    def test_two_riders_swapping_sides_keep_their_ids_more_often_with_hypotheses_over_scans(self):
+        """Two riders 45 m ahead swap sides (2.4 m apart, passing through each other's bearing) in a microwave radar
         whose azimuth noise is 0.8 m there, with misses and clutter. Counted: how often each still has, two seconds
         after the swap, the id it had before it."""
         def run(seed, cfg):
@@ -486,7 +486,7 @@ class Tracking(unittest.TestCase):
                 tr = {"a": (45.0, yy), "b": (46.0, -yy)}
                 if i % 2 == 0:
                     dets = [{"range_m": math.hypot(x - 2.0, y) + rng.gauss(0, 0.25), "range_rate_mps": rng.gauss(0, 0.15),
-                             "azimuth_deg": math.degrees(math.atan2(y, x - 2.0)) + rng.gauss(0, 1.0)}
+                             "azimuth_deg": math.degrees(math.atan2(y, x - 2.0)) + rng.gauss(0, 1.0), "class": "bike", "prob": 0.9}
                             for x, y in tr.values() if rng.random() >= 0.15]
                     dets += [{"range_m": rng.uniform(38, 52), "azimuth_deg": rng.uniform(-6, 6), "range_rate_mps": rng.gauss(0, 3)}
                              for _ in range(rng.choice([0, 1, 1, 2]))]     # and clutter
@@ -535,6 +535,178 @@ class Tracking(unittest.TestCase):
                 rd.on_road_users({"type": "road_users", "sensor": "cam", "ts_mono_ns": int(t * NS), "objects": []})
             self.assertEqual(rd.frame(int(t * NS))["objects"], [])
         self.assertEqual(rd.health()["objects"], 0)                        # and it is forgotten
+
+
+F_PX, CX, CY, HC = 975.0, 640.0, 360.0, 1.22
+
+
+def cam_boxes(t, things, hide=()):
+    """A `road_users` message of a level camera at the car frame's origin: things {name: (x of the near face, y left,
+    width, height, class)} as boxes standing on the road."""
+    objs = []
+    for name, (x, y, w, h, cls) in things.items():
+        if name in hide:
+            continue
+        u, hw = CX - F_PX * y / x, 0.5 * F_PX * w / x
+        objs.append({"class": cls, "class_conf": 0.8, "bearing_deg": math.degrees(math.atan2(y, x)), "bearing_std_deg": 0.3,
+                     "range_m": x, "range_std_m": 0.05 * x, "box": [u - hw, CY + F_PX * (HC - h) / x, u + hw, CY + F_PX * HC / x]})
+    return {"type": "road_users", "sensor": "cam", "ts_mono_ns": int(t * NS), "objects": objs,
+            "coverage": {"bearing_min_deg": -33, "bearing_max_deg": 33, "ground_min_m": 8.0}}
+
+
+class Seeing(unittest.TestCase):
+    """What a sensor can see of an object (occlusion, the field's edge) and the object's extent."""
+
+    def hidden_car(self, cfg):
+        """A van 14 m ahead and a car 32 m ahead, both at the car's speed; from 3 s to 7 s the van drives in front
+        of the car (no box of the car in that time)."""
+        rd = Radar({"tracker": cfg})
+        out = []
+        for i in range(190):
+            t, s = 20 + i * 0.05, i * 0.05
+            rd.on_ego({"ts_mono_ns": int(t * NS), "speed_mps": 12.0, "yaw_rate_rps": 0.0})
+            yv = 3.0 if s < 1.5 else max(0.0, 3.0 - 2.0 * (s - 1.5)) if s < 3.0 else 0.0 if s < 7.0 else min(3.0, 2.0 * (s - 7.0))
+            things = {"van": (14.0, yv, 2.0, 2.4, "truck"), "car": (32.0, 0.2, 1.8, 1.5, "car"),
+                      "far": (75.0, -9.0, 1.8, 1.5, "car")}            # (the detector boxes things far smaller than the car)
+            if i % 4 == 0:
+                rd.on_road_users(cam_boxes(t, things, hide=("car",) if 3.0 <= s <= 7.0 else ()))
+            m = rd.frame(int(t * NS))
+            car = [o for o in m["objects"] if abs(o["x_m"] - 32.0) < 6 and abs(o["y_m"] - 0.2) < 2.0]
+            van = [o for o in m["objects"] if abs(o["x_m"] - 14.0) < 3]
+            out.append((s, car[0] if car else None, van[0]["id"] if van else None))
+        return out
+
+    def test_an_object_hidden_behind_another_is_kept_and_found_again_as_itself(self):
+        out = self.hidden_car({})
+        before = [c for s, c, v in out if 2.0 < s < 2.9]
+        hidden = [(s, c, v) for s, c, v in out if 3.6 < s < 6.9]
+        after = [c for s, c, v in out if s > 8.0]
+        self.assertTrue(all(c is not None for c in before) and all(c is not None for s, c, v in hidden) and all(c is not None for c in after))
+        cid = before[0]["id"]
+        self.assertEqual({c["id"] for s, c, v in hidden} | {c["id"] for c in after}, {cid})   # one object throughout
+        for s, c, v in hidden:
+            self.assertEqual((c["occ"], c["occ_by"]), ("object", v))        # hidden, and by what
+            self.assertLess(c["vis"], 0.1)
+            self.assertGreater(c["exist"], 0.95)                           # not being seen there says nothing
+            self.assertEqual(c["state"], "coast")
+        sd = [c["std"][0] for s, c, v in hidden]
+        self.assertGreater(sd[-1], 1.5 * sd[0])                            # where it is, is known less and less
+        self.assertTrue(all(c["state"] == "confirmed" and c["occ"] is None and c["vis"] > 0.9 for c in after[4:]))
+        self.assertLess(after[-1]["std"][0], sd[-1] / 1.5)
+
+    def test_without_the_visibility_model_the_hidden_object_is_lost(self):
+        out = self.hidden_car({"occlusion": False})
+        before = [c for s, c, v in out if 2.0 < s < 2.9]
+        after = [c for s, c, v in out if s > 8.5]
+        self.assertTrue(all(c is not None and c["occ"] is None for c in before))
+        self.assertTrue(any(c is None for s, c, v in out if 6.0 < s < 7.0))      # dropped while hidden: "not seen"
+        self.assertTrue(all(c is None or c["id"] != before[0]["id"] for c in after))
+
+    def test_an_object_cut_by_the_edge_of_the_field_is_not_held_against(self):
+        """A parked car passed by: as it leaves the picture its box is cut and then gone; its existence does not fall
+        while part of it is outside the field."""
+        rd = Radar()
+        seen = []
+        for i in range(160):
+            t, s = 20 + i * 0.05, i * 0.05
+            rd.on_ego({"ts_mono_ns": int(t * NS), "speed_mps": 8.0, "yaw_rate_rps": 0.0})
+            x = 40.0 - 8.0 * s                                             # its near face; 6 m to the right
+            edge = math.degrees(math.atan2(6.0 + 0.9, x)) if x > 0.5 else 90.0     # its far side's bearing
+            if i % 4 == 0:                                                 # (its box: as wide as it looks from there)
+                b = math.atan2(6.0, max(x, 0.5))
+                rd.on_road_users(cam_boxes(t, {"p": (max(x, 0.5), -6.0, 1.8 * math.cos(b) + 4.5 * math.sin(b), 1.5, "car")},
+                                           hide=("p",) if edge > 33.0 or x < 8.0 else ()))
+            m = rd.frame(int(t * NS))
+            seen.extend((s, o) for o in m["objects"])
+        cut = [(s, o) for s, o in seen if o["occ"] == "edge"]
+        self.assertTrue(cut)
+        self.assertTrue(all(o["exist"] > 0.9 and o["vis"] < 0.8 for s, o in cut))
+        self.assertEqual(len({o["id"] for s, o in seen}), 1)
+        self.assertEqual(seen[-1][1]["state"], "memory")                   # passed: remembered where it stands
+        self.assertEqual(seen[-1][1]["occ"], "fov")
+
+    def rectangle(self, heading_deg, speed, T=6.0, start=(22.0, -6.0), seed=4):
+        """A car 4.6 x 1.9 m in an extended microwave radar's view (several returns per scan on the sides that face
+        the sensor), driving at `speed` along `heading_deg` (ground). Returns the last messages' object and truth."""
+        from chris_integrator.sim.radar import RadarSim
+        sim = RadarSim(extended=True)
+        rng = random.Random(seed)
+        rd = Radar()
+        h = math.radians(heading_deg)
+        out = None
+        for i in range(int(T / 0.05) + 1):
+            t, s = 30 + i * 0.05, i * 0.05
+            rd.on_ego({"ts_mono_ns": int(t * NS), "speed_mps": 0.0, "yaw_rate_rps": 0.0, "standstill": True})
+            x, y = start[0] + speed * s * math.cos(h), start[1] + speed * s * math.sin(h)
+            pts = sim._returns({"x": x, "y": y, "heading": h, "L": 4.6, "W": 1.9, "kind": "car"}, rng, 2.0, 0.0)
+            dets = []
+            for px, py in pts:
+                dx, dy = px - 2.0, py
+                r = math.hypot(dx, dy)
+                rr = speed * (math.cos(h) * dx + math.sin(h) * dy) / r
+                dets.append({"range_m": r + rng.gauss(0, 0.15), "azimuth_deg": math.degrees(math.atan2(dy, dx) + rng.gauss(0, 0.004)),
+                             "range_rate_mps": rr + rng.gauss(0, 0.1)})
+            rd.on_objects({"type": "objects", "kind": "radar", "sensor": "front", "extended": True, "ts_mono_ns": int(t * NS),
+                           "mount": {"x_m": 2.0, "y_m": 0.0, "yaw_deg": 0.0}, "objects": dets})
+            m = rd.frame(int(t * NS))
+            if s > T - 1.0:
+                out = (m, x, y)
+        return out
+
+    def test_an_extended_radars_returns_give_one_object_with_its_size_heading_and_centre(self):
+        for heading, speed, start in ((90.0, 4.0, (22.0, -9.0)), (0.0, 6.0, (12.0, 3.0)), (35.0, 5.0, (14.0, -8.0))):
+            m, x, y = self.rectangle(heading, speed, start=start)
+            objs = [o for o in m["objects"] if o["state"] == "confirmed"]
+            self.assertEqual(len(objs), 1, (heading, [(o["id"], o["x_m"], o["y_m"]) for o in objs]))   # not one per side
+            o = objs[0]
+            self.assertLess(math.hypot(o["ctr"][0] - x, o["ctr"][1] - y), 1.0, heading)      # the centre, not the near side
+            self.assertLess(abs(o["len"] - 4.6), 2.0 if heading == 0.0 else 1.2, (heading, o["len"]))   # (from behind: hardly seen)
+            self.assertLess(abs(o["wid"] - 1.9), 0.9, (heading, o["wid"]))                   # (side-on the width hardly shows)
+            dh = (o["hdg"] - math.radians(heading) + math.pi) % (2 * math.pi) - math.pi
+            self.assertLess(abs(dh), 0.2, heading)                                           # the way it drives
+            self.assertLess(o["ext_std"][2], 0.2)
+            self.assertLess(math.hypot(o["x_m"] - x, o["y_m"] - y), 3.0)                     # the near face is on it
+
+    def test_the_heading_follows_the_motion_and_is_held_when_the_object_stops(self):
+        rd = Radar()
+        hdg = []
+        for i in range(240):
+            t, s = 20 + i * 0.05, i * 0.05
+            rd.on_ego({"ts_mono_ns": int(t * NS), "speed_mps": 0.0, "yaw_rate_rps": 0.0, "standstill": True})
+            v = 6.0 if s < 5.0 else max(0.0, 6.0 - 3.0 * (s - 5.0))       # crossing from the right, then it stops
+            y = -14.0 + (6.0 * min(s, 5.0) + (6.0 * (min(s, 7.0) - 5.0) - 1.5 * (min(s, 7.0) - 5.0) ** 2 if s > 5.0 else 0.0))
+            if i % 2 == 0:
+                az = math.atan2(y, 28.0)
+                rd.on_objects({"type": "objects", "kind": "radar", "sensor": "front", "ts_mono_ns": int(t * NS),
+                               "mount": {"x_m": 2.0, "y_m": 0.0, "yaw_deg": 0.0},
+                               "objects": [{"range_m": math.hypot(28.0, y), "azimuth_deg": math.degrees(az),
+                                            "range_rate_mps": v * math.sin(az), "class": "car", "prob": 0.9}]})
+            m = rd.frame(int(t * NS))
+            hdg.extend((s, o["hdg"], o["heading_rad"], o["motion"], o["ext_std"][2]) for o in m["objects"])
+        moving = [h for h in hdg if 3.0 < h[0] < 5.0]
+        self.assertTrue(moving and all(abs(h[1] - math.pi / 2) < 0.15 for h in moving))      # across, to the left
+        stopped = [h for h in hdg if h[0] > 10.0]
+        self.assertTrue(stopped and all(h[2] is None for h in stopped[-20:]))               # no direction of travel now
+        self.assertTrue(all(abs(h[1] - math.pi / 2) < 0.25 for h in stopped))               # ... but it still points there
+        self.assertLess(stopped[-1][4], 0.3)
+
+    def test_a_camera_box_seen_side_on_is_a_long_object_and_its_place_is_its_centre(self):
+        rd = Radar()
+        last = None
+        for i in range(120):
+            t = 20 + i * 0.05
+            rd.on_ego({"ts_mono_ns": int(t * NS), "speed_mps": 0.0, "yaw_rate_rps": 0.0, "standstill": True})
+            if i % 4 == 0:      # a car standing across the road 20 m ahead (4.5 m of it across the picture), one end-on beside it
+                rd.on_road_users(cam_boxes(t, {"side": (20.0, 0.0, 4.5, 1.5, "car"), "end": (20.0, 6.0, 1.8, 1.5, "car")}))
+            last = rd.frame(int(t * NS))
+        side, end = nearest(last, 20.0, 0.0, 4.0), nearest(last, 20.0, 6.0, 4.0)
+        self.assertLess(abs(abs(side["hdg"]) - math.pi / 2), 0.5)          # it points across
+        self.assertLess(abs(end["hdg"]), 0.5)                              # that one along
+        self.assertAlmostEqual(side["ctr"][0] - side["x_m"], 0.5 * side["wid"], delta=0.35)   # half its depth behind its face
+        self.assertAlmostEqual(end["ctr"][0] - end["x_m"], 0.5 * end["len"], delta=0.35)
+        self.assertGreater(side["len"], 3.5)
+        self.assertLess(side["wid"], 2.4)
+        self.assertLess(abs(end["wid"] - 1.8), 0.4)                        # its width is what the box shows
 
 
 if __name__ == "__main__":

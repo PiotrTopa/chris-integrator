@@ -4858,7 +4858,12 @@ static int out_get(PyObject *o, View *v, Py_ssize_t n, int optional, double **ou
 
 /* an object's row in the tracker's state array (tracker.py `_LAY`) */
 enum { RO_XS = 0, RO_PS = 24, RO_MU = 216, RO_XF = 219, RO_PF = 227, RO_X = 291, RO_P = 299, RO_E = 363, RO_PE = 366,
-       RO_ST = 375, RO_M = 388, RROW = 406 };
+       RO_ST = 375, RO_M = 388, RROW = 408 };
+
+/* a node's record (RO_M ...) and the step that led into it (RO_ST ...): see "the radar's hypotheses" */
+enum { M_T, M_L, M_HITS, M_THIT, M_RANGE_T, M_BOXW, M_BOXT, M_BOXS, M_NIS, M_DL, M_DET, M_LEVEL, M_VIS, M_PD, M_SRC,
+       M_OCC, M_COV, M_OCCBY, M_SENSE, M_HOLD, RMETA };
+enum { ST_T = 0, ST_DT = 9, ST_E = 10 };
 
 /* the state array (capacity, RROW), writable */
 static int store_get(PyObject *o, View *v, Py_ssize_t *cap)
@@ -4930,7 +4935,7 @@ typedef struct {
         born, born_s;
     double bias_var, dp_var, jit2, bias_floor2, top_rel, top_range;
     /* microwave */
-    double mx, my, yaw, fov, clutter;
+    double mx, my, yaw, fov, clutter, extended;
 } RSens;
 
 /* sensors.py `Sensor.native()`: RSENS numbers */
@@ -4951,6 +4956,7 @@ static int sens_get(PyObject *o, RSens *s)
         s->bias_var = v[24]; s->dp_var = v[25]; s->jit2 = v[26]; s->bias_floor2 = v[27]; s->top_rel = v[28]; s->top_range = v[29];
     } else if (s->type == SEN_MICROWAVE) {
         s->mx = v[1]; s->my = v[2]; s->yaw = v[3]; s->fov = v[4]; s->max_range = v[5]; s->p_d = v[6]; s->clutter = v[7];
+        s->extended = v[8];
     } else if (s->type == SEN_POSITION) {
         s->fov = v[1]; s->max_range = v[2]; s->p_d = v[3]; s->clutter = v[4];
     } else {
@@ -5020,11 +5026,11 @@ static int r_angle_row(const RSens *s, int kind)
 }
 
 /* CameraBoxes._scale_row */
-static double r_scale_row(const double *x, const double *pose, double sdt, double *row)
+static double r_scale_row(const double *x, const double *pose, double sdt, double *row, double near)
 {
     double dx = x[R_PX] - pose[0], dy = x[R_PY] - pose[1];
     double c = cos(pose[2]), s = sin(pose[2]);
-    double depth = pymax(c * dx + s * dy, 0.5);
+    double depth = pymax((c * dx + s * dy) * near, 0.5);
     double w = pose[5];
     double rate = (c * (x[R_VX] - pose[3]) + s * (x[R_VY] - pose[4])) + w * (-s * dx + c * dy);
     double dt = pymax(sdt, 1e-3);
@@ -5038,8 +5044,22 @@ static double r_scale_row(const double *x, const double *pose, double sdt, doubl
     return log(u) / dt;
 }
 
-/* sensor.h(x, pose, det): the predicted measurement z (m) and its Jacobian H (m x N); returns m */
-static int r_h(const RSens *s, int kind, double sdt, const double *x, const double *pose, double *z, double *H)
+/* half the depth of a rectangle (e: length, width, heading) along the line of sight `los` (a ground angle): how
+ * far its near face is in front of its centre; *dda: the derivative by the heading */
+static double r_half_depth(const double *e, double los, double *dda)
+{
+    double a = e[2] - los, sa = sin(a), ca = cos(a);
+    if (dda)
+        *dda = 0.5 * (-e[0] * (ca >= 0.0 ? sa : -sa) + e[1] * (sa >= 0.0 ? ca : -ca));
+    return 0.5 * (e[0] * fabs(ca) + e[1] * fabs(sa));
+}
+
+/* sensor.h(x, pose, det): the predicted measurement z (m) and its Jacobian H (m x N); returns m. The state's place
+ * is the object's CENTRE. A camera's box stands on the road at the object's near face and its height is that
+ * face's: with the object's extent e (length, width, heading; NULL: a point) the ground angle, the box height, the
+ * top edge and the scale rate are those of the near face, half the object's depth nearer than its centre. */
+static int r_h(const RSens *s, int kind, double sdt, const double *x, const double *pose, double *z, double *H,
+               const double *e)
 {
     memset(H, 0, 4 * RN * sizeof(double));
     if (s->type == SEN_POSITION) {                      /* a place in the car frame */
@@ -5075,12 +5095,18 @@ static int r_h(const RSens *s, int kind, double sdt, const double *x, const doub
         return 3;
     }
     int base = kind & 7, m = 0;
+    double near = 1.0;                                  /* the near face's range over the centre's */
     if (base != K_NONE) {
         double dx = x[R_PX] - pose[0], dy = x[R_PY] - pose[1];
         double r = pymax(py_hypot(dx, dy), 0.5);
+        double rc = r;                                  /* the centre's range; r: the near face's */
+        if (e) {
+            r = pymax(rc - r_half_depth(e, atan2(dy, dx), NULL), 0.5);
+            near = r / rc;
+        }
         double brow[RN] = {0};
-        brow[R_PX] = -dy / (r * r);
-        brow[R_PY] = dx / (r * r);
+        brow[R_PX] = -dy / (rc * rc);
+        brow[R_PY] = dx / (rc * rc);
         double b = wrap_pi(atan2(dy, dx) - pose[2]);
         double hc = s->hc;
         if (base == K_B) {
@@ -5093,15 +5119,15 @@ static int r_h(const RSens *s, int kind, double sdt, const double *x, const doub
             double q = r * r + dh * dh;
             z[0] = b;
             memcpy(H, brow, sizeof(brow));
-            H[RN + R_PX] = -dh / q * dx / r;
-            H[RN + R_PY] = -dh / q * dy / r;
+            H[RN + R_PX] = -dh / q * dx / rc;
+            H[RN + R_PY] = -dh / q * dy / rc;
             H[RN + R_LH] = -ho * r / q;
             z[1] = atan2(dh, r) + s->bias;
             m = 2;
         } else {
             double g = -hc / (r * r + hc * hc);
-            H[R_PX] = g * dx / r;
-            H[R_PY] = g * dy / r;
+            H[R_PX] = g * dx / rc;
+            H[R_PY] = g * dy / rc;
             H[R_DP] = 1.0;
             z[0] = atan2(hc, r) + s->bias + x[R_DP];
             z[1] = b;
@@ -5109,7 +5135,7 @@ static int r_h(const RSens *s, int kind, double sdt, const double *x, const doub
             m = 2;
             if (base != K_RB) {
                 double c = cos(pose[2]), sn = sin(pose[2]);
-                double depth = pymax(c * dx + sn * dy, 0.5);
+                double depth = pymax((c * dx + sn * dy) * near, 0.5);
                 H[2 * RN + R_PX] = -c / depth;
                 H[2 * RN + R_PY] = -sn / depth;
                 H[2 * RN + R_LH] = 1.0;
@@ -5119,7 +5145,11 @@ static int r_h(const RSens *s, int kind, double sdt, const double *x, const doub
         }
     }
     if (kind & K_SCALE) {
-        z[m] = r_scale_row(x, pose, sdt, H + m * RN);
+        if (e && base == K_NONE) {
+            double dx = x[R_PX] - pose[0], dy = x[R_PY] - pose[1], rc = pymax(py_hypot(dx, dy), 0.5);
+            near = pymax(rc - r_half_depth(e, atan2(dy, dx), NULL), 0.5) / rc;
+        }
+        z[m] = r_scale_row(x, pose, sdt, H + m * RN, s->type == SEN_CAMERA ? near : 1.0);
         m++;
     }
     return m;
@@ -5739,10 +5769,10 @@ static void r_take(double *x, double *P, const double *K, const double *H, const
 
 /* nu = z - h(x) wrapped, S = H P H^T + diag(R); returns m */
 static int r_innov(const RSens *s, int kind, double sdt, const double *x, const double *P, const double *pose,
-                   const double *z, const double *R, double *nu, double *H, double *S)
+                   const double *z, const double *R, double *nu, double *H, double *S, const double *e)
 {
     double zp[4], HP[4 * RN];
-    int m = r_h(s, kind, sdt, x, pose, zp, H);
+    int m = r_h(s, kind, sdt, x, pose, zp, H, e);
     int ar = r_angle_row(s, kind);
     for (int r = 0; r < m; r++)
         nu[r] = r == ar ? wrap_pi(z[r] - zp[r]) : z[r] - zp[r];
@@ -6173,7 +6203,7 @@ static PyObject *n_radar_h(PyObject *self, PyObject *args)
     if (sens_get(osen, &sen) < 0 || rnums_get(ox, RN, x, "x") < 0 || rnums_get(opose, 6, pose, "pose") < 0 ||
         out_get(oz, &vz, 4, 0, &z, "z_out") < 0 || out_get(oH, &vH, 4 * RN, 0, &H, "H_out") < 0)
         goto done;
-    res = PyLong_FromLong(r_h(&sen, kind, sdt, x, pose, z, H));
+    res = PyLong_FromLong(r_h(&sen, kind, sdt, x, pose, z, H, NULL));
 done:
     view_drop(&vz);
     view_drop(&vH);
@@ -6321,14 +6351,16 @@ enum { RK_TS, RK_XM, RK_YM, RK_STDM, RK_STAND, RK_CV, RK_CA, RK_ID, RK_STATE, RK
        RK_SEEN, RK_VX, RK_VY, RK_AX, RK_AY, RK_SPEED, RK_HEADING, RK_VREL, RK_STD, RK_MOTION, RK_PST, RK_MODELS,
        RK_CLASS, RK_FLAGS, RK_POFF, RK_TTC, RK_PTHR, RK_CONS, RK_PERR, RK_ANG, RK_PRED, RK_PPATH, RK_LABEL, RK_CONF,
        RK_SOURCE, RK_VOTES, RK_ON_PATH, RK_IN_PATH, RK_THREAT, RK_PARKED, RK_WITH, RK_STATIONARY, RK_HUMAN, RK_BIKE,
-       RK_MOTORBIKE, RK_N };
+       RK_MOTORBIKE, RK_LEN, RK_WID, RK_HDG, RK_EXTSTD, RK_VIS, RK_OCC, RK_OCCBY, RK_OBJECT, RK_EDGE, RK_FOV, RK_VS,
+       RK_VSSTD, RK_VSAGE, RK_GRP, RK_GRPKIND, RK_HYP, RK_CTR, RK_N };
 static PyObject *rkey[RK_N + 1];
 static const char *const RKEYS[RK_N + 1] = {
     "t_s", "x_m", "y_m", "std_m", "stand", "cv", "ca", "id", "state", "exist", "age_s", "hits", "sources", "seen",
     "vx_mps", "vy_mps", "ax_mps2", "ay_mps2", "speed_mps", "heading_rad", "v_rel_mps", "std", "motion",
     "p_stationary", "models", "class", "flags", "path_offset_m", "ttc_s", "p_threat", "consistency", "pred_err_m",
     "angle_offset_deg", "predict", "predict_path", "label", "confidence", "source", "votes", "on_path", "in_path",
-    "threat", "parked", "with_traffic", "stationary", "human", "bike", "motorbike", NULL};
+    "threat", "parked", "with_traffic", "stationary", "human", "bike", "motorbike", "len", "wid", "hdg", "ext_std",
+    "vis", "occ", "occ_by", "object", "edge", "fov", "vs", "vs_std", "vs_age_s", "grp", "grp_kind", "hyp", "ctr", NULL};
 
 static int rkeys_init(void)
 {
@@ -6648,6 +6680,20 @@ static PyObject *n_radar_frame(PyObject *self, PyObject *args)
         /* ground -> car axes */
         double dx = x[R_PX] - X, dy = x[R_PY] - Y;
         double pc0 = ch * dx + sh * dy, pc1 = -sh * dx + ch * dy;
+        /* the state's place is the object's centre; the message's place (x_m, y_m, and where it will be) is its
+         * near face, as a camera's ground point always was: the centre brought nearer along the line of sight by
+         * half the object's depth. The centre goes out as `ctr`. */
+        double ctr0 = pc0, ctr1 = pc1, near0 = 0.0, near1 = 0.0;
+        {
+            double rc = hypot(dx, dy);
+            if (rc > 1e-6) {
+                double hd = pymin(r_half_depth(row + RO_E, atan2(dy, dx), NULL), rc);
+                near0 = -hd * pc0 / rc;
+                near1 = -hd * pc1 / rc;
+                pc0 += near0;
+                pc1 += near1;
+            }
+        }
         double vc0 = ch * x[R_VX] + sh * x[R_VY], vc1 = -sh * x[R_VX] + ch * x[R_VY];
         double ac0 = ch * x[R_AX] + sh * x[R_AY], ac1 = -sh * x[R_AX] + ch * x[R_AY];
         double Pp[4], Pv[4];
@@ -6703,7 +6749,7 @@ static PyObject *n_radar_frame(PyObject *self, PyObject *args)
             goto obj_fail;
         for (Py_ssize_t h = 0; h < H; h++) {
             double qx = xp[h][R_PX] - X, qy = xp[h][R_PY] - Y;
-            double q0 = ch * qx + sh * qy, q1 = -sh * qx + ch * qy;
+            double q0 = ch * qx + sh * qy + near0, q1 = -sh * qx + ch * qy + near1;
             PyObject *d = PyDict_New();
             if (d == NULL)
                 goto obj_fail;
@@ -6789,6 +6835,18 @@ static PyObject *n_radar_frame(PyObject *self, PyObject *args)
             Py_DECREF(t);
             t = od;
             if (t == NULL)
+                goto obj_fail;
+            /* its extent (the heading in the car's axes) and what the last scan could see of it */
+            const double *e = row + RO_E, *Pe = row + RO_PE, *M = row + RO_M;
+            PyObject *es = Py_BuildValue("[NNN]", round_obj(sqrt(pymax(Pe[0], 0.0)), 2), round_obj(sqrt(pymax(Pe[4], 0.0)), 2),
+                                         round_obj(sqrt(pymax(Pe[8], 0.0)), 3));
+            int oc = (int)M[M_OCC];
+            PyObject *ocv = oc == 1 ? rkey[RK_OBJECT] : oc == 2 ? rkey[RK_EDGE] : oc == 3 ? rkey[RK_FOV] : Py_None;
+            PyObject *by = oc == 1 && M[M_OCCBY] > 0.0 ? PyLong_FromDouble(M[M_OCCBY]) : (Py_INCREF(Py_None), Py_None);
+            if (dset(t, RK_CTR, Py_BuildValue("[NN]", round_obj(ctr0, 2), round_obj(ctr1, 2))) < 0 ||
+                dset(t, RK_LEN, round_obj(e[0], 2)) < 0 || dset(t, RK_WID, round_obj(e[1], 2)) < 0 ||
+                dset(t, RK_HDG, round_obj(wrap_pi(e[2] - pose[2]), 3)) < 0 || dset(t, RK_EXTSTD, es) < 0 ||
+                dset(t, RK_VIS, round_obj(M[M_VIS], 2)) < 0 || dput(t, RK_OCC, ocv) < 0 || dset(t, RK_OCCBY, by) < 0)
                 goto obj_fail;
         }
         PyList_SetItem(res, b, t);
@@ -6962,6 +7020,27 @@ static PyObject *n_radar_merge(PyObject *self, PyObject *args)
                 double nu[2] = {xb[R_PX] - xa[R_PX], xb[R_PY] - xa[R_PY]}, d2;
                 if (r_mahal(S, 2, nu, &d2, NULL) == 0 && d2 > cfg[3])
                     same = 0;
+                /* ... unless one's centre lies inside the other's rectangle: two things are not in one place.
+                 * (Said only of places that are known: an overlap of two guesses is no evidence.) */
+                if (!same && r_eig2(Pa[0], Pa[RN], Pa[RN + 1]) < 1.0 && r_eig2(Pb[0], Pb[RN], Pb[RN + 1]) < 1.0) {
+                    const double *ea = ra + RO_E, *eb = rb + RO_E;
+                    for (int w = 0; w < 2 && !same; w++) {
+                        const double *e = w ? eb : ea;
+                        double sgn = w ? -1.0 : 1.0, c = cos(e[2]), sn = sin(e[2]);
+                        double bx = sgn * (c * nu[0] + sn * nu[1]), by = sgn * (-sn * nu[0] + c * nu[1]);
+                        same = fabs(bx) <= 0.5 * e[0] && fabs(by) <= 0.5 * e[1];
+                    }
+                    /* ... or the two drive as one, end to end with no room between them: the parts of one long
+                     * thing (things that drive keep a distance; things that stand may stand bumper to bumper) */
+                    if (!same && ra[RO_M + M_HOLD] >= 2.0 && rb[RO_M + M_HOLD] >= 2.0 && sp[i] > 2.0 && sp[j] > 2.0 &&
+                        dv <= 1.0 + 2.0 * sv) {
+                        double c = cos(ea[2]), sn = sin(ea[2]);
+                        double bx = c * nu[0] + sn * nu[1], by = -sn * nu[0] + c * nu[1];
+                        double ch = fabs(cos(eb[2] - ea[2])), shh = fabs(sin(eb[2] - ea[2]));
+                        double hx = 0.5 * (ea[0] + eb[0] * ch + eb[1] * shh), hy = 0.5 * (ea[1] + eb[0] * shh + eb[1] * ch);
+                        same = fabs(bx) <= hx + 1.0 && fabs(by) <= hy + 0.3;
+                    }
+                }
             }
             PyObject *t = Py_BuildValue("(nnO)", i, j, same ? Py_True : Py_False);
             if (t == NULL || PyList_Append(res, t) < 0) {
@@ -7198,9 +7277,7 @@ static PyObject *HypType;
 /* the row of an object's numbers (tracker.py `_LAY`): hypotheses, free estimate, combination; then the extent
  * (length, width, heading and their covariance), the step that led into this node (for the smoother: the
  * switching matrix, dt, what the car's own movement added), and the node's own record (RMETA numbers) */
-enum { M_T, M_L, M_HITS, M_THIT, M_RANGE_T, M_BOXW, M_BOXT, M_BOXS, M_NIS, M_DL, M_DET, M_LEVEL, M_VIS, M_PD, M_SRC,
-       M_OCC, M_COV, M_OCCBY, RMETA };
-enum { ST_T = 0, ST_DT = 9, ST_E = 10 };
+
 
 static inline double sigm(double l) { return 1.0 / (1.0 + exp(-l)); }
 
@@ -7602,10 +7679,13 @@ static int murty(Arena *ar, const double *c, int n, int m, int k, int *out_col, 
 #define RDET 20                  /* a detection: kind, sdt, group, vehicle (-1, 0, 1), box width, z[4], R[4], what its
                                     score adds to the log odds of "a real thing", the whole box's aspect (0: not
                                     known), then for a cell of several returns of an extended sensor: their number
-                                    and the scatter of their places about the mean (sxx, sxy, syy; sensor axes) */
-enum { D_KIND, D_SDT, D_GROUP, D_VEH, D_W, D_Z, D_R = 9, D_SCORE = 13, D_ASPECT, D_NRET, D_SXX, D_SXY, D_SYY, D_SPARE };
-#define RSCFG 13                 /* gate for 1..4 rows, feat_sigma, feat_same, feat_span, map_bw[3], feat_max_s,
-                                    common_min, common_pair */
+                                    and the scatter of their places about the mean (sxx, sxy, syy; sensor axes); 1 if
+                                    both sides of the box are in the picture (its width is the object's) */
+enum { D_KIND, D_SDT, D_GROUP, D_VEH, D_W, D_Z, D_R = 9, D_SCORE = 13, D_ASPECT, D_NRET, D_SXX, D_SXY, D_SYY, D_WOK };
+#define RSCFG 18                 /* gate for 1..4 rows, feat_sigma, feat_same, feat_span, map_bw[3], feat_max_s,
+                                    common_min, common_pair, occlusion (0: off), the share hidden from which the
+                                    chance of a report falls and at which it is lowest, that lowest chance for a
+                                    camera and for a microwave radar */
 
 typedef struct {
     const RSens *sen;
@@ -7658,6 +7738,42 @@ static void ras_dets(RAs *q, double nscan)
     }
 }
 
+static void r_cell_centre(const double *row, const RSens *sen, const double *pose, double *d);
+
+/* A detection's variances as a leaf reads them: what the detection states (R), and for a camera's rows that see
+ * the object's near face what is not known of how far that face is in front of the centre (the leaf's extent). */
+static void r_reff(const RSens *sen, int kind, const double *row, const double *pose, const double *R, double *Rf)
+{
+    memcpy(Rf, R, 4 * sizeof(double));
+    int base = kind & 7;
+    if (sen->type != SEN_CAMERA || base == K_B || base == K_NONE)
+        return;
+    const double *x = row + RO_X, *e = row + RO_E, *Pe = row + RO_PE;
+    double dx = x[R_PX] - pose[0], dy = x[R_PY] - pose[1], rc = pymax(hypot(dx, dy), 0.5), los = atan2(dy, dx), dda;
+    double a = e[2] - los, d = r_half_depth(e, los, &dda), rn = pymax(rc - d, 0.5);
+    double vd = 0.25 * (cos(a) * cos(a) * Pe[0] + sin(a) * sin(a) * Pe[4]) + dda * dda * pymin(Pe[8], 0.6);
+    if (base == K_BT) {
+        double dh = sen->hc - exp(x[R_LH]), g = dh / (rn * rn + dh * dh);
+        Rf[1] += g * g * vd;
+        return;
+    }
+    double g = sen->hc / (rn * rn + sen->hc * sen->hc);
+    Rf[0] += g * g * vd;
+    if (base == K_RBH)
+        Rf[2] += vd / (rn * rn);
+}
+
+/* detection j as this leaf reads it: a cell of several returns is the leaf's centre by the leaf's own rectangle */
+static const double *ras_det(const RAs *q, const double *row, Py_ssize_t j, double *dc)
+{
+    const double *d = q->D + j * RDET;
+    if (q->sen->type != SEN_MICROWAVE)
+        return d;
+    memcpy(dc, d, RDET * sizeof(double));
+    r_cell_centre(row, q->sen, q->pose, dc);
+    return dc;
+}
+
 /* One leaf against every detection of the scan. lr[j]: the logarithm of (pd x the likelihood the leaf's hypotheses
  * give detection j x the box feature) over the density of "something else" there, -inf where the pair may not be
  * (outside the gate, a pedestrian's box on a vehicle, a kind of box this place cannot give). pd: the leaf's
@@ -7699,20 +7815,22 @@ static void ras_row(const RAs *q, const double *row, double pd, double cx, doubl
         if (!anyok)
             continue;
         /* the gate: the object as a whole */
-        int m = r_h(sen, kind, sdt, x, pose, zp, H);
+        int m = r_h(sen, kind, sdt, x, pose, zp, H, row + RO_E);
         int ar = r_angle_row(sen, kind);
         double gate = (m >= 1 && m <= 4) ? cfg[m - 1] : 16.0;
         r_hph(H, m, P, HP, S);
         int sing = 0;
         anyok = 0;
         for (Py_ssize_t a = 0; a < nJ; a++) {
-            const double *d = dt + J[a] * RDET;
+            double dc[RDET], Rf[4];
+            const double *d = ras_det(q, row, J[a], dc);
             double nuj[4], Sj[16], s;
+            r_reff(sen, kind, row, pose, d + D_R, Rf);
             for (int r = 0; r < m; r++)
                 nuj[r] = r == ar ? wrap_pi(d[D_Z + r] - zp[r]) : d[D_Z + r] - zp[r];
             memcpy(Sj, S, sizeof(double) * (size_t)(m * m));
             for (int r = 0; r < m; r++)
-                Sj[r * m + r] = S[r * m + r] + d[D_R + r];
+                Sj[r * m + r] = S[r * m + r] + Rf[r];
             if (r_mahal(Sj, m, nuj, &s, NULL) < 0) {
                 sing = 1;
                 break;
@@ -7729,19 +7847,21 @@ static void ras_row(const RAs *q, const double *row, double pd, double cx, doubl
         for (int mm = 0; mm < 3; mm++) {
             if (mu[mm] < 1e-4)
                 continue;
-            r_h(sen, kind, sdt, row + RO_XS + mm * RN, pose, zm, Hm);
+            r_h(sen, kind, sdt, row + RO_XS + mm * RN, pose, zm, Hm, row + RO_E);
             r_hph(Hm, m, row + RO_PS + mm * RNN, HPm, Sm);
             int bad = 0;
             for (Py_ssize_t a = 0; a < nJ; a++) {
                 if (!ok[a])
                     continue;
-                const double *d = dt + J[a] * RDET;
+                double dc[RDET], Rf[4];
+                const double *d = ras_det(q, row, J[a], dc);
                 double nuj[4], Sj[16];
+                r_reff(sen, kind, row, pose, d + D_R, Rf);
                 for (int r = 0; r < m; r++)
                     nuj[r] = r == ar ? wrap_pi(d[D_Z + r] - zm[r]) : d[D_Z + r] - zm[r];
                 memcpy(Sj, Sm, sizeof(double) * (size_t)(m * m));
                 for (int r = 0; r < m; r++)
-                    Sj[r * m + r] = Sm[r * m + r] + d[D_R + r];
+                    Sj[r * m + r] = Sm[r * m + r] + Rf[r];
                 if (r_mahal(Sj, m, nuj, &qs[a], &dets[a]) < 0) {
                     bad = 1;
                     break;
@@ -7794,11 +7914,12 @@ static int r_update_full(double *row, const RSens *sen, const double *pose, cons
     double *mu = row + RO_MU;
     int kind = (int)d[D_KIND];
     double sdt = d[D_SDT], hits = row[RO_M + M_HITS];
-    double like[3], Hs[3][4 * RN], nus[3][4], Ss[3][16], Sis[3][16];
+    double like[3], Hs[3][4 * RN], nus[3][4], Ss[3][16], Sis[3][16], Rf[4];
     int m = 0;
+    r_reff(sen, kind, row, pose, d + D_R, Rf);
     for (int j = 0; j < 3; j++) {
         double det;
-        m = r_innov(sen, kind, sdt, row + RO_XS + j * RN, row + RO_PS + j * RNN, pose, d + D_Z, d + D_R, nus[j], Hs[j], Ss[j]);
+        m = r_innov(sen, kind, sdt, row + RO_XS + j * RN, row + RO_PS + j * RNN, pose, d + D_Z, Rf, nus[j], Hs[j], Ss[j], row + RO_E);
         if (r_inv(Ss[j], m, Sis[j], &det) < 0)
             return -1;
         double t[4], d2 = 0.0;
@@ -7813,17 +7934,17 @@ static int r_update_full(double *row, const RSens *sen, const double *pose, cons
         like[j] = exp(-0.5 * pymin(d2, 400.0)) / sqrt(pymax(pow(2.0 * PI, (double)m) * det, 1e-30));
     }
     double nu0[4], H0[4 * RN], S0[16], d20, nuf[4], Hf[4 * RN], Sf[16], Sif[16], detf;
-    int m0 = r_innov(sen, kind, sdt, row + RO_X, row + RO_P, pose, d + D_Z, d + D_R, nu0, H0, S0);
+    int m0 = r_innov(sen, kind, sdt, row + RO_X, row + RO_P, pose, d + D_Z, Rf, nu0, H0, S0, row + RO_E);
     if (r_mahal(S0, m0, nu0, &d20, NULL) < 0)
         return -1;
-    int mf = r_innov(sen, kind, sdt, row + RO_XF, row + RO_PF, pose, d + D_Z, d + D_R, nuf, Hf, Sf);
+    int mf = r_innov(sen, kind, sdt, row + RO_XF, row + RO_PF, pose, d + D_Z, Rf, nuf, Hf, Sf, row + RO_E);
     if (r_inv(Sf, mf, Sif, &detf) < 0)
         return -1;
     for (int j = 0; j < 3; j++) {
         double K[RN * 4];
         double *x = row + RO_XS + j * RN, *P = row + RO_PS + j * RNN;
         r_gain(P, Hs[j], m, Sis[j], K);
-        r_take(x, P, K, Hs[j], d + D_R, nus[j], m, 1.0);
+        r_take(x, P, K, Hs[j], Rf, nus[j], m, 1.0);
         if (j == R_STAND)
             for (int k = R_VX; k <= R_AY; k++)
                 x[k] = 0.0;
@@ -7833,17 +7954,60 @@ static int r_update_full(double *row, const RSens *sen, const double *pose, cons
         double K[RN * 4];
         double *x = row + RO_XF, *P = row + RO_PF;
         r_gain(P, Hf, mf, Sif, K);
-        r_take(x, P, K, Hf, d + D_R, nuf, mf, 1.0);
+        r_take(x, P, K, Hf, Rf, nuf, mf, 1.0);
         x[R_DP] = clamp_dp(x[R_DP]);
     }
     double tot = (mu[0] * like[0] + mu[1] * like[1]) + mu[2] * like[2];
     double w[3] = {mu[0] * like[0], mu[1] * like[1], mu[2] * like[2]};
     if (tot > 0.0 && (sen->type == SEN_MICROWAVE || hits >= hold || (kind & K_SCALE))) {
-        double nm[3], s2 = 0.0;
+        double nm[3], s2 = 0.0, post[3];
         for (int j = 0; j < 3; j++) {
             double v = w[j] / tot;
+            post[j] = v;
             nm[j] = (isnan(v) || v >= floor_) ? v : floor_;
             s2 += nm[j];
+        }
+        /* A hypothesis the detection has all but ruled out is kept at the floor: "it may still turn out so". What
+         * is kept is not its old story (a standing hypothesis of a thing that has driven on for seconds stands
+         * where the thing was then, and a detection taken from there is nonsense), but the possibility that the
+         * thing does so FROM WHERE IT IS: the share that the floor adds is given the other hypotheses' state
+         * (for "it stands": their place, no speed). */
+        for (int j = 0; j < 3; j++) {
+            if (isnan(post[j]) || post[j] >= floor_)
+                continue;
+            int a = (j + 1) % 3, b = (j + 2) % 3;
+            double wa = post[a], wb = post[b], ws = wa + wb, keep = post[j] / floor_;
+            if (!(ws > 0.0))
+                continue;
+            wa /= ws;
+            wb /= ws;
+            double *xj = row + RO_XS + j * RN, *Pj = row + RO_PS + j * RNN;
+            const double *xa = row + RO_XS + a * RN, *xb = row + RO_XS + b * RN;
+            const double *Pa = row + RO_PS + a * RNN, *Pb = row + RO_PS + b * RNN;
+            double xd[RN], xn[RN], Pn[RNN];
+            for (int k = 0; k < RN; k++)
+                xd[k] = wa * xa[k] + wb * xb[k];
+            if (j == R_STAND)
+                for (int k = R_VX; k <= R_AY; k++)
+                    xd[k] = 0.0;
+            for (int k = 0; k < RN; k++)
+                xn[k] = keep * xj[k] + (1.0 - keep) * xd[k];
+            for (int r = 0; r < RN; r++)
+                for (int c = r; c < RN; c++) {
+                    double da = xa[r] - xd[r], db = xb[r] - xd[r], ca = xa[c] - xd[c], cb = xb[c] - xd[c];
+                    if (j == R_STAND && (r >= R_VX && r <= R_AY))
+                        da = db = 0.0;
+                    if (j == R_STAND && (c >= R_VX && c <= R_AY))
+                        ca = cb = 0.0;
+                    double pd = wa * (Pa[r * RN + c] + da * ca) + wb * (Pb[r * RN + c] + db * cb);
+                    if (j == R_STAND && ((r >= R_VX && r <= R_AY) || (c >= R_VX && c <= R_AY)))
+                        pd = r == c ? Pj[r * RN + c] : 0.0;      /* its own (small) spread on speed stays */
+                    double v = keep * (Pj[r * RN + c] + (xj[r] - xn[r]) * (xj[c] - xn[c])) +
+                               (1.0 - keep) * (pd + (xd[r] - xn[r]) * (xd[c] - xn[c]));
+                    Pn[r * RN + c] = Pn[c * RN + r] = v;
+                }
+            memcpy(xj, xn, sizeof(xn));
+            memcpy(Pj, Pn, sizeof(Pn));
         }
         for (int j = 0; j < 3; j++)
             mu[j] = nm[j] / s2;
@@ -7895,6 +8059,8 @@ static void r_rot_block(double *P, int r, double c, double s, double a, double b
 }
 
 static void r_extent_birth(double *row, const RSens *sen, const double *d, const double *pose, const double *kb, double ps);
+static void r_scatter(double L, double W, double th, double from, double *sc, double *mean);
+static void r_sensor_at(const RSens *sen, const double *pose, double *sx, double *sy, double *axis);
 
 /* The row of an object first seen in detection d (kind kb), all of it: the place from the detection, what its kind
  * may be doing as three stories (it stands; it drives with the traffic; it comes the other way, or crosses when
@@ -8044,6 +8210,29 @@ static int r_birth(double *row, const RSens *sen, const double *d, const double 
     row[RO_ST + 0] = row[RO_ST + 4] = row[RO_ST + 8] = 1.0;
     double *M = row + RO_M;
     memset(M, 0, RMETA * sizeof(double));
+    /* its extent; the detection gave the near face (a camera's box) or the sides that face the sensor (a radar's
+     * returns): the place of every hypothesis is the centre behind them */
+    r_extent_birth(row, sen, d, pose, kb, ps);
+    {
+        double sx, sy, axis, off[2] = {0.0, 0.0};
+        r_sensor_at(sen, pose, &sx, &sy, &axis);
+        double lx = x0[R_PX] - sx, ly = x0[R_PY] - sy, lr = pymax(hypot(lx, ly), 0.5), los = atan2(ly, lx);
+        if (sen->type == SEN_CAMERA) {
+            double dd = r_half_depth(row + RO_E, los, NULL);
+            off[0] = dd * lx / lr;
+            off[1] = dd * ly / lr;
+        } else if (sen->type == SEN_MICROWAVE) {
+            double sc[3], mm[2];
+            r_scatter(row[RO_E], row[RO_E + 1], row[RO_E + 2], los + PI, sc, mm);
+            off[0] = -mm[0];
+            off[1] = -mm[1];
+        }
+        for (int j = 0; j < 4; j++) {
+            double *xx = j == 3 ? row + RO_XF : row + RO_XS + j * RN;
+            xx[R_PX] += off[0];
+            xx[R_PY] += off[1];
+        }
+    }
     M[M_T] = M[M_THIT] = M[M_RANGE_T] = t;
     M[M_L] = log(bc[0] / (1.0 - bc[0])) + d[D_SCORE];
     M[M_HITS] = 1.0;
@@ -8073,7 +8262,7 @@ static int r_birth(double *row, const RSens *sen, const double *d, const double 
         for (int j = 0; j < 4; j++) {
             double *x = j == 3 ? row + RO_XF : row + RO_XS + j * RN, *P = j == 3 ? row + RO_PF : row + RO_PS + j * RNN;
             double nu[4], H[4 * RN], S[16], K[RN * 4];
-            r_innov(sen, K_NONE | K_SCALE, d[D_SDT], x, P, pose, &zs, &Rs, nu, H, S);
+            r_innov(sen, K_NONE | K_SCALE, d[D_SDT], x, P, pose, &zs, &Rs, nu, H, S, row + RO_E);
             if (!(S[0] > 0.0) || !isfinite(S[0]))
                 continue;
             double Si = 1.0 / S[0];
@@ -8099,30 +8288,250 @@ static int r_birth(double *row, const RSens *sen, const double *d, const double 
         }
     }
     r_combine(row + RO_XS, row + RO_PS, mu, row + RO_X, row + RO_P);
-    r_extent_birth(row, sen, d, pose, kb, ps);
     return 1;
 }
 
-/* ---- the extent (length, width, heading) of a leaf ---- */
+/* ---- the extent of a leaf: length, width (m) and heading (rad, ground frame: where its front points) ----
+ * A rectangle on the ground, kept beside the motion state as a Gaussian of its own (the motion state and the
+ * shape are taken as independent, as the random-matrix trackers do): born from what the kind is like, turned to
+ * the direction of travel when the object moves and held when it stands, measured by a camera box's width (the
+ * rectangle's silhouette seen from the camera) and by the scatter of a microwave radar's returns over the sides
+ * that face it. docs/RADAR.md, section 4. */
+enum { E_LEN, E_WID, E_HDG };
+
 static void r_extent_birth(double *row, const RSens *sen, const double *d, const double *pose, const double *kb, double ps)
 {
     double *e = row + RO_E, *Pe = row + RO_PE;
-    int wl = kb[KB_LEN] > 0.0;
-    e[0] = wl ? kb[KB_LEN] : 0.6;
-    e[1] = wl ? kb[KB_WID] : 0.6;
-    e[2] = pose[2];
+    int wl = kb[KB_LEN] > 0.0, known = kb[KB_KNOWN] != 0.0;
     memset(Pe, 0, 9 * sizeof(double));
-    Pe[0] = pow(0.25 * e[0], 2.0);
-    Pe[4] = pow(0.15 * e[1], 2.0);
-    Pe[8] = PI * PI / 3.0;
+    if (wl) {
+        e[E_LEN] = kb[KB_LEN];
+        e[E_WID] = kb[KB_WID];
+        Pe[0] = pow(0.22 * e[E_LEN], 2.0);
+        Pe[4] = pow(0.10 * e[E_WID], 2.0);
+    } else if (known) {                                  /* a person, a two-wheeler: small, no long axis known */
+        e[E_LEN] = e[E_WID] = 0.6;
+        Pe[0] = 0.5 * 0.5;
+        Pe[4] = 0.15 * 0.15;
+    } else {                                             /* not known what it is: as a car, and wide open */
+        e[E_LEN] = 4.5;
+        e[E_WID] = 1.8;
+        Pe[0] = 2.0 * 2.0;
+        Pe[4] = 0.5 * 0.5;
+    }
+    /* a vehicle points along the road the car is on, or across it when its box shows it side-on; how sure that is
+     * follows how clearly the box says which (a person has no direction until it walks) */
+    double side = (!isnan(ps) && ps > 0.5) ? 0.5 * PI : 0.0;
+    e[E_HDG] = wrap_pi(pose[2] + side);
+    if (wl && !isnan(ps))
+        Pe[8] = pow(0.35 + 4.8 * ps * (1.0 - ps), 2.0);
+    else if (wl)
+        Pe[8] = 0.6 * 0.6;
+    else
+        Pe[8] = PI * PI / 3.0;
+    row[RO_M + M_SENSE] = 0.0;                           /* which end is the front is not known yet */
 }
 
+/* one scalar measurement z = h(e) + noise (variance R), row H, into (e, Pe), Joseph form; the innovation given.
+ * Returns the squared normalised innovation (the measurement is not taken beyond `gate`). */
+static double r_extent_take(double *e, double *Pe, const double *H, double nu, double R, double gate)
+{
+    double PH[3], S = R;
+    for (int i = 0; i < 3; i++) {
+        PH[i] = Pe[i * 3] * H[0] + Pe[i * 3 + 1] * H[1] + Pe[i * 3 + 2] * H[2];
+        S += H[i] * PH[i];
+    }
+    if (!(S > 0.0) || !isfinite(S))
+        return INFINITY;
+    double d2 = nu * nu / S;
+    if (d2 > gate)
+        return d2;
+    double K[3], A[9], AP[9], Pn[9];
+    for (int i = 0; i < 3; i++)
+        K[i] = PH[i] / S;
+    for (int i = 0; i < 3; i++)
+        for (int j = 0; j < 3; j++)
+            A[i * 3 + j] = (i == j ? 1.0 : 0.0) - K[i] * H[j];
+    for (int i = 0; i < 3; i++)
+        for (int j = 0; j < 3; j++)
+            AP[i * 3 + j] = A[i * 3] * Pe[j] + A[i * 3 + 1] * Pe[3 + j] + A[i * 3 + 2] * Pe[6 + j];
+    for (int i = 0; i < 3; i++)
+        for (int j = i; j < 3; j++)
+            Pn[i * 3 + j] = Pn[j * 3 + i] = AP[i * 3] * A[j * 3] + AP[i * 3 + 1] * A[j * 3 + 1] + AP[i * 3 + 2] * A[j * 3 + 2] +
+                                            K[i] * R * K[j];
+    for (int i = 0; i < 3; i++)
+        e[i] += K[i] * nu;
+    memcpy(Pe, Pn, sizeof(Pn));
+    return d2;
+}
+
+static void r_extent_bounds(double *e)
+{
+    e[E_LEN] = pymin(25.0, pymax(0.3, e[E_LEN]));
+    e[E_WID] = pymin(3.2, pymax(0.3, e[E_WID]));
+    e[E_HDG] = wrap_pi(e[E_HDG]);
+}
+
+/* The extent over a step of dt: the size stays; the heading of a thing that moves is its direction of travel (a
+ * measurement as good as the velocity's direction is known, weighed by how surely it moves at all; the first
+ * time it says which end is the front), the heading of a thing that stands is held. */
 static void r_extent_step(double *row, double dt, const double *kin)
 {
+    double *e = row + RO_E, *Pe = row + RO_PE;
+    const double *x = row + RO_X, *P = row + RO_P, *mu = row + RO_MU;
+    double adt = fabs(dt), vx = x[R_VX], vy = x[R_VY], v = hypot(vx, vy), pm = 1.0 - mu[R_STAND];
+    /* a moving thing may turn (as fast as its kind corners at that speed); a standing one does not */
+    double wmax = pm * pymin(kin[1] / pymax(v, 2.0), 0.8);
+    Pe[8] += pow(0.01, 2.0) * adt + pow(wmax * adt, 2.0);
+    Pe[0] += pow(0.03, 2.0) * adt;                       /* (the size is not held to the last centimetre for ever) */
+    Pe[4] += pow(0.01, 2.0) * adt;
+    if (v > 2.5 && pm > 0.5) {
+        double c = vx / v, s = vy / v;
+        double vp = s * s * P[R_VX * RN + R_VX] - 2.0 * c * s * P[R_VX * RN + R_VY] + c * c * P[R_VY * RN + R_VY];
+        double R = (pymax(vp, 0.0) / (v * v) + 0.03 * 0.03) / pm;
+        double th = atan2(vy, vx), nu = wrap_pi(th - e[E_HDG]);
+        if (fabs(nu) > 0.5 * PI && row[RO_M + M_SENSE] == 0.0) {
+            e[E_HDG] = wrap_pi(e[E_HDG] + PI);          /* the other end was the front */
+            nu = wrap_pi(th - e[E_HDG]);
+        }
+        double H[3] = {0.0, 0.0, 1.0};
+        r_extent_take(e, Pe, H, nu, R, INFINITY);
+        if (R < 0.3 * 0.3 && v > 2.5)
+            row[RO_M + M_SENSE] = 1.0;
+    }
+    r_extent_bounds(e);
 }
 
+/* the rectangle's silhouette seen from the direction `los` (ground angle from the viewer to its centre): its
+ * width across the line of sight, and the derivatives by length, width, heading */
+static double r_silhouette(const double *e, double los, double *H)
+{
+    double a = e[E_HDG] - los, sa = sin(a), ca = cos(a), as = fabs(sa), ac = fabs(ca);
+    if (H) {
+        H[0] = as;
+        H[1] = ac;
+        H[2] = e[E_LEN] * (sa >= 0.0 ? ca : -ca) - e[E_WID] * (ca >= 0.0 ? sa : -sa);
+    }
+    return e[E_LEN] * as + e[E_WID] * ac;
+}
+
+/* The scatter of the returns of a rectangle (length L, width W, heading th) seen from the ground direction
+ * `from` (the direction from its centre to the sensor): the returns lie on the two sides that face the sensor,
+ * each in proportion to how broad it looks from there, evenly along it. Out: the covariance of their places
+ * (sxx, syy, sxy; ground axes) and the mean's offset from the centre (mx, my). */
+static void r_scatter(double L, double W, double th, double from, double *sc, double *mean)
+{
+    double a = from - th, dbx = cos(a), dby = sin(a);   /* the sensor's direction in the body's axes */
+    double sx = dbx >= 0.0 ? 1.0 : -1.0, sy = dby >= 0.0 ? 1.0 : -1.0;
+    /* a side returns as it is long, less when it is seen at a grazing angle (never nothing: wheel arches, sills) */
+    double wL = L * (0.4 * fabs(dby) + 0.6), wW = W * (0.4 * fabs(dbx) + 0.6), tot = wL + wW;
+    double pc = 0.3, pL = tot > 1e-9 ? (1.0 - pc) * wL / tot : 0.35, pW = 1.0 - pc - pL;
+    /* the long side: x even over L at y = sy W / 2; the short side: y even over W at x = sx L / 2; the corner
+     * between them, the nearest point, returns most */
+    double hx = sx * 0.5 * L, hy = sy * 0.5 * W;
+    double mxb = (pW + pc) * hx, myb = (pL + pc) * hy;
+    double vx = pL * L * L / 12.0 + (pW + pc) * hx * hx - mxb * mxb;
+    double vy = pW * W * W / 12.0 + (pL + pc) * hy * hy - myb * myb;
+    double cxy = pc * hx * hy - mxb * myb;
+    double c = cos(th), s = sin(th);
+    sc[0] = c * c * vx - 2.0 * c * s * cxy + s * s * vy;
+    sc[1] = s * s * vx + 2.0 * c * s * cxy + c * c * vy;
+    sc[2] = c * s * (vx - vy) + (c * c - s * s) * cxy;
+    if (mean) {
+        mean[0] = c * mxb - s * myb;
+        mean[1] = s * mxb + c * myb;
+    }
+}
+
+/* the sensor's place on the ground and the angle of its axis */
+static void r_sensor_at(const RSens *sen, const double *pose, double *sx, double *sy, double *axis)
+{
+    double c = cos(pose[2]), sn = sin(pose[2]);
+    if (sen->type == SEN_MICROWAVE) {
+        *sx = pose[0] + c * sen->mx - sn * sen->my;
+        *sy = pose[1] + sn * sen->mx + c * sen->my;
+        *axis = pose[2] + sen->yaw;
+    } else {
+        *sx = pose[0];
+        *sy = pose[1];
+        *axis = pose[2];
+    }
+}
+
+/* What a detection says about the extent of the leaf that took it (after the motion state took it). A camera box
+ * whose sides are both in the picture: its width as an angle is the silhouette over the range. A cell of several
+ * returns of a microwave radar: the scatter of their places is that of the two sides that face the sensor. */
 static void r_extent_update(double *row, const RSens *sen, const double *d, const double *pose, const double *kin)
 {
+    double *e = row + RO_E, *Pe = row + RO_PE;
+    const double *x = row + RO_X, *P = row + RO_P;
+    double sx, sy, axis;
+    r_sensor_at(sen, pose, &sx, &sy, &axis);
+    double dx = x[R_PX] - sx, dy = x[R_PY] - sy, r = pymax(hypot(dx, dy), 1.0), los = atan2(dy, dx);
+    if (sen->type == SEN_CAMERA && d[D_W] > 0.0 && d[D_WOK] > 0.0) {
+        double H[3], wp = r_silhouette(e, los, H) / r;
+        for (int i = 0; i < 3; i++)
+            H[i] /= r;
+        /* how well the range is known (along the line of sight) is how well the box's width says a size */
+        double ux = dx / r, uy = dy / r;
+        double vr = ux * ux * P[0] + 2.0 * ux * uy * P[1] + uy * uy * P[RN + 1];
+        double R = pow(0.06 * d[D_W], 2.0) + pow(3.0 / exp(sen->logf), 2.0) + pow(wp / r, 2.0) * pymax(vr, 0.0);
+        r_extent_take(e, Pe, H, d[D_W] - wp, R, 16.0);
+    } else if (sen->type == SEN_MICROWAVE && d[D_NRET] >= 3.0) {
+        /* the returns' scatter in ground axes (given in the sensor's) */
+        double n = d[D_NRET], c = cos(axis), s = sin(axis);
+        double zs[3] = {c * c * d[D_SXX] - 2.0 * c * s * d[D_SXY] + s * s * d[D_SYY],
+                        s * s * d[D_SXX] + 2.0 * c * s * d[D_SXY] + c * c * d[D_SYY],
+                        c * s * (d[D_SXX] - d[D_SYY]) + (c * c - s * s) * d[D_SXY]};
+        /* what one return's own error adds: the range's along the line of sight, the azimuth's across it */
+        double cl = cos(los), sl = sin(los), ra = d[D_R] * n, rb = d[D_R + 1] * n * r * r;   /* (the cell's R is per mean) */
+        double noise[3] = {cl * cl * ra + sl * sl * rb, sl * sl * ra + cl * cl * rb, cl * sl * (ra - rb)};
+        for (int pass = 0; pass < 2; pass++) {           /* twice: the model is far from linear in the heading */
+            double h0[3], Hn[9], from = los + PI;
+            r_scatter(e[E_LEN], e[E_WID], e[E_HDG], from, h0, NULL);
+            for (int k = 0; k < 3; k++) {
+                double ep[3] = {e[0], e[1], e[2]}, hp[3], step = k == 2 ? 0.02 : 0.05;
+                ep[k] += step;
+                r_scatter(ep[0], ep[1], ep[2], from, hp, NULL);
+                for (int i = 0; i < 3; i++)
+                    Hn[i * 3 + k] = (hp[i] - h0[i]) / step;
+            }
+            /* a sample covariance of n points: its entries' own variances (Wishart) */
+            double pxx = h0[0] + noise[0], pyy = h0[1] + noise[1], pxy = h0[2] + noise[2], dof = pymax(n - 1.0, 1.0);
+            /* (as the rectangle believed predicts them, so that scatters above and below what is expected weigh
+             * alike; never tighter than a rectangle of a metre would give) */
+            double qx = pymax(pxx, 0.08), qy = pymax(pyy, 0.08);
+            double Rm[3] = {2.0 * qx * qx / dof, 2.0 * qy * qy / dof, (qx * qy + pxy * pxy) / dof};
+            double nu[3] = {zs[0] - pxx, zs[1] - pyy, zs[2] - pxy};
+            for (int i = 0; i < 3; i++)                  /* the three entries one after the other */
+                r_extent_take(e, Pe, Hn + i * 3, nu[i], Rm[i] * (pass ? 1.0 : 4.0), 25.0);
+            r_extent_bounds(e);
+        }
+    }
+    r_extent_bounds(e);
+}
+
+/* A cell of several returns as a detection of the object's centre: the returns' mean lies on the sides that
+ * face the sensor, nearer than the centre by what the leaf's rectangle says; d (a copy) gets the range and the
+ * azimuth of the centre, and the variance that the mean of n returns spread over those sides has. */
+static void r_cell_centre(const double *row, const RSens *sen, const double *pose, double *d)
+{
+    if (sen->type != SEN_MICROWAVE)
+        return;
+    const double *e = row + RO_E, *x = row + RO_X;
+    double sx, sy, axis;
+    r_sensor_at(sen, pose, &sx, &sy, &axis);
+    double dx = x[R_PX] - sx, dy = x[R_PY] - sy, r = pymax(hypot(dx, dy), 1.0), los = atan2(dy, dx);
+    double sc[3], m[2], cl = cos(los), sl = sin(los);
+    r_scatter(e[E_LEN], e[E_WID], e[E_HDG], los + PI, sc, m);
+    double along = cl * m[0] + sl * m[1], across = -sl * m[0] + cl * m[1];
+    d[D_Z] -= along;                                     /* (along is negative: the mean is nearer) */
+    d[D_Z + 1] -= across / r;
+    double va = cl * cl * sc[0] + 2.0 * cl * sl * sc[2] + sl * sl * sc[1];
+    double vc = sl * sl * sc[0] - 2.0 * cl * sl * sc[2] + cl * cl * sc[1];
+    double n = pymax(d[D_NRET], 1.0);
+    d[D_R] += va / n;
+    d[D_R + 1] += vc / (n * r * r);
 }
 
 /* ---- one scan ---- */
@@ -8578,6 +8987,17 @@ static int uf_find(int *uf, int i)
     return i;
 }
 
+/* ---- what a sensor can see of an object: other objects in front of it, the edge of its field ----
+ * An object behind another one is not reported however surely it is there: its probability of being reported is a
+ * function of where the others are. Each settled object's primary is an occluder: an interval of bearings (its
+ * silhouette), a range, and for a camera the rows of the picture its box covers. A leaf's own silhouette is
+ * sampled across; each sample is hidden as far as a nearer occluder's interval holds it (softly: neither place is
+ * known exactly) and, for a camera, as far as the occluder's box reaches up the leaf's box. */
+typedef struct {
+    double b, hw, r, top, bot, sb, id;
+    int k;
+} Occ;
+
 typedef struct {
     Hyp *H;
     double *A;
@@ -8607,13 +9027,132 @@ typedef struct {
     int births_left;
     PyObject *dead, *births;
     char *mark;
+    Occ *occ;                        /* the scan's occluders */
+    int nocc;
 } Scan;
 
-/* how much of the leaf the sensor can see (1: all of it) */
+static double r_phi(double x)
+{
+    return 0.5 * (1.0 + erf(x * 0.7071067811865476));
+}
+
+/* a leaf's silhouette as the sensor sees it: bearing in the sensor's axes, half width, range, the angles below
+ * the horizon of its top and bottom (camera), how well its bearing is known */
+static void r_outline(const Scan *s, const double *row, Occ *o)
+{
+    const double *x = row + RO_X, *P = row + RO_P, *e = row + RO_E;
+    double sx, sy, axis;
+    r_sensor_at(&s->sen, s->pose, &sx, &sy, &axis);
+    double dx = x[R_PX] - sx, dy = x[R_PY] - sy, r = pymax(hypot(dx, dy), 0.5), los = atan2(dy, dx);
+    o->r = r;
+    o->b = wrap_pi(los - axis);
+    o->hw = 0.5 * r_silhouette(e, los, NULL) / r;
+    double ux = -dy / r, uy = dx / r;
+    o->sb = sqrt(pymax(ux * ux * P[0] + 2.0 * ux * uy * P[1] + uy * uy * P[RN + 1], 0.0)) / r;
+    if (s->sen.type == SEN_CAMERA) {
+        o->bot = atan2(s->sen.hc, r);
+        o->top = atan2(s->sen.hc - exp(x[R_LH]), r);
+    } else {
+        o->bot = 1.0;
+        o->top = -1.0;
+    }
+}
+
+/* How much of leaf a the sensor can see (1: all of it), written into its record with what hides it. */
 static double r_visible(Scan *s, int a, double cx, double cy)
 {
-    s->A[(Py_ssize_t)s->lrow[a] * RROW + RO_M + M_VIS] = 1.0;
-    return 1.0;
+    double *M = s->A + (Py_ssize_t)s->lrow[a] * RROW + RO_M;
+    M[M_VIS] = 1.0;
+    M[M_OCC] = 0.0;
+    M[M_OCCBY] = 0.0;
+    if (s->acfg[13] == 0.0)
+        return 1.0;
+    Occ me;
+    r_outline(s, s->A + (Py_ssize_t)s->lrow[a] * RROW, &me);
+    double c0 = s->acfg[14], c1 = s->acfg[15], fl = s->sen.type == SEN_CAMERA ? s->acfg[16] : s->acfg[17];
+    /* behind other objects */
+    double cover = 0.0, by = 0.0, bybest = 0.0;
+    if (s->nocc > 0) {
+        double contrib[64];
+        int no = s->nocc < 64 ? s->nocc : 64;
+        for (int q = 0; q < no; q++)
+            contrib[q] = 0.0;
+        for (int p = 0; p < 5; p++) {
+            double beta = me.b + me.hw * (-0.8 + 0.4 * p), hid = 0.0;
+            for (int q = 0; q < no; q++) {
+                const Occ *o = &s->occ[q];
+                if (o->k == s->lk[a] || !(o->r < me.r - 1.0))
+                    continue;
+                /* (how far the hidden one may have strayed while nobody saw it does not open the view: that it
+                 * is not reported is itself the evidence that it is still behind) */
+                double sg = pymin(sqrt(o->sb * o->sb + me.sb * me.sb), 0.35 * o->hw) + 1e-4;
+                double in = r_phi((o->b + o->hw - beta) / sg) - r_phi((o->b - o->hw - beta) / sg);
+                double up = 1.0;
+                if (s->sen.type == SEN_CAMERA) {         /* the rows of the leaf's box that the occluder's box holds */
+                    double h = me.bot - me.top;
+                    up = h > 1e-6 ? pymin(1.0, pymax(0.0, (pymin(me.bot, o->bot) - pymax(me.top, o->top)) / h)) : 1.0;
+                }
+                double v = in * up;
+                contrib[q] += v;
+                if (v > hid)
+                    hid = v;
+            }
+            cover += 0.2 * hid;
+        }
+        for (int q = 0; q < no; q++)
+            if (contrib[q] > bybest) {
+                bybest = contrib[q];
+                by = s->occ[q].id;
+            }
+    }
+    double pv = cover <= c0 ? 1.0 : cover >= c1 ? fl : 1.0 - (1.0 - fl) * (cover - c0) / (c1 - c0);
+    /* cut by the edge of the field */
+    double lo = 0.0, hi = 0.0, pe = 1.0;
+    int edged = 0;
+    if (s->sen.type == SEN_CAMERA && s->sen.cover) {
+        lo = s->sen.bmin;
+        hi = s->sen.bmax;
+        edged = 1;
+    } else if (s->sen.type == SEN_MICROWAVE) {
+        lo = -s->sen.fov;
+        hi = s->sen.fov;
+        edged = 1;
+    }
+    if (edged && me.hw > 1e-6) {
+        double in = pymin(me.b + me.hw, hi) - pymax(me.b - me.hw, lo);
+        double f = pymin(1.0, pymax(0.0, in / (2.0 * me.hw)));
+        pe = f >= 0.9 ? 1.0 : f <= 0.4 ? fl : fl + (1.0 - fl) * (f - 0.4) / 0.5;
+    }
+    double vis = pv * pe;
+    M[M_VIS] = vis;
+    if (pv < 0.5 && pv <= pe) {
+        M[M_OCC] = 1.0;
+        M[M_OCCBY] = by;
+    } else if (pe < 0.8)
+        M[M_OCC] = 2.0;
+    return vis;
+}
+
+/* the occluders of a scan: the primaries of the settled objects, as they are at the scan's time */
+static int h_occluders(Scan *s)
+{
+    s->nocc = 0;
+    if (s->acfg[13] == 0.0 || s->n == 0)
+        return 0;
+    s->occ = (Occ *)ar_get(&s->ar, (size_t)s->n * sizeof(Occ));
+    if (s->occ == NULL)
+        return -1;
+    for (int a = 0; a < s->nl; a++) {
+        int k = s->lk[a];
+        const double *ti = s->ti + (size_t)k * HTI;
+        if (ti[9] == 0.0 || s->lold[a] != s->H->tr[s->th[k]].primary)
+            continue;
+        Occ *o = &s->occ[s->nocc++];
+        r_outline(s, s->A + (Py_ssize_t)s->lrow[a] * RROW, o);
+        o->k = k;
+        o->id = ti[8];
+    }
+    return 0;
 }
 
 /* every leaf against the scan's detections (as they are in s->D, with the sensor's bias as it is in s->sen) */
@@ -8631,6 +9170,8 @@ static void h_ratios(Scan *s)
         double pd = r_p_detect(&s->sen, cx, cy, x) * vis;
         s->lpd[a] = pd;
         s->lcov[a] = r_coverage(&s->sen, cx, cy);
+        if (s->lcov[a] <= 0.0)
+            s->A[(Py_ssize_t)s->lrow[a] * RROW + RO_M + M_OCC] = 3.0;    /* outside the sensor's field */
         double r = sigm(M[M_L]);
         s->lnr[a] = log(pymax(r, 1e-300));
         s->lmiss[a] = log(pymax(1.0 - r * pd, 1e-12));
@@ -8702,7 +9243,7 @@ static int h_common(Scan *s, double *bias)
             continue;
         double z[4], Hm[4 * RN];
         const double *P = row + RO_P;
-        r_h(&s->sen, (int)d[D_KIND], d[D_SDT], row + RO_X, s->pose, z, Hm);
+        r_h(&s->sen, (int)d[D_KIND], d[D_SDT], row + RO_X, s->pose, z, Hm, row + RO_E);
         double s00 = 0.0;
         for (int c = 0; c < RN; c++) {
             double tt = 0.0;
@@ -8751,9 +9292,11 @@ static int32_t h_detchild(Scan *s, int a, int j)
     double *row = s->A + (Py_ssize_t)r * RROW, *M = row + RO_M;
     const double *d = s->D + (size_t)j * RDET;
     memcpy(row, s->A + (Py_ssize_t)s->lrow[a] * RROW, RROW * sizeof(double));
-    double nis = NAN, dl = 0.0;
+    double nis = NAN, dl = 0.0, dc[RDET];
     int base = (int)d[D_KIND] & 7;
-    if (r_update_full(row, &s->sen, s->pose, d, s->ucfg[0], s->ucfg[1], &nis, &dl) == 0)
+    memcpy(dc, d, sizeof(dc));
+    r_cell_centre(row, &s->sen, s->pose, dc);
+    if (r_update_full(row, &s->sen, s->pose, dc, s->ucfg[0], s->ucfg[1], &nis, &dl) == 0)
         r_extent_update(row, &s->sen, d, s->pose, s->ti + (size_t)s->lk[a] * HTI + 3);
     M[M_L] = pymax(-12.0, pymin(12.0, M[M_L] + dl + d[D_SCORE]));
     M[M_HITS] += 1.0;
@@ -8767,6 +9310,8 @@ static int32_t h_detchild(Scan *s, int a, int j)
     }
     M[M_NIS] = nis;
     M[M_DL] = dl;
+    if (s->sen.type == SEN_MICROWAVE && s->sen.extended != 0.0)
+        M[M_HOLD] = 2.0;                                 /* seen by a sensor that returns the parts of a thing */
     M[M_DET] = (double)j;
     M[M_SRC] = (double)s->src;
     M[M_PD] = s->lpd[a];
@@ -9170,6 +9715,10 @@ static PyObject *hyp_scan(PyObject *self, PyObject *args)
             }
         }
         /* 2. the leaves against the detections; the scan's common angle taken out, and once more without it */
+        if (h_occluders(&s) < 0) {
+            PyErr_NoMemory();
+            goto fail;
+        }
         h_ratios(&s);
         if (has_bias && nd) {
             took = h_common(&s, bias);
@@ -9813,6 +10362,144 @@ static PyType_Slot hyp_slots[] = {
     {Py_tp_new, hyp_new}, {Py_tp_init, hyp_init}, {Py_tp_dealloc, hyp_dealloc}, {Py_tp_methods, hyp_methods}, {0, NULL}};
 static PyType_Spec hyp_spec = {"chris_integrator.native._chris_native.Hyp", sizeof(Hyp), 0, Py_TPFLAGS_DEFAULT, hyp_slots};
 
+/* radar_cells(returns (n, 3): range, azimuth (rad), range rate; eps_m, eps_v, S | None, rows, dts, sensor, pose,
+ *             margin) -> [(range, azimuth, range rate, n, sxx, sxy, syy)]
+ * The returns of one scan of a sensor that gives several per object, grouped into cells: first the returns that
+ * lie on a known object (rows: the objects' rows, each taken dt on at its velocity; inside its rectangle widened by
+ * `margin` and by what is not known of its place, with a range rate that fits its velocity) are that object's
+ * cell, a return that fits two going to the nearer; the rest by single linkage (two returns are one cell's when
+ * they are nearer than eps_m and their range rates differ by less than eps_v). A cell: the mean of its returns'
+ * places (sensor axes, given back as range and azimuth), the mean range rate, the number of returns and the
+ * scatter of their places about the mean. The objects' cells first, in the objects' order. */
+static PyObject *n_radar_cells(PyObject *self, PyObject *args)
+{
+    PyObject *oz, *oS = Py_None, *orows = Py_None, *odt = Py_None, *osen = Py_None, *opose = Py_None;
+    double eps_m, eps_v, margin = 0.0;
+    if (!PyArg_ParseTuple(args, "Odd|OOOOOd", &oz, &eps_m, &eps_v, &oS, &orows, &odt, &osen, &opose, &margin))
+        return NULL;
+    Py_ssize_t n = batch_len(oz);
+    if (n < 0)
+        return NULL;
+    double *z = (double *)PyMem_Malloc((size_t)(5 * n + 1) * sizeof(double));
+    int *lab = (int *)PyMem_Malloc((size_t)(2 * n + 1) * sizeof(int));
+    PyObject *res = NULL;
+    View vS;
+    vS.held = 0;
+    Py_ssize_t cap, B = 0, *rows = NULL;
+    double *dts = NULL, pose[6];
+    RSens sen;
+    if (z == NULL || lab == NULL) {
+        PyErr_NoMemory();
+        goto done;
+    }
+    if (n && rows_get(oz, n, 3, z, "returns") < 0)
+        goto done;
+    double *xy = z + 3 * n;
+    int *own = lab + n;
+    for (Py_ssize_t i = 0; i < n; i++) {
+        xy[2 * i] = z[3 * i] * cos(z[3 * i + 1]);
+        xy[2 * i + 1] = z[3 * i] * sin(z[3 * i + 1]);
+        lab[i] = (int)i;
+        own[i] = -1;
+    }
+    if (oS != Py_None && n) {
+        if (store_get(oS, &vS, &cap) < 0 || (rows = idx_get(orows, cap, &B)) == NULL || sens_get(osen, &sen) < 0 ||
+            rnums_get(opose, 6, pose, "pose") < 0)
+            goto done;
+        dts = (double *)PyMem_Malloc((size_t)(B + 1) * sizeof(double));
+        if (dts == NULL) {
+            PyErr_NoMemory();
+            goto done;
+        }
+        if (B && rows_get(odt, B, 1, dts, "dts") < 0)
+            goto done;
+        double sx, sy, axis;
+        r_sensor_at(&sen, pose, &sx, &sy, &axis);
+        double ca = cos(axis), sa = sin(axis), cps = cos(pose[2]), sps = sin(pose[2]);
+        double ox = cps * sen.mx - sps * sen.my, oy = sps * sen.mx + cps * sen.my;
+        double svx = pose[3] - pose[5] * oy, svy = pose[4] + pose[5] * ox;
+        for (Py_ssize_t i = 0; i < n; i++) {
+            double gx = sx + ca * xy[2 * i] - sa * xy[2 * i + 1], gy = sy + sa * xy[2 * i] + ca * xy[2 * i + 1];
+            double best = INFINITY;
+            for (Py_ssize_t b = 0; b < B; b++) {
+                const double *row = (const double *)vS.b.buf + rows[b] * RROW, *x = row + RO_X, *P = row + RO_P, *e = row + RO_E;
+                double cx = x[R_PX] + x[R_VX] * dts[b], cy = x[R_PY] + x[R_VY] * dts[b];
+                double c = cos(e[E_HDG]), sn = sin(e[E_HDG]);
+                double bx = c * (gx - cx) + sn * (gy - cy), by = -sn * (gx - cx) + c * (gy - cy);
+                double m = margin + pymin(2.0 * sqrt(pymax(r_eig2(P[0], P[RN], P[RN + 1]), 0.0)), 2.5);
+                double hx = 0.5 * e[E_LEN] + m, hy = 0.5 * e[E_WID] + m;
+                if (fabs(bx) > hx || fabs(by) > hy)
+                    continue;
+                double lx = gx - sx, ly = gy - sy, lr = pymax(hypot(lx, ly), 0.5);
+                double rr = ((x[R_VX] - svx) * lx + (x[R_VY] - svy) * ly) / lr;
+                double sv = sqrt(pymax(P[R_VX * RN + R_VX] + P[R_VY * RN + R_VY], 0.0));
+                if (fabs(z[3 * i + 2] - rr) > 2.0 * eps_v + 2.0 * sv)
+                    continue;
+                double q = pymax(fabs(bx) / hx, fabs(by) / hy);
+                if (q < best) {
+                    best = q;
+                    own[i] = (int)b;
+                }
+            }
+        }
+        for (Py_ssize_t i = 0; i < n; i++)               /* an object's returns are one cell */
+            for (Py_ssize_t j = i + 1; j < n; j++)
+                if (own[i] >= 0 && own[j] == own[i]) {
+                    int a = uf_find(lab, (int)i), b = uf_find(lab, (int)j);
+                    if (a != b)
+                        lab[a > b ? a : b] = a > b ? b : a;
+                }
+    }
+    for (Py_ssize_t i = 0; i < n; i++)
+        for (Py_ssize_t j = i + 1; j < n; j++)
+            if (own[i] < 0 && own[j] < 0 && hypot(xy[2 * i] - xy[2 * j], xy[2 * i + 1] - xy[2 * j + 1]) <= eps_m &&
+                fabs(z[3 * i + 2] - z[3 * j + 2]) <= eps_v) {
+                int a = uf_find(lab, (int)i), b = uf_find(lab, (int)j);
+                if (a != b)
+                    lab[a > b ? a : b] = a > b ? b : a;
+            }
+    res = PyList_New(0);
+    for (int pass = 0; res && pass < 2; pass++)
+        for (Py_ssize_t i = 0; res && i < n; i++) {
+            if (uf_find(lab, (int)i) != (int)i || (own[i] >= 0) != (pass == 0))
+                continue;
+            double mx = 0.0, my = 0.0, mr = 0.0, sxx = 0.0, sxy = 0.0, syy = 0.0;
+            int m = 0;
+            for (Py_ssize_t j = i; j < n; j++)
+                if (uf_find(lab, (int)j) == (int)i) {
+                    mx += xy[2 * j];
+                    my += xy[2 * j + 1];
+                    mr += z[3 * j + 2];
+                    m++;
+                }
+            mx /= m;
+            my /= m;
+            mr /= m;
+            for (Py_ssize_t j = i; j < n; j++)
+                if (uf_find(lab, (int)j) == (int)i) {
+                    double ax = xy[2 * j] - mx, ay = xy[2 * j + 1] - my;
+                    sxx += ax * ax;
+                    sxy += ax * ay;
+                    syy += ay * ay;
+                }
+            double dof = m > 1 ? m - 1.0 : 1.0;
+            PyObject *t = Py_BuildValue("(dddiddd)", hypot(mx, my), atan2(my, mx), mr, m, sxx / dof, sxy / dof, syy / dof);
+            if (t == NULL || PyList_Append(res, t) < 0) {
+                Py_XDECREF(t);
+                Py_CLEAR(res);
+                break;
+            }
+            Py_DECREF(t);
+        }
+done:
+    PyMem_Free(z);
+    PyMem_Free(lab);
+    PyMem_Free(rows);
+    PyMem_Free(dts);
+    view_drop(&vS);
+    return res;
+}
+
 /* radar_kbest(cost (n, m), k) -> [(cost, [column of each row])]: the k cheapest assignments of n rows to m >= n
  * columns in order (the hypotheses' ranked assignment, for tests and tools); a pair that may not be: >= 1e17 */
 static PyObject *n_radar_kbest(PyObject *self, PyObject *args)
@@ -9895,6 +10582,7 @@ static PyMethodDef methods[] = {
     {"radar_marginals", n_radar_marginals, METH_VARARGS, "tracker.marginals into a given array"},
     {"radar_assign", n_radar_assign, METH_O, "tracker.assign"},
     {"radar_peek_models", n_radar_peek_models, METH_VARARGS, "one row's motion hypotheses after dt, each by itself"},
+    {"radar_cells", n_radar_cells, METH_VARARGS, "an extended sensor's returns grouped into cells"},
     {"radar_kbest", n_radar_kbest, METH_VARARGS, "the k cheapest assignments in order (Murty)"},
     {"radar_frame", n_radar_frame, METH_VARARGS, "the output's per-object numbers (box.py Radar.frame)"},
     {"radar_life", n_radar_life, METH_VARARGS, "Tracker.manage's numbers: stillness, finiteness, out-of-view place"},
@@ -9921,7 +10609,8 @@ PyMODINIT_FUNC PyInit__chris_native(void)
     if (builtin_round == NULL)
         goto fail;
     Py_INCREF(Fallback);
-    if (PyModule_AddObject(m, "Fallback", Fallback) < 0 || PyModule_AddIntConstant(m, "VERSION", NATIVE_VERSION) < 0)
+    if (PyModule_AddObject(m, "Fallback", Fallback) < 0 || PyModule_AddIntConstant(m, "VERSION", NATIVE_VERSION) < 0 ||
+        PyModule_AddIntConstant(m, "RADAR_ROW", RROW) < 0)
         goto fail;
     if ((NisWinType = PyType_FromSpec(&niswin_spec)) == NULL || (TrendType = PyType_FromSpec(&trend_spec)) == NULL)
         goto fail;

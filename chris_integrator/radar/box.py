@@ -38,6 +38,13 @@ y LEFT, origin the reference camera):
                                                     following the road as the car does: along the car's own
                                                     path, at its present offset beside it, at its present speed
 
+    ctr [x, y]                                      the object's centre; x_m, y_m (and predict) are its NEAR FACE
+    len, wid, hdg, ext_std [len, wid, hdg]          its rectangle: length, width (m), where its front points (rad,
+                                                    car frame, left positive; held when it stands) and their 1 sigma
+    vis, occ, occ_by                                how much of it its last scan's sensor could see (0..1); what
+                                                    hides it ("object" | "edge" | "fov" | null) and the hiding
+                                                    object's id (docs/RADAR.md)
+
 Scans are processed in time order once the car's own motion is known up to their time; a scan that arrives
 late is applied to the objects taken back to its time (tracker.py).
 """
@@ -72,6 +79,9 @@ CFG = dict(
     with_heading_deg=20.0, with_speed=(0.5, 1.5), with_min_mps=3.0,
     queue_max=200,
     tentative=False,                         # list tentative objects too
+    # microwave radars that give several returns per object (a message may say so itself: "extended": true):
+    # True (all), or the sensor ids; how near in place and in range rate two returns of one cell are
+    radar_extended=False, cell_m=1.6, cell_mps=1.5, cell_margin_m=0.6,
 )
 
 
@@ -149,6 +159,7 @@ class Radar:
             box = [float(v) for v in box] if isinstance(box, (list, tuple)) and len(box) == 4 and all(_fin(v) for v in box) else None
             hpx = box[3] - box[1] if box else None
             wa = (box[2] - box[0]) / f if box and box[2] > box[0] else None      # the box's width as an angle
+            wok = bool(box) and "l" not in clip and "r" not in clip             # ... and it is the object's own
             if box and not clip and hpx and hpx >= 6.0 and wa:
                 at["aspect"] = (box[2] - box[0]) / hpx   # of a whole box: which way a vehicle points
             # the box's centre: as good as its edges, unless a side is cut (then the centre is not the object's)
@@ -168,9 +179,10 @@ class Radar:
                 if hpx is not None and hpx >= 6.0 and "t" not in clip and "b" not in clip:
                     sh = (c["height_std_px"] + c["height_std_rel"] * hpx) / hpx          # of the logarithm
                     dets.append({"kind": "rbh", "z": np.array([ang, b, math.log(hpx * self.frame_scale)]),
-                                 "R": np.array([sa * sa, sb * sb, sh * sh]), "attrs": at, "w": wa})
+                                 "R": np.array([sa * sa, sb * sb, sh * sh]), "attrs": at, "w": wa, "wok": wok})
                 else:
-                    dets.append({"kind": "rb", "z": np.array([ang, b]), "R": np.array([sa * sa, sb * sb]), "attrs": at, "w": wa})
+                    dets.append({"kind": "rb", "z": np.array([ang, b]), "R": np.array([sa * sa, sb * sb]), "attrs": at,
+                                 "w": wa, "wok": wok})
                 self._scale_rate(dets[-1], o)
             elif "b" in clip:
                 top = None
@@ -179,9 +191,10 @@ class Radar:
                     top = math.atan2(ry[2], math.hypot(ry[0], ry[1]))          # below the horizon: positive
                 if top is not None:
                     st = math.hypot((c["bottom_px"] + c["bottom_rel"] * hpx) / f, jit)
-                    dets.append({"kind": "bt", "z": np.array([b, top]), "R": np.array([sb * sb, st * st]), "attrs": at, "w": wa})
+                    dets.append({"kind": "bt", "z": np.array([b, top]), "R": np.array([sb * sb, st * st]), "attrs": at,
+                                 "w": wa, "wok": wok})
                 else:
-                    dets.append({"kind": "b", "z": np.array([b]), "R": np.array([sb * sb]), "attrs": at, "w": wa})
+                    dets.append({"kind": "b", "z": np.array([b]), "R": np.array([sb * sb]), "attrs": at, "w": wa, "wok": wok})
                 self._scale_rate(dets[-1], o)
         # the detector's size limit in this view, as its boxes show it: the smallest seen, forgotten slowly
         key = round(cover["ground_min_m"]) if cover else None
@@ -231,6 +244,19 @@ class Radar:
             sen = self.radars[sid] = MicrowaveRadar(mount)
         dets = []
         sr, sa, sv = sen.sigma
+        ext = self.cfg["radar_extended"]
+        if msg.get("extended") is True or ext is True or (isinstance(ext, (list, tuple)) and sid in ext):
+            # a sensor that gives several returns per object: the returns of one scan are grouped into cells (the
+            # returns on a known object; the rest by nearness in place and range rate), and a cell is one detection:
+            # the mean of its returns, how many they are, and how they are spread (the tracker reads the spread as
+            # the object's sides: docs/RADAR.md)
+            # the tracker groups them (it knows where the objects are): Tracker._cells
+            sen.extended = (self.cfg["cell_m"], self.cfg["cell_mps"], self.cfg["cell_margin_m"])
+            dets = [(float(o["range_m"]), math.radians(o["azimuth_deg"]), float(o["range_rate_mps"])) for o in objs
+                    if isinstance(o, dict) and _fin(o.get("range_m")) and _fin(o.get("azimuth_deg")) and _fin(o.get("range_rate_mps"))]
+            dets = [z for z in dets if 0.5 <= z[0] <= sen.max_range and abs(z[1]) <= sen.fov]
+            self._push((ts / NS, sid, sen, dets))
+            return
         for o in objs:
             if not isinstance(o, dict) or not (_fin(o.get("range_m")) and _fin(o.get("azimuth_deg")) and _fin(o.get("range_rate_mps"))):
                 continue
