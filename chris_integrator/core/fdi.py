@@ -53,86 +53,7 @@ class Finding:
                 "since_s": round(max(0.0, now - self.since), 1), "text": self.text}
 
 
-class _StreamPy:
-    """Signal integrity of one raw stream (group, quantity)."""
-
-    def __init__(self, cfg):
-        self.c = cfg
-        self.q = collections.deque(maxlen=max(cfg["noise_window"], cfg["repeat_window"]) + 2)   # (t, v, sigma)
-        self.run_t = self.run_v = None
-        self.run_n = 0
-        self.noise_ratio = 1.0
-        self.k = 0
-        self.held = []
-        self.h_n, self.h_rep = 0, 0.0
-        self.peak = {}                     # per kind: the largest statistic over its fault level (1 = a fault)
-
-    def offer(self, t, v, s):
-        """-> [(kind, level, text)] conditions that hold now."""
-        c = self.c
-        out = []
-        if not (isinstance(v, (int, float)) and math.isfinite(v)):
-            return [("invalid", "fault", "value is not a number")]
-        if self.q and t <= self.q[-1][0]:
-            return out
-        if v == self.run_v:
-            self.run_n += 1
-        else:
-            self.run_v, self.run_t, self.run_n = v, t, 1
-        self.q.append((t, v, s))
-        # what this stream normally does: the share of samples that equal their predecessor (learned while no
-        # run is going on). A stream that has always repeated itself (a coarse signal, a test fixture) is not
-        # stuck when it repeats; one that never did, is.
-        if v != 0.0 and self.run_n <= 3:
-            self.h_n += 1
-            self.h_rep += ((1.0 if self.run_n > 1 else 0.0) - self.h_rep) / min(self.h_n, 500)
-        varies = self.h_n >= c["learn_n"] and self.h_rep < c["learn_repeat"]
-        if not varies:
-            return out
-        # (a value within its own noise of zero may well stay where it is: a standing car)
-        if abs(v) > 4.0 * s > 0.0 and self.run_n >= c["stuck_n"]:
-            self.peak["stuck"] = max(self.peak.get("stuck", 0.0), (t - self.run_t) / c["stuck_fault_s"])
-        if abs(v) > 4.0 * s > 0.0 and self.run_n >= c["stuck_n"] and t - self.run_t >= c["stuck_s"]:
-            out.append(("stuck", "fault" if t - self.run_t >= c["stuck_fault_s"] else "warn",
-                        "value frozen at %.4g for %.1f s (%d samples)" % (v, t - self.run_t, self.run_n)))
-        n = len(self.q)
-        self.k += 1
-        if self.k % 4:                                      # the windowed statistics: every fourth sample
-            return out + self.held
-        self.held = []
-        out0 = len(out)
-        if n >= c["repeat_window"]:
-            vals = [x[1] for x in self.q]
-            k = n - c["repeat_window"]
-            rep = sum(1 for i in range(k + 1, n) if vals[i] == vals[i - 1] and vals[i] != 0.0)
-            if rep / (n - k - 1) >= c["repeat_share"] and not out:
-                out.append(("repeat", "warn", "%d %% of samples repeat their predecessor" % round(100.0 * rep / (n - k - 1))))
-        if n >= c["noise_window"]:
-            vals = [x[1] for x in self.q]
-            sig = statistics.median(x[2] for x in self.q)
-            if sig > 0.0:
-                d2 = [abs(vals[i] - 2.0 * vals[i - 1] + vals[i - 2]) / 2.449 for i in range(2, n) if vals[i] != vals[i - 1]]
-                if len(d2) >= 10:
-                    ratio = 1.4826 * statistics.median(d2) / sig
-                    self.noise_ratio = ratio
-                    self.peak["noise"] = max(self.peak.get("noise", 0.0), ratio / c["noise_fault_ratio"])
-                    if ratio >= c["noise_ratio"]:
-                        out.append(("noise", "fault" if ratio >= c["noise_fault_ratio"] else "warn",
-                                    "noise %.1fx the characterised level" % ratio))
-                    else:
-                        wild = sum(1 for d in d2 if d > c["outlier_z"] * sig)
-                        if wild / len(d2) >= c["outlier_share"] and wild >= 3:
-                            out.append(("outliers", "warn", "%d wild samples in the last %d" % (wild, len(d2))))
-        self.held = out[out0:]
-        return out
-
-    def clear(self):
-        self.q.clear()
-        self.run_v = self.run_t = None
-        self.run_n = 0
-
-
-class _StreamNative(_C.StreamState):
+class Stream(_C.StreamState):
     """Signal integrity of one raw stream (group, quantity): a value frozen while it should vary, samples that
     repeat their predecessor, noise beyond the characterised level, wild samples, values that are not numbers. The
     arithmetic is the native core's (chris_native.c `StreamState`); the findings' texts are made here."""
@@ -213,11 +134,6 @@ class Clock:
         self.base = self.t0 = None
         self.early = []
         self.shift = 0.0
-
-
-from .monitors import MON_PY  # noqa: E402
-
-Stream = _StreamPy if MON_PY else _StreamNative
 
 
 def Trend(cfg):

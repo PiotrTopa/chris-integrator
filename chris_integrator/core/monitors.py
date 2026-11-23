@@ -7,8 +7,6 @@ import collections
 import math
 import statistics
 
-import os
-
 from ..native import core as _C
 from ..native import round                  # builtins.round (its results; the native core)
 
@@ -305,60 +303,7 @@ class Pair:
         self.cusum_on = False
 
 
-# (lane estimator-native, temporary: CHRIS_MON_PY=1 runs the Python SelfCheck and fdi.Stream, for the equivalence runs)
-MON_PY = os.environ.get("CHRIS_MON_PY") == "1"
-
-
-class _SelfCheckPy:
-    """A source's stated uncertainty over its characterised one: the median over a window."""
-
-    kind = "self"
-
-    def __init__(self, group, quantity, cfg):
-        self.group, self.quantity, self.c = group, quantity, cfg
-        self.win = _Window(cfg["recover_window_s"], cfg["max_step_s"])
-        self.fault = False
-        self.median = None
-        self.n = 0
-        self.changed_t = None
-        self.peak = 0.0
-
-    def offer(self, t, ratio):
-        c = self.c
-        self.win.add(t, ratio)
-        fire = self.win.last(c["fire_window_s"])
-        self.n = len(fire)
-        self.median = statistics.median(fire) if fire else None
-        if self.n >= c["min_n"]:
-            self.peak = max(self.peak, self.median / c["fire_ratio"])
-        old = self.fault
-        if not old:
-            if self.n >= c["min_n"] and self.median > c["fire_ratio"]:
-                self.fault = True
-        else:
-            rec = self.win.last(c["recover_window_s"])
-            if len(rec) >= c["recover_min_n"] and self.win.span() >= 0.9 * c["recover_window_s"] \
-                    and statistics.median(rec) < c["recover_ratio"] and self.median < c["recover_ratio"]:
-                self.fault = False
-        if self.fault != old:
-            self.changed_t = t
-            return True
-        return False
-
-    def report(self):
-        return {"kind": "self", "a": self.group, "quantity": self.quantity,
-                "verdict": "fault" if self.fault else ("ok" if self.n >= self.c["min_n"] else "unknown"),
-                "n": self.n, "ratio": None if self.median is None else round(self.median, 2), "peak": round(self.peak, 2),
-                "evidence_s": round(min(self.win.span(), self.c["fire_window_s"]), 1)}
-
-    def describe(self):
-        return "own %s uncertainty %.1fx its characterised level" % (self.quantity, self.median or 0.0)
-
-    def reset_data(self):
-        self.win.clear()
-
-
-class _SelfCheckNative(_C.SelfWindow):
+class SelfCheck(_C.SelfWindow):
     """A source's stated uncertainty over its characterised one: the median over a window of evidence time (the
     native core's: chris_native.c `SelfWindow`: `offer`, `fault`, `median`, `n`, `peak`, `changed_t`, `span`,
     `reset_data`)."""
@@ -379,8 +324,6 @@ class _SelfCheckNative(_C.SelfWindow):
     def describe(self):
         return "own %s uncertainty %.1fx its characterised level" % (self.quantity, self.median or 0.0)
 
-
-SelfCheck = _SelfCheckPy if MON_PY else _SelfCheckNative
 
 
 class NisMonitor(_C.NisWindow):

@@ -665,8 +665,7 @@ def selfcheck_run(SelfCheck, cfg, offers, reset_at):
         if i == reset_at:
             m.reset_data()
         ch = m.offer(t, r)
-        span = m.win.span() if hasattr(m, "win") else m.span
-        out.append((ch, m.fault, m.median, m.n, m.peak, m.changed_t, span))
+        out.append((ch, m.fault, m.median, m.n, m.peak, m.changed_t, m.span))
     return out
 
 
