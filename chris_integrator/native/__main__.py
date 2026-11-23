@@ -273,11 +273,84 @@ def _check_filter():
     return vals
 
 
+def _check_monitors():
+    """The estimator's monitor windows on fixed sequences: innovation window, own-uncertainty window, a raw stream's
+    integrity (exact: medians, comparisons, elementwise arithmetic)."""
+    from ..core.fdi import DEFAULT_CFG, Stream
+    from ..core.monitors import NisMonitor, SelfCheck
+    rng = random.Random(11)
+    out = []
+    m = NisMonitor("g", "q", dict(window_s=2.0, max_n=20, min_n=4, fire=2.0, recover=1.0))
+    s = SelfCheck("g", "q", dict(fire_window_s=1.0, min_n=5, fire_ratio=4.0, recover_window_s=2.0, recover_min_n=8,
+                                 recover_ratio=3.0, max_step_s=0.25))
+    st = Stream(dict(DEFAULT_CFG, learn_n=5, noise_window=12, repeat_window=6))
+    t, v, level = 0.0, 1.0, 1.0
+    for i in range(600):
+        t += rng.choice([0.05, 0.05, 0.0, 0.3])
+        if i % 50 == 0:
+            level = rng.choice([0.5, 6.0, 1.0])
+        d = float("nan") if i % 97 == 5 else _normal(rng) ** 2 * level
+        out.append((m.offer(t, d), m.value, m.high, m.peak, m.n))
+        out.append((s.offer(t, level * (0.5 + rng.random())), s.fault, s.median, s.n, s.span))
+        v = v if i % 7 < 3 else v + _normal(rng, 0.3 * level)
+        out.append((st.offer(t, v, 0.1), st.noise_ratio))
+    return out
+
+
+def _check_pass():
+    """The filter pass over a model of plain arithmetic (no libm): late rows, robust rows against an exact one,
+    a group disabled, the monitors' hooks; every entry's state and every hook call (exact)."""
+    from ..core.ekf import Filter, Row
+    from ..core.fdi import Trend
+    from ..core.monitors import NisMonitor
+
+    class Model:
+        def predict(self, x, P, dt):
+            F = [[1.0, dt], [0.0, 1.0]]
+            x1 = np.array([x[0] + dt * x[1], x[1]])
+            FP = [[F[i][0] * P[0][j] + F[i][1] * P[1][j] for j in range(2)] for i in range(2)]
+            P1 = np.array([[FP[i][0] * F[j][0] + FP[i][1] * F[j][1] + (0.1 * dt if i == j else 0.0) for j in range(2)]
+                           for i in range(2)])
+            return x1, P1, None
+    rng = random.Random(12)
+    f = Filter(Model(), np.zeros(2), np.diag([100.0, 10.0]), horizon_s=1e9)
+    nis, trends, log = {}, {}, []
+
+    def nis_new(key):
+        r = nis[key] = NisMonitor(key[0], key[1], dict(window_s=3.0, max_n=30, min_n=3, fire=3.0, recover=1.5))
+        return r
+
+    def trend_new(key):
+        r = trends[key] = Trend(dict(trend_tau_s=5.0, trend_fire=1.5, trend_clear=1.0, trend_min_n=4, trend_corr=2.0))
+        return r
+    f.watch(nis, nis_new, lambda k, m, t, ch: log.append((k, t, ch, m.value)), trends, trend_new,
+            lambda k, tr, t: log.append((k, t, tr.high, tr.score)), "standstill")
+    i0, i1 = np.array([0], dtype=np.intp), np.array([1], dtype=np.intp)
+    one = np.array([1.0])
+    t = 0.0
+    for k in range(300):
+        t += 0.05
+        tt = t - (rng.random() if k % 9 == 0 else 0.0)
+        f.insert(tt, Row("p", 0.5 * t * t + _normal(rng, 0.3), 0.09, lambda x: (float(x[0]), i0, one), "a", "ga"))
+        f.insert(tt, Row("v", t + _normal(rng, 0.2) + (8.0 if k % 13 == 0 else 0.0), 0.04, lambda x: (x[1], i1, one),
+                         "b", "gb", robust=True, freeze=[0] if k % 5 == 0 else None))
+        if k % 13 == 0:                            # a wild robust row while an exact one anchors its quantity
+            f.insert(tt, Row("p", 0.5 * t * t + 8.0, 0.09, lambda x: (float(x[0]), i0, one), "c", "gc", robust=True))
+        if k == 150:
+            f.set_disabled(["ga"])
+        if k % 4 == 0:
+            f.flush()
+    f.flush()
+    return [log, [(e.t, e.x, e.P, e.usedq) for e in f.entries], dict(f.rejected), f.reruns]
+
+
 _CHECKS = (("view", _check_view), ("road line", _check_road_line), ("road geometry", _check_geometry),
-           ("lanes", _check_lanes), ("filter rows", _check_rows), ("filter", _check_filter))
+           ("lanes", _check_lanes), ("filter rows", _check_rows), ("filter", _check_filter),
+           ("monitors", _check_monitors), ("filter pass", _check_pass))
 # what the development build gives (x86-64, glibc; held to the removed references by tests/test_native.py)
 EXPECT = {"view": "1d8746b3a5684186", "road line": "6ec3625f028f58ce", "road geometry": "4997564407c2f49f",
-          "lanes": "6ca8cd4c07318197", "filter rows": "87ce1e5c039ae00b",
+          "lanes": "6ca8cd4c07318197", "filter rows": "87ce1e5c039ae00b", "monitors": "a698169328321f5d",
+          "filter pass": "7116b780dc1f1ba9",
           "filter": [7.723780535727707, 10.435565184078538, 26.99841329569997, 193.8061211825356, 189.01412870797915,
                      8.782660472555797, 168.72298218978383, 169.76519932373355, 23.100822279577056, 10.480539787057944,
                      26.9920707506736, 207.80726029609707, 193.519507522703, 24.874612526046533, 180.82839053291355,
