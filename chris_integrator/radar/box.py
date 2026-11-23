@@ -62,7 +62,9 @@ CFG = dict(
     path_max_m=150.0,
     ttc_min_closing=0.5,
     in_path_sigma=1.0, in_path_slack_m=0.4, in_path_hold_s=0.4,
-    threat_ttc_s=2.7, threat_p=0.85, threat_hold_s=0.2, threat_min_mps=3.0,
+    threat_ttc_s=2.7, threat_p=0.7, threat_hold_s=0.2,
+    threat_range_s=1.0,
+    threat_min_mps=5.5,                      # 20 km/h: below, a time to reach says little (walking pace, manoeuvring)
     predict_s=(0.5, 1.0, 2.0),
     # "drives with the car": heading within this of the path's direction where it is, speed within this ratio
     # of the car's own, and both really driving
@@ -333,14 +335,21 @@ class Radar:
             # below the one that would just make it
             p_thr = 0.0
             if sure_in and v_ego >= c["threat_min_mps"] and o.state != "tentative":
-                need = v_ego - float(pc[0]) / c["threat_ttc_s"]
+                # reached within T at the present speeds: g = distance - T x closing speed < 0, with what is not
+                # known of BOTH the distance and the object's speed (a near object whose box is cut has a poor
+                # range: its closeness must not be taken for a fact)
+                Tt = c["threat_ttc_s"]
+                u = np.zeros(M.N)
+                u[PX], u[PY], u[VX], u[VY] = ch, sh, Tt * ch, Tt * sh
                 for m_ in range(len(M.MODELS)):
-                    vm = ch * o.xs[m_][VX] + sh * o.xs[m_][VY]
-                    Pm = o.Ps[m_]
-                    sm = math.sqrt(max(ch * ch * Pm[VX, VX] + 2.0 * ch * sh * Pm[VX, VY] + sh * sh * Pm[VY, VY], 0.0) + 0.09)
-                    p_thr += float(o.mu[m_]) * 0.5 * (1.0 + math.erf((need - vm) / (sm * 1.4142)))
+                    xm = o.xs[m_]
+                    g = ch * (xm[PX] - X) + sh * (xm[PY] - Y) + Tt * (ch * xm[VX] + sh * xm[VY]) - Tt * v_ego
+                    sg = math.sqrt(max(float(u @ o.Ps[m_] @ u), 0.0) + 0.09 * Tt * Tt)
+                    p_thr += float(o.mu[m_]) * 0.5 * (1.0 + math.erf(-g / (sg * 1.4142)))
             th0 = self._threat_since.get(o.id)
-            if p_thr >= c["threat_p"]:
+            # a threat is not STARTED on an object whose distance has lately come from cut boxes only (a
+            # vehicle close beside the car: its range is the poorest there is); one raised before stays
+            if p_thr >= c["threat_p"] and (th0 is not None or T - o.range_t <= c["threat_range_s"]):
                 if th0 is None:
                     th0 = self._threat_since[o.id] = T
                 if T - th0 >= c["threat_hold_s"]:

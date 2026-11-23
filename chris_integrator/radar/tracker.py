@@ -164,7 +164,7 @@ def marginals(ratio, iters=30, tol=1e-4):
 class Obj:
     __slots__ = ("id", "xs", "Ps", "mu", "t", "t0", "logodds", "hits", "state", "sources", "last_seen", "vote",
                  "history", "checks", "consistency", "pred_err", "n_checks", "nis", "verdict", "coast_s", "x", "P",
-                 "velocity_seen", "merge_t", "flags", "last_cover", "dp0", "gain", "last_box", "xf", "Pf", "scores")
+                 "velocity_seen", "merge_t", "flags", "last_cover", "dp0", "gain", "last_box", "xf", "Pf", "scores", "range_t")
 
     def __init__(self, oid, x0, P0, mu, t, src, exist, coast_s):
         self.id = oid
@@ -198,6 +198,7 @@ class Obj:
         self.gain = None             # of its last pairing: log odds for "this detection is mine"
         self.last_box = None         # (time, sensor, angular width) of its last box
         self.scores = []             # (sensor, score) of its boxes while it is not confirmed
+        self.range_t = t             # the last time a detection said how far it is (not a bearing alone)
         self.x, self.P = M.combine(self.xs, self.Ps, self.mu)
 
     @property
@@ -793,6 +794,8 @@ class Tracker:
         o.logodds = max(-12.0, min(12.0, o.logodds))
         o.x, o.P = M.combine(o.xs, o.Ps, o.mu)
         o.hits += 1
+        if (d.get("kind") or "rb").rstrip("s") not in ("b", "bt"):
+            o.range_t = t            # a box cut at the bottom gives a direction, and a range only by the top edge
         o.sources.add(src)
         o.last_seen[src] = t
         o.coast_s = max(o.coast_s, sensor.coast_s) if len(o.sources) == 1 else min(o.coast_s, sensor.coast_s)

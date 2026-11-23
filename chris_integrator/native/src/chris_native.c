@@ -2333,7 +2333,7 @@ static void r_predict(int model, const double *x, const double *P, double dt, do
             col[R_PX + i][1] = R_VX + i;
             val[R_PX + i][1] = dt;
             col[R_PX + i][2] = R_AX + i;
-            val[R_PX + i][2] = 0.5 * dt * adt;
+            val[R_PX + i][2] = 0.5 * dt * dt;          /* also for a step back: x - v|dt| + a dt^2 / 2 */
             nz[R_VX + i] = 2;
             col[R_VX + i][1] = R_AX + i;
             val[R_VX + i][1] = dt;

@@ -175,7 +175,7 @@ def predict_b(xs, Ps, dt, a_lon, a_lat, v_max, cfg=CFG):
     # ca: an acceleration that persists, driven by a jerk noise
     rho = np.exp(-adt / cfg["ca_tau_s"])
     F[:, CA, PX, VX] = F[:, CA, PY, VY] = dt
-    F[:, CA, PX, AX] = F[:, CA, PY, AY] = 0.5 * dt * adt
+    F[:, CA, PX, AX] = F[:, CA, PY, AY] = 0.5 * dt * dt          # also for a step back: x - v|dt| + a dt^2 / 2
     F[:, CA, VX, AX] = F[:, CA, VY, AY] = dt
     F[:, CA, AX, AX] = F[:, CA, AY, AY] = rho
     qj = _shape_b((cfg["ca_jerk"] * a_lon) ** 2, (cfg["ca_jerk"] * a_lat) ** 2, xs[:, CA])
