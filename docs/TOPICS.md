@@ -950,6 +950,8 @@ How the numbers are made (docs/DESIGN.md section 17; the arithmetic is native, `
 | `btn`, `stn`, `tn` | `a_req.brake / a_avail[0]`, `min(left, right) / a_avail[1]`, the least share of the friction ellipse of any direction tried |
 | `ttb_s`, `tts_s` | the latest onset of full braking / full steering (to either side) that still avoids it |
 | levels | per pair: a collision course and `tn >= tn_min` or `tm <= tm_max` of the level (per class: vehicle, vru, unknown); per object: the highest level whose mass reaches its minimum |
+| footprint | the futures carry the radar's reference point (`x_m`, `y_m`: the footprint's near face); the centre is the radar's `ctr` (its offset held in the body frame), else half the depth beyond along the line of sight. Heading now: the stated one; a standing object (radar verdict, p_stationary >= 0.5, `parked`) whose heading is not its direction of travel takes the road's axis at its place when within 0.7 rad of it (`road_axis_standing`; the camera cannot tell which side of the line of sight a car points). Later steps: the direction of the mode's travel over the next second from 1 m/s on average, else held, modulo a half turn |
+| lanes | with predicted futures, a mode that stands (moves under 1 m over the horizon) is weighted by the prediction's P(lane ego) + P(lane cross), at least 0.05 (`lane_weight`); not where the radar's corridor test says it surely stands in the path (`in_path`, `threat`); moving modes (pulling out, crossing) keep their weight |
 
 Alerts (`chris_integrator/decide/alerts.py`): `obstacle_ahead` (everything on a collision course ahead) and
 `headway` (time headway to a vehicle ahead: information below 1.5 s, caution below 0.9 s held 2 s, warning

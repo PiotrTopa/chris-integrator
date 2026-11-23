@@ -42,6 +42,7 @@
 #define DK_MAXS 4096             /* Monte Carlo samples */
 #define DK_OH 10                 /* the object header's columns; 12 with the centre's offset */
 #define DK_OHC 12
+#define DK_HMOVE 1.0             /* m/s: a mode's travel over a second that sets the heading */
 #define DK_PF 24
 #define DK_OF 18
 
@@ -926,16 +927,37 @@ static PyObject *n_decide_eval(PyObject *self, PyObject *args)
             o->sdw = hd[5] > 0.0 ? hd[5] : 0.0;
             o->sdh = isfinite(hd[7]) && hd[7] > 0.0 ? hd[7] : 0.0;
             double h0 = isfinite(hd[6]) ? hd[6] : 0.0, hprev = h0;
-            /* the heading per grid interval: of the motion where it moves, else the stated heading */
+            /* the heading per step: now the stated one (the rectangle the radar measured; the offset of its centre
+             * is taken in that frame); later the direction of the mode's travel over the next second where it
+             * travels at least DK_HMOVE m/s on average, else held. The rectangle's axis, not its front: a step's
+             * heading is taken modulo a half turn nearest the last. Before 2026-11-23 every grid interval's own
+             * direction counted from 0.6 m/s on, now included: a mode starting 0.4 m beside the radar's point (the
+             * first quarter second, a prepended "now") turned a car parked beside the path across it, its centre
+             * offset swung by 90 degrees onto the path (parked_street object 400, move_off, pc 1.0). */
             double offb_x = 0.0, offb_y = 0.0;           /* the reference point to the centre, in the body frame */
             for (int i = 0; i < n; i++) {
                 double tau = t[0] + i * dt, f;
                 int i0;
                 dk_interp_idx(&g, tau, &i0, &f);
                 double x = X[i0] + f * (X[i0 + 1] - X[i0]), y = Y[i0] + f * (Y[i0 + 1] - Y[i0]);
-                double dx = X[i0 + 1] - X[i0], dy = Y[i0 + 1] - Y[i0];
-                double h = (dx * dx + dy * dy > 0.09 * (t[i0 + 1] - t[i0]) * (t[i0 + 1] - t[i0]) * 4.0) ? atan2(dy, dx)
-                           : (isfinite(hd[6]) ? hd[6] : hprev);
+                double tau2 = tau + 1.0 < t[N - 1] ? tau + 1.0 : t[N - 1], hm = NAN;
+                if (tau2 - tau > 0.2) {
+                    double f2;
+                    int j0;
+                    dk_interp_idx(&g, tau2, &j0, &f2);
+                    double mx = X[j0] + f2 * (X[j0 + 1] - X[j0]) - x, my = Y[j0] + f2 * (Y[j0 + 1] - Y[j0]) - y;
+                    if (mx * mx + my * my > DK_HMOVE * DK_HMOVE * (tau2 - tau) * (tau2 - tau))
+                        hm = atan2(my, mx);
+                }
+                double h;
+                if (i == 0)
+                    h = isfinite(hd[6]) ? hd[6] : (isfinite(hm) ? hm : h0);
+                else {
+                    h = isfinite(hm) ? hm : hprev;
+                    double dh = remainder(h - hprev, 2.0 * M_PI);
+                    if (fabs(dh) > 0.5 * M_PI)
+                        h = remainder(h + M_PI, 2.0 * M_PI);
+                }
                 hprev = h;
                 double c = cos(h), s = sin(h);
                 if (i == 0 && cfg[DC_REF] > 0.5 && ohw == DK_OHC && hd[9] > 0.5 && isfinite(hd[10]) &&

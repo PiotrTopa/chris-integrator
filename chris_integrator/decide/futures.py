@@ -12,8 +12,8 @@ companion `radar_fut` message of the same `ts_mono_ns`:
     (`radar_fut`: the same top level, and "objects": [{"id", "fut", "lane", "intent"}])
     in process: chris_integrator.predict.Predictor.update(radar_msg, context) -> the same, arrays for lists
 
-An object's x, y are the radar's reference point of it (the nearest point of its footprint to the car's origin,
-as `x_m`, `y_m`); its extent comes from `len`, `wid`, `hdg` (with their uncertainties) where the radar gives them,
+An object's x, y are the radar's reference point of it (its near face: where the line of sight from the car's
+origin to its centre enters its footprint, as `x_m`, `y_m`); its extent comes from `len`, `wid`, `hdg` (with their uncertainties) where the radar gives them,
 else from its class's prior size (CLASS_SIZE). The footprint's centre is the radar's `ctr` where given (its offset
 from the reference point, `centre_offset`); else half the footprint's depth beyond the reference point along the
 line of sight.
@@ -109,7 +109,7 @@ def extent(o):
 
 
 def centre_offset(o):
-    """The radar's footprint centre (`ctr`) less its reference point (`x_m`, `y_m`, the footprint's nearest point),
+    """The radar's footprint centre (`ctr`) less its reference point (`x_m`, `y_m`, the footprint's near face),
     car axes, or None where the radar does not give it. The futures carry the reference point; the footprint is
     drawn this far from it (turning with the object), not reconstructed from the line of sight."""
     c = o.get("ctr")
@@ -118,6 +118,54 @@ def centre_offset(o):
         return None
     dx, dy = float(c[0]) - float(o["x_m"]), float(c[1]) - float(o["y_m"])
     return (dx, dy) if math.hypot(dx, dy) <= 25.0 else None
+
+
+def stands(o):
+    """The radar says the object stands (its verdict, or p_stationary at least one half and not called moving)."""
+    if o.get("motion") == "moving":
+        return False
+    ps = o.get("p_stationary")
+    return o.get("motion") == "stationary" or "parked" in (o.get("flags") or ()) or (_fin(ps) and ps >= 0.5)
+
+
+def heading_from_motion(o):
+    """The radar's heading of the object comes from its own travel (a direction of travel, at a speed clear of its
+    spread)."""
+    if not _fin(o.get("heading_rad")):
+        return False
+    sd = o.get("std") or ()
+    sv = max(float(sd[2]), float(sd[3])) if len(sd) >= 4 and _fin(sd[2]) and _fin(sd[3]) else math.inf
+    sp = o.get("speed_mps") if _fin(o.get("speed_mps")) else math.hypot(float(o.get("vx_mps") or 0.0),
+                                                                        float(o.get("vy_mps") or 0.0))
+    return sp >= max(2.0, 2.0 * sv)
+
+
+def road_axis(h, sh, road, snap, sd):
+    """(heading, sd) of a standing object: the road's axis at its place (either direction, whichever is nearer the
+    stated heading) when the stated heading is within `snap` of it or not known; else as stated."""
+    if not math.isfinite(h):
+        return road, sd
+    d = (h - road + math.pi / 2.0) % math.pi - math.pi / 2.0          # to the axis, modulo a half turn
+    if abs(d) > snap:
+        return h, sh
+    return h - d, (min(sh, sd) if math.isfinite(sh) else sd)
+
+
+def in_path_weight(o, lane, floor):
+    """The weight of an object's standing modes from the prediction's lane probabilities: P(ego) + P(cross), at
+    least `floor`; 1 without lanes, or where the radar's corridor test puts it surely in the path."""
+    fl = o.get("flags") or ()
+    if "in_path" in fl or "threat" in fl or not isinstance(lane, dict):
+        return 1.0
+    vals = {k: v for k, v in lane.items() if _fin(v)}
+    if sum(vals.values()) < 0.5:
+        return 1.0
+    return min(1.0, max(floor, float(vals.get("ego", 0.0)) + float(vals.get("cross", 0.0))))
+
+
+def mode_stands(x, y, move_m):
+    """A mode whose place moves less than move_m over the horizon."""
+    return float(np.max(np.hypot(np.asarray(x) - x[0], np.asarray(y) - y[0]))) < move_m
 
 
 class FrameFutures:

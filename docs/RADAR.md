@@ -138,10 +138,14 @@ rectangle (section 4) at that centre:
 * a position sensor gives the centre.
 
 The message keeps `x_m`, `y_m` (and `predict`) as the near face, as they were (what is in the way is the face,
-not the centre: `on_path`, `in_path`, `ttc_s` use it); the centre goes out as `ctr`. The near face is the point of
-the rectangle nearest the car's origin (`r_near_offset`), the simulator's `ref_x`, `ref_y`. Until 2026-11-23 it was
-the centre brought nearer along the line of sight by half the depth (`r_half_depth`, the camera model's range): a
-point off the rectangle, towards the car, by up to the half width when the object is beside. A car parked 2.7 m to
+not the centre: `on_path`, `in_path`, `ttc_s` use it); the centre goes out as `ctr`. The near face is where the
+line of sight from the car's origin to the centre enters the rectangle (`r_near_offset`): on the rectangle,
+continuous, for a thing ahead its rear face at about the centre's lateral place. Until 2026-11-23 it was the centre
+brought nearer along the line of sight by half the depth (`r_half_depth`, the camera model's range): a point off the
+rectangle, towards the car, by up to the half width when the object is beside. (The rectangle's nearest point, the
+simulator's `ref_x`, `ref_y`, was tried: it puts a car in the next lane ahead at its inner corner, 0.9 m nearer the
+car's lane than its centre, and the prediction, which reads `x_m`, `y_m` as the object's place in its lane, called
+the adjacent car a cut-in with 0.97.) A car parked 2.7 m to
 the side read 0.4 to 0.8 m nearer the path than its side as it was passed, and a long one beside the car was put at
 the origin itself (the half depth clamped to the range): the decision layer's `obstacle_ahead` warned on parked
 cars at "contact" (parked_street: near-face lateral error under 8 m 0.35 m median, inward). The decision layer

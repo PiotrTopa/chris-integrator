@@ -114,6 +114,34 @@ class Futures(unittest.TestCase):
         self.assertEqual([m[0] for m in ms], ["stand", "cv"])
         self.assertAlmostEqual(ms[0][1], 0.7)
 
+    def test_a_parked_car_beside_the_path_is_drawn_where_the_radar_says_and_along_the_road(self):
+        """The footprint's centre is the radar's `ctr` (not reconstructed along the line of sight); a standing car's
+        heading is the road's axis when near it; a standing mode counts as far as the prediction puts it in the
+        car's lane; a mode starting beside the radar's point does not turn the car across the path."""
+        o = {"id": 7, "state": "confirmed", "x_m": 9.0, "y_m": -1.8, "ctr": [11.25, -2.7], "len": 4.5, "wid": 1.8,
+             "hdg": -0.3, "motion": "stationary", "flags": ["parked"], "std": [0.5, 0.2, 0.1, 0.1]}
+        np.testing.assert_allclose(FU.centre_offset(o), (2.25, -0.9))
+        self.assertTrue(FU.stands(o) and not FU.heading_from_motion(o))
+        self.assertAlmostEqual(FU.road_axis(-0.3, 0.2, 0.05, 0.7, 0.1)[0], 0.05)
+        self.assertAlmostEqual(FU.road_axis(-3.0, 0.2, 0.05, 0.7, 0.1)[0], -3.0 + (0.05 - (-3.0 + math.pi)))
+        self.assertEqual(FU.road_axis(1.5, 0.2, 0.0, 0.7, 0.1), (1.5, 0.2))           # a bay-parked car: as stated
+        self.assertAlmostEqual(FU.in_path_weight(o, {"ego": 0.1, "park": 0.85, "cross": 0.05}, 0.05), 0.15)
+        self.assertEqual(FU.in_path_weight(dict(o, flags=["in_path"]), {"park": 1.0}, 0.05), 1.0)
+        self.assertEqual(FU.in_path_weight(o, None, 0.05), 1.0)
+        # through the native core: the car stands beside a straight path, 1.0 m clear of the car's side
+        t = np.arange(0.0, 4.01, 0.25)
+        F = FU.FrameFutures(t)
+        F.ego = [("path", 1.0, 11.0 * t, 0.0 * t, 11.0 + 0.0 * t)]
+        x0, y0 = np.full(len(t), 9.0), np.full(len(t), -1.8)
+        jump = y0.copy()
+        jump[1:] -= 0.4                                   # a mode 0.4 m beside the radar's point from its first step
+        F.objects = [(o, [("stopped", 0.6, 0.6, x0, y0, 0.1 + 0 * t, 0.1 + 0 * t, 0 * t),
+                          ("move_off", 0.4, 0.4, x0, jump, 0.1 + 0 * t, 0.1 + 0 * t, 0 * t)], "contract")]
+        F.road_hdg[7] = 0.0
+        res, _ = TH.ThreatModel().evaluate(F, {"speed_mps": 11.0})
+        orow = res[0][3]
+        self.assertLess(orow[TH.DO_PC], 0.05)
+
 
 def rec(oid, le, lx=None, tn=0.5, tm=0.5, kind="vehicle", ab=3.0, al=2.0, ar=2.0, mass=None):
     return {"id": oid, "level": le, "level_exit": le if lx is None else lx, "kind": kind, "tn": tn, "tm_s": tm,

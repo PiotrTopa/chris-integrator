@@ -69,6 +69,15 @@ DEFAULT_CFG = dict(
     horizon_ext_s=4.0,                        # an evasion is followed this much further (objects on their last motion)
     exit_tn=0.8, exit_tm=0.5, exit_mass=0.7,
     thresholds=None,                          # {kind: {"tn", "tm", "mass"}} overrides
+    # a standing road user's heading: the camera's box width does not say on which side of the line of sight it
+    # points (the radar's rectangle turned the wrong way by 0.2-0.55 rad on bends), the road does: the stated heading
+    # snapped to the road's axis at its place when within road_axis_snap_rad of it (else as stated: a bay-parked car)
+    road_axis_standing=True, road_axis_snap_rad=0.7, road_axis_std_rad=0.1,
+    # the prediction's lane probabilities (contract futures): a mode that stands (moves less than stand_move_m over
+    # the horizon) can only be hit where the object is in the car's lane or across it: its weight is scaled by
+    # P(lane ego) + P(lane cross), at least lane_weight_floor; not where the radar's own corridor test says it surely
+    # stands in the path (flags in_path, threat). Moving modes (pulling out, crossing) keep their weight.
+    lane_weight=True, lane_weight_floor=0.05, stand_move_m=1.0,
 )
 
 
@@ -169,16 +178,22 @@ class ThreatModel:
         ext = []
         for i, (o, ms, _) in enumerate(F.objects):
             L, W, sL, sW, h, sh, label, esrc = FU.extent(o)
-            if not math.isfinite(h) and o.get("id") in F.road_hdg:
+            rh = F.road_hdg.get(o.get("id"))
+            if not math.isfinite(h) and rh is not None:
                 h = F.road_hdg[o.get("id")]
+            elif rh is not None and self.cfg["road_axis_standing"] and FU.stands(o) and not FU.heading_from_motion(o):
+                h, sh = FU.road_axis(h, sh, rh, self.cfg["road_axis_snap_rad"], self.cfg["road_axis_std_rad"])
             ext.append((L, W, label, esrc))
+            w_stand = FU.in_path_weight(o, F.lane.get(o.get("id")), self.cfg["lane_weight_floor"]) \
+                if self.cfg["lane_weight"] else 1.0
             ohdr[i, :9] = (k, len(ms), L, W, sL, sW, h, sh, FU.KIND_SET[FU.kind_of(label)])
             off = FU.centre_offset(o)
             if off is not None:          # the radar says where the footprint's centre is (decide.c: has_ctr)
                 ohdr[i, 9:] = (1.0, off[0], off[1])
             for (_, p0, p, x, y, sx, sy, r) in ms:
                 row = modes[k]
-                row[0], row[1] = p0, p
+                f = w_stand if w_stand < 1.0 and FU.mode_stands(x, y, self.cfg["stand_move_m"]) else 1.0
+                row[0], row[1] = p0 * f, p * f
                 row[2:2 + N] = x
                 row[2 + N:2 + 2 * N] = y
                 row[2 + 2 * N:2 + 3 * N] = sx
