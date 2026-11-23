@@ -8,7 +8,7 @@ Everything here is configuration of the mixer; nothing here is needed to use the
 
 Configuration: one JSON file per plug-in in the configuration directory, named after the plug-in
 (`integrator.json` for the estimator, `road_users.json`, `lead.json`, `lanes.json`, `egolane.json`, `roadgeom.json`, `view.json`,
-`lights.json`, `rules.json`, `fused.json`, `mapper.json`, `rates.json`), and `mixer.json` for the wiring:
+`lights.json`, `rules.json`, `fused.json`, `mapper.json`, `rates.json`, `predict.json`), and `mixer.json` for the wiring:
 
     {"disable": ["fused"],                                        plug-ins of the default stack to leave out
      "plugins": [{"class": "mypkg.mymod:MyPlugin", "cfg": {...}},   further plug-ins (in process)
@@ -29,6 +29,7 @@ import os
 from .mixer import Mixer, Plugin, StreamSpec
 from .plugins.common import Rates
 from .plugins.estimator import Estimator
+from .plugins.predict import Predict
 from .plugins.radar import Radar
 from .plugins.roadusers import RoadUsers
 from .plugins.trackers import EgoLane, EgoLight, Fused, Lanes, RideWatch, RoadGeom, Rules, SignContext, View
@@ -186,6 +187,7 @@ def build(cfg=None, config_dir=None, datadir=None, clock=None, mapper="auto", ex
     boxes += [Lanes(conf("lanes") or None), EgoLane(conf("egolane") or None), RoadGeom(conf("roadgeom") or None),
               EgoLight(conf("lights")), SignContext(), View(view_cfg or None),
               Rules(dict(conf("rules"), rules=rules)), Fused(dict(conf("fused"), rules=rules))]
+    boxes.append(Predict(conf("predict") or None))  # the radar's objects' futures (chris_integrator/predict)
     disable = set(wiring.get("disable") or ())
     replace = wiring.get("replace") or {}
     for b in boxes:

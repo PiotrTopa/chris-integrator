@@ -17,8 +17,8 @@ import functools
 import json
 import os
 
-VERSION = 7                    # of the compiled module's functions: the package needs this one
-PARTS = ("json", "round", "interp", "ekf", "lanes", "radar")
+VERSION = 8                    # of the compiled module's functions: the package needs this one
+PARTS = ("json", "round", "interp", "ekf", "lanes", "radar", "predict")
 _HOW = ("build it: `sh native/build.sh` in the source tree (this machine: a C compiler and the Python headers), "
         "`sh native/cross-build.sh` for another platform (docs/NATIVE.md), or `pip install .`")
 
@@ -32,7 +32,7 @@ if getattr(_n, "VERSION", 0) != VERSION:
     raise ImportError("chris-integrator: the native core is version %s, this package needs version %d: rebuild it. %s"
                       % (getattr(_n, "VERSION", "?"), VERSION, _HOW))
 
-core = radar = _n
+core = radar = predict = _n
 Fallback = _n.Fallback                 # the C code leaves an input to json (dumps, loads)
 _dumps_py, _loads_py = json.dumps, json.loads
 _SEP = (",", ":")

@@ -32,7 +32,7 @@
 #include <stdint.h>
 #include <string.h>
 
-#define NATIVE_VERSION 7
+#define NATIVE_VERSION 8
 
 static PyObject *Fallback;          /* raised where CPython's json must decide */
 static PyObject *builtin_round;
@@ -7571,6 +7571,8 @@ done:
     return res;
 }
 
+#include "predict.c"                 /* the `predict` part (chris_integrator/predict): its functions are PREDICT_METHODS */
+
 /* ==================================================================================================== */
 static PyMethodDef methods[] = {
     {"dumps", n_dumps, METH_O, "json.dumps(obj, separators=(',', ':')); raises Fallback where json must decide"},
@@ -7614,6 +7616,7 @@ static PyMethodDef methods[] = {
     {"radar_check", n_radar_check, METH_VARARGS, "Tracker._check for one expectation"},
     {"radar_register", n_radar_register, METH_VARARGS, "Tracker._register for one sensor: the shared offset, taken out"},
     {"radar_common", n_radar_common, METH_VARARGS, "Tracker._common's numbers: the scan's angle innovations, their weighted median"},
+    PREDICT_METHODS
     {NULL, NULL, 0, NULL}};
 
 static struct PyModuleDef moduledef = {PyModuleDef_HEAD_INIT, "_chris_native",
