@@ -1,0 +1,10 @@
+platform: linux-aarch64-musl
+image: alpine:edge (linux/arm64)
+compiler: cc (Alpine 15.2.0) 15.2.0
+python headers: Python 3.14.10
+numpy in the test run: 2.5.5
+source sha256: 292fb65862de3b46faba020a4152a8aa87385f85655c3c9f262af36783309701
+binary sha256: 1a06b5dd0a9fa55e5de9cfade4697d05f8103b9930798871d2dd5069cfd25227
+=========================== short test summary info ============================
+FAILED tests/test_native.py::test_radar_messages_native_against_reference - A...
+1 failed, 20 passed in 672.08s (0:11:12)
