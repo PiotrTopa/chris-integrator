@@ -245,13 +245,14 @@ class RoadGeometryTracker:
         self.x = None               # the model's 33 distances
         self.y = None               # [6, n] filtered lateral offsets
         self.p = None               # [6, n] variances
-        self.have = np.zeros(N_LINES, bool)       # a geometry track exists
-        self.present = np.zeros(N_LINES, bool)    # reported as present (hysteresis)
-        self.conf = np.zeros(N_LINES)
-        self.since = np.zeros(N_LINES)            # ts (s) of the last presence change
-        self.unsupported = np.zeros(N_LINES)      # seconds without a usable frame
+        # (per line: plain lists, read and written one element at a time in the frame's loop)
+        self.have = [False] * N_LINES             # a geometry track exists
+        self.present = [False] * N_LINES          # reported as present (hysteresis)
+        self.conf = [0.0] * N_LINES
+        self.since = [0.0] * N_LINES              # ts (s) of the last presence change
+        self.unsupported = [0.0] * N_LINES        # seconds without a usable frame
         self.cand_t = [None] * N_LINES            # ts (s) of the first misfitting frame
-        self.cand_n = np.zeros(N_LINES, int)
+        self.cand_n = [0] * N_LINES
         self.cand_y = [None] * N_LINES
         self.snaps = 0
         self.ts = None
@@ -364,7 +365,7 @@ class RoadGeometryTracker:
             self.y = np.zeros((N_LINES, len(x)))
             self.p = np.ones((N_LINES, len(x)))
             self.ts, self.seq = ts / NS, seq
-            self.since[:] = self.ts
+            self.since = [self.ts] * N_LINES
             v, vsrc, yaw = self._motion(es)
             return self._message(road, np.zeros(N_LINES), np.zeros(N_LINES, bool), v, vsrc, yaw, None)
         t = ts / NS
@@ -375,7 +376,7 @@ class RoadGeometryTracker:
             self.x = x
             self.y = np.zeros((N_LINES, len(x)))
             self.p = np.ones((N_LINES, len(x)))
-            self.since[:] = t
+            self.since = [t] * N_LINES
             dt = 0.0
         self.ts, self.seq = t, seq
         v, vsrc, yaw = self._motion(es)
@@ -390,10 +391,11 @@ class RoadGeometryTracker:
         # measurement noise, and how well this frame fits every track, for all lines at once
         r, gate, nu_all, jumps, nsigs = _fit(c, x, zs, zy, prob, self.y, self.p)
         upd = []
+        probs, oks, jumps, nsigs = prob.tolist(), ok.tolist(), jumps.tolist(), nsigs.tolist()   # (the same values)
 
         for i in range(N_LINES):
             # presence (hysteresis on the filtered probability, thresholds moved by the map prior)
-            p_i = prob[i] if ok[i] else 0.0
+            p_i = probs[i] if oks[i] else 0.0
             self.conf[i] += (p_i - self.conf[i]) * a
             on, off = c["on_conf"], c["off_conf"]
             if prior is not None and i in (0, 3):
@@ -402,16 +404,16 @@ class RoadGeometryTracker:
                     on, off = on + c["prior_shift"], off + c["prior_off_shift"]
                 elif tag == "expected":
                     on, off = on - 0.5 * c["prior_shift"], off - c["prior_off_shift"]
-            was = bool(self.present[i])
+            was = self.present[i]
             if not was and self.conf[i] >= on:
                 self.present[i] = True
             elif was and self.conf[i] < off:
                 self.present[i] = False
-            if bool(self.present[i]) != was:
+            if self.present[i] != was:
                 self.since[i] = t
 
             # geometry
-            usable = ok[i] and p_i >= c["update_prob"]
+            usable = oks[i] and p_i >= c["update_prob"]
             if not usable:
                 self.unsupported[i] += dt
                 if self.cand_t[i] is not None and t - self.cand_t[i] > c["cand_keep_s"] + c["snap_s"]:
@@ -502,9 +504,10 @@ class RoadGeometryTracker:
         c = self.cfg
         valid, reason, inputs = getattr(self, "_validity", (True, None, {}))
         ys = sds = None
-        if np.count_nonzero(self.present & self.have) > 1:      # element-wise, so the same numbers as line by line
+        if sum(1 for p, h in zip(self.present, self.have) if p and h) > 1:   # element-wise: the same numbers as line by line
             ys = _round2(self.y)
             sds = _round2(self.p, True)
+        prob, ok = prob.tolist(), ok.tolist()
         lines = [self._line(i, prob, ok, ys, sds) for i in range(N_LINES)]
         width = None
         if lines[1]["present"] and lines[2]["present"]:
