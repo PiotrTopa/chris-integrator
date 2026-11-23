@@ -26,6 +26,7 @@ class Estimator(Plugin):
         self.stream_of = dict(self.STREAM_OF if stream_of is None else stream_of)
         super().__init__(cfg, name)
         self.saved = None
+        self.on_new = []                   # callbacks after the integrator is made anew (the learnt values' priors)
         self._new()
 
     def _new(self):
@@ -37,6 +38,8 @@ class Estimator(Plugin):
         types = [self.FRAME] + sorted(self.stream_of.get(t, t) for t in self.integ.by_type if t != self.FRAME)
         self.inputs = tuple(In(t, trigger=True, optional=True, feedback=t in self.feedback) for t in types) + \
             (In("governor", optional=True), In(self.RESET, trigger=True, optional=True))
+        for fn in getattr(self, "on_new", ()):
+            fn(self)
 
     def register(self, src):
         """A source added while running (its message type becomes an input at the next wiring)."""

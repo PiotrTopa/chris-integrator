@@ -1027,3 +1027,24 @@ surely in the path. Measured on the simulator (seed 1, by day; `tools/decide_rep
 On fixtures with contract futures (decide/fixtures.py: stationary in path, lead braking, cut-in, crossing,
 oncoming on our side, a pedestrian stepping out; parked row, adjacent lane, oncoming passing) the collision
 courses warn 1.5 to 3 s before contact and the rest stays at stage 0 (tests/test_decide.py).
+
+
+## 18. Learnt values across drives (lane DECIDE, 2026-11-23)
+
+`chris_integrator/learnt.py` (the store) and `chris_integrator/learners.py` (the learners' adapters and the plug-in
+`learnt`; table of what is kept and why the rest is not). One versioned file, `<data dir>/learnt.json` (on the
+phone `/var/lib/chris/learnt.json`, the unit's `StateDirectory=chris`; `learnt.json` in the configuration
+directory may set `path`), per value: value, variance (or counts), samples, last update (wall clock), the
+conditions it was learnt under. On start a value is a prior, not the truth: its variance grows by what a restart
+can change and by its own walk over its age, never beyond the spread the learner starts with; counts are halved
+per 30 days; a limit relaxes; a record outside its sanity bounds, too old, or learnt under another calibration is
+not used (health says why). Vision calibration states are given under the last drive's calibration and undone
+(`reset_aux`) if the camera's calibration message says another one is in use.
+
+Power may go at any moment (the phone has no battery): writes are write-temp, fsync, rename (the previous file
+kept), fsync of the directory; reads try the file, the temp, the previous one, each checked by format, version
+and a checksum over the values; a damaged file is moved aside (`.bad`). Writes are rare: when something changed
+and 10 minutes passed, at a standstill after driving (10 s still after 60 s of driving: the power may go next),
+at shutdown; at most 12 an hour; about 4 kB each. The old `integrator.json` (faults and calibration) is still
+written and read as before; where both hold a calibration state the learnt store's prior wins (it is applied
+after).
