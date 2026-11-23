@@ -46,13 +46,10 @@ core is not built, does not load, or is of the wrong version, and how to build i
 | `ekf` | `ekf_project`, `ekf_update`, `ekf_sym` (core/ekf) | one scalar row of the filter | golden: the bits for rows of one state index (most rows); the projection to rounding for rows over several states |
 | `ekf` | `ekf_predict` (core/ego) | the process model | golden: state and transition to the last bit (sin, cos, exp of the C library), covariance to rounding |
 | `ekf` | `ekf_rts` (core/ego) | one smoother step | golden: to rounding |
-| `radar` | `radar_evolve` (stillness, switching, interaction with the free estimate's hand-over, prediction with the speed bound; optionally the combination and the free estimate's prediction: `Tracker._evolve` + `combine_b` in one call for B objects) | `radar/models.py`: `_evolve_py` = `still_b`, `transition_b`, `mix_b`, `predict_b`, `combine_b` | to rounding (tests: 1e-12 of each block's largest magnitude); on the development machine the same bits |
-| `radar` | `radar_combine`, `radar_p_still` | `combine_b`, `Tracker.p_still_many`'s numpy | to rounding |
-| `radar` | `radar_h` (the sensors' measurement functions: camera kinds b, rb, rbh, bt with and without the scale-rate row, microwave radar) | `CameraBoxes.h_py`, `MicrowaveRadar.h_py` | the same bits (`math.hypot` as CPython computes it) |
-| `radar` | `radar_scan` (one scan's association: p_detect, coverage, the map's density, gate, likelihoods of the hypotheses, the box feature, `radar_marginals`, `radar_assign`) | `Tracker._associate`, `tracker.marginals`, `tracker.assign` | pairs and assignment the same; gains and probabilities to rounding; marginals and assignment alone the same bits |
-| `radar` | `radar_update` (every pair of a scan: hypotheses, free estimate, NIS, model probabilities, existence increment, combination), `radar_common` (the scan's common pitch), `radar_check`, `radar_register` | `Tracker._update`, `_common`, `_check`, `_register` | to rounding |
-| `radar` | `radar_advance`, `radar_peek`, `radar_peek_pos`, `radar_still`, `radar_life`, `radar_merge` (on the objects' rows of the tracker's state array) | `Tracker._advance_all`, `peek_many`, `p_still_many`, `_life`, `_merge` | to rounding; `radar_peek_pos` the same bits as `radar_peek` for what it computes |
-| `radar` | `radar_frame` (every listed object's numbers of a message, and with the objects' attributes the message's objects themselves, flags and their hysteresis included) | `Radar._numbers` + the dict assembly in `Radar.frame` | to rounding (printed digits: the same except a last digit now and then) |
+| `radar` | `radar_scan` (one scan's association: p_detect, coverage, the map's density, gate, likelihoods of the hypotheses, the box feature, the pairings' probabilities by loopy belief propagation, the assignment), `radar_update` (every pair of a scan: hypotheses, free estimate, NIS, model probabilities, existence increment, combination), `radar_common`, `radar_check`, `radar_register` (radar/tracker) | the tracker's arithmetic for a scan | golden: pairs and assignment the same; numbers to rounding (below) |
+| `radar` | `radar_advance`, `radar_peek`, `radar_peek_pos`, `radar_life`, `radar_merge`, `radar_combine_rows` (radar/tracker, on the rows of the tracker's state array) | the motion model and the objects' upkeep | golden: to rounding |
+| `radar` | `radar_frame` (radar/box) | the message's objects: their numbers, flags with their hysteresis, the dicts | golden: to rounding (printed digits the same but for a last digit now and then); digests of three drives' messages (x86-64) |
+| `radar` | `radar_h` (radar/sensors: camera kinds b, rb, rbh, bt with and without the scale-rate row, microwave radar, position), `radar_marginals`, `radar_assign`, `radar_predict1`, `radar_still1`, `radar_transition1` (radar/models: one hypothesis) | measurement functions, pairings' probabilities, assignment, one hypothesis' step | golden: marginals and assignment the bits, measurement functions to the last bit of libm |
 
 The lane tracker's steps are exact because its arithmetic is elementwise, and its two means over the gate points
 are added in sequence, as numpy adds a masked selection. The road geometry's arc length is a sequential sum of
@@ -64,15 +61,29 @@ the last bit or two of a double. After the monitors and trackers, on recorded dr
 messages per drive in which a number that rounds to zero carries the other sign (`-0.0` / `0.0`) and, rarely, a
 last printed digit; lane report L50 has the counts.
 
-The `radar` part propagates only the entries of the motion model's transition that are not zero (at most three
-per row of the 8x8 `F`; the reference multiplies dense matrices), takes the elementwise steps in numpy's order
-of operations (the same `exp`, `pow`, `hypot` of libm) and sums the products in index order. On the development
-machine (x86-64, numpy 2.3) that gives numpy's bits in every random and edge case of the tests and the same radar
-messages on simulated drives; where numpy's products use fused multiply-adds or another order (ARM BLAS) the
-results differ at the last bit, like the filter's. Inputs that are not finite go to the reference (`Fallback`):
-a dense product makes NaN of 0 * inf where skipping the zero does not. The switch points are `models.evolve_b`,
-`models.combine_many`, `models.combine` and `models.p_still_many`; arrays the native call does not take (not
-float64, not contiguous) also go to the reference.
+### The radar: native only
+
+Since native version 6 the radar (`chris_integrator/radar`) has no Python implementation of its arithmetic either:
+the motion model, the measurement functions, a scan's association and update, the objects' upkeep and the
+message's objects are C only. Python keeps the objects' life (states,
+votes, records, merging), the message's assembly around the objects, and the glue. The objects' numbers live in one
+float64 array of the tracker (`tracker.State`, a row per object), which the native calls read and write in place.
+
+How the native radar was held to its Python reference before that was removed (lane report native-radar2): the
+measurement functions, marginals and assignment gave the reference's bits (on one machine: the frozen measurement
+functions hold to the last bit of libm elsewhere); everything else the reference's
+formulas with the products summed in index order and small systems solved by elimination with partial pivoting
+(the reference: BLAS, LAPACK): results to rounding. Scan by scan on simulated drives, native and reference on
+copies of the same tracker agreed to 2e-9 of each block's size (a covariance update that takes most of a variance
+away subtracts nearly equal numbers); whole drives gave the same messages but for a last printed digit in a
+handful of values (12 drives, 1.38 M values: 9; one object whose filter amplifies rounding-level differences).
+What the reference gave is frozen: `tests/data/radar_golden.npz` (the inputs of chosen calls of every native radar
+function on simulated drives and the reference's answers, plus random and edge cases), replayed by
+`test_radar_golden` with those tolerances; `test_radar_messages_digests` holds three simulated drives' radar
+messages byte for byte on the development machine; `python -m chris_integrator.native` checks a few of the
+reference's answers on a target (`native/_radar_selftest.py`). A state that is not finite is computed like any
+other (no hand-over to a reference any more): NaN and inf go where the arithmetic takes them, and the upkeep
+drops such an object as before.
 
 ### Inputs the C code takes, and what it does with others
 

@@ -16,8 +16,9 @@
  *   geom_centre, geom_reach    the road geometry's centre line from the camera (trackers/roadgeom.py)
  *   ekf_predict, ekf_project, ekf_update, ekf_sym, ekf_rts     the estimator's filter (core/ekf.py,
  *                              core/ego.py); elementwise steps exact, sums of products in index order
- *   radar_evolve, radar_combine, radar_p_still     the radar's motion model (radar/models.py, tracker.py):
- *                              interaction, prediction, combination of the hypotheses; agree to rounding
+ *   radar_*                    the radar (radar/): its motion model, the sensors' measurement functions, a scan's
+ *                              association and update, the objects' upkeep and the message's objects; held to
+ *                              what its Python reference gave before it was removed (tests/data/radar_golden.npz)
  *
  * Compile with -ffp-contract=off: a fused multiply-add would change the bits.
  *
@@ -33,7 +34,7 @@
 
 #define NATIVE_VERSION 6
 
-static PyObject *Fallback;          /* raised where CPython's json (or the radar's reference) must decide */
+static PyObject *Fallback;          /* raised where CPython's json must decide */
 static PyObject *builtin_round;
 
 static const double POW10[23] = {1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11, 1e12, 1e13, 1e14,
@@ -2892,6 +2893,15 @@ done:
  * steps are written in numpy's order of operations; sums of products differ from numpy's (BLAS, einsum) in
  * the order of addition: the results agree to rounding. Inputs that are not finite are left to the reference
  * (`Fallback`): a dense product turns 0 * inf into NaN where skipping the zero does not.
+=======
+ * The radar (chris_integrator/radar): its motion model, the sensors' measurement functions, one scan's
+ * association and update, the objects' upkeep and the message's objects. The only implementation since the
+ * Python reference was removed; tests/test_native.py holds it to what that reference gave (golden data).
+ * State [px, py, vx, vy, ax, ay, dp, lh], three hypotheses (stand, cv, ca). Only the entries of the transition
+ * that are not zero are propagated (F has at most three per row), summed in index order; the reference took
+ * the elementwise steps in numpy's order of operations, which is kept, and summed products in BLAS's order:
+ * the results agree to rounding. A state that is not finite is computed like any other (NaN and inf go where
+ * the arithmetic takes them: skipping F's zeros, 0 * inf does not become NaN as a dense product would).
  * ==================================================================================================== */
 enum { R_PX, R_PY, R_VX, R_VY, R_AX, R_AY, R_DP, R_LH, RN };
 enum { R_STAND, R_CV, R_CA };
@@ -2917,66 +2927,6 @@ static int dview_get(PyObject *o, View *v, int writable, Py_ssize_t n, const cha
         PyErr_Format(PyExc_TypeError, "%s: a C-contiguous float64 array of %zd values is needed", what, n);
         return -1;
     }
-    return 0;
-}
-
-/* a batch of B items of `len` doubles: one buffer of B * len, or a list / tuple of B buffers of len each */
-typedef struct {
-    View one;
-    View *items;
-    Py_ssize_t nitems;
-    const double **p;
-} Bat;
-
-static void bat_init(Bat *bt)
-{
-    bt->one.held = 0;
-    bt->items = NULL;
-    bt->nitems = 0;
-    bt->p = NULL;
-}
-
-static void bat_drop(Bat *bt)
-{
-    view_drop(&bt->one);
-    for (Py_ssize_t i = 0; i < bt->nitems; i++)
-        view_drop(&bt->items[i]);
-    PyMem_Free(bt->items);
-    PyMem_Free((void *)bt->p);
-    bat_init(bt);
-}
-
-static int bat_get(PyObject *o, Py_ssize_t B, Py_ssize_t len, Bat *bt, const char *what)
-{
-    bt->p = (const double **)PyMem_Malloc((size_t)(B ? B : 1) * sizeof(double *));
-    if (bt->p == NULL) {
-        PyErr_NoMemory();
-        return -1;
-    }
-    int is_list = PyList_Check(o);
-    if (is_list || PyTuple_Check(o)) {
-        Py_ssize_t n = is_list ? PyList_Size(o) : PyTuple_Size(o);
-        if (n != B) {
-            PyErr_Format(PyExc_ValueError, "%s: %zd items, %zd expected", what, n, B);
-            return -1;
-        }
-        bt->items = (View *)PyMem_Calloc((size_t)(B ? B : 1), sizeof(View));
-        if (bt->items == NULL) {
-            PyErr_NoMemory();
-            return -1;
-        }
-        for (Py_ssize_t b = 0; b < B; b++) {
-            if (dview_get(seq_item(o, is_list, b), &bt->items[b], 0, len, what) < 0)
-                return -1;
-            bt->nitems = b + 1;
-            bt->p[b] = (const double *)bt->items[b].b.buf;
-        }
-        return 0;
-    }
-    if (dview_get(o, &bt->one, 0, B * len, what) < 0)
-        return -1;
-    for (Py_ssize_t b = 0; b < B; b++)
-        bt->p[b] = (const double *)bt->one.b.buf + b * len;
     return 0;
 }
 
@@ -3285,7 +3235,7 @@ static int rpar_get(PyObject *o, RPar *p)
     if (rows_get(o, RNPAR, 1, v, "par") < 0)           /* 12 numbers: a tuple or a buffer */
         return -1;
     if (!all_finite(v, RNPAR)) {
-        PyErr_SetString(Fallback, "radar: parameters not finite");
+        PyErr_SetString(PyExc_ValueError, "radar: the model's parameters must be finite");
         return -1;
     }
     p->dpw2 = v[0]; p->sd2 = v[1]; p->sv2 = v[2]; p->cvn = v[3]; p->caj = v[4]; p->tau = v[5]; p->qacc = v[6];
@@ -3306,172 +3256,11 @@ static int out_get(PyObject *o, View *v, Py_ssize_t n, int optional, double **ou
     return 0;
 }
 
-/* radar_evolve(xs, Ps, mu, xf, Pf, dt, kin, par, xs_out, Ps_out, mu_out, x_out | None, P_out | None,
- *              xf_out | None, Pf_out | None)
- * Tracker._evolve for B objects: stillness of the moving hypotheses, switching matrix, interaction with the
- * free estimate's hand-over, prediction of the three hypotheses by dt[b]; with x_out, P_out also combine_b of
- * the result with the predicted probabilities; with xf_out, Pf_out the free estimate predicted by the steady
- * hypothesis (Tracker._advance_all).
- *   xs (B, 3, N), Ps (B, 3, N, N), mu (B, 3), xf (B, N), Pf (B, N, N): one buffer each, or a list / tuple of B
- *   per-object buffers;  dt: (B) buffer or list of numbers;  kin: (B, 4) buffer or list of
- *   (a_lon, a_lat, v_max, v_still);  par: 12 numbers (models.py `_native_par`). Outputs: float64 buffers. */
-static PyObject *n_radar_evolve(PyObject *self, PyObject *args)
-{
-    PyObject *oxs, *oPs, *omu, *oxf, *oPf, *odt, *okin, *opar, *o1, *o2, *o3, *o4, *o5, *o6, *o7;
-    if (!PyArg_ParseTuple(args, "OOOOOOOOOOOOOOO", &oxs, &oPs, &omu, &oxf, &oPf, &odt, &okin, &opar, &o1, &o2, &o3,
-                          &o4, &o5, &o6, &o7))
-        return NULL;
-    PyObject *res = NULL;
-    Bat xs, Ps, mu, xf, Pf;
-    bat_init(&xs); bat_init(&Ps); bat_init(&mu); bat_init(&xf); bat_init(&Pf);
-    View v1, v2, v3, v4, v5, v6, v7;
-    v1.held = v2.held = v3.held = v4.held = v5.held = v6.held = v7.held = 0;
-    double *dk = NULL;
-    double *xso, *Pso, *muo, *xo, *Po, *xfo, *Pfo;
-    RPar par;
-    Py_ssize_t B = batch_len(odt);
-    if (B < 0 || rpar_get(opar, &par) < 0)
-        goto done;
-    dk = (double *)PyMem_Malloc((size_t)(B ? B : 1) * 5 * sizeof(double));
-    if (dk == NULL) {
-        PyErr_NoMemory();
-        goto done;
-    }
-    if (rows_get(odt, B, 1, dk, "dt") < 0 || rows_get(okin, B, 4, dk + B, "kin") < 0 ||
-        bat_get(oxs, B, 3 * RN, &xs, "xs") < 0 || bat_get(oPs, B, 3 * RNN, &Ps, "Ps") < 0 ||
-        bat_get(omu, B, 3, &mu, "mu") < 0 || bat_get(oxf, B, RN, &xf, "xf") < 0 ||
-        bat_get(oPf, B, RNN, &Pf, "Pf") < 0 ||
-        out_get(o1, &v1, B * 3 * RN, 0, &xso, "xs_out") < 0 || out_get(o2, &v2, B * 3 * RNN, 0, &Pso, "Ps_out") < 0 ||
-        out_get(o3, &v3, B * 3, 0, &muo, "mu_out") < 0 || out_get(o4, &v4, B * RN, 1, &xo, "x_out") < 0 ||
-        out_get(o5, &v5, B * RNN, 1, &Po, "P_out") < 0 || out_get(o6, &v6, B * RN, 1, &xfo, "xf_out") < 0 ||
-        out_get(o7, &v7, B * RNN, 1, &Pfo, "Pf_out") < 0)
-        goto done;
-    if ((xo == NULL) != (Po == NULL) || (xfo == NULL) != (Pfo == NULL)) {
-        PyErr_SetString(PyExc_ValueError, "radar_evolve: x_out and P_out (xf_out and Pf_out) go together");
-        goto done;
-    }
-    if (!all_finite(dk, B * 5))
-        goto fallback;
-    for (Py_ssize_t b = 0; b < B; b++)
-        if (!all_finite(xs.p[b], 3 * RN) || !all_finite(Ps.p[b], 3 * RNN) || !all_finite(mu.p[b], 3) ||
-            !all_finite(xf.p[b], RN) || !all_finite(Pf.p[b], RNN))
-            goto fallback;
-    for (Py_ssize_t b = 0; b < B; b++) {
-        const double *K = dk + B + 4 * b;            /* a_lon, a_lat, v_max, v_still */
-        double dt = dk[b], T[9], c[3], xm[3 * RN], Pm[3 * RNN];
-        const double *X = xs.p[b], *P = Ps.p[b];
-        double q0 = r_still(X + RN, P + RNN, K[3]), q1 = r_still(X + 2 * RN, P + 2 * RNN, K[3]);
-        r_transition(dt, q0, q1, &par, T);
-        r_mix(X, P, mu.p[b], T, xf.p[b], Pf.p[b], xm, Pm, c);
-        double *xb = xso + b * 3 * RN, *Pb = Pso + b * 3 * RNN;
-        for (int j = 0; j < 3; j++)
-            r_predict(j, xm + j * RN, Pm + j * RNN, dt, K[0], K[1], K[2], &par, xb + j * RN, Pb + j * RNN);
-        muo[3 * b] = c[0];
-        muo[3 * b + 1] = c[1];
-        muo[3 * b + 2] = c[2];
-        if (xo)
-            r_combine(xb, Pb, c, xo + b * RN, Po + b * RNN);
-        if (xfo)
-            r_predict(R_CV, xf.p[b], Pf.p[b], dt, K[0], K[1], K[2], &par, xfo + b * RN, Pfo + b * RNN);
-    }
-    res = Py_None;
-    Py_INCREF(res);
-    goto done;
-fallback:
-    PyErr_SetString(Fallback, "radar_evolve: an input is not finite");
-done:
-    PyMem_Free(dk);
-    bat_drop(&xs); bat_drop(&Ps); bat_drop(&mu); bat_drop(&xf); bat_drop(&Pf);
-    view_drop(&v1); view_drop(&v2); view_drop(&v3); view_drop(&v4); view_drop(&v5); view_drop(&v6); view_drop(&v7);
-    return res;
-}
-
-/* radar_combine(xs, Ps, mu, x_out, P_out): combine_b for B objects (inputs as in radar_evolve) */
-static PyObject *n_radar_combine(PyObject *self, PyObject *args)
-{
-    PyObject *oxs, *oPs, *omu, *o1, *o2;
-    if (!PyArg_ParseTuple(args, "OOOOO", &oxs, &oPs, &omu, &o1, &o2))
-        return NULL;
-    PyObject *res = NULL;
-    Bat xs, Ps, mu;
-    bat_init(&xs); bat_init(&Ps); bat_init(&mu);
-    View v1, v2;
-    v1.held = v2.held = 0;
-    double *xo, *Po;
-    Py_ssize_t B = batch_len(omu);
-    if (B < 0)
-        goto done;
-    if (bat_get(oxs, B, 3 * RN, &xs, "xs") < 0 || bat_get(oPs, B, 3 * RNN, &Ps, "Ps") < 0 ||
-        bat_get(omu, B, 3, &mu, "mu") < 0 || out_get(o1, &v1, B * RN, 0, &xo, "x_out") < 0 ||
-        out_get(o2, &v2, B * RNN, 0, &Po, "P_out") < 0)
-        goto done;
-    for (Py_ssize_t b = 0; b < B; b++)
-        if (!all_finite(xs.p[b], 3 * RN) || !all_finite(Ps.p[b], 3 * RNN) || !all_finite(mu.p[b], 3)) {
-            PyErr_SetString(Fallback, "radar_combine: an input is not finite");
-            goto done;
-        }
-    for (Py_ssize_t b = 0; b < B; b++)
-        r_combine(xs.p[b], Ps.p[b], mu.p[b], xo + b * RN, Po + b * RNN);
-    res = Py_None;
-    Py_INCREF(res);
-done:
-    bat_drop(&xs); bat_drop(&Ps); bat_drop(&mu);
-    view_drop(&v1); view_drop(&v2);
-    return res;
-}
-
-/* radar_p_still(xs, Ps, mu, v_still) -> [min(1, mu_stand + mu_cv q_cv + mu_ca q_ca)] (Tracker.p_still_many) */
-static PyObject *n_radar_p_still(PyObject *self, PyObject *args)
-{
-    PyObject *oxs, *oPs, *omu, *ov;
-    if (!PyArg_ParseTuple(args, "OOOO", &oxs, &oPs, &omu, &ov))
-        return NULL;
-    PyObject *res = NULL;
-    Bat xs, Ps, mu;
-    bat_init(&xs); bat_init(&Ps); bat_init(&mu);
-    double *v0 = NULL;
-    Py_ssize_t B = batch_len(ov);
-    if (B < 0)
-        goto done;
-    v0 = (double *)PyMem_Malloc((size_t)(B ? B : 1) * sizeof(double));
-    if (v0 == NULL) {
-        PyErr_NoMemory();
-        goto done;
-    }
-    if (rows_get(ov, B, 1, v0, "v_still") < 0 || bat_get(oxs, B, 3 * RN, &xs, "xs") < 0 ||
-        bat_get(oPs, B, 3 * RNN, &Ps, "Ps") < 0 || bat_get(omu, B, 3, &mu, "mu") < 0)
-        goto done;
-    for (Py_ssize_t b = 0; b < B; b++)
-        if (!isfinite(v0[b]) || !all_finite(xs.p[b] + RN, 2 * RN) || !all_finite(Ps.p[b] + RNN, 2 * RNN) ||
-            !all_finite(mu.p[b], 3)) {
-            PyErr_SetString(Fallback, "radar_p_still: an input is not finite");
-            goto done;
-        }
-    res = PyList_New(B);
-    if (res == NULL)
-        goto done;
-    for (Py_ssize_t b = 0; b < B; b++) {
-        const double *X = xs.p[b], *P = Ps.p[b], *m = mu.p[b];
-        double q0 = r_still(X + RN, P + RNN, v0[b]), q1 = r_still(X + 2 * RN, P + 2 * RNN, v0[b]);
-        double s = (m[0] + m[1] * q0) + m[2] * q1;
-        PyObject *f = PyFloat_FromDouble(s > 1.0 ? 1.0 : s);
-        if (f == NULL) {
-            Py_CLEAR(res);
-            goto done;
-        }
-        PyList_SetItem(res, b, f);
-    }
-done:
-    PyMem_Free(v0);
-    bat_drop(&xs); bat_drop(&Ps); bat_drop(&mu);
-    return res;
-}
-
-/* ---- the radar, phase 2: the objects' rows, the sensors' measurement functions, one scan's association
- * (gate, likelihoods of the hypotheses, the box as a feature, the pairing's probabilities, the assignment),
- * the update of every pair of a scan, and the output's per-object numbers. radar/tracker.py, sensors.py and
- * box.py are the reference; the same formulas, sums of products in index order, small systems solved by
- * Gaussian elimination with partial pivoting (numpy hands them to LAPACK): results agree to rounding. ---- */
+/* ---- the objects' rows, the sensors' measurement functions, one scan's association (gate, likelihoods of the
+ * hypotheses, the box as a feature, the pairing's probabilities, the assignment), the update of every pair of a
+ * scan, the objects' upkeep and the message's objects. The formulas of the Python reference (radar/tracker.py,
+ * sensors.py, box.py before its removal), sums of products in index order, small systems solved by Gaussian
+ * elimination with partial pivoting (the reference: LAPACK): results agree with it to rounding. ---- */
 
 /* an object's row in the tracker's state array (tracker.py `_LAY`) */
 enum { RO_XS = 0, RO_PS = 24, RO_MU = 216, RO_XF = 219, RO_PF = 227, RO_X = 291, RO_P = 299, RROW = 363 };
@@ -3533,7 +3322,7 @@ static int rnums_get(PyObject *o, Py_ssize_t n, double *out, const char *what)
 }
 
 /* ---- the sensors (sensors.py): what a scan measures of a state ---- */
-enum { SEN_CAMERA = 0, SEN_MICROWAVE = 1 };
+enum { SEN_CAMERA = 0, SEN_MICROWAVE = 1, SEN_POSITION = 2 };
 enum { K_B = 0, K_RB = 1, K_RBH = 2, K_BT = 3, K_NONE = 4, K_SCALE = 8 };
 #define RSENS 24
 
@@ -3565,6 +3354,8 @@ static int sens_get(PyObject *o, RSens *s)
         s->srspan = v[20]; s->lhspan = v[21]; s->born = v[22]; s->born_s = v[23];
     } else if (s->type == SEN_MICROWAVE) {
         s->mx = v[1]; s->my = v[2]; s->yaw = v[3]; s->fov = v[4]; s->max_range = v[5]; s->p_d = v[6]; s->clutter = v[7];
+    } else if (s->type == SEN_POSITION) {
+        s->fov = v[1]; s->max_range = v[2]; s->p_d = v[3]; s->clutter = v[4];
     } else {
         PyErr_SetString(PyExc_ValueError, "radar: a sensor of a kind the native core does not know");
         return -1;
@@ -3625,6 +3416,8 @@ static int r_angle_row(const RSens *s, int kind)
 {
     if (s->type == SEN_MICROWAVE)
         return 1;
+    if (s->type == SEN_POSITION)
+        return -1;
     int b = kind & 7;
     return (b == K_B || b == K_BT) ? 0 : b == K_NONE ? -1 : 1;
 }
@@ -3652,6 +3445,17 @@ static double r_scale_row(const double *x, const double *pose, double sdt, doubl
 static int r_h(const RSens *s, int kind, double sdt, const double *x, const double *pose, double *z, double *H)
 {
     memset(H, 0, 4 * RN * sizeof(double));
+    if (s->type == SEN_POSITION) {                      /* a place in the car frame */
+        double c = cos(pose[2]), sn = sin(pose[2]);
+        double dx = x[R_PX] - pose[0], dy = x[R_PY] - pose[1];
+        H[R_PX] = c;
+        H[R_PY] = sn;
+        H[RN + R_PX] = -sn;
+        H[RN + R_PY] = c;
+        z[0] = c * dx + sn * dy;
+        z[1] = -sn * dx + c * dy;
+        return 2;
+    }
     if (s->type == SEN_MICROWAVE) {
         double c = cos(pose[2]), sn = sin(pose[2]);
         double ox = c * s->mx - sn * s->my, oy = sn * s->mx + c * s->my;
@@ -3727,6 +3531,10 @@ static int r_h(const RSens *s, int kind, double sdt, const double *x, const doub
 /* CameraBoxes.coverage / MicrowaveRadar.coverage at a place of the car frame */
 static double r_coverage(const RSens *s, double xc, double yc)
 {
+    if (s->type == SEN_POSITION) {
+        double r = py_hypot(xc, yc);
+        return (1.0 < r && r < s->max_range && fabs(atan2(yc, xc)) < s->fov) ? s->p_d : 0.0;
+    }
     if (s->type == SEN_MICROWAVE) {
         double dx = xc - s->mx, dy = yc - s->my;
         double r = py_hypot(dx, dy);
@@ -3750,7 +3558,7 @@ static double r_coverage(const RSens *s, double xc, double yc)
 static double r_p_detect(const RSens *s, double xc, double yc, const double *x)
 {
     double p = r_coverage(s, xc, yc);
-    if (s->type == SEN_MICROWAVE)
+    if (s->type != SEN_CAMERA)
         return p;
     if (p > 0.0 && s->cover && py_hypot(xc, yc) < s->gmin)
         p *= s->p_cut;
@@ -3764,7 +3572,7 @@ static double r_p_detect(const RSens *s, double xc, double yc, const double *x)
 /* sensor.density(det) */
 static double r_density(const RSens *s, int kind, const double *z)
 {
-    if (s->type == SEN_MICROWAVE)
+    if (s->type != SEN_CAMERA)
         return s->clutter;
     int b = kind & 7;
     if (b == K_NONE)                                    /* the reference has no volume for this: never asked */
@@ -5099,47 +4907,81 @@ done:
     return res;
 }
 
-/* radar_still(S, rows, v_still) -> [p_still] (Tracker.p_still_many on the objects' rows) */
-static PyObject *n_radar_still(PyObject *self, PyObject *args)
+/* radar_combine_rows(S, rows) -> None: each object's combination (x, P) from its hypotheses and their
+ * probabilities, in its row */
+static PyObject *n_radar_combine_rows(PyObject *self, PyObject *args)
 {
-    PyObject *oS, *orows, *ov;
-    if (!PyArg_ParseTuple(args, "OOO", &oS, &orows, &ov))
+    PyObject *oS, *orows;
+    if (!PyArg_ParseTuple(args, "OO", &oS, &orows))
+        return NULL;
+    View vS;
+    Py_ssize_t cap, B = 0, *rows = NULL;
+    if (store_get(oS, &vS, &cap) < 0)
         return NULL;
     PyObject *res = NULL;
-    View vS;
-    vS.held = 0;
-    Py_ssize_t cap, B = 0, *rows = NULL;
-    double *v0 = NULL;
-    if (store_get(oS, &vS, &cap) < 0 || (rows = idx_get(orows, cap, &B)) == NULL)
-        goto done;
-    v0 = (double *)PyMem_Malloc((size_t)(B ? B : 1) * sizeof(double));
-    if (v0 == NULL) {
-        PyErr_NoMemory();
-        goto done;
-    }
-    if (rows_get(ov, B, 1, v0, "v_still") < 0)
-        goto done;
-    res = PyList_New(B);
-    if (res == NULL)
-        goto done;
-    double *A = (double *)vS.b.buf;
-    for (Py_ssize_t b = 0; b < B; b++) {
-        const double *row = A + rows[b] * RROW;
-        const double *X = row + RO_XS, *P = row + RO_PS, *m = row + RO_MU;
-        double q0 = r_still(X + RN, P + RNN, v0[b]), q1 = r_still(X + 2 * RN, P + 2 * RNN, v0[b]);
-        double s = (m[0] + m[1] * q0) + m[2] * q1;
-        PyObject *f = PyFloat_FromDouble(s > 1.0 ? 1.0 : s);
-        if (f == NULL) {
-            Py_CLEAR(res);
-            goto done;
+    if ((rows = idx_get(orows, cap, &B)) != NULL) {
+        double *A = (double *)vS.b.buf;
+        for (Py_ssize_t b = 0; b < B; b++) {
+            double *row = A + rows[b] * RROW;
+            r_combine(row + RO_XS, row + RO_PS, row + RO_MU, row + RO_X, row + RO_P);
         }
-        PyList_SetItem(res, b, f);
+        res = Py_None;
+        Py_INCREF(res);
     }
-done:
     PyMem_Free(rows);
-    PyMem_Free(v0);
     view_drop(&vS);
     return res;
+}
+
+/* radar_predict1(model, x, P, dt, kin, par, x_out, P_out) -> None: one hypothesis forward by dt (no interaction):
+ * models.predict */
+static PyObject *n_radar_predict1(PyObject *self, PyObject *args)
+{
+    int model;
+    double dt, x[RN], P[RNN], kin[4], *xo, *Po;
+    PyObject *ox, *oP, *okin, *opar, *o1, *o2;
+    if (!PyArg_ParseTuple(args, "iOOdOOOO", &model, &ox, &oP, &dt, &okin, &opar, &o1, &o2))
+        return NULL;
+    RPar par;
+    View v1, v2;
+    v1.held = v2.held = 0;
+    PyObject *res = NULL;
+    if (model < 0 || model > 2) {
+        PyErr_SetString(PyExc_ValueError, "radar_predict1: the model is 0, 1 or 2");
+        return NULL;
+    }
+    if (rnums_get(ox, RN, x, "x") < 0 || rnums_get(oP, RNN, P, "P") < 0 || rnums_get(okin, 4, kin, "kin") < 0 ||
+        rpar_get(opar, &par) < 0 || out_get(o1, &v1, RN, 0, &xo, "x_out") < 0 || out_get(o2, &v2, RNN, 0, &Po, "P_out") < 0)
+        goto done;
+    r_predict(model, x, P, dt, kin[0], kin[1], kin[2], &par, xo, Po);
+    res = Py_None;
+    Py_INCREF(res);
+done:
+    view_drop(&v1);
+    view_drop(&v2);
+    return res;
+}
+
+/* radar_still1(x, P, v0) -> how much a hypothesis says "it does not move" (models.still) */
+static PyObject *n_radar_still1(PyObject *self, PyObject *args)
+{
+    PyObject *ox, *oP;
+    double v0, x[RN], P[RNN];
+    if (!PyArg_ParseTuple(args, "OOd", &ox, &oP, &v0) || rnums_get(ox, RN, x, "x") < 0 || rnums_get(oP, RNN, P, "P") < 0)
+        return NULL;
+    return PyFloat_FromDouble(r_still(x, P, v0));
+}
+
+/* radar_transition1(dt, q0, q1, par) -> [[...] x 3]: the switching probabilities (models.transition) */
+static PyObject *n_radar_transition1(PyObject *self, PyObject *args)
+{
+    double dt, q0, q1, T[9];
+    PyObject *opar;
+    RPar par;
+    if (!PyArg_ParseTuple(args, "dddO", &dt, &q0, &q1, &opar) || rpar_get(opar, &par) < 0)
+        return NULL;
+    r_transition(dt, q0, q1, &par, T);
+    return Py_BuildValue("[[ddd][ddd][ddd]]", T[0], T[1], T[2], T[3], T[4], T[5], T[6], T[7], T[8]);
 }
 
 /* radar_h(sensor, kind, sdt, x, pose, z_out (4), H_out (4 x N)) -> m: sensor.h */
@@ -6159,14 +6001,14 @@ static PyMethodDef methods[] = {
     {"round_lists", n_round_lists, METH_VARARGS, "np.round(a, decimals).tolist(), optionally of np.sqrt(a)"},
     {"geom_centre", n_geom_centre, METH_VARARGS, "the road geometry's centre line lists (RoadGeometryFusion._centre)"},
     {"geom_reach", n_geom_reach, METH_VARARGS, "how far the camera's centre line reaches (RoadGeometryFusion._reach)"},
-    {"radar_evolve", n_radar_evolve, METH_VARARGS, "Tracker._evolve (+ combine_b, + the free estimate's prediction) for B objects"},
-    {"radar_combine", n_radar_combine, METH_VARARGS, "combine_b for B objects into given arrays"},
-    {"radar_p_still", n_radar_p_still, METH_VARARGS, "Tracker.p_still_many: a list of floats"},
     {"radar_advance", n_radar_advance, METH_VARARGS, "Tracker._advance_all on the objects' rows"},
-    {"radar_peek", n_radar_peek, METH_VARARGS, "Tracker.peek_many on the objects' rows into given arrays"},
+    {"radar_peek", n_radar_peek, METH_VARARGS, "Tracker.peek: where objects will be (x, P, mu), into given arrays"},
     {"radar_peek_pos", n_radar_peek_pos, METH_VARARGS, "Tracker.peek_many, the place only (x, y and its covariance)"},
-    {"radar_still", n_radar_still, METH_VARARGS, "Tracker.p_still_many on the objects' rows"},
     {"radar_h", n_radar_h, METH_VARARGS, "a sensor's measurement function (sensors.py h) into given arrays"},
+    {"radar_combine_rows", n_radar_combine_rows, METH_VARARGS, "the objects' combinations from their hypotheses, in their rows"},
+    {"radar_predict1", n_radar_predict1, METH_VARARGS, "one hypothesis forward by dt (models.predict)"},
+    {"radar_still1", n_radar_still1, METH_VARARGS, "how still one hypothesis is (models.still)"},
+    {"radar_transition1", n_radar_transition1, METH_VARARGS, "the switching probabilities over dt (models.transition)"},
     {"radar_marginals", n_radar_marginals, METH_VARARGS, "tracker.marginals into a given array"},
     {"radar_assign", n_radar_assign, METH_O, "tracker.assign"},
     {"radar_scan", n_radar_scan, METH_VARARGS, "one scan's association (Tracker.process): pairs, p_detect, coverage"},

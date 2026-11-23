@@ -78,9 +78,11 @@ def run(name, seed, night, radar_cfg=None, det_params=None):
         return out
     CameraBoxes.start = start
 
-    orig_process, orig_update = tr.process, tr._update
+    orig_process, orig_assoc, orig_after = tr.process, tr._associate, tr._after_update
+    pending = {}
 
     def process(src, t, sensor, dets):
+        ctx["dets"] = dets
         lk = box_actor(t)
         T = truth(t)
         pose = tr._pose(t)
@@ -121,7 +123,8 @@ def run(name, seed, night, radar_cfg=None, det_params=None):
         R["scans"].append({"t": t, "dets": len(dets), "objs": n_obj, "view": getattr(sensor, "cover", None) and
                            round(sensor.cover["ground_min_m"], 1)})
 
-    def update(o, d, Rm, sensor, pose, src, t, *more):
+    def upd_row(o, d, Rm, sensor, pose, src, t, gain):
+        """The row of an update, from the object as it is before it (the scan's pairs are updated in one call)."""
         T = ctx["truth"]
         prev = owner.get(o.id)
         act = d.get("actor")
@@ -132,7 +135,7 @@ def run(name, seed, night, radar_cfg=None, det_params=None):
         d2 = float(nu @ np.linalg.solve(S, nu))
         a = T.get(prev) if prev is not None else None
         row = {"t": t, "obj": o.id, "actor": act, "prev": prev, "hop": prev is not None and act != prev, "kind": d["kind"],
-               "hits": o.hits, "gain": o.gain, "nis": d2 / len(nu), "dim": len(nu), "mu0": [float(m) for m in o.mu],
+               "hits": o.hits, "gain": gain, "nis": d2 / len(nu), "dim": len(nu), "mu0": [float(m) for m in o.mu],
                "nu": [float(v) for v in nu], "sd": [float(math.sqrt(max(S[i, i], 0.0))) for i in range(len(nu))]}
         like = []
         for j in range(3):
@@ -163,13 +166,26 @@ def run(name, seed, night, radar_cfg=None, det_params=None):
                        sep=math.hypot(an["x"] - ap["x"], an["y"] - ap["y"]) if an is not None and ap is not None else None,
                        sep_b=abs(math.degrees(math.atan2(an["y"], an["x"]) - math.atan2(ap["y"], ap["x"]))) if an is not None and ap is not None else None,
                        seen_ago=t - max(o.last_seen.values()), sd_pos=float(math.sqrt(max(np.linalg.eigvalsh(o.P[:2, :2])[-1], 0.0))))
-        orig_update(o, d, Rm, sensor, pose, src, t, *more)
+        return row
+
+    def assoc(src, t, sensor, pose, objs, D):
+        out = orig_assoc(src, t, sensor, pose, objs, D)
+        for i, j, g, _, _ in out[0]:
+            d = ctx["dets"][j]
+            pending[objs[i].id] = upd_row(objs[i], d, np.diag(np.asarray(d["R"], float)), sensor, pose, src, t, g)
+        return out
+
+    def after(o, d, sensor, src, t, n, dl):
+        orig_after(o, d, sensor, src, t, n, dl)
+        row = pending.pop(o.id, None)
+        if row is None:
+            return
         row["mu1"] = [float(m) for m in o.mu]
-        owner[o.id] = act
-        actors_of[o.id].append(act)
+        owner[o.id] = d.get("actor")
+        actors_of[o.id].append(d.get("actor"))
         R["upd"].append(row)
 
-    tr.process, tr._update = process, update
+    tr.process, tr._associate, tr._after_update = process, assoc, after
 
     orig_frame = box.frame
 

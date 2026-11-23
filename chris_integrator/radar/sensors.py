@@ -3,10 +3,13 @@ state in the ground frame and of where the car was at that moment.
 
 A sensor model supplies, for one scan (one message of that sensor):
 
-    h(x, pose)        predicted measurement and its Jacobian (m x 7) for an object state x
+    native()          its constants as the native core reads them (24 numbers): there (chris_native.c `r_h`,
+                      `r_coverage`, `r_p_detect`, `r_density`) are its measurement function, its coverage (the
+                      probability that an object at a place of the CAR frame is reported in this scan, 0 outside the
+                      field of view / range), the probability of reporting a given object and the density of
+                      detections that are not a known object's; the native core is their only implementation
+    h(x, pose, det)   predicted measurement and its Jacobian (m x N) for an object state x (the native function)
     residual(z, zp)   measurement minus prediction (angles wrapped)
-    coverage(xc, yc)  probability that an object at this place of the CAR frame is reported in this scan
-                      (0 outside the field of view / range of this scan)
     clutter           false detections per unit of measurement volume
     start(det, pose, label)   (x0, P0) of an object first seen in this detection, or None if a detection of this
                       kind cannot start one
@@ -31,12 +34,9 @@ import math
 
 import numpy as np
 
-from .. import native as _native
-from .models import DP, LH, N, PX, PY, VX, VY, kin
+from .models import DP, LH, NR as _NR, N, PX, PY, VX, VY, kin
 
-# The measurement functions in the native core (chris_native.c `r_h`), when its radar part is in use: the sensor
-# hands its constants over as 24 numbers (`native()`), a detection its kind as a code (`kind_code`)
-_NR = _native.radar
+# a detection's kind as the native core takes it (`kind_code`)
 _KCODE = {"b": 0, "rb": 1, "rbh": 2, "bt": 3, "": 4}
 
 
@@ -53,8 +53,14 @@ class Sensor:
     coast_s = 1.0                # an object only this sensor sees is kept this long without a detection
     angle_rows = ()              # measurement rows that are angles
 
-    def h(self, x, pose, det=None):
+    def native(self):
         raise NotImplementedError
+
+    def h(self, x, pose, det=None):
+        z, H = np.empty(4), np.empty((4, N))
+        m = _NR.radar_h(self.native(), kind_code((det or {}).get("kind")), float((det or {}).get("sdt") or 0.0),
+                        np.ascontiguousarray(x, float), [float(v) for v in pose] + [0.0] * (6 - len(pose)), z, H)
+        return z[:m], H[:m]
 
     def rows(self, det):
         """Which measurement rows of a detection are angles."""
@@ -65,23 +71,6 @@ class Sensor:
         for i in self.rows(det):
             d[i] = wrap(d[i])
         return d
-
-    def takes(self, det, xc, yc):
-        """May this detection belong to an object at this place of the car frame (beyond the statistical gate)?"""
-        return True
-
-    def density(self, det):
-        """Detections per unit of this detection's measurement space that do NOT come from a known object:
-        false ones and objects seen for the first time. What a detection's fit to an object is weighed against."""
-        return self.clutter
-
-    def coverage(self, xc, yc):
-        return self.p_d
-
-    def p_detect(self, xc, yc, x=None):
-        """Probability that an object (state x, at this place of the car frame) is reported in this scan:
-        `coverage`, less where the sensor has a reason to miss this very object."""
-        return self.coverage(xc, yc)
 
     def start(self, det, pose, label):
         return None
@@ -100,12 +89,6 @@ def kind_code(kind):
 def base(kind):
     """A detection kind without the mark of an extra scale-rate row ("rbhs" -> "rbh")."""
     return kind[:-1] if kind and kind.endswith("s") else kind
-
-
-def _rel(x, pose):
-    dx, dy = x[PX] - pose[0], x[PY] - pose[1]
-    r = max(math.hypot(dx, dy), 0.5)
-    return dx, dy, r
 
 
 def _prior(label, cfg):
@@ -172,54 +155,9 @@ class CameraBoxes(Sensor):
         self.extraneous = c["false_per_scan"] + c["new_per_scan"]     # per scan; the tracker raises it in a busy scene
         self.clutter = self.extraneous / self.vol["rb"]
 
-    def density(self, det):
-        k = base(det["kind"])
-        d = self.extraneous / self.vol[k]
-        if k != det["kind"]:
-            d /= self.cfg["scale_rate_span"]             # one more row: scale rates of unknown things, anywhere
-        if k != "rbh":
-            return d
-        # objects are mostly born where they become detectable: as small boxes. A part appears anywhere (from
-        # behind another, from the side): uniform over the heights
-        c = self.cfg
-        u = float(det["z"][2]) - (math.log(self.h_min) if self.h_min and math.isfinite(self.h_min) else float(det["z"][2]))
-        born = math.exp(-max(u, 0.0) / c["born_small_scale"]) / c["born_small_scale"]
-        return d * c["logh_span"] * ((1.0 - c["born_small"]) / c["logh_span"] + c["born_small"] * born)
-
-    def p_detect(self, xc, yc, x=None):
-        p = self.coverage(xc, yc)
-        if p > 0.0 and self.cover is not None and math.hypot(xc, yc) < self.cover["ground_min_m"]:
-            p *= self.cfg["p_cut"]                        # nearer than the view's first ground point: its box
-                                                          # is cut there, and a cut box is often not reported
-        if p <= 0.0 or x is None or self.h_min is None:
-            return p
-        # a detector does not report boxes below a size, and is unsure just above it
-        h = math.exp(self.logf + x[LH]) / max(xc, 0.5)
-        ramp = (h / self.h_min - 1.0) / (self.cfg["h_full_rel"] - 1.0)
-        return p * min(1.0, max(self.cfg["p_small"], ramp))
-
     def rows(self, det):
         k = base(det["kind"]) if det else "rb"
         return (0,) if k in ("b", "bt") else () if k == "" else (1,)
-
-    def _scale_row(self, x, pose, det):
-        """How fast the object's image grows: the detector's measurement on the pixels of two frames
-        `sdt` apart, (ln size now - ln size then) / sdt. A thing of fixed size seen from depth d along the
-        camera's axis has size ~ 1 / d, so this is ln(d_then / d_now) / sdt, with d_then = d_now - d' sdt for the
-        relative motion now: no size, no road, no pitch in it. For a standing thing it is the car's own speed
-        over the distance: a range. Returns (value, Jacobian row)."""
-        dx, dy = x[PX] - pose[0], x[PY] - pose[1]
-        c, s_ = math.cos(pose[2]), math.sin(pose[2])
-        depth = max(c * dx + s_ * dy, 0.5)
-        w = pose[5] if len(pose) > 5 else 0.0
-        rate = c * (x[VX] - pose[3]) + s_ * (x[VY] - pose[4]) + w * (-s_ * dx + c * dy)     # d(depth)/dt
-        dt = max(float(det.get("sdt") or 0.0), 1e-3)
-        u = max(1.0 - rate * dt / depth, 0.05)
-        row = np.zeros(N)
-        row[VX], row[VY] = -c / (u * depth), -s_ / (u * depth)
-        row[PX] = (w * s_ / depth + rate * c / (depth * depth)) / u
-        row[PY] = (-w * c / depth + rate * s_ / (depth * depth)) / u
-        return math.log(u) / dt, row
 
     def native(self):
         """The constants the native core's measurement, coverage and density functions read (24 numbers)."""
@@ -232,68 +170,7 @@ class CameraBoxes(Sensor):
                 c["logh_span"], c["born_small"], c["born_small_scale"])
 
     def h(self, x, pose, det=None):
-        if _NR is not None:
-            z, H = np.empty(4), np.empty((4, N))
-            m = _NR.radar_h(self.native(), kind_code(det["kind"] if det else "rb"),
-                            float((det.get("sdt") if det else 0.0) or 0.0), x, pose, z, H)
-            return z[:m], H[:m]
-        return self.h_py(x, pose, det)
-
-    def h_py(self, x, pose, det=None):
-        """h in Python: the reference."""
-        k = det["kind"] if det else "rb"
-        if k.endswith("s"):                               # the base kind's rows, then the scale rate
-            zs, rs = self._scale_row(x, pose, det)
-            if k == "s":
-                return np.array([zs]), rs.reshape(1, N)
-            z0, H0 = self._h(x, pose, k[:-1])
-            return np.append(z0, zs), np.vstack([H0, rs])
-        return self._h(x, pose, k)
-
-    def _h(self, x, pose, k):
-        dx, dy, r = _rel(x, pose)
-        brow = np.zeros(N)
-        brow[PX], brow[PY] = -dy / (r * r), dx / (r * r)
-        b = wrap(math.atan2(dy, dx) - pose[2])
-        if k == "b":
-            return np.array([b]), brow.reshape(1, N)
-        hc = self.hc
-        if k == "bt":
-            ho = math.exp(x[LH])
-            dh = hc - ho                                  # the top below (+) or above (-) the camera
-            q = r * r + dh * dh
-            trow = np.zeros(N)
-            trow[PX], trow[PY], trow[LH] = -dh / q * dx / r, -dh / q * dy / r, -ho * r / q
-            return np.array([b, math.atan2(dh, r) + self.bias]), np.array([brow, trow])
-        g = -hc / (r * r + hc * hc)                       # d(angle) / d(distance)
-        arow = np.zeros(N)
-        arow[PX], arow[PY], arow[DP] = g * dx / r, g * dy / r, 1.0
-        ang = math.atan2(hc, r) + self.bias + x[DP]
-        if k == "rb":
-            return np.array([ang, b]), np.array([arow, brow])
-        c, s_ = math.cos(pose[2]), math.sin(pose[2])
-        depth = max(c * dx + s_ * dy, 0.5)                # along the camera's axis
-        hrow = np.zeros(N)
-        hrow[PX], hrow[PY], hrow[LH] = -c / depth, -s_ / depth, 1.0
-        return np.array([ang, b, self.logf + x[LH] - math.log(depth)]), np.array([arow, brow, hrow])
-
-    def in_field(self, xc, yc):
-        if xc <= 0.5:
-            return False
-        if self.cover is None:
-            return True
-        return self.cover["bearing_min"] <= math.atan2(yc, xc) <= self.cover["bearing_max"]
-
-    def coverage(self, xc, yc):
-        if not self.in_field(xc, yc) or math.hypot(xc, yc) > self.cfg["max_range_m"]:
-            return 0.0
-        return self.p_d
-
-    def takes(self, det, xc, yc):
-        if base(det["kind"]) not in ("b", "bt") or self.cover is None:
-            return True
-        # a bearing alone fits everything on its ray: it holds only an object near enough to be cut at the bottom
-        return math.hypot(xc, yc) <= self.cfg["near_margin"] * self.cover["ground_min_m"]
+        return Sensor.h(self, x, pose, det or {"kind": "rb"})
 
     def _start_top(self, det, pose, label):
         """An object first seen in a box cut at the bottom: its feet are out of the picture, its top is not.
@@ -428,33 +305,6 @@ class MicrowaveRadar(Sensor):
         ox, oy = c * self.mx - s * self.my, s * self.mx + c * self.my          # the mount's lever on the ground
         return X + ox, Y + oy, vx - w * oy, vy + w * ox
 
-    def h(self, x, pose, det=None):
-        if _NR is not None:
-            z, H = np.empty(4), np.empty((4, N))
-            _NR.radar_h(self.native(), 0, 0.0, x, pose, z, H)
-            return z[:3], H[:3]
-        return self.h_py(x, pose, det)
-
-    def h_py(self, x, pose, det=None):
-        """h in Python: the reference."""
-        sx, sy, svx, svy = self._sensor(pose)
-        dx, dy = x[PX] - sx, x[PY] - sy
-        r = max(math.hypot(dx, dy), 0.5)
-        rvx, rvy = x[VX] - svx, x[VY] - svy
-        rr = (dx * rvx + dy * rvy) / r
-        H = np.zeros((3, N))
-        H[0, PX], H[0, PY] = dx / r, dy / r
-        H[1, PX], H[1, PY] = -dy / (r * r), dx / (r * r)
-        H[2, PX], H[2, PY] = rvx / r - rr * dx / (r * r), rvy / r - rr * dy / (r * r)
-        H[2, VX], H[2, VY] = dx / r, dy / r
-        return np.array([r, wrap(math.atan2(dy, dx) - pose[2] - self.yaw), rr]), H
-
-    def coverage(self, xc, yc):
-        dx, dy = xc - self.mx, yc - self.my
-        r = math.hypot(dx, dy)
-        if r < 0.5 or r > self.max_range or abs(wrap(math.atan2(dy, dx) - self.yaw)) > self.fov:
-            return 0.0
-        return self.p_d
 
     def start(self, det, pose, label):
         r, az, rr = (float(v) for v in det["z"])
@@ -485,17 +335,8 @@ class Position(Sensor):
         self.fov, self.max_range = fov, max_range
         self.clutter = false_per_scan / (max_range * max_range)
 
-    def h(self, x, pose, det=None):
-        c, s = math.cos(pose[2]), math.sin(pose[2])
-        dx, dy = x[PX] - pose[0], x[PY] - pose[1]
-        H = np.zeros((2, N))
-        H[0, PX], H[0, PY] = c, s
-        H[1, PX], H[1, PY] = -s, c
-        return np.array([c * dx + s * dy, -s * dx + c * dy]), H
-
-    def coverage(self, xc, yc):
-        r = math.hypot(xc, yc)
-        return self.p_d if 1.0 < r < self.max_range and abs(math.atan2(yc, xc)) < self.fov else 0.0
+    def native(self):
+        return (2.0, self.fov, self.max_range, self.p_d, self.clutter) + (0.0,) * 19
 
     def start(self, det, pose, label):
         c, s = math.cos(pose[2]), math.sin(pose[2])

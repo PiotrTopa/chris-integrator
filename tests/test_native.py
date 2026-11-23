@@ -516,173 +516,10 @@ def test_smoother_step_singular_and_wrapped():
 # ---- the lane tracker's array steps ------------------------------------------------------------------------
 
 
-# ---- the radar's motion model ------------------------------------------------------------------------------
-needs_radar = pytest.mark.skipif(N.radar is None, reason="the native radar part is not in use in this process")
+# ---- the radar (the native core is its only implementation) -------------------------------------------------
+needs_radar = pytest.mark.skipif(N.radar is None, reason="the native core is not built (the radar needs it)")
 
 
-def _radar_batch(g, B):
-    """B objects' hypotheses with the corners in them: speeds above every kind's top speed and below 1 m/s,
-    probabilities with zeros and certainties, dt behind, at and ahead of the objects' time (and a dt so small
-    that nothing flows into a hypothesis), kinds known and not."""
-    from chris_integrator.radar import models as M
-
-    def cov():
-        a = g.standard_normal((8, 8)) * 10.0 ** g.uniform(-2, 1, 8)
-        P = a @ a.T + np.diag(10.0 ** g.uniform(-4, 1, 8))
-        return 0.5 * (P + P.T)
-    xs = g.standard_normal((B, 3, 8)) * np.array([30.0, 30.0, 10.0, 10.0, 2.0, 2.0, 0.01, 0.3])
-    r = g.random()
-    if r < 0.3:
-        xs[:, :, 2:4] *= 10.0
-    elif r < 0.6:
-        xs[:, :, 2:4] *= 0.05
-    Ps = np.array([[cov() for _ in range(3)] for _ in range(B)])
-    mu = g.random((B, 3))
-    for b in range(B):
-        r = g.random()
-        if r < 0.2:
-            mu[b, g.integers(3)] = 0.0
-        elif r < 0.35:
-            mu[b] = np.eye(3)[g.integers(3)]
-    mu /= mu.sum(axis=1, keepdims=True)
-    xf, Pf = g.standard_normal((B, 8)) * 10.0, np.array([cov() for _ in range(B)])
-    dt = g.choice([-0.3, -0.05, 0.0, 1e-14, 0.033, 0.1, 0.5, 1.0, 3.0], B) * (1.0 + 0.1 * g.random(B))
-    dt[g.random(B) < 0.15] = 0.0
-    kinds = list(M.KIN) + ["zeppelin"]
-    labels = [kinds[i] for i in g.integers(len(kinds), size=B)]
-    return xs, Ps, mu, xf, Pf, dt, labels
-
-
-def _to_rounding(ref, got, block):
-    """The largest difference of two batched arrays, relative to the largest magnitude of each object's (or
-    hypothesis') block (at least 1)."""
-    ref, got = np.asarray(ref), np.asarray(got)
-    lead = ref.shape[:block]
-    scale = np.maximum(np.abs(ref).reshape(lead + (-1,)).max(axis=-1), 1.0)
-    return float((np.abs(ref - got).reshape(lead + (-1,)).max(axis=-1) / scale).max())
-
-
-@needs_native
-def test_radar_evolve_agrees_with_numpy():
-    """Interaction, prediction (speed bound included), combination and the free estimate's prediction of the
-    native core against the numpy reference (models._evolve_py), on stacked arrays and on lists of per-object
-    arrays: to rounding (1e-12 of each block's size)."""
-    from chris_integrator.radar import models as M
-    g = np.random.default_rng(5)
-    par = M._native_par(M.CFG)
-    worst = 0.0
-    seen = {"over": 0, "low": 0, "back": 0, "still": 0}
-    for it in range(1500):
-        B = int(g.integers(1, 9))
-        xs, Ps, mu, xf, Pf, dt, labels = _radar_batch(g, B)
-        ref = M._evolve_py(xs, Ps, mu, xf, Pf, dt, labels, M.CFG, True, True)
-        got = (np.empty((B, 3, 8)), np.empty((B, 3, 8, 8)), np.empty((B, 3)), np.empty((B, 8)), np.empty((B, 8, 8)),
-               np.empty((B, 8)), np.empty((B, 8, 8)))
-        kin = [M._KIN4.get(l) or M._KIN4[None] for l in labels]
-        if it % 2:
-            C.radar_evolve(xs, Ps, mu, xf, Pf, dt, np.array(kin), np.array(par), *got)
-        else:
-            C.radar_evolve(list(xs), list(Ps), list(mu), list(xf), list(Pf), list(dt), kin, par, *got)
-        for a, b, blk in zip(ref, got, (2, 2, 1, 1, 1, 1, 1)):
-            worst = max(worst, _to_rounding(a, b, blk))
-        vmax = np.array([k[2] for k in kin])
-        seen["over"] += int((np.hypot(ref[0][:, 1:, 2], ref[0][:, 1:, 3]) >= vmax[:, None] * (1 - 1e-12)).any())
-        seen["low"] += int(((dt > 0) & (dt < 1e-12) & (mu.min(axis=1) == 0.0)).any())
-        seen["back"] += int((dt < 0).any())
-        seen["still"] += int((np.hypot(xs[:, 1:, 2], xs[:, 1:, 3]) < 1.0).any())
-    assert worst < 1e-12, worst
-    assert min(seen.values()) > 20, seen
-    # without the optional outputs: the same hypotheses
-    xs, Ps, mu, xf, Pf, dt, labels = _radar_batch(g, 4)
-    a = M.evolve_b(xs, Ps, mu, xf, Pf, dt, labels)
-    assert a[3] is None and a[5] is None
-    b = M._evolve_py(xs, Ps, mu, xf, Pf, dt, labels)
-    assert _to_rounding(b[1], a[1], 2) < 1e-12 and _to_rounding(b[0], a[0], 2) < 1e-12
-
-
-@needs_native
-def test_radar_p_still_and_combine_agree_with_numpy():
-    from chris_integrator.radar import models as M
-    g = np.random.default_rng(6)
-    for _ in range(500):
-        B = int(g.integers(1, 9))
-        xs, Ps, mu, xf, Pf, dt, labels = _radar_batch(g, B)
-        v0 = M.kin_arrays(labels)[3]
-        q = M.still_b(xs[:, 1:], Ps[:, 1:], v0[:, None])
-        ref = np.minimum(1.0, mu[:, 0] + mu[:, 1] * q[:, 0] + mu[:, 2] * q[:, 1])
-        got = C.radar_p_still(list(xs), list(Ps), list(mu), list(v0))
-        assert isinstance(got, list) and len(got) == B
-        assert float(np.max(np.abs(ref - np.array(got)))) < 1e-12
-        x0, P0 = M.combine_b(xs, Ps, mu)
-        x1, P1 = np.empty((B, 8)), np.empty((B, 8, 8))
-        C.radar_combine(xs, Ps, mu, x1, P1)
-        assert _to_rounding(x0, x1, 1) < 1e-12 and _to_rounding(P0, P1, 1) < 1e-12
-        x2, P2 = M.combine(xs[0], Ps[0], mu[0])
-        assert _to_rounding(x0[:1], x2[None], 1) < 1e-12 and _to_rounding(P0[:1], P2[None], 1) < 1e-12
-
-
-@needs_native
-def test_radar_leaves_what_is_not_finite_to_the_reference():
-    """A state that is not finite (an object gone wrong) is the reference's: the native call says so and the
-    switch point runs numpy, whose NaN and inf are what the tracker checks for."""
-    from chris_integrator.radar import models as M
-    g = np.random.default_rng(7)
-    xs, Ps, mu, xf, Pf, dt, labels = _radar_batch(g, 3)
-    Ps[1, 2, 0, 0] = np.inf
-    xs[2, 1, 3] = np.nan
-    out = (np.empty((3, 3, 8)), np.empty((3, 3, 8, 8)), np.empty((3, 3)), None, None, None, None)
-    with pytest.raises(C.Fallback):
-        C.radar_evolve(xs, Ps, mu, xf, Pf, dt, [M._KIN4["car"]] * 3, M._native_par(M.CFG), *out)
-    with pytest.raises(C.Fallback):
-        C.radar_p_still(xs, Ps, mu, [0.7] * 3)
-    with np.errstate(invalid="ignore", over="ignore"):
-        ref = M._evolve_py(xs, Ps, mu, xf, Pf, dt, labels, M.CFG, True, True)
-        got = M.evolve_b(xs, Ps, mu, xf, Pf, dt, labels, M.CFG, True, True)
-    for a, b in zip(ref, got):
-        assert np.array_equal(a, b, equal_nan=True)
-    # arrays it does not take (not float64, not contiguous): the reference, through the switch point
-    with np.errstate(invalid="ignore", over="ignore"):
-        got = M.evolve_b(xs.astype(np.float32), Ps, mu, xf, Pf, dt, labels)
-        ref = M._evolve_py(xs.astype(np.float32), Ps, mu, xf, Pf, dt, labels)
-    assert np.array_equal(got[0], ref[0], equal_nan=True)
-
-
-RADAR = r"""
-import json, sys
-sys.path.insert(0, %r)
-import os
-from chris_integrator.mixer import MessageClock
-if os.environ.get("RADAR_REF") == "1":                   # the radar's numpy reference
-    from chris_integrator.radar import models as _M
-    _M._NR = None
-from chris_integrator.sim import default_sensors
-from chris_integrator.sim import roaduser_sim as rs
-from chris_integrator.stack import build
-out = {"radar_native": os.environ.get("RADAR_REF") != "1", "runs": {}}
-for name, seed, night in (("parked_street", 1, True), ("adjacent", 1, False), ("stopped_brake_25", 1, False)):
-    w = rs.scenario(name, seed=seed, night=night)
-    det = rs.DetectorSim(seed=1000 + seed, night=night)
-    sensors = default_sensors(vehicle={"seed": 11 + 97 * seed}, vision={"seed": 21 + 97 * seed, "leads": True},
-                              gnss={"seed": 31 + 97 * seed}, map={"seed": 41 + 97 * seed})
-    sensors.append(det)
-    st = build(cfg={"estimator": {"sources": [{"kind": "road_users", "id": "*"}]}}, mapper=None, clock=MessageClock())
-    box = st.mixer.slots["radar"].plugin.box
-    msgs, frame = [], box.frame
-    def grab(ts, frame=frame, msgs=msgs):
-        m = frame(ts)
-        if m is not None:
-            msgs.append(m)
-        return m
-    box.frame = grab
-    sent = False
-    for _, m in w.messages(sensors):
-        if not sent:
-            st.deliver(det.calib_msg(m["ts_mono_ns"]))
-            sent = True
-        st.deliver(m)
-    out["runs"][name] = msgs
-print(json.dumps(out))
-"""
 
 
 def _msg_diffs(u, v, path, out):
@@ -705,320 +542,6 @@ def _msg_diffs(u, v, path, out):
 def _last_digit(*vs):
     """One unit of the last printed digit of the numbers (the finer of them): 0.01 for 7.47, 0.001 for 0.125."""
     return min(10.0 ** -len(repr(v).split(".")[1]) if "." in repr(v) and "e" not in repr(v) else 1.0 for v in vs)
-
-
-@needs_radar
-def test_radar_messages_native_against_reference():
-    """Simulated drives through the whole stack with the radar part native and not (every other part the same):
-    the radar's messages agree except, at most, in a last printed digit or the sign of a zero, in a handful of
-    messages (none on the development machine)."""
-    res = {}
-    for ref in ("1", "0"):
-        out = subprocess.run([sys.executable, "-c", RADAR % HERE], cwd=HERE, env=dict(os.environ, RADAR_REF=ref),
-                             capture_output=True, text=True, check=True).stdout
-        res[ref == "0"] = json.loads(out)
-    assert not res[False]["radar_native"] and res[True]["radar_native"]
-    for name, a in res[False]["runs"].items():
-        b = res[True]["runs"][name]
-        assert len(a) == len(b) and len(a) > 150, name
-        bad = 0
-        for u, v in zip(a, b):
-            d = []
-            _msg_diffs(u, v, "", d)
-            for item in d:
-                assert len(item) == 3 and isinstance(item[1], float) and isinstance(item[2], float), (name, item)
-                assert abs(item[1] - item[2]) <= 1.01 * _last_digit(item[1], item[2]), (name, item)
-            bad += bool(d)
-        assert bad <= max(3, len(a) // 30), (name, bad, len(a))
-
-
-# ---- the radar, phase 2: sensors, association, update, output, upkeep ---------------------------------------
-def _cameras(g):
-    from chris_integrator.radar.sensors import CameraBoxes
-    cov = None if g.random() < 0.3 else {"bearing_min": -0.6, "bearing_max": 0.55, "ground_min_m": float(g.uniform(4, 12))}
-    s = CameraBoxes(cov, None, 975.0, float(g.uniform(1.0, 1.6)), None if g.random() < 0.3 else float(g.choice([9.0, 14.0, math.inf])))
-    s.bias = float(g.normal() * 0.01)
-    s.extraneous = float(g.uniform(0.1, 3.0))
-    return s
-
-
-@needs_radar
-def test_radar_measurement_functions_are_the_python_bit_for_bit():
-    """sensors.py `h` (every camera kind with and without the scale-rate row, the microwave radar), coverage,
-    p_detect and density in C against their Python: the same bits (math.hypot as CPython computes it)."""
-    from chris_integrator.radar.sensors import MicrowaveRadar, kind_code
-    g = np.random.default_rng(11)
-    kinds = ["b", "rb", "rbh", "bt", "bs", "rbs", "rbhs", "bts", "s"]
-    for it in range(30000):
-        s = _cameras(g)
-        x = g.standard_normal(8) * [30, 30, 10, 10, 2, 2, 0.01, 0.3]
-        if it % 7 == 0:
-            x[:2] *= 1e-3                                # at the car: the 0.5 m floor of the range
-        pose = tuple(g.standard_normal(6) * [10, 10, 3, 10, 10, 0.3])
-        k = kinds[it % len(kinds)]
-        d = {"kind": k, "sdt": float(g.choice([0.0, 1e-4, 0.2, 0.8]))}
-        z1, H1 = s.h(x, pose, d)
-        z2, H2 = s.h_py(x, pose, d)
-        assert z1.shape == z2.shape and H1.shape == H2.shape and np.array_equal(z1, z2) and np.array_equal(H1, H2), (k, z1, z2)
-        r = MicrowaveRadar((float(g.normal()), float(g.normal()), float(g.normal() * 0.3)))
-        z1, H1 = r.h(x, pose)
-        z2, H2 = r.h_py(x, pose)
-        assert np.array_equal(z1, z2) and np.array_equal(H1, H2)
-        assert kind_code(k) == ({"b": 0, "rb": 1, "rbh": 2, "bt": 3, "": 4}[k.rstrip("s") if k != "s" else ""] + 8 * k.endswith("s"))
-    # math.hypot (CPython's own algorithm, not libm's) through the camera's bearing row at awkward magnitudes
-    s = _cameras(g)
-    for _ in range(20000):
-        x = np.zeros(8)
-        x[:2] = g.standard_normal(2) * 10.0 ** g.uniform(-1, 4, 2)
-        z1, H1 = s.h(x, (0.0,) * 6, {"kind": "b"})
-        z2, H2 = s.h_py(x, (0.0,) * 6, {"kind": "b"})
-        assert np.array_equal(H1, H2)
-
-
-@needs_radar
-def test_radar_marginals_and_assignment_are_the_python():
-    """tracker.marginals (loopy belief propagation, numpy's pairwise sums) and tracker.assign (groups, the
-    Hungarian of core.objects): the same bits, the same pairs in the same order."""
-    from chris_integrator.radar import tracker as T
-    g = np.random.default_rng(12)
-    for it in range(4000):
-        nt, nd = int(g.integers(0, 14)), int(g.integers(0, 14))
-        L = g.random((nt, nd)) * 10.0 ** g.uniform(-3, 3, (nt, nd))
-        L[g.random((nt, nd)) < 0.6] = 0.0
-        if it % 9 == 0:
-            L[:] = 0.0
-        out = np.empty((nt, nd))
-        C.radar_marginals(np.ascontiguousarray(L), out)
-        assert np.array_equal(out, T.marginals(L)), (nt, nd)
-        G = np.where(L > 1.0, np.log(np.where(L > 1.0, L, 1.0)), -np.inf)
-        if it % 5 == 0:                                  # ties
-            G = np.where(np.isfinite(G), np.round(G), -np.inf)
-            G[G == 0.0] = -np.inf
-        assert C.radar_assign(np.ascontiguousarray(G)) == [(int(i), int(j)) for i, j in T.assign(G)], (nt, nd)
-
-
-def _clone_tracker(tr):
-    """An independent copy of a tracker: its state array copied, every object re-made on it."""
-    import copy
-    from chris_integrator.radar import tracker as T
-    new = copy.copy(tr)
-    new.store = T.State(len(tr.store.a))
-    new.store.a[:] = tr.store.a
-    new.store.free = list(tr.store.free)
-    objs = []
-    for o in tr.objects:
-        q = T.Obj.__new__(T.Obj)
-        for k in T.Obj.__slots__:
-            if k.startswith("_"):
-                continue
-            v = getattr(o, k)
-            setattr(q, k, copy.deepcopy(v) if isinstance(v, (dict, set, list)) or hasattr(v, "maxlen") else v)
-        q.bind(new.store)
-        objs.append(q)
-    new.objects = objs
-    for k in ("stats", "sensors", "bias", "new_rate", "unexplained", "scan_times", "real_ids", "score_hist", "score_odds"):
-        setattr(new, k, copy.deepcopy(getattr(tr, k)))
-    return new
-
-
-def _rows_close(a, b, tol=1e-7):
-    """Two trackers' objects: the same ids and discrete record, numbers to rounding (relative to each block's
-    largest magnitude: a state, a covariance, the probabilities). Rounding, not 1e-16: one update can lose digits
-    (a covariance update that takes most of a variance away subtracts nearly equal numbers; small systems solved
-    by LAPACK in the reference and by elimination here), seen up to 2e-9 on the simulated drives."""
-    assert [o.id for o in a.objects] == [o.id for o in b.objects]
-    worst, where = 0.0, None
-    for o, q in zip(a.objects, b.objects):
-        assert (o.state, o.hits, o.verdict, sorted(o.sources), o.n_checks, sorted(o.flags)) == \
-               (q.state, q.hits, q.verdict, sorted(q.sources), q.n_checks, sorted(q.flags)), o.id
-        for k in ("xs", "Ps", "mu", "xf", "Pf", "x", "P"):
-            u, v = getattr(o, k), getattr(q, k)
-            blocks = (u.reshape(3, -1), v.reshape(3, -1)) if k in ("xs", "Ps") else (u.reshape(1, -1), v.reshape(1, -1))
-            scale = np.maximum(np.abs(blocks[1]).max(axis=1, keepdims=True), 1.0)
-            e = float((np.abs(blocks[0] - blocks[1]) / scale).max())
-            if e > worst:
-                worst, where = e, (o.id, k)
-        e = abs(o.logodds - q.logodds) / max(1.0, abs(q.logodds))
-        if e > worst:
-            worst, where = e, (o.id, "logodds")
-    assert worst < tol, (worst, where)
-    return worst
-
-
-@needs_radar
-def test_radar_scan_by_scan_native_against_reference(monkeypatch):
-    """On the states of simulated drives (camera boxes with and without the scale-rate row, a microwave radar),
-    every scan's processing, every message's upkeep and every message's numbers: native against the Python
-    reference on a copy of the same tracker, before the two can drift apart. The same pairs, objects, states
-    and verdicts; numbers to rounding."""
-    from chris_integrator.mixer import MessageClock
-    from chris_integrator.radar import box as Bx, sensors as Sn, tracker as T
-    from chris_integrator.sim import default_sensors
-    from chris_integrator.sim import roaduser_sim as rs
-    from chris_integrator.stack import build
-    seen = {"scans": 0, "pairs": 0, "frames": 0, "objects": 0}
-
-    def reference(fn):                                   # run fn with the Python reference of the radar
-        saved = (T._NR, Sn._NR, Bx._NR)
-        T._NR = Sn._NR = Bx._NR = None
-        try:
-            return fn()
-        finally:
-            T._NR, Sn._NR, Bx._NR = saved
-
-    SC = {"px": 0.08, "rel": 0.002, "p": 0.78, "min_dt": 0.2, "max_dt": 1.0, "max_std": 0.06}
-    errors = []
-
-    def guarded(fn):                                     # the mixer logs a plug-in's exception and goes on
-        def call(*a, **k):
-            try:
-                return fn(*a, **k)
-            except Exception as e:
-                errors.append(repr(e))
-                raise
-        return call
-
-    for name, seed, night, scale in (("curve_parked", 1, False, False), ("parked_street", 1, True, True),
-                                     ("junction", 1, False, True), ("adjacent", 1, False, False)):
-        w = rs.scenario(name, seed=seed, night=night)
-        det = rs.DetectorSim(seed=1000 + seed, night=night, params={"scale_rate": SC} if scale else None)
-        sensors = default_sensors(vehicle={"seed": 11 + 97 * seed}, vision={"seed": 21 + 97 * seed, "leads": True},
-                                  gnss={"seed": 31 + 97 * seed}, map={"seed": 41 + 97 * seed})
-        sensors.append(det)
-        st = build(cfg={"estimator": {"sources": [{"kind": "road_users", "id": "*"}]}}, mapper=None, clock=MessageClock())
-        box = st.mixer.slots["radar"].plugin.box
-        tr = box.tracker
-        process, manage, numbers = tr.process, tr.manage, box._numbers
-
-        def proc(src, t, sensor, dets, process=process, tr=tr):
-            import copy
-            twin = _clone_tracker(tr)
-            dets2 = copy.deepcopy(dets)
-            sen2 = copy.copy(sensor)
-            before = tr.stats.get(src, {}).get("assigned", 0)
-            r = process(src, t, sensor, dets)
-            reference(lambda: T.Tracker.process(twin, src, t, sen2, dets2))
-            _rows_close(tr, twin)
-            seen["scans"] += 1
-            seen["pairs"] += tr.stats[src]["assigned"] - before
-            return r
-
-        def mng(T_, manage=manage, tr=tr):
-            twin = _clone_tracker(tr)
-            manage(T_)
-            reference(lambda: T.Tracker.manage(twin, T_))
-            _rows_close(tr, twin)
-            for o, q in zip(tr.objects, twin.objects):
-                assert o.merge_t.keys() == q.merge_t.keys()
-
-        tr.process, tr.manage = guarded(proc), guarded(mng)
-        frame = box.frame
-
-        def frm(ts, frame=frame, box=box):
-            out = frame(ts)
-            if out is not None and out["objects"]:
-                # the numbers of the objects as the reference computes them, against the message's
-                T_ = ts / 1e9
-                X, Y, psi = box.ego.pose_at(T_)
-                es = box.ego.state_at(T_)
-                shown = [o for o in box.tracker.objects if o.state != "tentative"]
-                ref = reference(lambda: numbers(T_, shown, X, Y, psi, es[3], es[4]))
-                byid = {r["id"]: r for r in out["objects"]}
-                for o, r in zip(shown, ref):
-                    m = byid[o.id]
-                    got = (m["x_m"], m["y_m"], m["vx_mps"], m["vy_mps"], m["ax_mps2"], m["ay_mps2"], m["speed_mps"],
-                           m["heading_rad"], m["v_rel_mps"], m["std"], m["models"], m["p_stationary"], m["angle_offset_deg"],
-                           m["predict"], None, m["path_offset_m"], None, None, None, m["ttc_s"], m["predict_path"])
-                    for k, (u, v) in enumerate(zip(got, r)):
-                        if k in (14, 16, 17, 18):
-                            continue
-                        d = []
-                        _msg_diffs(v, u, "", d)
-                        for item in d:
-                            assert len(item) == 3 and abs(item[1] - item[2]) <= 1.01 * _last_digit(item[1], item[2]), (k, item)
-                    assert m["p_threat"] == round(r[18], 3) or abs(m["p_threat"] - round(r[18], 3)) <= 0.0011
-                    seen["objects"] += 1
-                seen["frames"] += 1
-            return out
-
-        box.frame = guarded(frm)
-        sent = False
-        for _, m in w.messages(sensors):
-            if not sent:
-                st.deliver(det.calib_msg(m["ts_mono_ns"]))
-                sent = True
-            st.deliver(m)
-    assert not errors, errors[:5]
-    assert seen["scans"] > 500 and seen["pairs"] > 1500 and seen["frames"] > 500 and seen["objects"] > 3000, seen
-
-
-@needs_radar
-def test_radar_microwave_scans_native_against_reference(monkeypatch):
-    """A microwave radar's scans (range, azimuth, range rate) through the tracker: native against reference."""
-    import copy
-    from chris_integrator.radar import Radar, sensors as Sn, tracker as T
-    g = np.random.default_rng(14)
-    rd = Radar()
-    NS = 1_000_000_000
-    targets = [(30.0, 3.5, 0.0, 0.0), (55.0, -0.2, 18.0, 0.0), (12.0, -3.0, 0.0, 0.0), (80.0, 0.0, -20.0, 0.0)]
-    n = 0
-    for k in range(240):
-        ts = 10 * NS + k * NS // 20
-        rd.on_ego({"ts_mono_ns": ts, "speed_mps": 15.0, "yaw_rate_rps": 0.01, "accel_long_mps2": 0.0})
-        if k % 2:
-            continue
-        t = (ts - 10 * NS) / NS
-        objs = []
-        for (x0, y0, vx, vy) in targets:
-            x, y = x0 + (vx - 15.0) * t, y0 + vy * t
-            r = math.hypot(x, y)
-            if g.random() < 0.85 and r < 150:
-                objs.append({"range_m": r + g.normal() * 0.2, "azimuth_deg": math.degrees(math.atan2(y, x)) + g.normal() * 0.3,
-                             "range_rate_mps": (x * (vx - 15.0) + y * vy) / r + g.normal() * 0.1, "class": "car"})
-        if g.random() < 0.3:
-            objs.append({"range_m": float(g.uniform(5, 100)), "azimuth_deg": float(g.uniform(-40, 40)), "range_rate_mps": float(g.normal() * 5)})
-        rd.on_objects({"ts_mono_ns": ts, "sensor": "front_radar", "kind": "radar", "objects": objs,
-                       "mount": {"x_m": 2.0, "y_m": 0.0, "yaw_deg": 0.0}})
-        tr = rd.tracker
-        twin = _clone_tracker(tr)
-        scans = list(rd.queue)
-        rd.frame(ts)
-        saved = (T._NR, Sn._NR)
-        T._NR = Sn._NR = None
-        try:
-            for (t_, src, sen, dets) in scans:
-                if t_ <= ts / NS + 1e-6:
-                    T.Tracker.process(twin, src, t_, copy.copy(sen), copy.deepcopy(dets))
-            T.Tracker.manage(twin, ts / NS)
-        finally:
-            T._NR, Sn._NR = saved
-        _rows_close(tr, twin)
-        n += len(tr.objects)
-    assert n > 300
-
-
-@needs_radar
-def test_radar_prediction_peeks_are_the_full_evolution():
-    """r_peek_part (radar_peek_pos, and the message's present and horizons) against the full evolution and
-    combination (radar_peek): the same bits for the entries it computes, over states with the corners in them."""
-    from chris_integrator.radar import models as M, tracker as T
-    g = np.random.default_rng(15)
-    st = T.State(64)
-    par = M._native_par(M.CFG)
-    for it in range(300):
-        B = int(g.integers(1, 9))
-        xs, Ps, mu, xf, Pf, dt, labels = _radar_batch(g, B)
-        rows = list(range(B))
-        for b in rows:
-            r = st.a[b]
-            r[0:24], r[24:216], r[216:219], r[219:227], r[227:291] = xs[b].ravel(), Ps[b].ravel(), mu[b], xf[b], Pf[b].ravel()
-        kin = [M._KIN4.get(l) or M._KIN4[None] for l in labels]
-        x, P, m = np.empty((B, 8)), np.empty((B, 8, 8)), np.empty((B, 3))
-        dts = [d if abs(d) >= 1e-6 else 0.3 for d in dt]
-        C.radar_peek(st.a, rows, dts, kin, par, x, P, m)
-        out = np.empty((B, 6))
-        C.radar_peek_pos(st.a, rows, dts, kin, par, out)
-        assert np.array_equal(out[:, :2], x[:, :2]) and np.array_equal(out[:, 2:], P[:, :2, :2].reshape(B, 4)), it
 
 
 def _golden():
@@ -1054,11 +577,11 @@ def _rows_rel(a, b):
     return worst
 
 
-@needs_native
+@needs_radar
 def test_radar_golden():
     """The native radar functions against what the Python reference gave for the same inputs (frozen in
-    tests/data/radar_golden.npz by tests/make_radar_golden.py while the reference existed): measurement functions,
-    marginals and assignment the same bits; association, update, advance, peeks, upkeep, merge geometry, checks,
+    tests/data/radar_golden.npz by tests/make_radar_golden.py while the reference existed): marginals and assignment
+    the same bits, the measurement functions to the last bit of libm; association, update, advance, peeks, upkeep, merge geometry, checks,
     registration, the common pitch and the message's numbers: the same discrete results, numbers to rounding."""
     seen = {}
     for c in _golden():
@@ -1070,7 +593,8 @@ def test_radar_golden():
         if fn == "radar_h":
             z, H = np.empty(4), np.empty((4, 8))
             m = C.radar_h(a[0], a[1], a[2], a[3], a[4], z, H)
-            assert np.array_equal(z[:m], ref[0]) and np.array_equal(H[:m], np.reshape(ref[1], (m, 8)))
+            # the same bits on the machine that made them; elsewhere libm's atan2, exp, log may differ in the last bit
+            assert _rel(z[:m], ref[0]) < 1e-13 and _rel(H[:m], np.reshape(ref[1], (m, 8))) < 1e-13
         elif fn == "radar_marginals":
             L = np.reshape(a[0], c["shape"])
             out = np.empty(L.shape)
@@ -1136,8 +660,8 @@ def test_radar_golden():
 
 RADAR_DIGEST_RUNS = (("parked_street", 1, True, False), ("adjacent", 1, False, False), ("junction", 1, False, True))
 # sha256 of the radar messages of RADAR_DIGEST_RUNS (json.dumps of the list) on the development machine (x86-64);
-# made when the radar's Python reference still existed, from the native core then (whose messages agree with the
-# reference's to a last printed digit: test_radar_messages_native_against_reference had both). They change when
+# made when the radar's Python reference still existed, from the native core then (whose messages agreed with the
+# reference's to a last printed digit, in a handful of messages: lane report native-radar2). They change when
 # anything upstream of the radar changes its output on purpose: then write them anew (RADAR_DIGESTS=print shows them).
 RADAR_DIGESTS = {"parked_street:1:1:0": "951cac781ef48e369501918b4603cd6720e7bef0f0036d485e423305cdfd68b2",
                  "adjacent:1:0:0": "c9103ca895e5bf8dffd9feb4a130e9ce79622fcb3800d9e9a6dae05002f625a1",
@@ -1186,3 +710,56 @@ def test_radar_messages_digests():
     if os.environ.get("RADAR_DIGESTS") == "print":
         print(json.dumps(got, indent=1))
     assert got == RADAR_DIGESTS
+
+
+@needs_radar
+def test_radar_single_hypothesis_functions():
+    """models.predict / still / transition (one hypothesis, for tests and tools) give what the tracker's batch
+    functions give: the free estimate's prediction of radar_advance is models.predict of the steady hypothesis."""
+    from chris_integrator.radar import models as M, tracker as T
+    g = np.random.default_rng(41)
+    for it in range(200):
+        st = T.State(4)
+        a = g.standard_normal((8, 8))
+        P = a @ a.T + np.eye(8) * 0.1
+        x = g.standard_normal(8) * [30, 30, 10, 10, 2, 2, 0.01, 0.3]
+        st.a[0, 219:227], st.a[0, 227:291] = x, P.ravel()
+        st.a[0, 0:24], st.a[0, 24:216], st.a[0, 216:219] = np.tile(x, 3), np.tile(P.ravel(), 3), (0.2, 0.5, 0.3)
+        dt = float(g.choice([0.05, 0.4, 2.0]))
+        label = ["car", "human", None][it % 3]
+        C.radar_advance(st.a, [0], [dt], [M._KIN4.get(label) or M._KIN4[None]], M._native_par(M.CFG), [(0.0, 0.0)], (0.0, 0.0, 0.0))
+        xf, Pf = M.predict(M.CV, x, P, dt, label)
+        assert np.array_equal(st.a[0, 219:227], xf) and np.array_equal(st.a[0, 227:291], Pf.ravel())
+    T3 = M.transition(0.2, (0.3, 0.1))
+    assert T3.shape == (3, 3) and np.allclose(T3.sum(axis=1), 1.0)
+    assert M.still(np.zeros(8), np.eye(8) * 1e-4, 0.7) > 0.99
+
+
+@needs_radar
+def test_radar_object_gone_wrong_is_dropped():
+    """An object whose numbers are no longer finite (no Python reference to hand it to any more) goes through the
+    native calls without an error and is dropped by the upkeep, as the reference dropped it."""
+    from chris_integrator.radar import Radar
+    rd = Radar()
+    NS = 1_000_000_000
+    for k in range(60):
+        ts = 10 * NS + k * NS // 20
+        rd.on_ego({"ts_mono_ns": ts, "speed_mps": 10.0, "yaw_rate_rps": 0.0, "accel_long_mps2": 0.0})
+        if k % 2 == 0:
+            rd.on_objects({"ts_mono_ns": ts, "sensor": "r", "kind": "radar", "mount": {"x_m": 2.0, "y_m": 0.0, "yaw_deg": 0.0},
+                           "objects": [{"range_m": 30.0 - 0.5 * k / 20, "azimuth_deg": 2.0, "range_rate_mps": -10.0},
+                                       {"range_m": 50.0, "azimuth_deg": -5.0, "range_rate_mps": 0.0}]})
+        rd.frame(ts)
+    objs = rd.tracker.objects
+    assert len(objs) >= 2
+    bad = objs[0]
+    bad.xs[1][2] = np.nan                                # one hypothesis' velocity
+    bad.Ps[2][0, 0] = np.inf
+    bad.combine()
+    ts += NS // 10
+    rd.on_ego({"ts_mono_ns": ts, "speed_mps": 10.0, "yaw_rate_rps": 0.0, "accel_long_mps2": 0.0})
+    rd.on_objects({"ts_mono_ns": ts, "sensor": "r", "kind": "radar", "mount": {"x_m": 2.0, "y_m": 0.0, "yaw_deg": 0.0},
+                   "objects": [{"range_m": 50.0, "azimuth_deg": -5.0, "range_rate_mps": 0.0}]})
+    msg = rd.frame(ts)
+    assert bad.id not in {o.id for o in rd.tracker.objects}
+    assert all(math.isfinite(o["x_m"]) for o in msg["objects"])
