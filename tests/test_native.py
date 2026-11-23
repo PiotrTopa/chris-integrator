@@ -682,7 +682,8 @@ def _radar_digests():
         sensors = default_sensors(vehicle={"seed": 11 + 97 * seed}, vision={"seed": 21 + 97 * seed, "leads": True},
                                   gnss={"seed": 31 + 97 * seed}, map={"seed": 41 + 97 * seed})
         sensors.append(det)
-        st = build(cfg={"estimator": {"sources": [{"kind": "road_users", "id": "*"}]}}, mapper=None, clock=MessageClock())
+        st = build(cfg={"estimator": {"sources": [{"kind": "road_users", "id": "*"}]}, "radar": {"rate_hz": 10.0}},
+                   mapper=None, clock=MessageClock())      # the rate the digests were recorded at
         box = st.mixer.slots["radar"].plugin.box
         msgs, frame = [], box.frame
 

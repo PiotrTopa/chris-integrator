@@ -21,9 +21,10 @@ class Radar(Plugin):
     def __init__(self, cfg=None, name=None):
         super().__init__(None, name)
         cfg = dict(cfg or {})
-        # messages per second at most: the objects are carried between messages by their own velocity (the
-        # view does), and on a phone's small cores every message costs milliseconds
-        self.rate_hz = float(cfg.pop("rate_hz", 10.0))
+        # messages per second at most (the estimator's `ego_state` sets the times: 20 a second with the road
+        # model). Between messages the view carries the objects by their own velocity, so a host that must
+        # save more can lower it; one message costs 3 to 6 ms on a phone's small core.
+        self.rate_hz = float(cfg.pop("rate_hz", 20.0))
         self._ts = None
         self.box = _Radar(cfg or None)
 
