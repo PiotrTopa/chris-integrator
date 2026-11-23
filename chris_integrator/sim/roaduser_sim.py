@@ -28,7 +28,8 @@ CALIB = {"type": "calib", "pitch": 0.02, "yaw": -0.01, "roll": 0.005, "height_m"
          "cy": 360, "width": 1280, "height": 720, "source": "config"}
 
 # ---- actors ---------------------------------------------------------------------------------------------------
-DIMS = {"car": (4.5, 1.8, 1.5), "truck": (8.0, 2.5, 3.4), "human": (0.5, 0.6, 1.75), "post": (0.25, 0.25, 1.6)}
+DIMS = {"car": (4.5, 1.8, 1.5), "truck": (8.0, 2.5, 3.4), "human": (0.5, 0.6, 1.75), "post": (0.25, 0.25, 1.6),
+        "bike": (1.8, 0.6, 1.7)}
 VEHICLE_KINDS = ("car", "truck")
 LANE_W = 3.5
 
@@ -113,6 +114,13 @@ class ScenarioWorld(World):
             vx, vy = np.gradient(X, dt), np.gradient(Y, dt)
             sp = np.hypot(vx, vy)
             head = np.where(sp > 0.3, np.arctan2(vy, vx), hd + a.yaw_rel)
+            # one that has moved and stands now points the way it came (a car waiting at a junction's line), not
+            # along the road
+            mv = sp > 0.3
+            if mv.any() and not mv.all():
+                last = np.maximum.accumulate(np.where(mv, np.arange(len(sp)), -1))
+                held = (~mv) & (last >= 0)
+                head = np.where(held, np.arctan2(vy, vx)[np.maximum(last, 0)], head)
             self._A[a.id] = (s, q, X, Y, vx, vy, sp, head)
 
     def ego_lane(self, t):
@@ -201,6 +209,50 @@ class ScenarioWorld(World):
     def targets_at(self, t):
         return [{"id": o["id"], "x": o["x"], "y": o["y"], "vx": o["vx"], "vy": o["vy"], "kind": o["kind"],
                  "d": o["lane_offset"], "s": 0.0} for o in self.actors_at(t)]
+
+
+    def road_context(self, t):
+        """The road as a map and a lane tracker would give it, for the predictor (chris_integrator/predict; the dict
+        its docstring lists), in the car frame of time t: the centre line of the lane the ego is in, the lanes
+        beside it, junction arms and marked crossings. From the scenario's `layout` (n_left, n_right: lanes of the
+        ego's direction beside the ORIGINAL ego lane; oncoming, n_oncoming, park_left, park_right, kerb_left_m,
+        kerb_right_m), `junctions` [{"s", "arms": [(side, priority)], "control"}] and `crossings` [arc length].
+        None for a scenario without a layout."""
+        lay = self.spec.get("layout")
+        if lay is None:
+            return None
+        tr = self.truth_at(t)
+        s_e = tr["s"] + CAM_TO_AXLE
+        k = self.ego_lane(t)
+        pts = []
+        for x in np.arange(0.0, 160.0, 5.0):
+            s = s_e + float(x)
+            px, py, _ = self._road_xy(s, k * LANE_W - float(self.lane_shift(s)))
+            pts.append(list(self._to_car(tr, px, py)))
+        out = {"centre": pts, "lane_width_m": LANE_W, "n_left": max(0, lay.get("n_left", 0) - k),
+               "n_right": max(0, lay.get("n_right", 0) + k), "oncoming": 1.0 if lay.get("oncoming") else 0.0,
+               "n_oncoming": lay.get("n_oncoming", 1), "park_left": lay.get("park_left", 0.0),
+               "park_right": lay.get("park_right", 0.0), "quality": 0.9, "source": "sim"}
+        for key in ("kerb_left_m", "kerb_right_m"):
+            if lay.get(key) is not None:
+                out[key] = lay[key] + (-k if key == "kerb_left_m" else k) * LANE_W
+        arms = []
+        for j in self.spec.get("junctions") or ():
+            if not -40.0 <= j["s"] - s_e <= 160.0:
+                continue
+            for side, prio in j["arms"]:
+                sg = 1.0 if side == "left" else -1.0
+                ap = []
+                for dist in np.arange(0.0, 65.0, 5.0):
+                    px, py, _ = self._road_xy(j["s"], sg * float(dist) - float(self.lane_shift(j["s"])))
+                    ap.append(list(self._to_car(tr, px, py)))
+                arms.append({"pts": ap, "side": side, "s_m": j["s"] - s_e, "priority": prio, "control": j.get("control")})
+        if arms:
+            out["arms"] = arms
+        xs = [{"s_m": sx - s_e, "half_m": 2.0} for sx in self.spec.get("crossings") or () if -30.0 <= sx - s_e <= 160.0]
+        if xs:
+            out["crossings"] = xs
+        return out
 
 
 # ---- the camera ------------------------------------------------------------------------------------------------
@@ -425,7 +477,7 @@ class DetectorSim:
                     x0, x1 = x0 + sh, x1 + sh
                 if x1 - x0 < 3 or y1 - y0 < 3:
                     continue
-                cls = {"car": "car", "truck": "truck", "human": "person"}[o["kind"]]
+                cls = {"car": "car", "truck": "truck", "human": "person", "bike": "rider"}[o["kind"]]
                 r = rng.random()
                 if cls == "car" and r < p["p_car_as_truck"]:
                     cls = "truck"
@@ -750,6 +802,248 @@ def sc_stopped(speed, mode):
     return build
 
 
+# ---- scenarios that exercise the predictor's manoeuvres (chris_integrator/predict, tools/predict_eval.py) -------
+# Each carries a `layout` (the lanes of the road: ScenarioWorld.road_context) and `labels`: (actor id, from, to (s
+# of the run), names of the manoeuvre as the predictor publishes it), the truth of what the actor does when.
+def _lc(t0, d0, d1, dur=4.0):
+    """A lane change as a lateral plan: minimum jerk from d0 to d1 over dur, sampled."""
+    out = []
+    for i in range(11):
+        u = i / 10.0
+        out.append((t0 + u * dur, d0 + (d1 - d0) * (10 * u ** 3 - 15 * u ** 4 + 6 * u ** 5)))
+    return out
+
+
+def _brake_to(t_end, d_end, v, dec, sg, v_end=0.0):
+    """A lateral plan that arrives at d_end at t_end with speed v_end, braking from speed v with deceleration dec
+    (approaching from the side sg, +1 = from the left): [(t, d)] from the start of the braking."""
+    tb = (v - v_end) / dec
+    out = []
+    for i in range(9):
+        left = tb * (1.0 - i / 8.0)                      # time still to go
+        out.append((t_end - left, d_end + sg * (v_end * left + 0.5 * dec * left * left)))
+    return out
+
+
+def sc_cut_in(seed, night):
+    """Two lanes one way at 22 m/s (the ego in the right one): a car in the left lane a little ahead cuts in in
+    front of the ego at 9 s (4 s), brakes gently, and cuts out again at 24 s; a second car stays in the left lane;
+    a lead far ahead."""
+    rng = random.Random(seed * 101 + 11)
+    t1, t2 = 9.0 + rng.uniform(-1, 1), 24.0 + rng.uniform(-1, 1)
+
+    def actors(w):
+        a = [Actor(400, "car", "cut_in", 14.0 + rng.uniform(0, 4), speed=[(0, 23.0), (t1, 23.0), (t1 + 4, 21.3), (t2, 21.8), (t2 + 3, 23.5)],
+                   lateral=[(0, LANE_W)] + _lc(t1, LANE_W, 0.0) + _lc(t2, 0.0, LANE_W)),
+             Actor(401, "car", "adjacent", 55.0, speed=[(0, 23.0), (20, 23.6), (40, 22.6)], lateral=[(0, LANE_W)]),
+             Actor(402, "car", "lead", 95.0, speed=[(0, 22.0), (20, 22.5), (40, 22.0)], lateral=[(0, 0.0)])]
+        w.spec["labels"] = [(400, t1, t1 + 4.0, ("cut_in",)), (400, t2, t2 + 4.0, ("cut_out",))]
+        return a
+    return dict(T=36.0, speed=[(0, 22.0)], curv=[(0, 0.0), (300, 0.0), (300, 1 / 800.0), (700, 1 / 800.0), (700, 0.0)],
+                actors=actors, lead_range_m=70.0 if night else 100.0, layout=dict(n_left=1, n_right=0, oncoming=False))
+
+
+def sc_junction_priority(seed, night):
+    """A junction on a priority road, driven through at 11 m/s: cars on the side road that stop at the line and
+    wait (give way), cars that cross before the ego arrives, one that turns right out of the side road into the
+    ego's lane ahead of it, an oncoming car that turns left across the ego's lane into the side road, oncoming
+    traffic that drives straight on; a parked car on each corner."""
+    rng = random.Random(seed * 101 + 12)
+
+    def actors(w):
+        s_x = 190.0 + rng.uniform(0, 20)
+        t_x = float(np.interp(s_x, w.s + CAM_TO_AXLE, w.t - w.t0))          # the ego is at the junction then
+        a, lab = [], []
+        # stop and wait at the line: from the right (side -1), 5.5 m short of the ego lane's centre
+        for k, (side, t_arr) in enumerate(((-1, t_x - 7.0), (1, t_x - 5.0))):
+            v = rng.uniform(8.0, 11.0)
+            line = side * (LANE_W * (0.5 if side < 0 else 1.5) + 3.5)
+            br = _brake_to(t_arr, line, v, 2.0, side)           # brakes at 2 m/s2 to the line
+            t0 = br[0][0] - (45.0 - abs(br[0][1])) / v
+            a.append(Actor(410 + k, "car", "yielding", s_x + (2.0 if side < 0 else -2.0), speed=[(0, 0.0)],
+                           lateral=[(0, side * 45.0), (t0, side * 45.0)] + br + [(t_x + 3.0, line), (t_x + 9.0, -side * 30.0)],
+                           t_on=max(0.0, t0)))
+            lab.append((410 + k, br[0][0], t_x + 2.0, ("stop", "stopped", "move_off")))
+        # crossing well before the ego
+        for k in range(2):
+            side = rng.choice((-1, 1))
+            v = rng.uniform(9.0, 12.0)
+            t0 = t_x - 16.0 + 4.0 * k
+            a.append(Actor(420 + k, "car", "crossing", s_x + (2.0 if side < 0 else -2.0), speed=[(0, 0.0)],
+                           lateral=[(0, side * 45.0), (t0, side * 45.0), (t0 + 90.0 / v, -side * 45.0)], t_on=max(0.0, t0),
+                           t_off=t0 + 90.0 / v))
+            lab.append((420 + k, t0, t0 + 90.0 / v, ("cross",)))
+        # out of the right side road into the ego's lane, ahead of the ego: a right turn
+        tt = t_x - 9.0
+        br = _brake_to(tt + 1.5, -8.0, 9.0, 1.8, -1, v_end=3.2)       # brakes to 3.2 m/s for the corner
+        t0 = br[0][0] - (45.0 + br[0][1]) / 9.0
+        a.append(Actor(430, "car", "turn_in", s_x + 2.0, speed=[(0, 0.0), (tt + 1.5, 0.0), (tt + 4.0, 5.0), (tt + 9.0, 11.5)],
+                       lateral=[(0, -45.0), (t0, -45.0)] + br + [(tt + 2.8, -3.6), (tt + 4.5, -0.6), (tt + 6.0, 0.0)],
+                       t_on=max(0.0, t0)))
+        lab.append((430, br[0][0], tt + 4.5, ("turn_right",)))
+        # an oncoming car turns left into the right side road, across the ego's lane
+        tl = t_x - 12.0
+        s0 = s_x + 11.0 * (tl + 3.0) + 4.0
+        a.append(Actor(440, "car", "onc_turn", s0, speed=[(0, -11.0), (tl, -11.0), (tl + 3.0, -4.0), (tl + 5.0, 0.0)],
+                       lateral=[(0, LANE_W), (tl + 2.5, LANE_W), (tl + 3.5, LANE_W - 1.2), (tl + 4.5, -1.5), (tl + 5.5, -5.5),
+                                (tl + 10.0, -40.0)], t_off=tl + 10.0))
+        lab.append((440, tl + 0.5, tl + 5.0, ("turn_left",)))
+        t = 1.0
+        k = 0
+        while t < w.T - 8.0:
+            v = rng.uniform(10.0, 13.0)
+            t_meet = t + 7.0
+            if abs(t_meet - (tl + 4.0)) > 3.0:
+                a.append(Actor(450 + k, "car", "oncoming", _ego_s(w, t_meet) + v * t_meet, speed=[(0, -v)],
+                               lateral=[(0, LANE_W + rng.gauss(0, 0.15))]))
+                k += 1
+            t += rng.uniform(5.0, 9.0)
+        for j, (ds, q) in enumerate(((-22.0, -3.0), (16.0, -3.1))):
+            a.append(Actor(100 + j, "car", "parked", s_x + ds, lateral=[(0, q)]))
+        w.spec["junctions"] = [{"s": s_x, "arms": [("left", -1), ("right", -1)], "control": "give_way"}]
+        w.spec["labels"] = lab
+        return a
+    return dict(T=38.0, speed=[(0, 11.0)], curv=[(0, 0.0)], actors=actors, lead_range_m=70.0 if night else 100.0,
+                layout=dict(n_left=0, n_right=0, oncoming=True, park_right=0.6, park_left=0.0))
+
+
+def sc_ped_wait_cross(seed, night):
+    """A two-way town street at 10 m/s with a marked crossing: a pedestrian walks along the pavement to the
+    crossing, waits at the kerb for 4 s and crosses while the ego is still approaching (the ego brakes and lets it
+    pass); a second one stands at the kerb further on and never crosses; a third walks along; one crosses away
+    from any crossing."""
+    rng = random.Random(seed * 101 + 13)
+    spec = dict(T=42.0, curv=[(0, 0.0)], lead_range_m=70.0 if night else 100.0, accel_lim=2.5,
+                layout=dict(n_left=0, n_right=0, oncoming=True, park_right=0.0, park_left=0.0, kerb_right_m=2.1, kerb_left_m=5.6))
+    t_wait = 11.0 + rng.uniform(-1, 1)
+    t_go = t_wait + 4.0
+    spec["speed"] = [(0, 10.0), (t_go - 0.5, 10.0), (t_go + 2.5, 0.0), (t_go + 6.5, 0.0), (t_go + 10.0, 9.0)]
+
+    def actors(w):
+        s_x = _ego_s(w, t_go + 3.0) + 9.0                # the ego stops 9 m short of the crossing
+        a = [Actor(600, "human", "wait_cross", s_x - 1.3 * t_wait, speed=[(0, 1.3), (t_wait - 0.5, 1.3), (t_wait, 0.0)],
+                   lateral=[(0, -3.6), (t_wait - 2.0, -3.6), (t_wait, -2.6), (t_go, -2.6), (t_go + 7.0, 6.6), (t_go + 8.0, 6.8)]),
+             Actor(601, "human", "waiting", s_x + 45.0, speed=[(0, 0.0)], lateral=[(0, -2.7)]),
+             Actor(602, "human", "pedestrian", s_x + 70.0, speed=[(0, -1.3)], lateral=[(0, -3.8)]),
+             Actor(603, "human", "pedestrian", s_x - 30.0, speed=[(0, 1.4)], lateral=[(0, 6.9)])]
+        tc = t_go + 14.0
+        sc2 = _ego_s(w, tc) + 60.0
+        a.append(Actor(604, "human", "crossing_ped", sc2, speed=[(0, 0.0)], lateral=[(0, 7.0), (tc, 7.0), (tc + 7.0, -3.5)]))
+        w.spec["crossings"] = [s_x]
+        w.spec["labels"] = [(600, t_wait, t_go, ("wait", "start_cross")), (600, t_go - 1.5, t_go, ("start_cross",)),
+                            (600, t_go, t_go + 6.5, ("crossing", "start_cross")), (601, 0.0, 99.0, ("wait", "stand")),
+                            (604, tc, tc + 7.0, ("crossing", "start_cross"))]
+        return a
+    spec["actors"] = actors
+    return spec
+
+
+def sc_curve_parked_oncoming(seed, night):
+    """The trap with traffic: a two-way town road with a left then a right curve (R 110 m) at 13 m/s, cars parked on
+    the right all along (outside of the left curve, inside of the right one), oncoming cars every 4-8 s, one of
+    which drifts 1.3 m towards the centre line for a few seconds; nothing stands in the ego's path."""
+    rng = random.Random(seed * 101 + 14)
+
+    def actors(w):
+        a = _parked_row(rng, 100, 60.0, 680.0, -1, lat=(2.7, 3.2), p_gap=0.25)
+        t, k, lab = 0.0, 0, []
+        drift_k = 2
+        while t < 44.0:
+            v = rng.uniform(10.0, 14.0)
+            t_meet = t + 6.5
+            lat = [(0, LANE_W + rng.gauss(0, 0.15))]
+            if k == drift_k:
+                lat = [(0, LANE_W), (t_meet - 5.0, LANE_W), (t_meet - 2.5, LANE_W - 1.3), (t_meet - 1.0, LANE_W - 1.3), (t_meet + 1.0, LANE_W)]
+                lab.append((400 + k, t_meet - 5.0, t_meet - 2.0, ("onc_drift", "onc_overtake")))
+            a.append(Actor(400 + k, "car", "oncoming", _ego_s(w, t_meet) + v * t_meet, speed=[(0, -v)], lateral=lat))
+            k += 1
+            t += rng.uniform(4.0, 8.0)
+        w.spec["labels"] = lab
+        return a
+    return dict(T=50.0, speed=[(0, 13.0)],
+                curv=[(0, 0.0), (80, 0.0), (80, 1 / 110.0), (300, 1 / 110.0), (300, 0.0), (400, 0.0),
+                      (400, -1 / 110.0), (620, -1 / 110.0), (620, 0.0)],
+                actors=actors, lead_range_m=70.0 if night else 100.0,
+                layout=dict(n_left=0, n_right=0, oncoming=True, park_right=0.9, park_left=0.0))
+
+
+def sc_pull_out(seed, night):
+    """A town street at 11 m/s with a parked row on the right: one of the parked cars pulls out into the ego's lane
+    45 m ahead of the ego (3.5 s to the lane's centre, 1.5 m/s2 up to 9 m/s); the ego eases off behind it."""
+    rng = random.Random(seed * 101 + 15)
+    t_p = 12.0 + rng.uniform(-1, 1)
+    spec = dict(T=34.0, speed=[(0, 11.0), (t_p + 0.5, 11.0), (t_p + 3.0, 7.0), (t_p + 8.0, 9.0)], curv=[(0, 0.0)],
+                lead_range_m=70.0 if night else 100.0,
+                layout=dict(n_left=0, n_right=0, oncoming=True, park_right=0.9, park_left=0.0))
+
+    def actors(w):
+        s_p = _ego_s(w, t_p) + 45.0
+        a = [x for x in _parked_row(rng, 100, 30.0, 420.0, -1, lat=(2.8, 3.1), p_gap=0.25) if abs(x.s0 - s_p) > 7.0]
+        a.append(Actor(700, "car", "pull_out", s_p, speed=[(0, 0.0), (t_p, 0.0), (t_p + 6.0, 9.0)],
+                       lateral=[(0, -2.9), (t_p, -2.9)] + _lc(t_p + 0.3, -2.9, 0.0, 3.5)))
+        w.spec["labels"] = [(700, t_p, t_p + 4.0, ("pull_out",))]
+        return a
+    spec["actors"] = actors
+    return spec
+
+
+def sc_queue_stop(seed, night):
+    """A queue: two cars stand in the ego's lane; a lead 40 m ahead of the ego brakes from 13 m/s and stops behind
+    them; the ego stops behind the lead; after 8 s the queue moves off."""
+    rng = random.Random(seed * 101 + 16)
+    t_b = 9.0 + rng.uniform(-1, 1)
+    spec = dict(T=36.0, speed=[(0, 13.0), (t_b + 1.0, 13.0), (t_b + 7.5, 0.0), (t_b + 15.0, 0.0), (t_b + 20.0, 8.0)],
+                curv=[(0, 0.0)], lead_range_m=70.0 if night else 100.0, accel_lim=2.5,
+                layout=dict(n_left=0, n_right=0, oncoming=True, park_right=0.0, park_left=0.0))
+
+    def actors(w):
+        s_stop = float(w.s[int(np.argmax((w.t - w.t0 > t_b + 8.0) & (w.v < 0.05)))]) + CAM_TO_AXLE
+        s_l = s_stop + 4.5 / 2 + 7.0                      # the lead's centre when it stands
+        d_brake = 13.0 * 6.0 / 2.0
+        s_l0 = s_l - d_brake - 13.0 * t_b
+        go = t_b + 14.0
+        a = [Actor(700, "car", "lead", s_l0, speed=[(0, 13.0), (t_b, 13.0), (t_b + 6.0, 0.0), (go + 1.0, 0.0), (go + 6.0, 9.0)]),
+             Actor(701, "car", "stopped_in_lane", s_l + 7.0, speed=[(0, 0.0), (go, 0.0), (go + 5.0, 9.0)]),
+             Actor(702, "car", "stopped_in_lane", s_l + 14.0, speed=[(0, 0.0), (go - 1.0, 0.0), (go + 4.0, 9.0)])]
+        w.spec["labels"] = [(700, t_b, t_b + 6.0, ("stop", "follow"))]
+        return a
+    spec["actors"] = actors
+    return spec
+
+
+def sc_cyclist(seed, night):
+    """A cyclist rides along the right edge of the ego's lane at 5 m/s; a car is parked ahead of it half in its
+    way; it swerves 1.3 m into the lane to pass it and goes back. The ego follows 35 m behind at the cyclist's
+    speed. A second cyclist comes the other way on the far side."""
+    rng = random.Random(seed * 101 + 17)
+    spec = dict(T=40.0, speed=[(0, 9.0), (4.0, 5.2)], curv=[(0, 0.0)], lead_range_m=70.0 if night else 100.0,
+                layout=dict(n_left=0, n_right=0, oncoming=True, park_right=0.5, park_left=0.0))
+
+    def actors(w):
+        t_s = 16.0 + rng.uniform(-1, 1)
+        s_c0 = 55.0
+        s_park = s_c0 + 5.0 * (t_s + 3.0)
+        a = [Actor(800, "bike", "cyclist", s_c0, speed=[(0, 5.0)],
+                   lateral=[(0, -1.4), (t_s, -1.4)] + _lc(t_s, -1.4, -0.1, 2.5) + [(t_s + 4.5, -0.1)] + _lc(t_s + 4.5, -0.1, -1.4, 2.5)),
+             Actor(100, "car", "parked", s_park, lateral=[(0, -2.5)]),
+             Actor(801, "bike", "cyclist", 320.0, speed=[(0, -5.5)], lateral=[(0, LANE_W + 1.3)])]
+        w.spec["labels"] = [(800, t_s, t_s + 2.5, ("swerve",))]
+        return a
+    spec["actors"] = actors
+    return spec
+
+
+PREDICT_SCENARIOS = {
+    "cut_in": sc_cut_in,
+    "junction_priority": sc_junction_priority,
+    "ped_wait_cross": sc_ped_wait_cross,
+    "curve_parked_oncoming": sc_curve_parked_oncoming,
+    "pull_out": sc_pull_out,
+    "queue_stop": sc_queue_stop,
+    "cyclist": sc_cyclist,
+}
+
+
 SCENARIOS = {
     "parked_street": sc_parked_street,
     "oncoming": sc_oncoming,
@@ -765,7 +1059,7 @@ for _v in (14, 25, 33):
 
 
 def scenario(name, seed=1, night=False):
-    """A ScenarioWorld by name (SCENARIOS or ALERT_SCENARIOS)."""
-    fn = SCENARIOS.get(name) or ALERT_SCENARIOS[name]
+    """A ScenarioWorld by name (SCENARIOS, PREDICT_SCENARIOS or ALERT_SCENARIOS)."""
+    fn = SCENARIOS.get(name) or PREDICT_SCENARIOS.get(name) or ALERT_SCENARIOS[name]
     spec = fn(seed, night)
     return ScenarioWorld(spec, seed=seed, name=name, night=night)
