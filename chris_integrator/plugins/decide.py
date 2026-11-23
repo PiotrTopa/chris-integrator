@@ -89,7 +89,8 @@ class Decide(Plugin):
             return
         self._ts = ts
         T = ts / NS
-        path = FU.plan_path(ctx.get("road"), ts, self.fcfg["plan_max_age_s"])
+        objs_in = radar.get("objects") or ()
+        path = FU.plan_path(ctx.get("road"), ts, self.fcfg["plan_max_age_s"]) if objs_in else None
         if c["futures"] == "cv":
             radar = {k: v for k, v in radar.items() if k not in ("fut", "ego_fut")}
             radar["objects"] = [{k: v for k, v in o.items() if k != "fut"} for o in radar.get("objects") or ()]
@@ -137,7 +138,8 @@ class Decide(Plugin):
                                                                            actx.items() if k in ("a_long", "a_lat", "brake")}},
                "futures": {"objects": "cv" if n_cv == len(res) and res else ("contract" if not n_cv else "mixed"),
                            "cv": n_cv, "invalid": F.degraded["invalid"], "ego": "own" if F.degraded["ego"] else "contract",
-                           "ego_modes": [[m[0], round(m[1], 3)] for m in F.ego], "horizon_s": round(float(F.t[-1]), 2)},
+                           "ego_modes": [[m[0], round(m[1], 3)] for m in F.ego if m[2] is not None],
+                           "horizon_s": round(float(F.t[-1]), 2)},
                "objects": out_objs, "alerts": alerts,
                "primary": next((a for a in alerts if a["id"] == "obstacle_ahead" and a["stage"] > 0), None),
                "events": events,

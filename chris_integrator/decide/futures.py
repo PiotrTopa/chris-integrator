@@ -149,7 +149,9 @@ def _prob(v, default):
 
 
 def contract_modes(o, fut, t_in, prepend):
-    """The object's modes of the contract on the grid (now prepended when t_in[0] > 0), or None when invalid."""
+    """The object's modes of the contract on the grid (now prepended when t_in[0] > 0), or None when invalid.
+    One array per mode (x, y, sx, sy, rxy), one finiteness check: the prediction may send a dozen objects with a
+    few modes each per frame."""
     if not isinstance(fut, (list, tuple)) or not fut:
         return None
     n = len(t_in)
@@ -157,22 +159,25 @@ def contract_modes(o, fut, t_in, prepend):
     sd = o.get("std") or (1.0, 1.0)
     sx0, sy0 = (float(sd[0]), float(sd[1])) if len(sd) >= 2 and _fin(sd[0]) and _fin(sd[1]) else (1.0, 1.0)
     out = []
+    head = np.array([[x0], [y0], [sx0], [sy0], [0.0]]) if prepend else None
     for i, m in enumerate(fut):
-        if not isinstance(m, dict):
+        if not isinstance(m, dict) or m.get("x") is None or m.get("y") is None:
             return None
-        x, y = _arr(m, "x", n), _arr(m, "y", n)
-        if x is None or y is None:
+        sx, sy, r = m.get("sx"), m.get("sy"), m.get("rxy")
+        try:
+            a = np.array((m["x"], m["y"], sx if sx is not None else (sx0,) * n, sy if sy is not None else (sy0,) * n,
+                          r if r is not None else (0.0,) * n), float)
+        except (TypeError, ValueError):
             return None
-        sx, sy, r = _arr(m, "sx", n), _arr(m, "sy", n), _arr(m, "rxy", n)
-        sx = np.full(n, sx0) if sx is None else np.abs(sx)
-        sy = np.full(n, sy0) if sy is None else np.abs(sy)
-        r = np.zeros(n) if r is None else np.clip(r, -0.99, 0.99)
+        if a.shape != (5, n) or not np.isfinite(a).all():
+            return None
+        a[2:4] = np.abs(a[2:4])
+        np.clip(a[4], -0.99, 0.99, out=a[4])
+        if prepend:
+            a = np.concatenate([head, a], axis=1)
         p = _prob(m.get("p"), 1.0 / len(fut))
         p0 = _prob(m.get("p0"), p)
-        if prepend:
-            x, y = np.concatenate([[x0], x]), np.concatenate([[y0], y])
-            sx, sy, r = np.concatenate([[sx0], sx]), np.concatenate([[sy0], sy]), np.concatenate([[0.0], r])
-        out.append((str(m.get("m") or "mode%d" % i), p0, p, x, y, sx, sy, r))
+        out.append((str(m.get("m") or "mode%d" % i), p0, p, a[0], a[1], a[2], a[3], a[4]))
     s0, sc = sum(q[1] for q in out), sum(q[2] for q in out)
     if not (s0 > 0.0 and sc > 0.0):
         return None
@@ -358,6 +363,10 @@ def build(radar_msg, cfg, path=None, companion=None):
     F = FrameFutures(t)
     t_in = grid if grid is not None else t
     ego = radar_msg.get("ego") or {}
+    if not any(isinstance(o, dict) and o.get("state") in ("confirmed", "coast") for o in radar_msg.get("objects") or ()):
+        F.ego = [("none", 1.0, None, None, None)]          # nothing to judge: the car's futures are not made
+        F.degraded["ego"] = not (isinstance(radar_msg.get("ego_fut") or comp.get("ego_fut"), dict))
+        return F
     efut = radar_msg.get("ego_fut") or comp.get("ego_fut")
     em = None
     if grid is not None and isinstance(efut, dict) and isinstance(efut.get("modes"), (list, tuple)) and efut["modes"]:
