@@ -56,10 +56,8 @@ No I/O and no wall clock in here; times come from the messages (CLOCK_MONOTONIC 
 import bisect
 import math
 
-from ..native import round                  # builtins.round, native where built
-from .. import native as _native
+from ..native import core as _C, round, round_list
 from ..contract import LocalEgo, validity
-from ..fastround import round_flat, scales
 from .roadview import RoadView
 
 NS = 1e9
@@ -131,97 +129,26 @@ def _interp(xs, ys, x):
     return None
 
 
-def _interp_all_py(xs, ys, qs):
+def _interp_all(xs, ys, qs):
     """[_interp(xs, ys, q) for q in qs], walking the table once: for queries in rising order the segment search
     goes on where the last one ended (every earlier node was already below the smaller query); a query below
-    its predecessor starts over. The same comparisons and arithmetic as `_interp`, so the same numbers."""
-    if not xs or not ys:
-        return [None] * len(qs)
-    n = min(len(xs), len(ys))
-    x0, y0 = xs[0], ys[0]
-    out = []
-    i, prev = 1, None
-    for x in qs:
-        if x <= x0:
-            out.append(y0)
-            continue
-        if prev is not None and not x >= prev:
-            i = 1
-        prev = x
-        while i < n and not x <= xs[i]:
-            i += 1
-        if i >= n:
-            out.append(None)
-            continue
-        a, b = ys[i - 1], ys[i]
-        if a is None or b is None:
-            out.append(None)
-            continue
-        t = (x - xs[i - 1]) / ((xs[i] - xs[i - 1]) or 1.0)
-        out.append(a + (b - a) * t)
-    return out
+    its predecessor starts over. The same comparisons and arithmetic as `_interp`, so the same numbers (the
+    native core: chris_native.c `interp_all`; lists or tuples of numbers)."""
+    return _C.interp_all(xs, ys, qs)
 
 
-if _native.interp_all is None:
-    _interp_all = _interp_all_py
-else:
-    def _interp_all(xs, ys, qs, _n=_native.interp_all, _fb=_native.Fallback):
-        """`_interp_all_py` in the native core (lists of floats; anything else goes to the Python walk)."""
-        try:
-            return _n(xs, ys, qs)
-        except _fb:
-            return _interp_all_py(xs, ys, qs)
-
-
-def _prep_py(gx, y, y_std, xs, reach_std, b):
+def _prep(gx, y, y_std, xs, reach_std, b):
     """A drawn line's points over `xs`: None when the first two have no value, else (ys, reach, jump). reach: the
     distance up to which the line is drawn (it ends before the first point without a value or with a std above
     `reach_std` beyond 10 m); ys: the points beyond it carry the last value (never drawn); jump: how far the
-    near part (5-20 m) moved against `b`, the drawn line (None without one)."""
-    ys = _interp_all(gx, y, xs)
-    stds = _interp_all(gx, y_std, xs)
-    if ys[0] is None or ys[1] is None:
-        return None
-    reach = xs[-1]
-    for i, (x, s) in enumerate(zip(xs, stds)):
-        if ys[i] is None or (s is not None and s > reach_std and x > 10.0):
-            reach = xs[i - 1]
-            break
-    last = ys[0]
-    for i in range(len(ys)):
-        if ys[i] is None:
-            ys[i] = last
-        last = ys[i]
-    if b is None:
-        return ys, reach, None
-    near = [yy - bb for yy, bb, x in zip(ys, b, xs) if 5.0 <= x <= 20.0]
-    return ys, reach, abs(sum(near) / len(near))
+    near part (5-20 m) moved against `b`, the drawn line (None without one). (chris_native.c `view_prep`)"""
+    return _C.view_prep(gx, y, y_std, xs, reach_std, b)
 
 
-def _blend_py(a, b, dy, ys, ks, dt, shifting):
-    """The drawn line's two smoothing stages towards ys (gains ks) and its lateral rate: (a, b, dy)."""
-    a = [p + (y - p) * k for p, y, k in zip(a, ys, ks)]
-    prev = b
-    b = list(a) if shifting else [p + (y - p) * k for p, y, k in zip(b, a, ks)]
-    if dt > 0:
-        dy = [0.7 * d0 + 0.3 * (bb - p) / dt for d0, bb, p in zip(dy, b, prev)]
-    return a, b, dy
-
-
-if _native.view_prep is None:
-    _prep, _blend = _prep_py, _blend_py
-else:
-    def _prep(gx, y, y_std, xs, reach_std, b, _n=_native.view_prep, _fb=_native.Fallback):
-        try:
-            return _n(gx, y, y_std, xs, reach_std, b)
-        except _fb:
-            return _prep_py(gx, y, y_std, xs, reach_std, b)
-
-    def _blend(a, b, dy, ys, ks, dt, shifting, _n=_native.view_blend, _fb=_native.Fallback):
-        try:
-            return _n(a, b, dy, ys, ks, dt, shifting)
-        except _fb:
-            return _blend_py(a, b, dy, ys, ks, dt, shifting)
+def _blend(a, b, dy, ys, ks, dt, shifting):
+    """The drawn line's two smoothing stages towards ys (gains ks; while `shifting` the second stage follows the
+    first) and its lateral rate: (a, b, dy). (chris_native.c `view_blend`)"""
+    return _C.view_blend(a, b, dy, ys, ks, dt, shifting)
 
 
 class _Static:
@@ -777,10 +704,7 @@ class ViewBuilder:
                 todo.append((o, m))
             out.append(o)
         if todo:
-            if _native.round_list is not None:          # the same numbers either way: round(v, 2) of each
-                rounded = _native.round_list(flat, 2)
-            else:
-                rounded = round_flat(flat, self._scale(len(flat)), self._two(len(flat)))
+            rounded = round_list(flat, 2)
             i = 0
             for o, m in todo:
                 pad = [None] * (nx - m)
@@ -790,20 +714,6 @@ class ViewBuilder:
         for lid in [k for k in self.lines if k not in seen]:
             del self.lines[lid]
         return out
-
-    _SCALES = {}
-
-    @classmethod
-    def _scale(cls, n):
-        """The scale array of `fastround.round_flat` for n numbers with two digits."""
-        sc = cls._SCALES.get(n)
-        if sc is None:
-            sc = cls._SCALES[n] = (scales([2] * n), [2] * n)
-        return sc[0]
-
-    @classmethod
-    def _two(cls, n):
-        return cls._SCALES[n][1]
 
     @staticmethod
     def _carry(ys, xs, v, r, dt):
