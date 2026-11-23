@@ -70,9 +70,12 @@ def _apply(x, P, ph, s, nu, freeze, own):
     row, the gain is no longer optimal) the Joseph form, symmetrised."""
     if not own:
         P = np.array(P, dtype=float, order="C")
-    if freeze is not None:
-        freeze = np.ascontiguousarray(freeze, dtype=np.intp)
-    _C.ekf_update(x, P, ph, s, nu, freeze)
+    try:
+        _C.ekf_update(x, P, ph, s, nu, freeze)
+    except (TypeError, ValueError, BufferError):      # freeze as a list or a view: made an index array
+        if freeze is None:
+            raise
+        _C.ekf_update(x, P, ph, s, nu, np.ascontiguousarray(freeze, dtype=np.intp))
     return P
 
 

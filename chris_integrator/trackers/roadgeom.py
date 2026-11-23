@@ -75,8 +75,12 @@ DEFAULT_CFG = dict(
 )
 
 
-def _f64(a):
-    return np.ascontiguousarray(a, dtype=float)
+def _native(fn, *args):
+    """fn(*args) of the native core, the arrays among args made contiguous float64 arrays when they are not."""
+    try:
+        return fn(*args)
+    except (TypeError, ValueError, BufferError):
+        return fn(*(np.ascontiguousarray(a, dtype=float) if isinstance(a, (np.ndarray, list, tuple)) else a for a in args))
 
 
 def _fin(v):
@@ -226,7 +230,7 @@ class RoadGeometryFusion:
         reach_std_m or that lies beyond reach_max_m, within [min(reach_min_m, x[-1]), min(reach_max_m, x[-1])]
         (the native core: chris_native.c `geom_reach`; the result is a float or one of the configured numbers)."""
         c = self.cfg
-        return _C.geom_reach(_f64(x), _f64(sd), c["reach_std_m"], c["reach_max_m"], c["reach_min_m"])
+        return _native(_C.geom_reach, x, sd, c["reach_std_m"], c["reach_max_m"], c["reach_min_m"])
 
     # ---- one frame -------------------------------------------------------------------------------
     def on_lanes(self, lanes, road=None, ego=None):
@@ -296,14 +300,14 @@ class RoadGeometryFusion:
     def _centre(x, y, conf, src, vision_to, end):
         """The centre line message part: arc length s from x[0] along the points, x, y, conf (per point), src (per
         point: v camera, b blend, m map), rounded (s, x to 0.1 m, y, conf to 0.01; chris_native.c `geom_centre`)."""
-        s, xl, yl, cl = _C.geom_centre(_f64(x), _f64(y), _f64(conf), None)
+        s, xl, yl, cl = _native(_C.geom_centre, x, y, conf, None)
         return {"s": s, "x": xl, "y": yl, "conf": cl, "src": src, "vision_to_m": round(vision_to, 1), "end": end}
 
     @staticmethod
     def _centre_vision(vx, vy, vsd, reach):
         """The centre line of the camera alone, up to its reach (the points with x <= reach), the confidence of
         each point from its sigma: clip(1 - sd / 1.5, 0.1, 1)."""
-        s, xl, yl, cl = _C.geom_centre(_f64(vx), _f64(vy), _f64(vsd), reach)
+        s, xl, yl, cl = _native(_C.geom_centre, vx, vy, vsd, reach)
         return {"s": s, "x": xl, "y": yl, "conf": cl, "src": "v" * len(s), "vision_to_m": round(reach, 1), "end": None}
 
     def _map_part(self, ts, vis, reach, dt, turn, out):
