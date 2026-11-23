@@ -182,10 +182,22 @@ class Tracking(unittest.TestCase):
         far = o["predict_path"][-1]                                        # straight road: the path is straight on
         self.assertAlmostEqual(far["x_m"], o["x_m"] + o["speed_mps"] * far["t_s"], delta=0.3)
         self.assertAlmostEqual(far["y_m"], o["y_m"], delta=0.3)
-        # the car turns: the path bends, and so does where the one ahead will be if it keeps to the road
-        x, y, th = rd._path_point(40.0, 15.0, 0.15)
-        self.assertGreater(y, 7.0)
-        self.assertGreater(th, 0.3)
+        # the car turns: the path bends, and so does where the one ahead will be if it keeps to the road (one object
+        # 35 m ahead on the car's arc, heading along it: its prediction along the path, 65 m on, is well to the left)
+        from chris_integrator.radar.tracker import State
+        st = State(1)
+        x = np.zeros(M.N)
+        th = 0.15 / 15.0 * 35.0
+        x[M.PX], x[M.PY], x[M.VX], x[M.VY] = math.sin(th) / 0.01, (1.0 - math.cos(th)) / 0.01, 15.0 * math.cos(th), 15.0 * math.sin(th)
+        st.a[0, 0:24], st.a[0, 216:219], st.a[0, 219:227] = np.tile(x, 3), (0.0, 1.0, 0.0), x
+        st.a[0, 24:216] = np.tile(np.eye(M.N).ravel() * 0.01, 3)
+        st.a[0, 227:291] = np.eye(M.N).ravel() * 0.01
+        M.NR.radar_combine_rows(st.a, [0])
+        num = M.NR.radar_frame(st.a, [0], [[0.0, 0.5, 1.0, 2.0]], [M._KIN4["car"]], M._native_par(M.CFG), (0.0, 0.0, 0.0),
+                               (15.0, 0.15), rd._ncfg(), (0.5, 1.0, 2.0), None, None, [1.0], [0.7])[0]
+        far = num[20][-1]
+        self.assertGreater(far["y_m"], 7.0)
+        self.assertGreater(math.atan2(far["y_m"] - num[1], far["x_m"] - num[0]), 0.3)
         # a standing car and an oncoming one are not "with the traffic"
         rd, m = world(15.0, {"stands": (70.0, 0.0, 0.0, 0.0)}, 3.0)
         for q in m["objects"]:

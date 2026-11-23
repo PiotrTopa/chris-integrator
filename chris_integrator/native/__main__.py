@@ -62,34 +62,31 @@ def selftest(n=20000, seed=1):
             ok = len(got) == len(want) and all(abs(u - v) <= 1e-7 * max(1.0, abs(v)) for u, v in zip(got, want))
         if not ok:
             bad.append("%s differs from the recorded results" % name)
-    g = np.random.default_rng(seed)
-    # the radar's motion model against its numpy reference (models._evolve_py): to rounding
+    # the radar (no Python implementation any more) against what its Python reference gave: to rounding
+    from ._radar_selftest import RADAR_EVOLVE, RADAR_H, RADAR_MARGINALS
     from ..radar import models as R
-    labels = list(R.KIN)
-    for it in range(40):
-        B = 1 + it % 7
-        xs = g.standard_normal((B, 3, 8)) * np.array([30.0, 30.0, 10.0 + 20.0 * (it % 3 == 0), 10.0, 2.0, 2.0, 0.01, 0.3])
-        a = g.standard_normal((B, 3, 8, 8))
-        Ps = np.einsum("bhij,bhkj->bhik", a, a) + np.eye(8)
-        mu = g.random((B, 3))
-        mu[0, it % 3] = 0.0
-        mu /= mu.sum(axis=1, keepdims=True)
-        xf, a = g.standard_normal((B, 8)), g.standard_normal((B, 8, 8))
-        Pf = np.einsum("bij,bkj->bik", a, a) + np.eye(8)
-        dt = g.choice([-0.05, 0.0, 1e-14, 0.05, 0.5, 2.0], B)
-        lab = [labels[i] for i in g.integers(len(labels), size=B)]
-        ref = R._evolve_py(xs, Ps, mu, xf, Pf, dt, lab, R.CFG, True, True)
-        got = tuple(np.empty_like(r) for r in ref)
-        _n.radar_evolve(list(xs), list(Ps), list(mu), list(xf), list(Pf), list(dt),
-                        [R._KIN4[l] for l in lab], R._native_par(R.CFG), *got)
-        if any(float(np.max(np.abs(r - o))) > 1e-12 * max(1.0, float(np.max(np.abs(r)))) for r, o in zip(ref, got)):
-            bad.append("radar_evolve differs from the numpy reference")
+
+    def close(a, b, tol=1e-12):
+        a, b = np.asarray(a, float), np.asarray(b, float)
+        return a.shape == b.shape and bool(np.all(np.abs(a - b) <= tol * np.maximum(np.abs(b), 1.0)))
+    for row, dt, label, ref in RADAR_EVOLVE:
+        S = np.array([row])
+        out = np.empty((1, 6))
+        _n.radar_peek_pos(S, [0], [dt], [R._KIN4.get(label) or R._KIN4[None]], R._native_par(R.CFG), out)
+        if not close(out[0], ref):
+            bad.append("radar_peek_pos differs from the reference's motion model")
             break
-        q = R.still_b(xs[:, 1:], Ps[:, 1:], R.kin_arrays(lab)[3][:, None])
-        ps = np.minimum(1.0, mu[:, 0] + mu[:, 1] * q[:, 0] + mu[:, 2] * q[:, 1])
-        if float(np.max(np.abs(ps - _n.radar_p_still(xs, Ps, mu, list(R.kin_arrays(lab)[3]))))) > 1e-12:
-            bad.append("radar_p_still differs from the numpy reference")
+    for sen, kind, sdt, x, pose, zr, Hr in RADAR_H:
+        z, H = np.empty(4), np.empty((4, 8))
+        m = _n.radar_h(sen, kind, sdt, x, pose, z, H)
+        if not (close(z[:m], zr) and close(H[:m], Hr)):
+            bad.append("radar_h differs from the reference's measurement function")
             break
+    L, ref = RADAR_MARGINALS
+    out = np.empty((len(L), len(L[0])))
+    _n.radar_marginals(np.array(L), out)
+    if not close(out, ref):
+        bad.append("radar_marginals differs from the reference")
     return bad
 
 

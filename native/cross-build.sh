@@ -8,6 +8,8 @@
 #   IMAGE=debian:stable-slim PLATFORM=linux/arm64 ...   -> native/dist/linux-aarch64-glibc/
 #   TEST=0 ...                                  skip the test run in the container (pytest tests/test_native.py)
 #
+# Exits with the container's status: not 0 when the build or the tests there fail.
+#
 # The container builds with the image's gcc against the image's Python headers and runs the self-test and
 # the native tests there (emulated: correct, slow). The binary uses the CPython limited API, so the image's
 # Python version need not be the target's: any CPython >= 3.11 on the same machine type and C library loads
@@ -44,9 +46,15 @@ cp chris_integrator/native/_chris_native.abi3.so /out/\$tag/
   echo \"source sha256: \$(sha256sum chris_integrator/native/src/chris_native.c | cut -d' ' -f1)\"
   echo \"binary sha256: \$(sha256sum chris_integrator/native/_chris_native.abi3.so | cut -d' ' -f1)\"
 } > /out/\$tag/BUILD.txt
+st=0
 if [ \"\$TEST\" = 1 ]; then
-  python3 -m pytest -q -p no:cacheprovider tests/test_native.py 2>&1 | tail -n 3 | tee -a /out/\$tag/BUILD.txt
+  python3 -m pytest -q -p no:cacheprovider tests/test_native.py > /tmp/tests.txt 2>&1 || st=\$?
+  tail -n 3 /tmp/tests.txt | tee -a /out/\$tag/BUILD.txt
 fi
 chown -R \$HOST_UID:\$HOST_GID /out/\$tag
 cat /out/\$tag/BUILD.txt
+if [ \$st != 0 ]; then
+  echo \"cross-build.sh: the tests FAILED in the container (exit \$st): the artefact is not to be used\" >&2
+  exit \$st
+fi
 "

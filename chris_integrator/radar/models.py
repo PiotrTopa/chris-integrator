@@ -31,6 +31,10 @@ import numpy as np
 
 from .. import native as _native
 
+# The radar's arithmetic is the native core's (chris_native.c, the `radar` part): its only implementation (the
+# package does not import without the module: chris_integrator/native)
+NR = _native.radar
+
 N = 8
 PX, PY, VX, VY, AX, AY, DP, LH = range(N)
 MODELS = ("stand", "cv", "ca")
@@ -78,200 +82,7 @@ def kin(label):
     return KIN.get(label, KIN[None])
 
 
-# ---- the kernel -----------------------------------------------------------------------------------------------
-# Everything below works on a batch: B objects (or B copies of objects taken to different times), each with its
-# three hypotheses. xs: (B, 3, N), Ps: (B, 3, N, N), mu: (B, 3). The functions without `_b` are the same thing for
-# one object or one hypothesis (tests, tools).
-_I = np.arange(N)
-_MOVE = (VX, VY, AX, AY)
-
-
-def kin_arrays(labels):
-    """(a_lon, a_lat, v_max, v_still) of each label, as arrays."""
-    ks = [KIN.get(l, KIN[None]) for l in labels]
-    return (np.array([k["a_lon"] for k in ks]), np.array([k["a_lat"] for k in ks]),
-            np.array([k["v_max"] for k in ks]), np.array([k["v_still"] for k in ks]))
-
-
-def still_b(x, P, v0):
-    """How much a hypothesis says "it does not move": the weight of its velocity (mean and uncertainty) inside
-    the window exp(-|v|^2 / v0^2). 1 for a velocity known to be zero, near 0 for a known speed and for a
-    velocity nothing is known about. x: (..., N), P: (..., N, N), v0: broadcastable to the leading shape."""
-    v2 = v0 * v0
-    a00, a11, a01 = 2.0 * P[..., VX, VX] + v2, 2.0 * P[..., VY, VY] + v2, 2.0 * P[..., VX, VY]
-    det = a00 * a11 - a01 * (2.0 * P[..., VY, VX])
-    ok = det > 0.0
-    dd = np.where(ok, det, 1.0)
-    vx, vy = x[..., VX], x[..., VY]
-    q = (a11 * vx * vx - 2.0 * a01 * vx * vy + a00 * vy * vy) / dd
-    return np.where(ok, np.minimum(1.0, v2 / np.sqrt(dd) * np.exp(-np.minimum(q, 60.0))), 0.0)
-
-
-def still(x, P, v0):
-    return float(still_b(x, P, v0))
-
-
-def transition_b(dt, q, cfg=CFG):
-    """Model switching probabilities over dt (rows: from, columns: to), (B, 3, 3). q: (B, 2), how still the cv
-    and the ca hypothesis are (`still`): a moving hypothesis that has found no speed hands over to "it stands",
-    which then has to hold as the rigid statement it is."""
-    dt = np.maximum(np.asarray(dt, float), 0.0)
-    B = len(dt)
-    f, r = cfg["r_move_to_stand_fast"], cfg["r_move_to_stand"]
-    R = np.zeros((B, 3, 3))
-    R[:, STAND, CV], R[:, STAND, CA] = cfg["r_stand_to_move"] * 0.7, cfg["r_stand_to_move"] * 0.3
-    R[:, CV, STAND], R[:, CV, CA] = f + r * q[:, 0], cfg["r_cv_to_ca"]
-    R[:, CA, STAND], R[:, CA, CV] = f + r * q[:, 1], cfg["r_ca_to_cv"]
-    P = 1.0 - np.exp(-R * dt[:, None, None])
-    off = P.sum(axis=2)
-    P *= np.where(off > 0.9, 0.9 / np.where(off > 0.9, off, 1.0), 1.0)[:, :, None]
-    P[:, (0, 1, 2), (0, 1, 2)] = 1.0 - P.sum(axis=2)
-    return P
-
-
-def transition(dt, q=(0.0, 0.0), cfg=CFG):
-    return transition_b(np.array([dt], float), np.array([q], float), cfg)[0]
-
-
-def _shape_b(q_lon, q_lat, x):
-    """(B, 2, 2) intensity with q_lon along each object's travel and q_lat across it (isotropic mean for one
-    that has no direction worth the name: slower than 1 m/s)."""
-    vx, vy = x[:, VX], x[:, VY]
-    sp = np.hypot(vx, vy)
-    has = sp >= 1.0
-    sps = np.where(has, sp, 1.0)
-    c, s = vx / sps, vy / sps
-    out = np.empty((len(sp), 2, 2))
-    iso = 0.5 * (q_lon + q_lat)
-    out[:, 0, 0] = np.where(has, c * c * q_lon + s * s * q_lat, iso)
-    out[:, 1, 1] = np.where(has, s * s * q_lon + c * c * q_lat, iso)
-    out[:, 0, 1] = out[:, 1, 0] = np.where(has, c * s * (q_lon - q_lat), 0.0)
-    return out
-
-
-def predict_b(xs, Ps, dt, a_lon, a_lat, v_max, cfg=CFG):
-    """Every hypothesis of every object forward by its dt (which may be slightly negative: a late measurement).
-    Returns (xs, Ps)."""
-    dt = np.asarray(dt, float)
-    B = len(dt)
-    adt = np.abs(dt)
-    F = np.zeros((B, 3, N, N))
-    Q = np.zeros((B, 3, N, N))
-    F[:, :, _I, _I] = 1.0
-    Q[:, :, DP, DP] = (cfg["dp_walk"] ** 2 * adt)[:, None]
-    # stand
-    F[:, STAND, _MOVE, _MOVE] = 0.0
-    Q[:, STAND, PX, PX] = Q[:, STAND, PY, PY] = (cfg["stand_drift"] ** 2) * adt
-    Q[:, STAND, _MOVE, _MOVE] = cfg["stand_v_std"] ** 2
-    # cv: an acceleration noise
-    dt2, dt3 = adt * adt, adt ** 3
-    F[:, CV, PX, VX] = F[:, CV, PY, VY] = dt
-    F[:, CV, AX, AX] = F[:, CV, AY, AY] = 0.0
-    qa = _shape_b((cfg["cv_noise"] * a_lon) ** 2, (cfg["cv_noise"] * a_lat) ** 2, xs[:, CV])
-    Q[:, CV, 0:2, 0:2] = qa * (dt3 / 3.0)[:, None, None]
-    Q[:, CV, 0:2, 2:4] = Q[:, CV, 2:4, 0:2] = qa * (dt2 / 2.0)[:, None, None]
-    Q[:, CV, 2:4, 2:4] = qa * adt[:, None, None]
-    Q[:, CV, AX, AX] = Q[:, CV, AY, AY] = 0.05 ** 2
-    # ca: an acceleration that persists, driven by a jerk noise
-    rho = np.exp(-adt / cfg["ca_tau_s"])
-    F[:, CA, PX, VX] = F[:, CA, PY, VY] = dt
-    F[:, CA, PX, AX] = F[:, CA, PY, AY] = 0.5 * dt * dt          # also for a step back: x - v|dt| + a dt^2 / 2
-    F[:, CA, VX, AX] = F[:, CA, VY, AY] = dt
-    F[:, CA, AX, AX] = F[:, CA, AY, AY] = rho
-    qj = _shape_b((cfg["ca_jerk"] * a_lon) ** 2, (cfg["ca_jerk"] * a_lat) ** 2, xs[:, CA])
-    dt4, dt5 = adt ** 4, adt ** 5
-    Q[:, CA, 0:2, 0:2] = qj * (dt5 / 20.0)[:, None, None]
-    Q[:, CA, 0:2, 2:4] = Q[:, CA, 2:4, 0:2] = qj * (dt4 / 8.0)[:, None, None]
-    Q[:, CA, 0:2, 4:6] = Q[:, CA, 4:6, 0:2] = qj * (dt3 / 6.0)[:, None, None]
-    Q[:, CA, 2:4, 2:4] = qj * (dt3 / 3.0)[:, None, None]
-    Q[:, CA, 2:4, 4:6] = Q[:, CA, 4:6, 2:4] = qj * (dt2 / 2.0)[:, None, None]
-    Q[:, CA, 4:6, 4:6] = qj * adt[:, None, None]
-    x1 = np.matmul(F, xs[..., None])[..., 0]
-    P1 = np.matmul(np.matmul(F, Ps), F.swapaxes(-1, -2)) + Q
-    # what this kind cannot do: faster than its top speed. The state is brought back to the bound and the
-    # velocity's uncertainty opened, so the next measurements decide (a wrong class must not pin a wrong speed)
-    sp = np.hypot(x1[:, 1:, VX], x1[:, 1:, VY])
-    over = sp > v_max[:, None]
-    if over.any():
-        f = np.where(over, v_max[:, None] / np.where(over, sp, 1.0), 1.0)
-        x1[:, 1:, VX] *= f
-        x1[:, 1:, VY] *= f
-        ex = np.where(over, (sp - v_max[:, None]) ** 2, 0.0)
-        P1[:, 1:, VX, VX] += ex
-        P1[:, 1:, VY, VY] += ex
-    return x1, 0.5 * (P1 + P1.swapaxes(-1, -2))
-
-
-def predict(model, x, P, dt, label, cfg=CFG):
-    """One hypothesis forward by dt. Returns (x, P)."""
-    xs, Ps = np.repeat(x[None, None], 3, axis=1), np.repeat(P[None, None], 3, axis=1)
-    al, at, vm, _ = kin_arrays([label])
-    x1, P1 = predict_b(xs, Ps, np.array([dt], float), al, at, vm, cfg)
-    return x1[0, model], P1[0, model]
-
-
-def combine_b(xs, Ps, mu):
-    """Moment-matched single estimate of the hypotheses: (B, N), (B, N, N)."""
-    x = np.einsum("bi,bin->bn", mu, xs)
-    d = xs - x[:, None, :]
-    P = np.einsum("bi,bimn->bmn", mu, Ps) + np.einsum("bi,bim,bin->bmn", mu, d, d)
-    return x, P
-
-
-def combine(xs, Ps, mu):
-    if _NR is not None:                              # (the native core's combination, when in use: combine_many)
-        x, P = np.empty(N), np.empty((N, N))
-        try:
-            _NR.radar_combine((xs,), (Ps,), (mu,), x, P)
-            return x, P
-        except _NATIVE_SKIP:
-            pass
-    x, P = combine_b(np.asarray(xs)[None], np.asarray(Ps)[None], np.asarray(mu, float)[None])
-    return x[0], P[0]
-
-
-def mix_b(xs, Ps, mu, PI, xf=None, Pf=None):
-    """The interaction step: each hypothesis starts the interval from a blend of all of them, weighted by how
-    likely the object was in each and switched. Returns (mixed xs, mixed Ps, predicted model probabilities).
-
-    xf, Pf (B, N), (B, N, N): the object's free estimate (tracker.py). When given, it is what "it stands" hands
-    to a moving hypothesis in place of its own state: "it stands" knows its velocity to be zero, but if the
-    object moves after all, the best knowledge of how is what its sightings have shown without the assumption
-    that it stands. (Handing over the standing state itself would pin the moving hypotheses to zero speed:
-    they could never learn the speed of a slow vehicle first taken for a standing one.)"""
-    c = np.einsum("bij,bi->bj", PI, mu)             # predicted probability of each model
-    low = c < 1e-12
-    w = PI * mu[:, :, None] / np.where(low, 1.0, c)[:, None, :]      # [b, from i, to j]
-    if low.any():                                   # a hypothesis nothing flows into keeps what it has
-        w = np.where(low[:, None, :], np.eye(3)[None], w)
-    if xf is not None:
-        SX = np.repeat(xs[:, :, None, :], 3, axis=2)             # [b, from i, to j, n]: what i hands to j
-        SP = np.repeat(Ps[:, :, None, :, :], 3, axis=2)
-        SX[:, STAND, CV], SX[:, STAND, CA] = xf, xf
-        SP[:, STAND, CV], SP[:, STAND, CA] = Pf, Pf
-        xo = np.einsum("bij,bijn->bjn", w, SX)
-        d = SX - xo[:, None, :, :]
-        Po = np.einsum("bij,bijmn->bjmn", w, SP) + np.einsum("bij,bijm,bijn->bjmn", w, d, d)
-        return xo, Po, c
-    xo = np.einsum("bij,bin->bjn", w, xs)
-    d = xs[:, :, None, :] - xo[:, None, :, :]       # [b, i, j, n]
-    Po = np.einsum("bij,bimn->bjmn", w, Ps) + np.einsum("bij,bijm,bijn->bjmn", w, d, d)
-    return xo, Po, c
-
-
-def mix(xs, Ps, mu, PI):
-    xo, Po, c = mix_b(np.asarray(xs)[None], np.asarray(Ps)[None], np.asarray(mu, float)[None], np.asarray(PI)[None])
-    return xo[0], Po[0], c[0]
-
-
-# ---- the kernel in one call per batch ------------------------------------------------------------------------
-# What the tracker asks of the model, batched: the interaction and prediction of every hypothesis of B objects
-# (with their combination, or the free estimate's prediction), the combination alone, how still each object is.
-# The functions above are the reference; where the native core's `radar` part is in use (chris_integrator.native)
-# the same steps run in C (results to rounding: docs/NATIVE.md), else the reference runs, unchanged. The arrays
-# of an object (xs, Ps, mu, xf, Pf) may come as (B, ...) arrays or as lists of B per-object arrays.
-_NR = _native.radar
-_NATIVE_SKIP = (_native.Fallback, TypeError, ValueError, BufferError)
+# ---- what the native core reads of the model ----------------------------------------------------------------
 _KIN4 = {l: (k["a_lon"], k["a_lat"], k["v_max"], k["v_still"]) for l, k in KIN.items()}
 _PAR = {}
 
@@ -290,68 +101,29 @@ def _native_par(cfg):
     return e[1]
 
 
-def evolve_b(xs, Ps, mu, xf, Pf, dt, labels, cfg=CFG, combine=False, free=False):
-    """The hypotheses of B objects after dt (each its own; <= 0: no switching): stillness of the moving ones
-    (`still_b`), switching (`transition_b`), interaction with the free estimate's hand-over (`mix_b`), prediction
-    (`predict_b`). Returns (xs, Ps, mu, x, P, xf, Pf): with `combine` (x, P) the moment-matched estimate of the
-    result (`combine_b` with the predicted probabilities), with `free` (xf, Pf) the free estimate predicted by
-    the steady hypothesis; None where not asked."""
-    if _NR is not None:
-        B = len(dt)
-        out = (np.empty((B, 3, N)), np.empty((B, 3, N, N)), np.empty((B, 3)),
-               np.empty((B, N)) if combine else None, np.empty((B, N, N)) if combine else None,
-               np.empty((B, N)) if free else None, np.empty((B, N, N)) if free else None)
-        try:
-            _NR.radar_evolve(xs, Ps, mu, xf, Pf, dt, [_KIN4.get(l) or _KIN4[None] for l in labels],
-                             _native_par(cfg), *out)
-            return out
-        except _NATIVE_SKIP:
-            pass
-    return _evolve_py(xs, Ps, mu, xf, Pf, dt, labels, cfg, combine, free)
+# ---- one hypothesis, for tests and tools (the tracker works on its objects' rows: tracker.py) -----------------
+def still(x, P, v0):
+    """How much a hypothesis says "it does not move": the weight of its velocity (mean and uncertainty) inside
+    the window exp(-|v|^2 / v0^2). 1 for a velocity known to be zero, near 0 for a known speed and for a
+    velocity nothing is known about."""
+    return NR.radar_still1(np.asarray(x, float), np.asarray(P, float), float(v0))
 
 
-def _evolve_py(xs, Ps, mu, xf, Pf, dt, labels, cfg=CFG, combine=False, free=False):
-    """evolve_b in numpy: the reference."""
-    xs, Ps, mu, xf, Pf = np.asarray(xs, float), np.asarray(Ps, float), np.asarray(mu, float), np.asarray(xf, float), np.asarray(Pf, float)
-    dt = np.asarray(dt, float)
-    a_lon, a_lat, v_max, v0 = kin_arrays(labels)
-    q = still_b(xs[:, 1:], Ps[:, 1:], v0[:, None])
-    PI = transition_b(dt, q, cfg)                    # dt <= 0: no switching (the identity)
-    xs1, Ps1, mu1 = mix_b(xs, Ps, mu, PI, xf=xf, Pf=Pf)
-    xs1, Ps1 = predict_b(xs1, Ps1, dt, a_lon, a_lat, v_max, cfg)
-    x = P = xf1 = Pf1 = None
-    if combine:
-        x, P = combine_b(xs1, Ps1, mu1)
-    if free:
-        xf1, Pf1 = predict_b(np.repeat(xf[:, None], 3, axis=1), np.repeat(Pf[:, None], 3, axis=1), dt, a_lon, a_lat, v_max, cfg)
-        xf1, Pf1 = xf1[:, CV], Pf1[:, CV]
-    return xs1, Ps1, mu1, x, P, xf1, Pf1
+def transition(dt, q=(0.0, 0.0), cfg=CFG):
+    """Model switching probabilities over dt (rows: from, columns: to), 3 x 3. q: how still the cv and the ca
+    hypothesis are (`still`): a moving hypothesis that has found no speed hands over to "it stands", which then
+    has to hold as the rigid statement it is."""
+    return np.array(NR.radar_transition1(float(dt), float(q[0]), float(q[1]), _native_par(cfg)))
 
 
-def combine_many(xs, Ps, mu):
-    """combine_b of B objects: (B, N), (B, N, N)."""
-    if _NR is not None:
-        B = len(mu)
-        x, P = np.empty((B, N)), np.empty((B, N, N))
-        try:
-            _NR.radar_combine(xs, Ps, mu, x, P)
-            return x, P
-        except _NATIVE_SKIP:
-            pass
-    return combine_b(np.asarray(xs, float), np.asarray(Ps, float), np.asarray(mu, float))
-
-
-def p_still_many(xs, Ps, mu, labels):
-    """Probability that each object does not move: "it stands", and the moving hypotheses as far as they have
-    found no speed (`still_b` with the kind's v_still). A list of floats."""
-    if _NR is not None:
-        try:
-            return _NR.radar_p_still(xs, Ps, mu, [(_KIN4.get(l) or _KIN4[None])[3] for l in labels])
-        except _NATIVE_SKIP:
-            pass
-    xs, Ps, mu = np.asarray(xs, float), np.asarray(Ps, float), np.asarray(mu, float)
-    q = still_b(xs[:, 1:], Ps[:, 1:], kin_arrays(labels)[3][:, None])
-    return np.minimum(1.0, mu[:, STAND] + mu[:, CV] * q[:, 0] + mu[:, CA] * q[:, 1]).tolist()
+def predict(model, x, P, dt, label, cfg=CFG):
+    """One hypothesis forward by dt (which may be slightly negative: a late measurement), with what its kind
+    cannot do (faster than its top speed: brought back to the bound, the velocity's uncertainty opened).
+    Returns (x, P)."""
+    xo, Po = np.empty(N), np.empty((N, N))
+    NR.radar_predict1(model, np.ascontiguousarray(x, float), np.ascontiguousarray(P, float), float(dt),
+                      _KIN4.get(label) or _KIN4[None], _native_par(cfg), xo, Po)
+    return xo, Po
 
 
 def side_on(label, aspect, bearing):

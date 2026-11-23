@@ -11,13 +11,13 @@ CPython) is called where the C code leaves an input to it.
     core                  the module: the estimator's filter (core/ekf.py, core/ego.py), the lane tracker
                           (trackers/lanes.py), the road geometry (trackers/roadgeom.py), the view
                           (trackers/view.py), the road line (fastjson.py, io/recorder.py)
-    radar                 the radar's motion model (radar/models.py)
+    radar                 the radar (chris_integrator/radar: motion model, measurement functions, association, update, upkeep, the message's objects)
 """
 import functools
 import json
 import os
 
-VERSION = 5                    # of the compiled module's functions: the package needs this one
+VERSION = 6                    # of the compiled module's functions: the package needs this one
 PARTS = ("json", "round", "interp", "ekf", "lanes", "radar")
 _HOW = ("build it: `sh native/build.sh` in the source tree (this machine: a C compiler and the Python headers), "
         "`sh native/cross-build.sh` for another platform (docs/NATIVE.md), or `pip install .`")

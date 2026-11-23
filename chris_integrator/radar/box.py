@@ -42,6 +42,7 @@ Scans are processed in time order once the car's own motion is known up to their
 late is applied to the objects taken back to its time (tracker.py).
 """
 import math
+import operator
 
 import numpy as np
 
@@ -50,11 +51,11 @@ from ..core.roadusers import Camera
 from ..native import round                  # builtins.round, native where built
 from . import models as M
 from .ego import EgoMotion
-from .models import AX, AY, DP, PX, PY, STAND, VX, VY
 from .sensors import CAMERA_CFG, CameraBoxes, MicrowaveRadar
 from .tracker import Tracker
 
 NS = 1e9
+_NR = M.NR                      # the native core (the message's objects: radar_frame)
 
 CFG = dict(
     corridor_m=1.3, corridor_rel=0.012,      # on the path: |offset| <= corridor_m + corridor_rel x distance
@@ -97,7 +98,8 @@ class Radar:
         self.ego.reset()
         self.tracker.reset()
         self.queue = []                  # (t, src, sensor, dets)
-        self.path = None                 # (xs, ys left) in the car frame of path_t
+        self._plan = None                # the road model's plan (x, y right) in the car frame of path_t
+        self._path = None                # ... as arrays, y left (`path`)
         self.path_t = None
         self.seq = 0
         self.dropped = 0
@@ -243,12 +245,19 @@ class Radar:
         plan, ts = msg.get("plan"), msg.get("ts_mono_ns")
         if isinstance(plan, dict) and isinstance(plan.get("x"), list) and isinstance(plan.get("y"), list) \
                 and len(plan["x"]) >= 2 and len(plan["x"]) == len(plan["y"]) and isinstance(ts, int):
-            xs = np.asarray(plan["x"], float)
-            if np.all(np.diff(xs) >= 0.0) and xs[-1] > 5.0:
-                self.path, self.path_t = (xs, -np.asarray(plan["y"], float)), ts / NS       # the road model's y is right
+            xs = plan["x"]
+            if all(map((0.0).__le__, map(operator.sub, xs[1:], xs))) and xs[-1] > 5.0:
+                self._plan, self._path, self.path_t = (xs, plan["y"]), None, ts / NS
                 return
         if isinstance(ts, int) and self.path_t is not None and ts / NS - self.path_t > 1.0:
-            self.path = None
+            self._plan = self._path = None
+
+    @property
+    def path(self):
+        """The path: (xs, ys left) in the car frame of path_t, or None; made from the plan when first asked."""
+        if self._path is None and self._plan is not None:
+            self._path = (np.asarray(self._plan[0], float), -np.asarray(self._plan[1], float))   # the road model's y is right
+        return self._path
 
     def _push(self, scan):
         self.queue.append(scan)
@@ -267,25 +276,23 @@ class Radar:
             self.tracker.process(src, t, sensor, dets)
         del self.queue[:k]
 
-    def _offset(self, x, y, v, w):
-        """Lateral offset of a car-frame point from the path (positive left) and what the path was."""
-        if self.path is not None and x <= self.path[0][-1] + 5.0:
-            return y - float(np.interp(x, self.path[0], self.path[1])), "plan"
-        k = w / v if v > 2.0 else 0.0
-        return y - 0.5 * k * x * x, "arc"
+    @staticmethod
+    def _class(o, T):
+        """classvote.result(o.vote, T): it changes with a vote only (kept on the object until the next one) and
+        lapses with its age."""
+        cls = o.cls
+        if cls is None:
+            cls = o.cls = (classvote.result(o.vote),)
+        cls = cls[0]
+        if cls is not None and o.vote.get("t") is not None and max(0.0, T - o.vote["t"]) > classvote.EXPIRE_S:
+            return None
+        return cls
 
-    def _path_point(self, s, v, w):
-        """The path at distance s ahead (car frame): (x, y, direction). The road model's plan as far as it
-        reaches, beyond it (and without one) the arc the car is driving."""
-        if self.path is not None and s <= self.path[0][-1]:
-            xs, ys = self.path
-            y = float(np.interp(s, xs, ys))
-            d = 1.0
-            return s, y, math.atan2(float(np.interp(s + d, xs, ys)) - float(np.interp(s - d, xs, ys)), 2.0 * d)
-        k = w / v if v > 2.0 else 0.0
-        if abs(k) < 1e-6:
-            return s, 0.0, 0.0
-        return math.sin(k * s) / k, (1.0 - math.cos(k * s)) / k, k * s
+    def _ncfg(self):
+        c = self.cfg
+        return (c["corridor_m"], c["corridor_rel"], c["path_max_m"], c["ttc_min_closing"], c["in_path_sigma"],
+                c["in_path_slack_m"], c["threat_ttc_s"], c["threat_min_mps"], c["with_heading_deg"], c["with_speed"][0],
+                c["with_speed"][1], c["with_min_mps"])
 
     def frame(self, ts):
         """The `radar` message for time ts (ns), or None while the car's own motion is unknown."""
@@ -299,107 +306,26 @@ class Radar:
         X, Y, psi = self.ego.pose_at(T)
         es = self.ego.state_at(T)
         v_ego, w_ego = es[3], es[4]
-        ch, sh = math.cos(psi), math.sin(psi)
-        Rm = np.array([[ch, sh], [-sh, ch]])              # ground -> car axes
-        out = []
         shown = [o for o in tr.objects if o.state != "tentative" or c["tentative"]]
+        # the objects of the message in one native call (chris_native.c `radar_frame`): each one taken to now and
+        # to the horizons, in the car frame; on the path (inside its corridor) or not; "it stands in the way" (the
+        # strongest thing the radar says: the place inside the corridor beyond what its own uncertainty could
+        # explain, and stayed there); reached within threat_ttc_s at the present speeds, over every hypothesis and
+        # with what is not known of both the distance and the object's speed (not started on an object whose
+        # distance has lately come from cut boxes only); parked; driving with the car and where it will be if it
+        # keeps following the road as the car does; and the message's dict of it
         hz = (0.0,) + tuple(c["predict_s"])
-        at = tr.peek_many([o for o in shown for _ in hz], [T + h for _ in shown for h in hz])     # now and ahead, in one go
-        still = tr.p_still_many(shown)
-        for n, o in enumerate(shown):
-            x, P, mu = at[n * len(hz)]
-            pc = Rm @ np.array([x[PX] - X, x[PY] - Y])
-            vc = Rm @ np.array([x[VX], x[VY]])
-            ac = Rm @ np.array([x[AX], x[AY]])
-            Pp, Pv = Rm @ P[:2, :2] @ Rm.T, Rm @ P[2:4, 2:4] @ Rm.T
-            speed = math.hypot(vc[0], vc[1])
-            label = o.label
-            off, by = self._offset(pc[0], pc[1], v_ego, w_ego)
-            flags = set(o.flags)
-            on = 0.3 < pc[0] <= c["path_max_m"] and abs(off) <= c["corridor_m"] + c["corridor_rel"] * pc[0]
-            if on:
-                flags.add("on_path")
-            # "it stands in the way" is the strongest thing the radar says: it needs the place to be inside the
-            # corridor beyond what the place's own uncertainty could explain, and to have stayed there
-            sy = math.sqrt(max(float(Pp[1, 1]), 0.0))
-            sure_in = on and abs(off) + c["in_path_sigma"] * sy <= c["corridor_m"] + c["corridor_rel"] * pc[0] + c["in_path_slack_m"]
-            hold = self._in_since.get(o.id)
-            if o.verdict == "stationary" and sure_in:
-                if hold is None:
-                    hold = self._in_since[o.id] = T
-                if T - hold >= c["in_path_hold_s"]:
-                    flags.add("in_path")
-            else:
-                self._in_since.pop(o.id, None)
-            # reached within threat_ttc_s? Each hypothesis says how likely its speed along the car's axis is
-            # below the one that would just make it
-            p_thr = 0.0
-            if sure_in and v_ego >= c["threat_min_mps"] and o.state != "tentative":
-                # reached within T at the present speeds: g = distance - T x closing speed < 0, with what is not
-                # known of BOTH the distance and the object's speed (a near object whose box is cut has a poor
-                # range: its closeness must not be taken for a fact)
-                Tt = c["threat_ttc_s"]
-                u = np.zeros(M.N)
-                u[PX], u[PY], u[VX], u[VY] = ch, sh, Tt * ch, Tt * sh
-                for m_ in range(len(M.MODELS)):
-                    xm = o.xs[m_]
-                    g = ch * (xm[PX] - X) + sh * (xm[PY] - Y) + Tt * (ch * xm[VX] + sh * xm[VY]) - Tt * v_ego
-                    sg = math.sqrt(max(float(u @ o.Ps[m_] @ u), 0.0) + 0.09 * Tt * Tt)
-                    p_thr += float(o.mu[m_]) * 0.5 * (1.0 + math.erf(-g / (sg * 1.4142)))
-            th0 = self._threat_since.get(o.id)
-            # a threat is not STARTED on an object whose distance has lately come from cut boxes only (a
-            # vehicle close beside the car: its range is the poorest there is); one raised before stays
-            if p_thr >= c["threat_p"] and (th0 is not None or T - o.range_t <= c["threat_range_s"]):
-                if th0 is None:
-                    th0 = self._threat_since[o.id] = T
-                if T - th0 >= c["threat_hold_s"]:
-                    flags.add("threat")
-            else:
-                self._threat_since.pop(o.id, None)
-            if o.verdict == "stationary" and not on and abs(off) > c["parked_offset_m"] \
-                    and label not in ("human", "bike", "motorbike"):
-                flags.add("parked")
-            v_rel = vc[0] - v_ego
-            ttc = pc[0] / -v_rel if on and v_rel < -c["ttc_min_closing"] else None
-            pred = []
-            for m, h in enumerate(c["predict_s"]):
-                xp, Pq, _ = at[n * len(hz) + 1 + m]
-                q = Rm @ np.array([xp[PX] - X, xp[PY] - Y])
-                pred.append({"t_s": h, "x_m": round(float(q[0]), 2), "y_m": round(float(q[1]), 2),
-                             "std_m": round(math.sqrt(max(float(np.trace(Pq[:2, :2])), 0.0)), 2)})
-            # the same object if it keeps following the road as the car does
-            along = None
-            if speed >= c["with_min_mps"] and v_ego >= c["with_min_mps"] and pc[0] > 0.0 \
-                    and c["with_speed"][0] <= speed / v_ego <= c["with_speed"][1]:
-                _, _, th = self._path_point(float(pc[0]), v_ego, w_ego)
-                dh = (math.atan2(vc[1], vc[0]) - th + math.pi) % (2.0 * math.pi) - math.pi
-                if abs(dh) <= math.radians(c["with_heading_deg"]):
-                    flags.add("with_traffic")
-                    along = []
-                    for h in c["predict_s"]:
-                        px_, py_, th = self._path_point(float(pc[0]) + speed * h, v_ego, w_ego)
-                        along.append({"t_s": h, "x_m": round(px_ - off * math.sin(th), 2), "y_m": round(py_ + off * math.cos(th), 2)})
-            cls = classvote.result(o.vote, T)
-            out.append({
-                "id": o.id, "state": o.state, "exist": round(o.exist, 3), "age_s": round(T - o.t0, 2), "hits": o.hits,
-                "sources": sorted(o.sources), "seen": {s: round(max(0.0, T - t), 3) for s, t in o.last_seen.items()},
-                "x_m": round(float(pc[0]), 2), "y_m": round(float(pc[1]), 2),
-                "vx_mps": round(float(vc[0]), 2), "vy_mps": round(float(vc[1]), 2),
-                "ax_mps2": round(float(ac[0]), 2), "ay_mps2": round(float(ac[1]), 2),
-                "speed_mps": round(speed, 2), "heading_rad": round(math.atan2(vc[1], vc[0]), 3) if speed >= 1.0 else None,
-                "v_rel_mps": round(float(v_rel), 2),
-                "std": [round(math.sqrt(max(float(Pp[0, 0]), 0.0)), 2), round(math.sqrt(max(float(Pp[1, 1]), 0.0)), 2),
-                        round(math.sqrt(max(float(Pv[0, 0]), 0.0)), 2), round(math.sqrt(max(float(Pv[1, 1]), 0.0)), 2)],
-                "motion": o.verdict, "p_stationary": round(still[n], 3),
-                "models": {n: round(float(m), 3) for n, m in zip(M.MODELS, mu)},
-                "class": None if cls is None else {"label": cls["label"], "confidence": cls["confidence"],
-                                                   "source": cls["source"], "votes": cls["votes"]},
-                "flags": sorted(flags), "path_offset_m": round(off, 2), "ttc_s": None if ttc is None else round(float(ttc), 2),
-                "p_threat": round(p_thr, 3),
-                "consistency": None if o.consistency is None else round(o.consistency, 2),
-                "pred_err_m": None if o.pred_err is None else round(o.pred_err, 2),
-                "angle_offset_deg": round(math.degrees(float(x[DP])), 3), "predict": pred,
-                "predict_path": along})
+        kin = [o.kin for o in shown]
+        path = self.path
+        out = _NR.radar_frame(tr.store.a, [o.slot for o in shown], [[T + h - o.t for h in hz] for o in shown], kin,
+                              M._native_par(tr.mcfg), (X, Y, psi), (v_ego, w_ego), self._ncfg(), tuple(c["predict_s"]),
+                              path[0] if path is not None else None, path[1] if path is not None else None,
+                              [0.0 if o.state == "tentative" else 1.0 for o in shown], [k[3] for k in kin],
+                              [(o.id, o.state, o.logodds, o.t0, o.hits, o.sources, o.last_seen, o.verdict, o.flags,
+                                o.label, o.range_t, o.consistency, o.pred_err, self._class(o, T)) for o in shown],
+                              self._in_since, self._threat_since, T,
+                              (c["in_path_hold_s"], c["threat_p"], c["threat_range_s"], c["threat_hold_s"],
+                               c["parked_offset_m"]))
         live = {o.id for o in tr.objects}
         for k in [k for k in self._in_since if k not in live]:
             del self._in_since[k]

@@ -5,10 +5,10 @@ dist/
 *.egg-info/
 .venv/
 .pytest_cache/
-# the native core: built modules (native/build.sh, pip) and cross-built artefacts (native/cross-build.sh) are
-# never committed; docs/NATIVE.md says how to build them
+# the native core: modules built in place (native/build.sh, pip) are never committed; the cross-built
+# artefacts of the reference deployment under native/dist/ are (the installer takes them from there)
 *.so
-native/dist/
+!native/dist/**/*.so
 # recordings, captures and map packs never belong in the repository
 *.jsonl.gz
 *.cap.gz

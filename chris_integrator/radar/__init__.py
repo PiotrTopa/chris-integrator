@@ -26,6 +26,12 @@ How it is built (each part is a file):
                 kept as the object's own record of how well it has been predicted. Objects have a memory: a
                 trajectory, a class vote, an age, and a life that does not end with one missed frame.
 * `box.py`      the component's face: messages in, the `radar` message out (car frame of the output time).
+
+The arithmetic of all of it (the motion model, the measurement functions, a scan's association and update, the
+objects' upkeep and the message's objects) runs in the native core (chris_integrator/native, the `radar` part),
+its only implementation: this package does not import without it (docs/NATIVE.md says how to build it). The
+objects' numbers live in one array of the tracker (`tracker.State`), which the native calls read and write; the
+Python here is the objects' life, the message's assembly and the glue.
 * `replay.py`   a recorded session through the component alone.
 
 The plug-in that wires it into the mixer is `chris_integrator/plugins/radar.py`.
