@@ -3,8 +3,8 @@ lines and road edges the integrator's estimator does not read; `drop()` cuts nam
 the bytes before the JSON parser sees them. Falls back to the whole line whenever the cut is not certain."""
 import re
 
-from . import native as _native
-from .native import loads as _loads      # json.loads, native where built
+from .native import core as _C
+from .native import loads as _loads      # json.loads (the native reader; json.loads what it leaves to json)
 
 _TOK = re.compile(rb'[\[\]{}"]')
 
@@ -108,62 +108,14 @@ _PLAN_KEY = b',"plan":{'
 _LIST_KEYS = (b',"lane_lines":[{', b',"road_edges":[{')
 
 
-def _trim_road_py(line):
-    """`line` (bytes of a `road` message) without the members listed above. Every cut is an array of numbers
-    found inside its parent's own span; whatever does not look as expected is left in."""
-    cuts = []
-    i = line.find(_PLAN_KEY)
-    if i >= 0:
-        e = line.find(b"}", i)             # the plan holds arrays of numbers and scalars: the first } closes it
-        if e > 0:
-            at = i                         # the members come in the order listed: each search starts where the
-            for pat in _PLAN_PAT:          # last cut ended (and from the plan's start when one is not there)
-                a = line.find(pat, at, e)
-                if a < 0 and at > i:
-                    a = line.find(pat, i, e)
-                if a >= 0:
-                    b = line.find(b"]", a + len(pat), e)
-                    if b > 0:
-                        cuts.append((a, b + 1))
-                        at = b + 1
-    for key in _LIST_KEYS:
-        i = line.find(key)
-        if i < 0:
-            continue
-        e = line.find(b"}]", i)            # objects of arrays of numbers and scalars: the first }] ends the list
-        if e < 0:
-            continue
-        for pat in _LINE_PAT:
-            a = line.find(pat, i, e)
-            while a >= 0:
-                b = line.find(b"]", a + len(pat), e)
-                if b < 0:
-                    break
-                cuts.append((a, b + 1))
-                a = line.find(pat, b + 1, e)
-    if not cuts:
-        return line
-    cuts.sort()
-    out, at = [], 0
-    for a, b in cuts:
-        if a < at:                         # overlapping spans: not the layout this was written for
-            return line
-        if a > at:
-            out.append(line[at:a])
-        at = b
-    out.append(line[at:])
-    return b"".join(out)
-
-
-if _native.json_n is None:
-    trim_road = _trim_road_py
-else:
-    def trim_road(line, _n=_native.json_n.trim_road, _pk=_PLAN_KEY, _keys=_LIST_KEYS):
-        """`line` (bytes of a `road` message) without the members listed above (the native core: the same
-        bytes); see `_trim_road_py`."""
-        if type(line) is not bytes:
-            return _trim_road_py(line)
-        return _n(line, _pk, _PLAN_PAT, _keys, _LINE_PAT)
+def trim_road(line):
+    """`line` (bytes of a `road` message) without the members listed above, cut from the bytes (the native core:
+    chris_native.c `trim_road`). Each cut is an array of numbers found inside its parent's own span: a plan
+    member `,"name":[...]` before the plan's first `}`, a line's `,"z":[...]` before the first `}]` of its list;
+    overlapping spans, or nothing to cut: the line as it is."""
+    if type(line) is not bytes:
+        line = bytes(line)
+    return _C.trim_road(line, _PLAN_KEY, _PLAN_PAT, _LIST_KEYS, _LINE_PAT)
 
 
 def loads_road_trimmed(raw):

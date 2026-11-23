@@ -39,9 +39,7 @@ import shutil
 import threading
 import time
 
-from ..native import round                  # builtins.round, native where built
-from .. import native
-from ..fastround import Layout, warm
+from ..native import core as _C
 
 log = logging.getLogger("chris_integrator.recorder")
 
@@ -65,100 +63,26 @@ def load_config(config_dir=None):
     return {k: v for k, v in cfg.items() if k in DEFAULTS}
 
 
-_LAYOUT = Layout()
-_MARK = "\x01"                  # stands for a list of numbers in the skeleton that json.dumps writes
-_MARK_TEXT = json.dumps(_MARK)
+def slim_road_line(road):
+    """The part of a `road` message the trackers and the replay tools read, numbers shortened, as one JSON line
+    (the native core: chris_native.c `slim_road_line`; json.dumps writes what it leaves to json):
 
+        type, seq, ts_mono_ns, ts_real_ns, model_ms, v_ego, valid, frames_skipped, pair_dt_ms, road_model,
+        road_model_fallback, policy_hz, frame_seq_prev, camera     as they are (those present)
+        pose            its floats to 4 decimals
+        lane_lines, road_edges    of each dict: x (2 decimals), y, y_std (3), prob (a number, 4)
+        leads           the first, every list in it to 3 decimals
+        plan            x, y, z (2 decimals; those present), held, age_ms
 
-def _slim(road, rounded=None):
-    """The reduced `road` with every list of numbers replaced by a marker: (dict, [(list, digits), ...] in the
-    order json.dumps meets the markers, [(container, key), ...]). With `rounded` (native.Rounded) every list
-    is wrapped as `rounded((list, digits))` instead, for the native writer, and the three lists stay empty."""
-    # every scalar a tracker or a replay tool reads: `road_model` selects the trackers' profile (it was dropped
-    # until lane L37, so replays ran the supercombo profile on vision-model sessions), `camera` names the camera
-    out = {k: road.get(k) for k in ("type", "seq", "ts_mono_ns", "ts_real_ns", "model_ms", "v_ego", "valid",
-                                    "frames_skipped", "pair_dt_ms", "road_model", "road_model_fallback",
-                                    "policy_hz", "frame_seq_prev", "camera") if k in road}
-    pose = road.get("pose")
-    if isinstance(pose, dict):
-        out["pose"] = {k: round(v, 4) if isinstance(v, float) else v for k, v in pose.items()}
-    parts, digits, slots = [], [], []
-
-    if rounded is None:
-        def put(d, k, v, nd):
-            if isinstance(v, list):
-                d[k] = _MARK
-                parts.append(v)
-                digits.append(nd)
-                slots.append((d, k))
-            else:
-                d[k] = v
-    else:
-        def put(d, k, v, nd):
-            d[k] = rounded((v, nd)) if isinstance(v, list) else v
-    for key in ("lane_lines", "road_edges"):
-        lines = road.get(key)
-        if isinstance(lines, list):
-            res = []
-            for ln in lines:
-                if isinstance(ln, dict):
-                    o = {}
-                    put(o, "x", ln.get("x"), 2)
-                    put(o, "y", ln.get("y"), 3)
-                    put(o, "y_std", ln.get("y_std"), 3)
-                    if isinstance(ln.get("prob"), (int, float)):
-                        o["prob"] = round(ln["prob"], 4)
-                    res.append(o)
-            out[key] = res
-    leads = road.get("leads")
-    if isinstance(leads, list) and leads and isinstance(leads[0], dict):
-        o = {}
-        for k, v in leads[0].items():
-            put(o, k, v, 3)
-        out["leads"] = [o]
-    plan = road.get("plan")
-    if isinstance(plan, dict):
-        o = out["plan"] = {}
-        for k in ("x", "y", "z"):
-            if k in plan:
-                put(o, k, plan.get(k), 2)
-        for k in ("held", "age_ms"):
-            if k in plan:
-                o[k] = plan[k]
-    return out, parts, digits, slots
+    `road_model` selects the trackers' profile in a replay (it was dropped until lane L37, so replays ran the
+    supercombo profile on vision-model sessions), `camera` names the camera. A list is written with every number
+    rounded (round(v, n); None stays null), anything else as it is."""
+    return _C.slim_road_line(road)
 
 
 def slim_road(road):
-    """The part of a `road` message the trackers and the replay tools read, numbers shortened."""
-    out, parts, digits, slots = _slim(road)
-    if parts:                   # about 700 numbers a frame, rounded in one go: fastround gives round()'s results
-        for (d, k), v in zip(slots, _LAYOUT.round_parts(parts, digits)):
-            d[k] = v
-    return out
-
-
-def slim_road_line(road):
-    """json.dumps(slim_road(road), separators=(",", ":")), made without writing each float: the skeleton goes
-    through json.dumps with a marker for every list, the lists' texts come from fastround's tables. With the
-    native core the lists are rounded and written by its `dumps` in one pass (`native.Rounded`)."""
-    if native.json_n is not None:
-        try:
-            return native.json_n.slim_road_line(road)
-        except native.Fallback:            # something the native writer leaves to json: the pure path below
-            pass
-    out, parts, digits, slots = _slim(road)
-    if parts:
-        pieces = json.dumps(out, separators=(",", ":")).split(_MARK_TEXT)
-        if len(pieces) == len(parts) + 1:
-            texts = _LAYOUT.text_parts(parts, digits)
-            res = [pieces[0]]
-            for t, p in zip(texts, pieces[1:]):
-                res.append(t)
-                res.append(p)
-            return "".join(res)
-        for (d, k), v in zip(slots, _LAYOUT.round_parts(parts, digits)):      # a string that looks like the marker
-            d[k] = v
-    return json.dumps(out, separators=(",", ":"))
+    """`slim_road_line` as a dict."""
+    return json.loads(slim_road_line(road))
 
 
 class Recorder:
@@ -168,9 +92,6 @@ class Recorder:
         self.preview_path = preview_path
         self.clock, self.wall = clock, wall
         self.topics = set(self.cfg["topics"])
-        if "road" in self.topics and not native.ROUNDED:
-            warm((2, 3))            # the number texts of the reduced `road`: built at start-up, not in a frame
-                                    # (the native core writes rounded lists itself and needs no tables)
         c = self.cfg
         self._caps = {"road": c["road_hz"], "ego": c["ego_hz"], "objects": c["objects_hz"], "view": c["view_hz"],
                       "camera": 1.0, "ego_state": c["ego_state_hz"], "tracks": c["ego_state_hz"]}
@@ -266,7 +187,7 @@ class Recorder:
         if not self._due(mtype, now):
             return
         if mtype == "road":
-            line = json.dumps(slim_road(json.loads(line)), separators=(",", ":"))
+            line = slim_road_line(json.loads(line))
         self._write(mtype, line, now)
 
     def _due(self, mtype, now):
