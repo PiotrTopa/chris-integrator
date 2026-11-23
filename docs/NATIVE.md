@@ -7,8 +7,8 @@ compiled to one module, `chris_integrator/native/_chris_native.abi3.so`. Where t
 it is used; where it is not, the same functions run in Python. Nothing else in the package knows which.
 
     python -m chris_integrator.native      which implementation runs here + a self-test against the reference
-    GET /v2/health  ->  "native": {"active": true, "implementation": "native", "parts": [...], "version": 2}
-    the daemon's first log lines: "hot path NATIVE (json, round, interp, ekf, lanes)"  |  "hot path pure Python: <why>"
+    GET /v2/health  ->  "native": {"active": true, "implementation": "native", "parts": [...], "version": 3}
+    the daemon's first log lines: "hot path NATIVE (json, round, interp, ekf, lanes, radar)"  |  "hot path pure Python: <why>"
 
 ## What is native, and what "the same" means for each part
 
@@ -23,6 +23,8 @@ it is used; where it is not, the same functions run in Python. Nothing else in t
 | `ekf` | `ekf_project`, `ekf_update`, `ekf_sym` (one scalar row of the filter) | numpy expressions in `core/ekf.py` | the same bits for rows of one state index (most rows); to rounding for rows over several states |
 | `ekf` | `ekf_predict` (the process model) | `EgoModel._predict_py` | state and transition: the same bits; covariance: to rounding |
 | `ekf` | `ekf_rts` (one smoother step) | `np.linalg.solve` + products in `core/ekf.py` | to rounding |
+| `radar` | `radar_evolve` (stillness, switching, interaction with the free estimate's hand-over, prediction with the speed bound; optionally the combination and the free estimate's prediction: `Tracker._evolve` + `combine_b` in one call for B objects) | `radar/models.py`: `_evolve_py` = `still_b`, `transition_b`, `mix_b`, `predict_b`, `combine_b` | to rounding (tests: 1e-12 of each block's largest magnitude); on the development machine the same bits |
+| `radar` | `radar_combine`, `radar_p_still` | `combine_b`, `Tracker.p_still_many`'s numpy | to rounding |
 
 The `lanes` part is exact because the tracker's arithmetic is elementwise (numpy computes those with plain
 IEEE operations, one element at a time), and its two means over the gate points are added in the order numpy
@@ -37,6 +39,16 @@ way: BLAS kernels differ per CPU). After the monitors and trackers, on recorded 
 of messages per drive in which a number that rounds to zero carries the other sign (`-0.0` / `0.0`) and, rarely,
 a last printed digit; lane report L50 has the counts. Everything else in the table is exact, by construction
 and by test.
+
+The `radar` part propagates only the entries of the motion model's transition that are not zero (at most three
+per row of the 8x8 `F`; the reference multiplies dense matrices), takes the elementwise steps in numpy's order
+of operations (the same `exp`, `pow`, `hypot` of libm) and sums the products in index order. On the development
+machine (x86-64, numpy 2.3) that gives numpy's bits in every random and edge case of the tests and the same radar
+messages on simulated drives; where numpy's products use fused multiply-adds or another order (ARM BLAS) the
+results differ at the last bit, like the filter's. Inputs that are not finite go to the reference (`Fallback`):
+a dense product makes NaN of 0 * inf where skipping the zero does not. The switch points are `models.evolve_b`,
+`models.combine_many`, `models.combine` and `models.p_still_many`; arrays the native call does not take (not
+float64, not contiguous) also go to the reference.
 
 A native function never guesses. Where it is not certain to give the reference's result for an input (a type
 it does not know, a number outside its exact path, damaged text) it raises `native.Fallback` (or calls the
@@ -77,7 +89,7 @@ under the address and undefined-behaviour sanitizers:
 * the module loads and has the expected version -> native, every part;
 * `CHRIS_NATIVE=0` in the environment -> pure Python (the reference; the comparison baseline);
 * `CHRIS_NATIVE=json,round,interp,lanes` -> only those parts native (the exact ones: a run with them must give
-  the reference's output line for line; adding `ekf` adds the filter's rounding-level differences);
+  the reference's output line for line; adding `ekf` or `radar` adds their rounding-level differences);
 * the module is absent or does not load -> pure Python, and `status()["reason"]` says why.
 
 The unit's environment can carry the switch (`/etc/chris/integrator.env`: `CHRIS_NATIVE=0`) for a rollback
