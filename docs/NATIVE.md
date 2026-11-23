@@ -1,14 +1,14 @@
 # The native core
 
 On a slow core (the reference deployment runs chris-integrator on a phone's little core) the price of Python
-is the budget, so the arithmetic and the text work of the per-message hot path are written in C: one file,
-`chris_integrator/native/src/chris_native.c`, compiled to one module, `chris_integrator/native/_chris_native.abi3.so`.
+is the budget, so the arithmetic and the text work of the per-message hot path are written in C: one translation
+unit, `chris_integrator/native/src/chris_native.c` (it includes `decide.c`, the decision layer's part), compiled to one module, `chris_integrator/native/_chris_native.abi3.so`.
 The module is part of the package: it is required, and every function in it exists once. There is no second,
 pure-Python implementation of what is native, and no switch between two.
 
     python -m chris_integrator.native      the module in use, and its self-test on this machine
     GET /v2/health  ->  "native": {"active": true, "implementation": "native", "parts": [...], "version": 8, "module": "..."}
-    the daemon's first log lines: "native core version 8 (_chris_native.abi3.so; json, round, interp, ekf, lanes, radar)"
+    the daemon's first log lines: "native core version 8 (_chris_native.abi3.so; json, round, interp, ekf, lanes, radar, predict, decide)"
 
 A package without the module (or with one of another version) does not import: the error says that the native
 core is not built, does not load, or is of the wrong version, and how to build it (below).
@@ -61,6 +61,7 @@ not float64 is made a float64 copy; a stream's value beyond 2^53 is read as the 
 | `radar` | `radar_cells` (an extended sensor's returns grouped into cells), `radar_groups`, `radar_group_support` (rows, queues, platoons and what a row says about a member) (radar/tracker) | docs/RADAR.md 4 and 7 | golden: to rounding |
 | `radar` | `radar_frame` (radar/box) | the message's objects: their numbers, flags with their hysteresis, the dicts | golden: to rounding; digests of three drives' messages (x86-64) |
 | `radar` | `radar_h` (radar/sensors: camera kinds b, rb, rbh, bt with and without the scale-rate row, microwave radar, position), `radar_marginals`, `radar_assign`, `radar_kbest`, `radar_predict1`, `radar_still1`, `radar_transition1` (one hypothesis; tests and tools) | measurement functions, pairings' probabilities, assignment, ranked assignments, one hypothesis' step | golden |
+| `predict` | `predict_frame` (chris_integrator/predict: one frame of the predictor: the road's curvilinear frame, every object's lane filter, manoeuvre filter, futures with their covariance, car following, the joint weights of interacting road users, the car's own futures), `predict_score` (a past prediction against what happened), `predict_cfg`, `predict_names` | the predictor's arithmetic; source file `native/src/predict.c`, included by `chris_native.c` | golden (`tests/data/predict_golden.json`, recorded from this code: there never was a Python implementation): to 2e-5 (sin, cos, exp, erfc of the C library); behaviour by `tests/test_predict.py` |
 
 The lane tracker's steps are exact because its arithmetic is elementwise, and its two means over the gate points
 are added in sequence, as numpy adds a masked selection. The road geometry's arc length is a sequential sum of
@@ -71,6 +72,11 @@ gave the frozen results) adds them in an order of its own, with fused multiply-a
 the last bit or two of a double. After the monitors and trackers, on recorded drives, that shows as a handful of
 messages per drive in which a number that rounds to zero carries the other sign (`-0.0` / `0.0`) and, rarely, a
 last printed digit; lane report L50 has the counts.
+
+| `decide` | `decide_eval` (decide/threat.py), `decide_inst_prob`, `decide_draws` (`native/src/decide.c`, included by chris_native.c) | per object, mode and car mode: collision probability over the horizon (quasi-Monte Carlo on fixed Halton draws, or the exact Gaussian over the footprints' Minkowski sum per time), required braking / steering / combined demand, threat numbers, time-to-brake / -steer, time to collision, headway, levels | closed forms (required deceleration v^2 / 2d, latest onset), the exact integral against products of normal distributions and against sampling; golden `tests/data/decide_golden.npz` (`python3 tests/data/make_decide_golden.py`): to rounding, bisected demands and times within their tolerances (0.06), Monte Carlo shares within 0.01 |
+
+The decision layer was written native from the start (no Python reference was removed): what holds it are the
+closed forms and the independent references of `tests/test_decide_native.py`, and its golden data freeze it.
 
 ### The radar: native only
 
@@ -121,6 +127,18 @@ degrees against a place known to metres is 1e-6); a square-root (Cholesky factor
 too, at the price of re-factorising at every mixing step of the interacting hypotheses, and was judged not worth
 it. `tests/test_native.py::test_radar_update_keeps_the_covariance_symmetric_and_positive` holds the property over
 random states with detections up to 1e-10 of the state's variance, many in a row.
+
+### The predictor: a second source file
+
+`chris_integrator/native/src/predict.c` holds the `predict` part. It is not a second module: `chris_native.c`
+includes it (one translation unit, one binary; the build scripts compile `chris_native.c` as before) just above
+its method table, where the macro `PREDICT_METHODS` adds the part's four functions. It uses that file's array
+helpers and nothing of the other parts; its names carry a `P` / `p_` / `pp_` prefix. Its constants are one list in
+the C file (`PCFG`: name and default), which Python reads (`predict_cfg()`) and hands back as an array: there is
+no second copy of a default. Its results were never a Python program's: the golden data
+(`python3 tests/data/make_predict_golden.py`) and the target's self-test
+(`python3 -m chris_integrator.native._predict_selftest record`) are recorded from the C code after a deliberate
+change, and what the code must DO is held by `tests/test_predict.py` and judged by `tools/predict_eval.py`.
 
 ### Inputs the C code takes, and what it does with others
 

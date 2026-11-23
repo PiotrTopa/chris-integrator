@@ -274,7 +274,7 @@ class View(Plugin):
               In("map", trigger=True, optional=True), In("lights", trigger=True, optional=True),
               In("signs", trigger=True, optional=True), In("display_lanes", trigger=True, optional=True),
               In("calib", optional=True), In("governor", optional=True), In("road_users", trigger=True, optional=True),
-              In("radar", trigger=True, optional=True))
+              In("radar", trigger=True, optional=True), In("decide", optional=True))
     outputs = (Out("view", "display", "frame", doc="the display channel: road picture, objects, lines"),)
 
     def __init__(self, cfg=None, name=None):
@@ -316,6 +316,7 @@ class View(Plugin):
             if out is not None:
                 self._lead = next((o for o in out["objects"] if o.get("role") == "lead"), None)
                 if self.radar is not None and self.radar.fresh(out["ts_mono_ns"]):
+                    self.radar.on_decide(ctx.get("decide"))      # the threat flags and the alert from `decide`
                     objs, alert = self.radar.objects(out["ts_mono_ns"], self._lead)
                     out["objects"] = out["objects"] + objs
                     out["alert"] = alert

@@ -975,3 +975,76 @@ estimate are the same, number for number, with and without a class detector (a t
   riderless bikes and motorbikes left out, the lead's own detection not drawn twice; display only, never a
   measurement topic. The equality test for this path: `tests/test_road_users.py` (tracks, lead, ego state
   equal; the view equal apart from the class and the `road_user` objects).
+
+
+## 17. The decision layer (lane DECIDE, 2026-11-23)
+
+`chris_integrator/decide` (plug-in `decide`, topic `decide`, docs/TOPICS.md). It replaces the radar's fixed
+time-to-reach (`threat_ttc_s`) as the source of the view's threat flags and alert with a measure of what the
+driver would have to do: for the car against every object, over the object's predicted modes and the car's own,
+
+* the **collision probability** over the horizon: both position distributions (the object's covariance per time
+  from the prediction, the car's own execution spread, bounded) and both extents (the object's length, width and
+  heading with their uncertainty; the car's footprint from the reference camera: 2.1 m to the front bumper, 2.35 m
+  to the rear, 1.76 m wide), by quasi-Monte Carlo with draws coherent in time (a draw is a whole future: the
+  prediction error is mostly a bias of the initial state and the manoeuvre, not white noise per step);
+* the **demand required to avoid** (Brännström et al., threat assessment for arbitrary collisions): the least
+  constant braking, steering left or right, or braking and steering together on the friction circle, applied from
+  now with the build-up of brakes and steering, that keeps the car clear of the object's footprint inflated by k
+  sigma (bounded: a poorly ranged camera object's spread is the collision probability's matter, not a wall);
+  steering must also keep clear of the other objects; against the **grip available** (mu g of the road
+  condition, the share a driver gets, falling with speed, the turning circle at low speed): the brake, steer and
+  combined threat numbers;
+* **time-to-brake and time-to-steer**: the last onset of full braking or steering that still avoids, and the
+  **time margin** tm = max(ttb, tts) - the driver's reaction time (0.9 quantile of a log-normal, median 1 s);
+* time to collision, time headway and the least separation on the mean futures, secondary;
+* a **level** per pair from per-class thresholds on the threat number and the time margin, and per object the
+  highest level whose probability mass (weight x pc over the pairs at or above it) reaches its minimum, with
+  entry and exit threshold sets (hysteresis) and the reasoning (which pair, which measure).
+
+Weights are the **unconditioned** mode probabilities (the other party does not yield); the conditioned figure is
+given alongside. The **alert logic** (alerts.py) stages information, caution, warning, imminent with entry and
+exit holds, minimum holds, a latched imminent, suppression (driver braking or steering away enough, low speed,
+sensors degraded), visibility and existence gates, a stable primary, and modes off / shadow / on per alert.
+
+Degraded mode (no prediction layer yet): the radar's own two hypotheses as constant-velocity modes (it stands
+with p_stationary; it drives on at its velocity with the rest; along the path's bends for traffic along it), the
+car's own modes from its motion and the plan; footprints of standing objects parallel to the road at their place.
+Three rules then stand in for the prediction's lanes, all from the radar's own evidence: an object whose velocity
+is not observed yet raises at most information until its p_stationary has moved off the prior to 0.65 (a lead
+appearing far ahead falls off within half a second, a standing car rises); one the radar calls parked raises at
+most information; one that most probably stands rises above caution only when the radar's corridor test puts it
+surely in the path. Measured on the simulator (seed 1, by day; `tools/decide_replay.py --scenario ...`):
+
+| scenario | today's radar flags (`threat` / `obstacle` s) | decide (`threat` / `obstacle` s, stages >= caution said) |
+|---|---|---|
+| stopped_cruise_14 (no reaction; impact at 15.5 s) | obstacle at 12.8 s, threat at 13.7 s | caution 12.0 s, warning 12.9 s (2.6 s before impact) |
+| stopped_cruise_25 (impact at 12.5 s) | threat at 11.0 s | warning 11.0 s (1.5 s before; the camera confirms the car at ~50 m) |
+| curve_parked | 0.6 / 1.9 | 3.0 / 4.4 (on parked cars the radar itself places in its corridor) |
+| slow_lead | 1.1 / 0.0 | 2.8 / 3.5 |
+| parked_street, adjacent, oncoming, junction | 0 / 0 | 0 / <= 0.1 |
+
+On fixtures with contract futures (decide/fixtures.py: stationary in path, lead braking, cut-in, crossing,
+oncoming on our side, a pedestrian stepping out; parked row, adjacent lane, oncoming passing) the collision
+courses warn 1.5 to 3 s before contact and the rest stays at stage 0 (tests/test_decide.py).
+
+
+## 18. Learnt values across drives (lane DECIDE, 2026-11-23)
+
+`chris_integrator/learnt.py` (the store) and `chris_integrator/learners.py` (the learners' adapters and the plug-in
+`learnt`; table of what is kept and why the rest is not). One versioned file, `<data dir>/learnt.json` (on the
+phone `/var/lib/chris/learnt.json`, the unit's `StateDirectory=chris`; `learnt.json` in the configuration
+directory may set `path`), per value: value, variance (or counts), samples, last update (wall clock), the
+conditions it was learnt under. On start a value is a prior, not the truth: its variance grows by what a restart
+can change and by its own walk over its age, never beyond the spread the learner starts with; counts are halved
+per 30 days; a limit relaxes; a record outside its sanity bounds, too old, or learnt under another calibration is
+not used (health says why). Vision calibration states are given under the last drive's calibration and undone
+(`reset_aux`) if the camera's calibration message says another one is in use.
+
+Power may go at any moment (the phone has no battery): writes are write-temp, fsync, rename (the previous file
+kept), fsync of the directory; reads try the file, the temp, the previous one, each checked by format, version
+and a checksum over the values; a damaged file is moved aside (`.bad`). Writes are rare: when something changed
+and 10 minutes passed, at a standstill after driving (10 s still after 60 s of driving: the power may go next),
+at shutdown; at most 12 an hour; about 4 kB each. The old `integrator.json` (faults and calibration) is still
+written and read as before; where both hold a calibration state the learnt store's prior wins (it is applied
+after).
