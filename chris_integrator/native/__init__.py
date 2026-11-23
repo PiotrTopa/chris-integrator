@@ -91,6 +91,7 @@ else:
 
     loads = _loads_py
 
+json_n = _n if "json" in ACTIVE else None           # trim_road (fastjson)
 round = _n.round if "round" in ACTIVE else builtins.round
 round_list = _n.round_list if "round" in ACTIVE else None      # [v if v is None else round(v, n) for v in list]
 interp_all = _n.interp_all if "interp" in ACTIVE else None

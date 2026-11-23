@@ -354,6 +354,41 @@ def test_loads_survives_damaged_input():
             pass
 
 
+@needs_json
+def test_trim_road_is_the_python_cut():
+    """fastjson.trim_road in the native core against `_trim_road_py`: the same bytes, on the vision model's layout
+    (tests/data), cut, damaged and rearranged lines, and other layouts."""
+    from chris_integrator import fastjson as F
+    with open(os.path.join(HERE, "tests", "data", "road_raw_vision.jsonl"), "rb") as f:
+        base = [ln.strip() for ln in f if ln.strip()]
+    base.append(json.dumps({"type": "road", "plan": {"vx": [1], "x": [0, 1], "vy": [2], "vx2": [], "prob": None},
+                            "lane_lines": [{"z": [1], "x": [], "z ": [2]}, {"x": [1], "z": [3, [4]]}],
+                            "road_edges": [{"y": [], "z": []}]}, separators=SEP).encode())
+    rng = random.Random(29)
+    n_cut = 0
+    for _ in range(60000):
+        b = bytearray(rng.choice(base))
+        for _ in range(rng.randrange(0, 4)):
+            if not b:
+                break
+            i, k = rng.randrange(len(b)), rng.randrange(4)
+            if k == 0:
+                del b[i:]
+            elif k == 1:
+                b[i] = rng.choice(b'[]{},:"z0')
+            elif k == 2:
+                del b[i:i + rng.randrange(1, 40)]
+            else:
+                j = rng.randrange(len(b))
+                b[i:i] = b[j:j + rng.randrange(1, 60)]
+        b = bytes(b)
+        got, want = F.trim_road(b), F._trim_road_py(b)
+        assert got == want, b
+        n_cut += got is not b
+    assert n_cut > 20000
+    assert F.trim_road(b"") == b"" and F.trim_road(base[0]) is not base[0]
+
+
 # ---- round, interpolation ----------------------------------------------------------------------------------
 @needs_native
 def test_round_is_builtin_round():

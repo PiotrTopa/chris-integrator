@@ -831,6 +831,167 @@ static PyObject *n_loads(PyObject *self, PyObject *arg)
 }
 
 /* ====================================================================================================
+ * The `road` line trimmed of what the default stack does not read (fastjson.trim_road is the reference;
+ * the same algorithm on the bytes, so the same bytes)
+ * ==================================================================================================== */
+
+/* bytes.find(sub, start, end): the first index >= start where sub lies entirely before end, or -1 */
+static Py_ssize_t b_find(const char *s, Py_ssize_t n, const char *sub, Py_ssize_t m, Py_ssize_t start, Py_ssize_t end)
+{
+    if (end > n)
+        end = n;
+    if (start < 0)
+        start = 0;
+    if (m == 0)
+        return start <= end ? start : -1;
+    /* by the last byte of `sub` (a bracket in every pattern here: rarer in the text than a comma or a quote) */
+    char last = sub[m - 1];
+    for (Py_ssize_t i = start + m - 1; i < end;) {
+        const char *q = memchr(s + i, last, (size_t)(end - i));
+        if (q == NULL)
+            return -1;
+        i = q - s;
+        if (memcmp(s + i - (m - 1), sub, (size_t)m) == 0)
+            return i - (m - 1);
+        i++;
+    }
+    return -1;
+}
+
+typedef struct {
+    Py_ssize_t a, b;
+} Cut;
+
+static int cut_add(Cut **cuts, Py_ssize_t *n, Py_ssize_t *cap, Py_ssize_t a, Py_ssize_t b)
+{
+    if (*n == *cap) {
+        Py_ssize_t nc = *cap ? 2 * *cap : 32;
+        Cut *c = PyMem_Realloc(*cuts, (size_t)nc * sizeof(Cut));
+        if (c == NULL) {
+            PyErr_NoMemory();
+            return -1;
+        }
+        *cuts = c;
+        *cap = nc;
+    }
+    (*cuts)[*n].a = a;
+    (*cuts)[*n].b = b;
+    (*n)++;
+    return 0;
+}
+
+/* trim_road(line, plan_key, plan_pats, list_keys, line_pats) -> bytes: fastjson.trim_road with its patterns
+ * (bytes, a tuple of bytes, a tuple of bytes, a tuple of bytes); the line itself when nothing is cut */
+static PyObject *n_trim_road(PyObject *self, PyObject *args)
+{
+    PyObject *line, *plan_key, *plan_pats, *list_keys, *line_pats;
+    if (!PyArg_ParseTuple(args, "O!O!O!O!O!", &PyBytes_Type, &line, &PyBytes_Type, &plan_key, &PyTuple_Type, &plan_pats,
+                          &PyTuple_Type, &list_keys, &PyTuple_Type, &line_pats))
+        return NULL;
+    char *s;
+    Py_ssize_t n;
+    if (PyBytes_AsStringAndSize(line, &s, &n) < 0)
+        return NULL;
+    Cut *cuts = NULL;
+    Py_ssize_t nc = 0, cap = 0;
+    PyObject *res = NULL;
+    char *pk;
+    Py_ssize_t pkn;
+    if (PyBytes_AsStringAndSize(plan_key, &pk, &pkn) < 0)
+        goto done;
+    Py_ssize_t i = b_find(s, n, pk, pkn, 0, n);
+    if (i >= 0) {
+        Py_ssize_t e = b_find(s, n, "}", 1, i, n);
+        if (e > 0) {
+            Py_ssize_t at = i;
+            for (Py_ssize_t k = 0; k < PyTuple_Size(plan_pats); k++) {
+                char *p;
+                Py_ssize_t pn;
+                if (PyBytes_AsStringAndSize(PyTuple_GetItem(plan_pats, k), &p, &pn) < 0)
+                    goto done;
+                Py_ssize_t a = b_find(s, n, p, pn, at, e);
+                if (a < 0 && at > i)
+                    a = b_find(s, n, p, pn, i, e);
+                if (a >= 0) {
+                    Py_ssize_t b = b_find(s, n, "]", 1, a + pn, e);
+                    if (b > 0) {
+                        if (cut_add(&cuts, &nc, &cap, a, b + 1) < 0)
+                            goto done;
+                        at = b + 1;
+                    }
+                }
+            }
+        }
+    }
+    for (Py_ssize_t kk = 0; kk < PyTuple_Size(list_keys); kk++) {
+        char *key;
+        Py_ssize_t kn;
+        if (PyBytes_AsStringAndSize(PyTuple_GetItem(list_keys, kk), &key, &kn) < 0)
+            goto done;
+        i = b_find(s, n, key, kn, 0, n);
+        if (i < 0)
+            continue;
+        Py_ssize_t e = b_find(s, n, "}]", 2, i, n);
+        if (e < 0)
+            continue;
+        for (Py_ssize_t k = 0; k < PyTuple_Size(line_pats); k++) {
+            char *p;
+            Py_ssize_t pn;
+            if (PyBytes_AsStringAndSize(PyTuple_GetItem(line_pats, k), &p, &pn) < 0)
+                goto done;
+            Py_ssize_t a = b_find(s, n, p, pn, i, e);
+            while (a >= 0) {
+                Py_ssize_t b = b_find(s, n, "]", 1, a + pn, e);
+                if (b < 0)
+                    break;
+                if (cut_add(&cuts, &nc, &cap, a, b + 1) < 0)
+                    goto done;
+                a = b_find(s, n, p, pn, b + 1, e);
+            }
+        }
+    }
+    if (nc == 0) {
+        Py_INCREF(line);
+        res = line;
+        goto done;
+    }
+    for (Py_ssize_t x = 1; x < nc; x++) {             /* cuts.sort() */
+        Cut v = cuts[x];
+        Py_ssize_t y = x - 1;
+        while (y >= 0 && (cuts[y].a > v.a || (cuts[y].a == v.a && cuts[y].b > v.b))) {
+            cuts[y + 1] = cuts[y];
+            y--;
+        }
+        cuts[y + 1] = v;
+    }
+    Py_ssize_t at = 0, len = 0;
+    for (Py_ssize_t x = 0; x < nc; x++) {
+        if (cuts[x].a < at) {                          /* overlapping spans: the line as it is */
+            Py_INCREF(line);
+            res = line;
+            goto done;
+        }
+        len += cuts[x].a - at;
+        at = cuts[x].b;
+    }
+    len += n - at;
+    res = PyBytes_FromStringAndSize(NULL, len);
+    if (res == NULL)
+        goto done;
+    char *o = PyBytes_AsString(res);
+    at = 0;
+    for (Py_ssize_t x = 0; x < nc; x++) {
+        memcpy(o, s + at, (size_t)(cuts[x].a - at));
+        o += cuts[x].a - at;
+        at = cuts[x].b;
+    }
+    memcpy(o, s + at, (size_t)(n - at));
+done:
+    PyMem_Free(cuts);
+    return res;
+}
+
+/* ====================================================================================================
  * round
  * ==================================================================================================== */
 static PyObject *n_round(PyObject *self, PyObject *args)
@@ -2923,6 +3084,7 @@ done:
 static PyMethodDef methods[] = {
     {"dumps", n_dumps, METH_O, "json.dumps(obj, separators=(',', ':')); raises Fallback where json must decide"},
     {"loads", n_loads, METH_O, "json.loads(bytes | str); raises Fallback where json must decide"},
+    {"trim_road", n_trim_road, METH_VARARGS, "fastjson.trim_road with its patterns: the same bytes"},
     {"set_rounded_type", n_set_rounded_type, METH_O, "the tuple subclass (values, digits) dumps writes rounded"},
     {"round", n_round, METH_VARARGS, "builtins.round"},
     {"round_list", n_round_list, METH_VARARGS, "[v if v is None else round(v, n) for v in values]"},

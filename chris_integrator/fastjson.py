@@ -3,6 +3,7 @@ lines and road edges the integrator's estimator does not read; `drop()` cuts nam
 the bytes before the JSON parser sees them. Falls back to the whole line whenever the cut is not certain."""
 import re
 
+from . import native as _native
 from .native import loads as _loads      # json.loads, native where built
 
 _TOK = re.compile(rb'[\[\]{}"]')
@@ -103,13 +104,15 @@ PLAN_UNREAD = ("vx", "vy", "vz", "ax", "ay", "az", "roll", "pitch", "yaw", "roll
 LINE_UNREAD = ("z",)
 _PLAN_PAT = tuple((',"%s":[' % k).encode() for k in PLAN_UNREAD)
 _LINE_PAT = tuple((',"%s":[' % k).encode() for k in LINE_UNREAD)
+_PLAN_KEY = b',"plan":{'
+_LIST_KEYS = (b',"lane_lines":[{', b',"road_edges":[{')
 
 
-def trim_road(line):
+def _trim_road_py(line):
     """`line` (bytes of a `road` message) without the members listed above. Every cut is an array of numbers
     found inside its parent's own span; whatever does not look as expected is left in."""
     cuts = []
-    i = line.find(b',"plan":{')
+    i = line.find(_PLAN_KEY)
     if i >= 0:
         e = line.find(b"}", i)             # the plan holds arrays of numbers and scalars: the first } closes it
         if e > 0:
@@ -123,7 +126,7 @@ def trim_road(line):
                     if b > 0:
                         cuts.append((a, b + 1))
                         at = b + 1
-    for key in (b',"lane_lines":[{', b',"road_edges":[{'):
+    for key in _LIST_KEYS:
         i = line.find(key)
         if i < 0:
             continue
@@ -150,6 +153,17 @@ def trim_road(line):
         at = b
     out.append(line[at:])
     return b"".join(out)
+
+
+if _native.json_n is None:
+    trim_road = _trim_road_py
+else:
+    def trim_road(line, _n=_native.json_n.trim_road, _pk=_PLAN_KEY, _keys=_LIST_KEYS):
+        """`line` (bytes of a `road` message) without the members listed above (the native core: the same
+        bytes); see `_trim_road_py`."""
+        if type(line) is not bytes:
+            return _trim_road_py(line)
+        return _n(line, _pk, _PLAN_PAT, _keys, _LINE_PAT)
 
 
 def loads_road_trimmed(raw):
