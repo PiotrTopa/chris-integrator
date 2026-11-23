@@ -432,6 +432,126 @@ def test_slim_road_line_is_the_reduced_road():
     assert R.slim_road_line(m) == json.dumps(R.slim_road(m), separators=SEP)
 
 
+# ---- held to what the references gave (tests/native_cases.py, tests/data/native_golden.json.gz) ---------------
+sys.path.insert(0, os.path.join(HERE, "tests"))
+import native_cases as K  # noqa: E402
+
+GOLD = K.load_golden()
+
+
+def _held(name, cases, fn):
+    """Every case's result digest equal to the reference's; the inputs the same as when it was recorded."""
+    cases = list(cases)
+    g = GOLD[name]
+    assert K.digest(cases) == g["inputs"], "the cases of %s are not the recorded ones (tests/native_cases.py)" % name
+    bad = [i for i, c in enumerate(cases) if K.digest(K.outcome(fn, *c)) != g["out"][i]]
+    assert not bad, "%s: %d of %d cases differ from the reference, first %d: %r" % (name, len(bad), len(cases), bad[0],
+                                                                                    cases[bad[0]])
+
+
+@needs_native
+def test_golden_view():
+    from chris_integrator.trackers import view as V
+    _held("interp", K.cases_interp(), V._interp_all)
+    _held("view_prep", K.cases_view_prep(), V._prep)
+    _held("view_blend", K.cases_view_blend(), V._blend)
+
+
+@needs_json
+def test_golden_road_line():
+    from chris_integrator import fastjson as F
+    from chris_integrator.io import recorder as R
+    _held("trim_road", ((b,) for b in K.cases_trim()), F.trim_road)
+    _held("slim_road_line", ((m,) for m in K.cases_slim()), R.slim_road_line)
+
+
+@needs_native
+def test_golden_road_geometry():
+    from chris_integrator.trackers.roadgeom import RoadGeometryFusion as G
+    _held("geom_centre", K.cases_geom(),
+          lambda x, y, c, reach: G._centre(x, y, c, "vb", 3.0, 7.5) if reach is None else G._centre_vision(x, y, c, reach))
+    g = G()
+
+    def reach(x, sd, rstd, rmax, rmin):
+        g.cfg.update(reach_std_m=rstd, reach_max_m=rmax, reach_min_m=rmin)
+        return g._reach(x, sd)
+    _held("geom_reach", K.cases_reach(), reach)
+
+
+@needs_native
+def test_golden_lane_tracker():
+    from chris_integrator.trackers import lanes as L
+    tr = L.RoadGeometryTracker()
+    _held("lanes_measure", ((r,) for r in K.cases_lanes_measure()), tr._measure)
+
+    def lane_arrays(c, x, zy, zs, prob, y, p, upd):
+        cfg = dict(L.DEFAULT_CFG, **c)
+        fit = L._fit(cfg, x, zs, zy, prob, y, p)
+        y1, p1 = y.copy(), p.copy()
+        if upd:
+            L._update(y1, p1, fit[0], fit[2], upd)
+        p2 = p1.copy()
+        p2[0, 0] = -1.0
+        rounded = [L._round2(y1), L._round2(p2, True), L._round2(x)]
+        pred = p1.copy()
+        C.lanes_predict(pred, x, cfg["q0"], cfg["q1"], 0.07, cfg["max_std"] ** 2)
+        return fit, (y1, p1), rounded, pred
+    _held("lanes_arrays", K.cases_lanes_arrays(), lane_arrays)
+    frames = K.lane_frames()
+    assert K.digest(frames) == GOLD["lane_messages"]["inputs"]
+    t = L.RoadGeometryTracker()
+    for i, (road, es) in enumerate(frames):
+        try:
+            got = json.dumps(t.on_road(road, es))
+        except (TypeError, ValueError) as e:
+            got = "raised %s" % type(e).__name__
+        assert K.digest(got) == GOLD["lane_messages"]["out"][i], (i, got[:200])
+
+
+@needs_native
+def test_golden_filter():
+    from chris_integrator.core import ekf as KF
+    pc = list(K.cases_predict())
+    g = GOLD["predict"]
+    assert K.digest(pc) == g["inputs"]
+    for i, (naux, x, P, dt) in enumerate(pc):
+        m = K.ego_model(None, naux)
+        xn, Pn, (Fn, rn) = m.predict(x, P, dt)
+        assert K.digest((xn, Fn, rn)) == g["out"][i], i                       # the state and transition: the bits
+        Pr = np.array(g["values"][i])
+        scale = np.sqrt(np.outer(np.diag(Pr), np.diag(Pr)))
+        assert float(np.max(np.abs(Pr - Pn) / scale)) < 1e-12, i              # the covariance: to rounding
+    rc = list(K.cases_rows())
+    g = GOLD["rows"]
+    assert K.digest(rc) == g["inputs"]
+    for i, (P, x, idx, coef, nu, var, freeze) in enumerate(rc):
+        ph, s0 = KF._project(P, idx, coef, np.empty(P.shape[0]))
+        if g["values"][i] is not None:                 # a row over several states: the projection to rounding
+            ph_r, s0_r = np.array(g["values"][i][0]), g["values"][i][1]
+            np.testing.assert_allclose(ph, ph_r, rtol=1e-12, atol=1e-12)
+            assert abs(s0 - s0_r) <= 1e-12 * max(abs(s0_r), 1.0)
+            ph, s0 = ph_r, s0_r
+        x1 = x.copy()
+        P1 = KF._apply(x1, P, ph.copy(), s0 + var, nu, freeze, False)
+        assert P1 is not P
+        S = KF._sym(P1 + 1e-3 * np.triu(P1, 1), True)
+        want = (ph, s0, x1, P1, S) if g["values"][i] is None else (x1, P1, S)
+        assert K.digest(want) == g["out"][i], i
+    tc = list(K.cases_rts())
+    g = GOLD["rts"]
+    assert K.digest(tc) == g["inputs"]
+    for i, (x, P, dt, noise, wrap) in enumerate(tc):
+        m = K.ego_model(None, 17)
+        xp, Pp, Fm = m.predict(x, P, dt)
+        xs = xp + noise
+        if wrap:
+            xs[2] += 2 * np.pi
+        Ps = Pp - 0.1 * np.diag(np.diag(Pp))
+        xn, Pn = m.rts(Pp, Fm, P, x, xp, xs, Ps, wrap)
+        np.testing.assert_allclose(xn, g["values"][i][0], rtol=1e-9, atol=1e-9)
+        np.testing.assert_allclose(Pn, g["values"][i][1], rtol=1e-8, atol=1e-9)
+
+
 # ---- round, interpolation ----------------------------------------------------------------------------------
 @needs_native
 def test_round_is_builtin_round():
