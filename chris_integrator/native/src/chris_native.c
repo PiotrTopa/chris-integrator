@@ -124,26 +124,24 @@ static int put_float(Buf *b, double v)
             if (fabs(y - r) > y * 1e-15)
                 continue;
             if (r / POW10[n] == a && r >= 1.0) {
+                /* the digits of k = r, right to left, with the point n digits from the right */
                 uint64_t k = (uint64_t)r;
-                if (v < 0.0 && buf_ch(b, '-') < 0)
-                    return -1;
-                if (n == 0) {
-                    if (put_u64(b, k) < 0)
-                        return -1;
-                    return buf_put(b, ".0", 2);
+                char t[48];
+                int i = 48;
+                if (n == 0)
+                    t[--i] = '0';
+                for (int d = 0; d < n; d++) {
+                    t[--i] = (char)('0' + k % 10);
+                    k /= 10;
                 }
-                uint64_t p = 1;
-                for (int i = 0; i < n; i++)
-                    p *= 10;
-                if (put_u64(b, k / p) < 0 || buf_ch(b, '.') < 0)
-                    return -1;
-                char t[24];
-                uint64_t f = k % p;
-                for (int i = n - 1; i >= 0; i--) {
-                    t[i] = (char)('0' + f % 10);
-                    f /= 10;
-                }
-                return buf_put(b, t, (size_t)n);
+                t[--i] = '.';
+                do {
+                    t[--i] = (char)('0' + k % 10);
+                    k /= 10;
+                } while (k);
+                if (v < 0.0)
+                    t[--i] = '-';
+                return buf_put(b, t + i, (size_t)(48 - i));
             }
         }
     }
