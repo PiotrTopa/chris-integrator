@@ -289,7 +289,8 @@ def _check_monitors():
         t += rng.choice([0.05, 0.05, 0.0, 0.3])
         if i % 50 == 0:
             level = rng.choice([0.5, 6.0, 1.0])
-        d = float("nan") if i % 97 == 5 else _normal(rng) ** 2 * level
+        e = None if i % 97 == 5 else _normal(rng)
+        d = float("nan") if e is None else e * e * level           # (not e ** 2: libm's pow is not exact on musl)
         out.append((m.offer(t, d), m.value, m.high, m.peak, m.n))
         out.append((s.offer(t, level * (0.5 + rng.random())), s.fault, s.median, s.n, s.span))
         v = v if i % 7 < 3 else v + _normal(rng, 0.3 * level)
@@ -349,7 +350,7 @@ _CHECKS = (("view", _check_view), ("road line", _check_road_line), ("road geomet
            ("monitors", _check_monitors), ("filter pass", _check_pass))
 # what the development build gives (x86-64, glibc; held to the removed references by tests/test_native.py)
 EXPECT = {"view": "1d8746b3a5684186", "road line": "6ec3625f028f58ce", "road geometry": "4997564407c2f49f",
-          "lanes": "6ca8cd4c07318197", "filter rows": "87ce1e5c039ae00b", "monitors": "a698169328321f5d",
+          "lanes": "6ca8cd4c07318197", "filter rows": "87ce1e5c039ae00b", "monitors": "6423be55c77bc093",
           "filter pass": "7116b780dc1f1ba9",
           "filter": [7.723780535727707, 10.435565184078538, 26.99841329569997, 193.8061211825356, 189.01412870797915,
                      8.782660472555797, 168.72298218978383, 169.76519932373355, 23.100822279577056, 10.480539787057944,

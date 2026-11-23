@@ -443,7 +443,8 @@ def cases_nis():
             elif k < 0.15:
                 d2 = prev
             else:
-                d2 = normal(rng) ** 2 * rng.choice([1.0, 1.0, 4.0, 20.0])
+                e = normal(rng)
+                d2 = e * e * rng.choice([1.0, 1.0, 4.0, 20.0])         # (not e ** 2: libm's pow, not exact on musl)
             prev = d2
             offers.append((t, d2))
         yield cfg, offers, rng.randrange(len(offers) + 1)

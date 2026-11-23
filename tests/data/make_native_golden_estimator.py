@@ -4,6 +4,10 @@ on the tree that still held them (lane estimator-native, the commit that added t
 of how the entries were made. It does not run on a later tree: the Python versions are gone.
 
     CHRIS_EKF_PY=1 python3 tests/data/make_native_golden_estimator.py
+
+The `nis` entry was recorded again (from the same Python NisMonitor, at the commit that added this script) after
+its cases took e * e instead of e ** 2: `**` is libm's pow, whose last bit differs between C libraries (glibc
+and musl), so the inputs were not the same on the phone's platform.
 """
 import gzip
 import json
