@@ -5055,6 +5055,32 @@ static double r_half_depth(const double *e, double los, double *dda)
     return 0.5 * (e[0] * fabs(ca) + e[1] * fabs(sa));
 }
 
+/* the offset (*g0, *g1) from a rectangle's centre (e: length, width, heading) to its point nearest an observer at
+ * (o0, o1) from the centre, in the axes of the heading's frame. NOT the centre brought nearer along the line of
+ * sight by r_half_depth: that point lies off the rectangle, towards the observer, by up to the half width when the
+ * object is beside (a car parked 2.7 m to the side, its centre 2 m ahead: 0.75 m nearer the car's path than its
+ * side). An observer inside the rectangle (an extent wide open): along the line of sight by the half depth, as far
+ * as the observer at most. */
+static void r_near_offset(const double *e, double o0, double o1, double *g0, double *g1)
+{
+    double c = cos(e[2]), s = sin(e[2]), hl = 0.5 * pymax(e[0], 0.0), hw = 0.5 * pymax(e[1], 0.0);
+    double bx = c * o0 + s * o1, by = -s * o0 + c * o1;          /* the observer in the body frame */
+    if (fabs(bx) > hl || fabs(by) > hw) {
+        double qx = bx > hl ? hl : bx < -hl ? -hl : bx, qy = by > hw ? hw : by < -hw ? -hw : by;
+        *g0 = c * qx - s * qy;
+        *g1 = s * qx + c * qy;
+        return;
+    }
+    double rc = hypot(o0, o1);
+    if (rc > 1e-6) {
+        double hd = pymin(r_half_depth(e, atan2(-o1, -o0), NULL), rc);
+        *g0 = hd * o0 / rc;
+        *g1 = hd * o1 / rc;
+    } else {
+        *g0 = *g1 = 0.0;
+    }
+}
+
 /* sensor.h(x, pose, det): the predicted measurement z (m) and its Jacobian H (m x N); returns m. The state's place
  * is the object's CENTRE. A camera's box stands on the road at the object's near face and its height is that
  * face's: with the object's extent e (length, width, heading; NULL: a point) the ground angle, the box height, the
@@ -6682,18 +6708,16 @@ static PyObject *n_radar_frame(PyObject *self, PyObject *args)
         double dx = x[R_PX] - X, dy = x[R_PY] - Y;
         double pc0 = ch * dx + sh * dy, pc1 = -sh * dx + ch * dy;
         /* the state's place is the object's centre; the message's place (x_m, y_m, and where it will be) is its
-         * near face, as a camera's ground point always was: the centre brought nearer along the line of sight by
-         * half the object's depth. The centre goes out as `ctr`. */
+         * near face: the point of its rectangle nearest the car's origin (what is in the way, and what a lead's
+         * distance refers to). The centre goes out as `ctr`. */
         double ctr0 = pc0, ctr1 = pc1, near0 = 0.0, near1 = 0.0;
         {
-            double rc = hypot(dx, dy);
-            if (rc > 1e-6) {
-                double hd = pymin(r_half_depth(row + RO_E, atan2(dy, dx), NULL), rc);
-                near0 = -hd * pc0 / rc;
-                near1 = -hd * pc1 / rc;
-                pc0 += near0;
-                pc1 += near1;
-            }
+            double g0, g1;                               /* centre -> nearest point, ground axes */
+            r_near_offset(row + RO_E, -dx, -dy, &g0, &g1);
+            near0 = ch * g0 + sh * g1;
+            near1 = -sh * g0 + ch * g1;
+            pc0 += near0;
+            pc1 += near1;
         }
         double vc0 = ch * x[R_VX] + sh * x[R_VY], vc1 = -sh * x[R_VX] + ch * x[R_VY];
         double ac0 = ch * x[R_AX] + sh * x[R_AY], ac1 = -sh * x[R_AX] + ch * x[R_AY];

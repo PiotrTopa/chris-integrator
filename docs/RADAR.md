@@ -138,7 +138,14 @@ rectangle (section 4) at that centre:
 * a position sensor gives the centre.
 
 The message keeps `x_m`, `y_m` (and `predict`) as the near face, as they were (what is in the way is the face,
-not the centre: `on_path`, `in_path`, `ttc_s` use it); the centre goes out as `ctr`.
+not the centre: `on_path`, `in_path`, `ttc_s` use it); the centre goes out as `ctr`. The near face is the point of
+the rectangle nearest the car's origin (`r_near_offset`), the simulator's `ref_x`, `ref_y`. Until 2026-11-23 it was
+the centre brought nearer along the line of sight by half the depth (`r_half_depth`, the camera model's range): a
+point off the rectangle, towards the car, by up to the half width when the object is beside. A car parked 2.7 m to
+the side read 0.4 to 0.8 m nearer the path than its side as it was passed, and a long one beside the car was put at
+the origin itself (the half depth clamped to the range): the decision layer's `obstacle_ahead` warned on parked
+cars at "contact" (parked_street: near-face lateral error under 8 m 0.35 m median, inward). The decision layer
+draws the footprint from `ctr` less `x_m`, `y_m` (decide/futures.py `centre_offset`), not from the line of sight.
 
 **A floored hypothesis is re-seeded.** The motion hypotheses are weighed by how well each predicted a detection
 and none is ever ruled out (`mu_floor`). A hypothesis held at the floor used to keep its own old story: "it

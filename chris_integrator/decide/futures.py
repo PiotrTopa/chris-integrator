@@ -12,9 +12,11 @@ companion `radar_fut` message of the same `ts_mono_ns`:
     (`radar_fut`: the same top level, and "objects": [{"id", "fut", "lane", "intent"}])
     in process: chris_integrator.predict.Predictor.update(radar_msg, context) -> the same, arrays for lists
 
-An object's x, y are the radar's reference point of it (the nearest point of its footprint as the camera sees it,
+An object's x, y are the radar's reference point of it (the nearest point of its footprint to the car's origin,
 as `x_m`, `y_m`); its extent comes from `len`, `wid`, `hdg` (with their uncertainties) where the radar gives them,
-else from its class's prior size (CLASS_SIZE).
+else from its class's prior size (CLASS_SIZE). The footprint's centre is the radar's `ctr` where given (its offset
+from the reference point, `centre_offset`); else half the footprint's depth beyond the reference point along the
+line of sight.
 
 Degraded mode: an object without `fut` gets constant-velocity futures built from its `radar` fields (`cv_futures`:
 by default the radar's own two hypotheses, it stands with p_stationary and it drives on at its velocity with the
@@ -104,6 +106,18 @@ def extent(o):
         if sp >= max(2.0, 2.0 * sv):
             h = float(o["heading_rad"])
     return L, W, sL, sW, (h if h is not None else math.nan), (sh if sh is not None else math.nan), label, src
+
+
+def centre_offset(o):
+    """The radar's footprint centre (`ctr`) less its reference point (`x_m`, `y_m`, the footprint's nearest point),
+    car axes, or None where the radar does not give it. The futures carry the reference point; the footprint is
+    drawn this far from it (turning with the object), not reconstructed from the line of sight."""
+    c = o.get("ctr")
+    if not (isinstance(c, (list, tuple)) and len(c) == 2 and _fin(c[0]) and _fin(c[1])
+            and _fin(o.get("x_m")) and _fin(o.get("y_m"))):
+        return None
+    dx, dy = float(c[0]) - float(o["x_m"]), float(c[1]) - float(o["y_m"])
+    return (dx, dy) if math.hypot(dx, dy) <= 25.0 else None
 
 
 class FrameFutures:

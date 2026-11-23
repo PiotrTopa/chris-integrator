@@ -19,9 +19,12 @@
  * It is included by chris_native.c (one translation unit) and uses its buffer helpers. Frame: the car frame of the
  * output time held fixed on the ground (x forward, y left, m); the car starts at the origin, heading 0.
  *
- * decide_eval(t[N], ego[E, 1+3N], ohdr[M, 10], modes[K, 2+5N], cfg[NC], thr[S*2*4*3], out_pair[K*E, PF], out_obj[M, OF])
+ * decide_eval(t[N], ego[E, 1+3N], ohdr[M, 10 | 12], modes[K, 2+5N], cfg[NC], thr[S*2*4*3], out_pair[K*E, PF], out_obj[M, OF])
  *   ego rows      p, x[N], y[N], v[N]
- *   ohdr rows     first mode, number of modes, len, wid, sd_len, sd_wid, hdg (NaN: unknown), sd_hdg, threshold set, 0
+ *   ohdr rows     first mode, number of modes, len, wid, sd_len, sd_wid, hdg (NaN: unknown), sd_hdg, threshold set,
+ *                 has_ctr (0 | 1) [, ctr_dx, ctr_dy]: with has_ctr 1 (12 columns) the futures' reference point to the
+ *                 footprint's centre at the first time, car axes (the radar's `ctr` less its `x_m`, `y_m`); else
+ *                 the centre is taken half the footprint's depth further along the line of sight (cfg DC_REF)
  *   modes rows    p0 (unconditioned), p (conditioned), x[N], y[N], sx[N], sy[N], rxy[N] (correlation)
  *   thr           per set, per entry/exit, per level 1..4: tn_min, tm_max, mass_min
  *
@@ -37,7 +40,8 @@
 #define DK_MAXN 512              /* time samples of a future */
 #define DK_MAXSIM 2048           /* steps of a simulated horizon */
 #define DK_MAXS 4096             /* Monte Carlo samples */
-#define DK_OH 10
+#define DK_OH 10                 /* the object header's columns; 12 with the centre's offset */
+#define DK_OHC 12
 #define DK_PF 24
 #define DK_OF 18
 
@@ -815,8 +819,9 @@ static PyObject *n_decide_eval(PyObject *self, PyObject *args)
     int N = (int)vt.b.shape[0], E = (int)ve.b.shape[0], M = (int)vh.b.shape[0], K = (int)vm.b.shape[0];
     const double *t = DATA(vt), *EG = DATA(ve), *OH = DATA(vh), *MD = DATA(vm), *cfg = DATA(vc), *thr = DATA(vthr);
     double *PO = DATA(vp), *OO = DATA(vo);
+    const int ohw = (int)vh.b.shape[1];
     if (N < 2 || N > DK_MAXN || E < 1 || vc.b.shape[0] < DC_NC || ve.b.shape[1] != 1 + 3 * N ||
-        vh.b.shape[1] != DK_OH || vm.b.shape[1] != 2 + 5 * N || vp.b.shape[0] != (Py_ssize_t)K * E ||
+        (vh.b.shape[1] != DK_OH && vh.b.shape[1] != DK_OHC) || vm.b.shape[1] != 2 + 5 * N || vp.b.shape[0] != (Py_ssize_t)K * E ||
         vp.b.shape[1] != DK_PF || vo.b.shape[0] != M || vo.b.shape[1] != DK_OF) {
         PyErr_SetString(PyExc_ValueError, "decide_eval: arrays of the documented shapes are needed");
         goto done;
@@ -897,7 +902,7 @@ static PyObject *n_decide_eval(PyObject *self, PyObject *args)
     /* the object modes */
     int *mode_obj = ibuf, *top = ibuf + K;
     for (int m = 0; m < M; m++) {
-        const double *hd = OH + (size_t)m * DK_OH;
+        const double *hd = OH + (size_t)m * ohw;
         int k0 = (int)hd[0], nk = (int)hd[1];
         top[m] = -1;
         double bestp = -1.0;
@@ -933,7 +938,13 @@ static PyObject *n_decide_eval(PyObject *self, PyObject *args)
                            : (isfinite(hd[6]) ? hd[6] : hprev);
                 hprev = h;
                 double c = cos(h), s = sin(h);
-                if (i == 0 && cfg[DC_REF] > 0.5) {
+                if (i == 0 && cfg[DC_REF] > 0.5 && ohw == DK_OHC && hd[9] > 0.5 && isfinite(hd[10]) &&
+                    isfinite(hd[11])) {
+                    /* the radar said where the centre is: its offset from the reference point, held in the body
+                     * frame (it turns with the object) */
+                    offb_x = hd[10] * c + hd[11] * s;
+                    offb_y = -hd[10] * s + hd[11] * c;
+                } else if (i == 0 && cfg[DC_REF] > 0.5) {
                     /* the radar's point is the nearest of the footprint as the camera sees it: the centre lies
                      * half the footprint's extent further along the line of sight */
                     double lx = x - eg[0].x[0], ly = y - eg[0].y[0], ll = sqrt(lx * lx + ly * ly);
@@ -988,7 +999,7 @@ static PyObject *n_decide_eval(PyObject *self, PyObject *args)
     int ndirs = (int)cfg[DC_NDIRS];
     double tmax = (nh - 1) * dt;
     for (int m = 0; m < M; m++) {
-        const double *hd = OH + (size_t)m * DK_OH;
+        const double *hd = OH + (size_t)m * ohw;
         int k0 = (int)hd[0], nk = (int)hd[1], set = (int)hd[8];
         if (set < 0 || set >= nsets)
             set = 0;

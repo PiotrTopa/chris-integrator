@@ -163,7 +163,7 @@ class ThreatModel:
             ego_rows[j, 1 + 2 * N:] = v
         M = len(F.objects)
         K = sum(len(m) for _, m, _ in F.objects)
-        ohdr = np.zeros((M, 10))
+        ohdr = np.zeros((M, 12))
         modes = np.empty((K, 2 + 5 * N))
         k = 0
         ext = []
@@ -172,7 +172,10 @@ class ThreatModel:
             if not math.isfinite(h) and o.get("id") in F.road_hdg:
                 h = F.road_hdg[o.get("id")]
             ext.append((L, W, label, esrc))
-            ohdr[i] = (k, len(ms), L, W, sL, sW, h, sh, FU.KIND_SET[FU.kind_of(label)], 0.0)
+            ohdr[i, :9] = (k, len(ms), L, W, sL, sW, h, sh, FU.KIND_SET[FU.kind_of(label)])
+            off = FU.centre_offset(o)
+            if off is not None:          # the radar says where the footprint's centre is (decide.c: has_ctr)
+                ohdr[i, 9:] = (1.0, off[0], off[1])
             for (_, p0, p, x, y, sx, sy, r) in ms:
                 row = modes[k]
                 row[0], row[1] = p0, p
