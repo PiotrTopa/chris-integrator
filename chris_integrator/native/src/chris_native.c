@@ -2369,17 +2369,15 @@ static PyType_Spec trend_spec = {"chris_integrator.native._chris_native.Trend", 
 /* ---- the filter pass ------------------------------------------------------------------------------------ */
 enum {
     A_t, A_rows, A_xp, A_Pp, A_F, A_x, A_P, A_anchor, A_usedq,
-    A_rejected, A_used, A_group, A_q, A_h, A_z, A_wrap, A_var, A_nis, A_counted, A_cb, A_robust, A_weight,
-    A_freeze, A_src,
-    A_entries, A_disabled, A_gate, A_anchor_s, A_quarantine, A_model, A_predict, A_nis_new, A_nis_note,
+    A_rejected, A_used, A_group, A_q, A_h, A_z, A_wrap, A_var, A_counted, A_cb, A_robust, A_freeze, A_src,
+    A_entries, A_disabled, A_gate, A_anchor_s, A_quarantine, A_model, A_predict, A_nis, A_nis_new, A_nis_note,
     A_trends, A_trend_new, A_trend_note, A_trend_skip,
     A_N
 };
 static const char *const ANAMES[A_N] = {
     "t", "rows", "xp", "Pp", "F", "x", "P", "anchor", "usedq",
-    "rejected", "used", "group", "q", "h", "z", "wrap", "var", "nis", "counted", "cb", "robust", "weight",
-    "freeze", "src",
-    "entries", "disabled", "gate", "anchor_s", "quarantine", "model", "predict", "nis_new", "nis_note",
+    "rejected", "used", "group", "q", "h", "z", "wrap", "var", "counted", "cb", "robust", "freeze", "src",
+    "entries", "disabled", "gate", "anchor_s", "quarantine", "model", "predict", "nis", "nis_new", "nis_note",
     "trends", "trend_new", "trend_note", "trend_skip"};
 static PyObject *AN[A_N];
 
@@ -2422,16 +2420,6 @@ static int attr_true(PyObject *o, int a)
 static int set_attr(PyObject *o, int a, PyObject *v)
 {
     return PyObject_SetAttr(o, AN[a], v);
-}
-
-static int set_attr_double(PyObject *o, int a, double d)
-{
-    PyObject *v = PyFloat_FromDouble(d);
-    if (v == NULL)
-        return -1;
-    int r = PyObject_SetAttr(o, AN[a], v);
-    Py_DECREF(v);
-    return r;
 }
 
 /* the three items of what h(x) returned (an iterable of three, as `pred, idx, coef = r.h(x)` takes it) */
@@ -2593,7 +2581,7 @@ static int take_copy(PyObject **o, View *v, Py_ssize_t a, Py_ssize_t b)
 /* ekf_run(filter, i, t, x, P, anchor, par | None): Filter._run from entry i on, starting from the state (t, x, P)
  * and the anchors of the entry before i. par: the native model's parameter block (EgoModel), or None (the
  * model's own predict is called). Every entry gets xp, Pp, F, x, P, anchor, usedq; every row used, rejected,
- * counted, nis, weight, as the Python pass gave them. */
+ * counted. */
 static PyObject *n_ekf_run(PyObject *self, PyObject *args)
 {
     PyObject *flt, *x0, *P0, *anchor, *opar;
@@ -2813,8 +2801,6 @@ static PyObject *n_ekf_run(PyObject *self, PyObject *args)
             if (wr)
                 nu = wrap_pi(nu);
             double d2 = nu * nu / (s0 + var);
-            if (set_attr_double(r, A_nis, d2) < 0)
-                goto row_done;
             int counted = attr_true(r, A_counted);
             if (counted < 0)
                 goto row_done;
@@ -2868,8 +2854,6 @@ static PyObject *n_ekf_run(PyObject *self, PyObject *args)
                 double w = (T_NU + 1.0) / (T_NU + d2);
                 if (w < 1.0)
                     var = (s0 + var) / w - s0;
-                if (set_attr_double(r, A_weight, (1.0 < w) ? 1.0 : w) < 0)
-                    goto row_done;
             } else if (PyDict_SetItem(anchor, q, et_o) < 0)
                 goto row_done;
             double s = s0 + var;

@@ -12,28 +12,22 @@ alone is followed, never locked out). No knowledge of what the state means lives
 """
 import bisect
 import math
-import os
 
 import numpy as np
 
 from ..native import core as _C
 
-T_NU = 4.0                      # degrees of freedom of the robust rows' Student-t (also chris_native.c T_NU)
-# (lane estimator-native, temporary: CHRIS_EKF_PY=1 runs the Python pass and monitors, for the equivalence runs)
-PY_PASS = os.environ.get("CHRIS_EKF_PY") == "1"
+# (the robust rows' Student-t has 4 degrees of freedom: chris_native.c T_NU)
 
 
 class Row:
-    __slots__ = ("q", "z", "var", "h", "src", "group", "robust", "wrap", "used", "rejected", "counted",
-                 "nis", "weight", "cb", "freeze")
+    __slots__ = ("q", "z", "var", "h", "src", "group", "robust", "wrap", "used", "rejected", "counted", "cb", "freeze")
 
     def __init__(self, q, z, var, h, src, group, robust=False, wrap=False, cb=None, freeze=None):
         self.q, self.z, self.var, self.h, self.src, self.group = q, z, var, h, src, group
         self.robust, self.wrap, self.cb = robust, wrap, cb
         self.freeze = freeze               # state indices this row must not correct (Schmidt "consider" states)
         self.used = self.rejected = self.counted = False
-        self.nis = None
-        self.weight = 1.0
 
 
 class Entry:
@@ -51,45 +45,6 @@ def wrap_pi(a):
     return (a + math.pi) % (2.0 * math.pi) - math.pi
 
 
-# ---- the arithmetic of one scalar row (the native core: chris_native.c `ekf_project`, `ekf_update`, `ekf_sym`) --
-# The steps work in place on arrays the filter pass owns (`own`: this pass made the array, nothing else holds it).
-# A row model may return lists, and an array may be a view: those are made contiguous arrays first.
-def _f64(a):
-    return np.ascontiguousarray(a, dtype=float)
-
-
-def _project(P, idx, coef, buf=None):
-    """(ph, s0): P h^T and h P h^T of a sparse row h (`buf`: a work array of the pass for ph)."""
-    ph = np.empty(P.shape[0]) if buf is None else buf
-    try:
-        return ph, _C.ekf_project(P, idx, coef, ph)
-    except (TypeError, ValueError, BufferError):     # lists, a view: made contiguous arrays (a wrong shape fails again)
-        return ph, _C.ekf_project(_f64(P), np.ascontiguousarray(idx, dtype=np.intp), _f64(coef), ph)
-
-
-def _apply(x, P, ph, s, nu, freeze, own):
-    """The row's correction: x in place (the caller's own copy), P in place when `own`; returns P. Without
-    `freeze`: k = ph / s, x += k nu, P -= k ph^T; with it (Schmidt-Kalman: those states are not corrected by this
-    row, the gain is no longer optimal) the Joseph form, symmetrised."""
-    if not own:
-        P = np.array(P, dtype=float, order="C")
-    try:
-        _C.ekf_update(x, P, ph, s, nu, freeze)
-    except (TypeError, ValueError, BufferError):      # freeze as a list or a view: made an index array
-        if freeze is None:
-            raise
-        _C.ekf_update(x, P, ph, s, nu, np.ascontiguousarray(freeze, dtype=np.intp))
-    return P
-
-
-def _sym(P, own):
-    """0.5 (P + P^T), in place when `own`."""
-    if not own:
-        P = np.array(P, dtype=float, order="C")
-    _C.ekf_sym(P)
-    return P
-
-
 class Filter:
     def __init__(self, model, x0, P0, horizon_s=10.0, gate_chi2=23.9, lookahead_s=0.6, anchor_s=0.5,
                  wrap_idx=()):
@@ -103,9 +58,7 @@ class Filter:
         self.disabled = frozenset()
         self.quarantine = frozenset()      # (group, q): rows still evaluated (their innovations are watched), not applied
         self.rejected = {}                 # src -> rows not applied (hard gate)
-        self.stat = None                   # callable(row, d2, t): first-pass normalised innovation of a row
-        self.stat_nu = None                # callable(row, nu, s, t): ... its signed innovation and variance
-        # the first-pass monitors of the native pass (`watch`)
+        # the first-pass monitors of every row (`watch`)
         self.nis = self.trends = None
         self.nis_new = self.nis_note = self.trend_new = self.trend_note = None
         self.trend_skip = ""
@@ -206,8 +159,6 @@ class Filter:
         from the one before, its rows applied in order (a robust row beyond the gate while an exact row of its
         quantity anchors it is rejected; a row of a disabled group or a quarantined class is not applied), every
         row's first innovation shown to the monitors (`watch`) and to its own callback."""
-        if PY_PASS:
-            return self._run_py(i)
         if self.base is None:
             return
         if i == 0:
@@ -219,78 +170,6 @@ class Filter:
             anchor = dict(e.anchor)
         par = getattr(self.model, "native_par", None)
         _C.ekf_run(self, i, t, x, P, anchor, None if par is None else par())
-
-    def _run_py(self, i):
-        if self.base is None:
-            return
-        if i == 0:
-            t, x, P = self.base
-            anchor = {}
-        else:
-            e = self.entries[i - 1]
-            t, x, P = e.t, e.x, e.P
-            anchor = dict(e.anchor)
-        predict = self.model.predict
-        disabled, gate, stat = self.disabled, self.gate, self.stat
-        buf = np.empty(x.shape[0])         # P h^T of the row in hand: used up before the next row is projected
-        for e in self.entries[i:]:
-            dt = e.t - t
-            if dt > 0.0:
-                x, P, F = predict(x, P, dt)
-            else:
-                F = None
-            e.xp, e.Pp, e.F = x, P, F
-            own = pown = dirty = False     # x / P are arrays of this entry's own (not the predicted ones it keeps)
-            for r in e.rows:
-                was = r.rejected
-                r.used = r.rejected = False
-                if r.group in disabled or (r.group, r.q) in disabled:
-                    continue
-                pred, idx, coef = r.h(x)
-                ph, s0 = _project(P, idx, coef, buf)
-                nu = r.z - pred
-                if r.wrap:
-                    nu = wrap_pi(nu)
-                var = r.var
-                d2 = nu * nu / (s0 + var)
-                r.nis = d2
-                if not r.counted:
-                    r.counted = True
-                    if stat is not None:
-                        stat(r, d2, e.t)
-                    if self.stat_nu is not None:
-                        self.stat_nu(r, nu, s0 + var, e.t)
-                    if r.cb is not None:
-                        r.cb(nu, s0, e.t)
-                if self.quarantine and (r.group, r.q) in self.quarantine:
-                    continue
-                if r.robust:
-                    if d2 > gate and e.t - anchor.get(r.q, -1e18) <= self.anchor_s:
-                        r.rejected = True
-                        if not was:
-                            self.rejected[r.src] = self.rejected.get(r.src, 0) + 1
-                        continue
-                    # Student-t weight on the innovation: the whole innovation variance is inflated, so the
-                    # state moves by weight x the Kalman step however small the row's own noise is
-                    w = (T_NU + 1.0) / (T_NU + d2)
-                    if w < 1.0:
-                        var = (s0 + var) / w - s0
-                    r.weight = min(w, 1.0)
-                else:
-                    anchor[r.q] = e.t
-                s = s0 + var
-                if not own:
-                    x, own = x.copy(), True                # (the predicted state is kept in the entry)
-                P = _apply(x, P, ph, s, nu, r.freeze, pown)
-                pown = True
-                r.used = True
-                dirty = True
-            if dirty:
-                P = _sym(P, pown)
-                e.usedq = tuple([(r.q, r.src) for r in e.rows if r.used])
-            else:
-                e.usedq = ()
-            e.x, e.P, t, e.anchor = x, P, e.t, dict(anchor)
 
     # ---- output --------------------------------------------------------------------------------------
     def latest(self):

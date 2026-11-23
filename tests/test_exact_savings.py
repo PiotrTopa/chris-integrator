@@ -90,7 +90,7 @@ def test_innovation_monitor_median_is_the_sorted_median():
             ref.append((t, d))
             while ref and ref[0][0] < t - 8.0:
                 ref.popleft()
-            assert (m.n if hasattr(m, "n") else len(m.q)) == len(ref)
+            assert m.n == len(ref)
             if len(ref) >= 8 and (t - t_eval >= 0.2 or t < t_eval):
                 t_eval = t
                 a, b = m.value, statistics.median(d for _, d in ref) / m.MED

@@ -23,7 +23,6 @@ import statistics
 
 from ..native import core as _C
 from ..native import round                  # builtins.round (its results; the native core)
-from .ekf import PY_PASS
 
 DEFAULT_CFG = dict(
     stuck_s=1.5, stuck_n=10,          # identical non-zero values for this long and this many samples: stuck
@@ -173,50 +172,13 @@ class Clock:
         self.shift = 0.0
 
 
-class _TrendPy:
-    """A signed, normalised innovation averaged over time (exponential window): |mean| x sqrt(effective n) is
-    about N(0, 1) for a consistent row class, and grows without bound for a bias the filter's states do not
-    explain (a slow drift, a calibration that moved)."""
-
-    def __init__(self, cfg):
-        self.c = cfg
-        self.m = 0.0
-        self.w = 0.0
-        self.t = None
-        self.n = 0
-        self.high = False
-        self.score = 0.0
-
-    def offer(self, t, z):
-        dt = 0.0 if self.t is None else max(t - self.t, 0.0)
-        self.t = t
-        a = math.exp(-dt / self.c["trend_tau_s"])
-        z = max(-4.0, min(4.0, z))                          # a wild sample is not a trend
-        self.m = a * self.m + z
-        self.w = a * self.w + 1.0
-        self.n += 1
-        # innovations of one class are correlated over many samples: count one in `trend_corr` as independent
-        self.score = self.m / math.sqrt(max(self.w * self.c["trend_corr"], 1.0))
-        if self.n >= self.c["trend_min_n"]:
-            self.high = abs(self.score) > (self.c["trend_clear"] if self.high else self.c["trend_fire"])
-        return self.high
-
-    def clear(self):
-        self.m = self.w = 0.0
-        self.t = None
-        self.n = 0
-        self.high = False
-
-
-def _trend_native(cfg):
+def Trend(cfg):
     """A signed, normalised innovation averaged over time (exponential window): |mean| x sqrt(effective n) is
     about N(0, 1) for a consistent row class, and grows without bound for a bias the filter's states do not
     explain (a slow drift, a calibration that moved). The native core's (chris_native.c `Trend`); the filter
     pass offers every row's first innovation to it directly."""
     return _C.Trend(cfg["trend_tau_s"], cfg["trend_fire"], cfg["trend_clear"], cfg["trend_min_n"], cfg["trend_corr"])
 
-
-Trend = _TrendPy if PY_PASS else _trend_native
 
 
 def describe_pair(samples):
@@ -301,20 +263,6 @@ class Diagnostics:
                           "stamps %.2f s %s than before against the other sources (stamp offset or latency jump)" % (abs(shift), "later" if shift > 0 else "earlier"))
         elif fk in self.findings and t - self.findings[fk].last > self.c["clear_s"]:
             del self.findings[fk]
-
-    def innovation(self, group, quantity, t, nu, s):
-        """First-pass innovation of a fused row: nu and its variance."""
-        if s <= 0.0:
-            return
-        tr = self.trends.get((group, quantity))
-        if tr is None:
-            tr = self.trends[(group, quantity)] = Trend(self.c)
-        was = tr.high
-        if tr.offer(t, nu / math.sqrt(s)):
-            self._set(group, quantity, "trend", "warn", t,
-                      "innovations keep one sign (%+.1f sigma of the mean): a bias or drift the model does not explain" % tr.score)
-        elif was:
-            self.findings.pop((group, quantity, "trend"), None)
 
     def trend_new(self, key):
         """The trend of a row class (group, quantity), made and entered (the filter pass asks for it)."""

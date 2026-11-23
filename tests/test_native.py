@@ -408,16 +408,17 @@ def test_golden_filter():
     g = GOLD["rows"]
     assert K.digest(rc) == g["inputs"]
     for i, (P, x, idx, coef, nu, var, freeze) in enumerate(rc):
-        ph, s0 = KF._project(P, idx, coef, np.empty(P.shape[0]))
+        ph = np.empty(P.shape[0])
+        s0 = C.ekf_project(P, idx, coef, ph)
         if g["values"][i] is not None:                 # a row over several states: the projection to rounding
             ph_r, s0_r = np.array(g["values"][i][0]), g["values"][i][1]
             np.testing.assert_allclose(ph, ph_r, rtol=1e-12, atol=1e-12)
             assert abs(s0 - s0_r) <= 1e-12 * max(abs(s0_r), 1.0)
             ph, s0 = ph_r, s0_r
-        x1 = x.copy()
-        P1 = KF._apply(x1, P, ph.copy(), s0 + var, nu, freeze, False)
-        assert P1 is not P
-        S = KF._sym(P1 + 1e-3 * np.triu(P1, 1), True)
+        x1, P1 = x.copy(), P.copy()
+        C.ekf_update(x1, P1, ph.copy(), s0 + var, nu, freeze)
+        S = P1 + 1e-3 * np.triu(P1, 1)
+        C.ekf_sym(S)
         want = (ph, s0, x1, P1, S) if g["values"][i] is None else (x1, P1, S)
         assert K.digest(want) == g["out"][i], i
     tc = list(K.cases_rts())
@@ -462,7 +463,7 @@ def test_golden_filter_pass():
     g = GOLD["filter_pass"]
     assert K.digest(cases) == g["inputs"]
     for i, (ego, ops) in enumerate(cases):
-        res = K.filter_pass(ego, ops, KF.Filter, KF.Row, MO.NisMonitor, FD.Trend, native=True)
+        res = K.filter_pass(ego, ops, KF.Filter, KF.Row, MO.NisMonitor, FD.Trend)
         exact, values = K.filter_pass_split(ego, res)
         assert K.digest(exact) == g["out"][i], i
         if values is not None:
@@ -508,26 +509,26 @@ def test_round_is_builtin_round():
 
 
 # ---- the estimator's filter: what the row and smoother steps are given ------------------------------------------
-def test_filter_steps_take_lists_and_views():
-    """A row model may return lists, and an array may be a view: the steps make contiguous arrays of them and give
-    what they give for those; an index beyond the state is an error."""
+def test_filter_pass_takes_lists_and_views():
+    """A row model may return lists or views, a state may be a view and a freeze a list: the pass makes contiguous
+    arrays of them and gives what it gives for those; an index beyond the state is an error."""
     from chris_integrator.core import ekf as KF
     rng = random.Random(21)
-    n = 27
-    P = K._cov(rng, n)
-    ph, s0 = KF._project(P, [3], [1.0])
-    assert np.array_equal(ph, P[:, 3]) and s0 == P[3, 3]
-    V = P[::-1]
-    ph, s0 = KF._project(V, np.array([3], dtype=np.intp), np.array([1.0]))
-    assert np.array_equal(ph, V[:, 3])
+    P = K._cov(rng, 3)
+
+    def run(h, freeze, view):
+        f = KF.Filter(K.ArithModel(), np.zeros(3), P[::-1][::-1] if view else P.copy(), horizon_s=1e9)
+        for k in range(5):
+            f.insert(0.1 * k, KF.Row("s", 1.0 + k, 0.5, h, "s", "g", freeze=freeze))
+        return f.latest()
+    idx, c = np.array([0, 2], dtype=np.intp), np.array([1.0, 0.5, 9.0])
+    a = run(lambda x: (x[0] + 0.5 * x[2], idx, c[:2]), np.array([1], dtype=np.intp), False)
+    b = run(lambda x: (float(x[0] + 0.5 * x[2]), [0, 2], [1.0, 0.5]), [1], True)
+    c2 = run(lambda x: (x[0] + 0.5 * x[2], np.array([0, 1, 2], dtype=np.intp)[::2], c[::1][:2]), (1,), True)
+    for u in (b, c2):
+        assert u[0] == a[0] and np.array_equal(u[1], a[1]) and np.array_equal(u[2], a[2])
     with pytest.raises(IndexError):
-        KF._project(P, np.array([99], dtype=np.intp), np.array([1.0]))
-    x = np.arange(n, dtype=float)
-    P1 = KF._apply(x, V, ph, s0 + 1.0, 0.5, [1, 2], False)
-    x2 = np.arange(n, dtype=float)
-    P2 = KF._apply(x2, np.ascontiguousarray(V), ph, s0 + 1.0, 0.5, np.array([1, 2], dtype=np.intp), False)
-    assert np.array_equal(x, x2) and np.array_equal(P1, P2)
-    assert np.array_equal(KF._sym(V, False), 0.5 * (V + V.T))
+        run(lambda x: (0.0, [7], [1.0]), None, False)
 
 
 def test_smoother_step_singular_and_wrapped():

@@ -389,7 +389,7 @@ def cases_predict():
 
 
 def cases_rows():
-    """(P, x, idx, coef, nu, var, freeze) of one scalar row (core/ekf.py `_project`, `_apply`, `_sym`). The first
+    """(P, x, idx, coef, nu, var, freeze) of one scalar row (ekf_project, ekf_update, ekf_sym). The first
     1500 rows read one state (the native result has the reference's bits), the rest several (to rounding)."""
     rng = random.Random(20)
     n = 27
@@ -525,11 +525,10 @@ def cases_filter_pass():
         yield ego, ops
 
 
-def filter_pass(ego, ops, Filter, Row, NisMonitor, Trend, native):
-    """Runs a script of cases_filter_pass through a Filter with the integrator's monitor wiring (`native`: the
-    filter's `watch`; else the reference's per-row callbacks, mirrored), and returns what it observed: the hooks'
-    log, the monitors after every flush, the entries' states, the rows' flags."""
-    import math
+def filter_pass(ego, ops, Filter, Row, NisMonitor, Trend):
+    """Runs a script of cases_filter_pass through a Filter with the integrator's monitor wiring (`watch`), and
+    returns what it observed: the hooks' log, the monitors after every flush, the entries' states, the rows'
+    flags. (The Python pass that the golden data comes from had the same wiring as per-row callbacks.)"""
     if ego:
         from chris_integrator.core import ego as E
         model = ego_model(None, 7)
@@ -558,25 +557,7 @@ def filter_pass(ego, ops, Filter, Row, NisMonitor, Trend, native):
     def trend_note(key, tr, t):
         log.append(("trend", key, t, bool(tr.high), float(tr.score)))
 
-    if native:
-        f.watch(nis, nis_new, nis_note, trends, trend_new, trend_note, "standstill")
-    else:
-        def stat(row, d2, t):
-            key = (row.group, row.q)
-            m = nis.get(key) or nis_new(key)
-            ch = m.offer(t, d2)
-            if ch or m.high:
-                nis_note(key, m, t, ch)
-
-        def stat_nu(row, nu, s, t):
-            if row.q.startswith("standstill") or s <= 0.0:
-                return
-            key = (row.group, row.q)
-            tr = trends.get(key) or trend_new(key)
-            was = tr.high
-            if tr.offer(t, nu / math.sqrt(s)) or was:
-                trend_note(key, tr, t)
-        f.stat, f.stat_nu = stat, stat_nu
+    f.watch(nis, nis_new, nis_note, trends, trend_new, trend_note, "standstill")
     rng = random.Random(len(ops))
     rows = []
     for op in ops:
@@ -617,7 +598,7 @@ def nis_run(NisMonitor, cfg, offers, reset_at):
         if i == reset_at:
             m.reset_data()
         ch = m.offer(t, d2)
-        out.append((ch, m.value, m.high, m.peak, m.n if hasattr(m, "n") else len(m.q)))
+        out.append((ch, m.value, m.high, m.peak, m.n))
     return out
 
 

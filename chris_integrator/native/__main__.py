@@ -243,16 +243,19 @@ def _model():
 
 
 def _check_rows():
-    from ..core import ekf as K
     rng = random.Random(7)
     out = []
     for i in range(100):
         P = _rng_cov(rng, 27)
         x = np.array([_normal(rng) for _ in range(27)])
-        ph, s0 = K._project(P, np.array([rng.randrange(27)], dtype=np.intp), np.array([rng.uniform(-3, 3)]))
+        ph = np.empty(27)
+        s0 = _n.ekf_project(P, np.array([rng.randrange(27)], dtype=np.intp), np.array([rng.uniform(-3, 3)]), ph)
         freeze = None if i % 3 else np.array(sorted(set(rng.randrange(27) for _ in range(5))), dtype=np.intp)
-        P1 = K._apply(x, P, ph, s0 + 0.1, _normal(rng), freeze, False)
-        out.extend([ph, s0, x, P1, K._sym(P1 + 1e-3 * np.triu(P1, 1), True)])
+        P1 = P.copy()
+        _n.ekf_update(x, P1, ph, s0 + 0.1, _normal(rng), freeze)
+        S = P1 + 1e-3 * np.triu(P1, 1)
+        _n.ekf_sym(S)
+        out.extend([ph, s0, x, P1, S])
     return out
 
 
