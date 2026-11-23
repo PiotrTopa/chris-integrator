@@ -7,8 +7,8 @@ The module is part of the package: it is required, and every function in it exis
 pure-Python implementation of what is native, and no switch between two.
 
     python -m chris_integrator.native      the module in use, and its self-test on this machine
-    GET /v2/health  ->  "native": {"active": true, "implementation": "native", "parts": [...], "version": 6, "module": "..."}
-    the daemon's first log lines: "native core version 6 (_chris_native.abi3.so; json, round, interp, ekf, lanes, radar)"
+    GET /v2/health  ->  "native": {"active": true, "implementation": "native", "parts": [...], "version": 7, "module": "..."}
+    the daemon's first log lines: "native core version 7 (_chris_native.abi3.so; json, round, interp, ekf, lanes, radar)"
 
 A package without the module (or with one of another version) does not import: the error says that the native
 core is not built, does not load, or is of the wrong version, and how to build it (below).
@@ -46,6 +46,8 @@ core is not built, does not load, or is of the wrong version, and how to build i
 | `ekf` | `ekf_project`, `ekf_update`, `ekf_sym` (core/ekf) | one scalar row of the filter | golden: the bits for rows of one state index (most rows); the projection to rounding for rows over several states |
 | `ekf` | `ekf_predict` (core/ego) | the process model | golden: state and transition to the last bit (sin, cos, exp of the C library), covariance to rounding |
 | `ekf` | `ekf_rts` (core/ego) | one smoother step | golden: to rounding |
+| `ekf` | `ekf_run` (core/ekf `Filter._run`) | the filter's pass over its queued entries (re-runs after late rows included): prediction, every row's projection, gate, Student-t weight and correction, the entry's symmetrisation; each row's first innovation to its class's window and trend; Python only for the rows' models h(x), a row's callback, the integrator's hooks when a verdict changes or holds | golden: every bit over an arithmetic model; over the estimator's model the decisions exactly, the states to rounding (sin, cos, exp) |
+| `ekf` | `NisWindow` (core/monitors `NisMonitor` subclasses it), `Trend` (core/fdi) | a row class's innovation window (median from an ordered copy; statistics.median while a NaN is in it) and its signed trend | golden: the window every bit; the trend's verdicts exactly, its sums to rounding (exp) |
 | `radar` | `radar_scan` (one scan's association: p_detect, coverage, the map's density, gate, likelihoods of the hypotheses, the box feature, the pairings' probabilities by loopy belief propagation, the assignment), `radar_update` (every pair of a scan: hypotheses, free estimate, NIS, model probabilities, existence increment, combination), `radar_common`, `radar_check`, `radar_register` (radar/tracker) | the tracker's arithmetic for a scan | golden: pairs and assignment the same; numbers to rounding (below) |
 | `radar` | `radar_advance`, `radar_peek`, `radar_peek_pos`, `radar_life`, `radar_merge`, `radar_combine_rows` (radar/tracker, on the rows of the tracker's state array) | the motion model and the objects' upkeep | golden: to rounding |
 | `radar` | `radar_frame` (radar/box) | the message's objects: their numbers, flags with their hysteresis, the dicts | golden: to rounding (printed digits the same but for a last digit now and then); digests of three drives' messages (x86-64) |

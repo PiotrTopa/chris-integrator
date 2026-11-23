@@ -17,7 +17,7 @@ import functools
 import json
 import os
 
-VERSION = 6                    # of the compiled module's functions: the package needs this one
+VERSION = 7                    # of the compiled module's functions: the package needs this one
 PARTS = ("json", "round", "interp", "ekf", "lanes", "radar")
 _HOW = ("build it: `sh native/build.sh` in the source tree (this machine: a C compiler and the Python headers), "
         "`sh native/cross-build.sh` for another platform (docs/NATIVE.md), or `pip install .`")
