@@ -41,11 +41,14 @@ class Actor:
     (parked, oncoming, crossing, adjacent, pedestrian, crossing_ped, stopped_in_lane, slow_lead, lead, overtaken)."""
 
     def __init__(self, aid, kind, role, s0, speed=((0, 0.0),), lateral=((0, 0.0),), yaw_rel=0.0, t_on=0.0, t_off=1e9,
-                 dims=None):
+                 dims=None, group=None, group_kind=None, group_t=(-1e9, 1e9)):
         self.id, self.kind, self.role, self.s0 = aid, kind, role, float(s0)
         self.speed, self.lateral, self.yaw_rel = list(speed), list(lateral), float(yaw_rel)
         self.t_on, self.t_off = float(t_on), float(t_off)
         self.L, self.W, self.H = dims or DIMS[kind]
+        # truth group membership (a parked row, a queue, a platoon): its id and kind while (s from the start)
+        # group_t[0] <= t < group_t[1]
+        self.group, self.group_kind, self.group_t = group, group_kind, (float(group_t[0]), float(group_t[1]))
 
 
 def _plan(plan, t):
@@ -123,7 +126,8 @@ class ScenarioWorld(World):
         """Truth per existing actor ahead of or near the car: [{id, kind, role, x, y (centre, left), heading
         (car frame, left positive), L, W, H, ref_x, ref_y (nearest footprint point), range, vx, vy (over the ground,
         car axes), speed, moving (bool), stationary_label ("in_path" | "parked" | None), lane_offset (m from the
-        ego's lane centre), dz (ground height above the ego's road plane, m)}]."""
+        ego's lane centre), dz (ground height above the ego's road plane, m), len, wid, yaw (the footprint: = L, W,
+        heading), group, group_kind (truth group membership at t, or None)}]."""
         tr = self.truth_at(t)
         i = self._i(t)
         rel = t - self.t0
@@ -161,7 +165,9 @@ class ScenarioWorld(World):
             out.append({"id": a.id, "kind": a.kind, "role": a.role, "x": x, "y": y, "heading": h, "L": a.L, "W": a.W,
                         "H": a.H, "ref_x": rx, "ref_y": ry, "range": math.hypot(rx, ry), "vx": vx, "vy": vy,
                         "speed": float(SP[i]), "moving": moving, "stationary_label": lab, "lane_offset": lane_off,
-                        "dz": dz})
+                        "dz": dz, "len": a.L, "wid": a.W, "yaw": h,
+                        "group": a.group if a.group is not None and a.group_t[0] <= rel < a.group_t[1] else None,
+                        "group_kind": a.group_kind if a.group is not None and a.group_t[0] <= rel < a.group_t[1] else None})
         return out
 
     # ---- what the other simulated sensors read ----------------------------------------------------------------
@@ -336,10 +342,13 @@ class DetectorSim:
         oh = max(0.0, min(b[3], roi[3]) - max(b[1], roi[1]))
         return ow / w, oh / h
 
-    def visibility(self, w, t, actors=None):
+    def visibility(self, w, t, actors=None, detail=False):
         """Noise-free detectability per actor at t: {id: (detectable in some view, ground point possible)}.
         Detectable: box inside a view's region by min_frac and at least h_min px tall; ground point: in some view
-        where it is detectable its bottom is inside the region (no "b")."""
+        where it is detectable its bottom is inside the region (no "b"). Occlusion by nearer actors is not
+        applied here; detail=True returns occlusion()'s dicts instead (occluded / outside the field / cut)."""
+        if detail:
+            return self.occlusion(w, t, actors)
         R = self.camera(w, t)
         out = {}
         for o in actors if actors is not None else w.actors_at(t):
@@ -353,6 +362,61 @@ class DetectorSim:
                         det = True
                         gnd = gnd or b[3] < roi[3] - 1.0
             out[o["id"]] = (det, gnd)
+        return out
+
+    def occlusion(self, w, t, actors=None):
+        """Noise-free truth of why an actor is or is not seen at t, per actor id: {occ, occ_by, cover, edge,
+        in_fov, small, detectable, ground}.
+
+        occ: "fov" (no view holds its box by min_frac_w / min_frac_h, or the box is behind / too near the camera),
+        "object" (its box is covered by the boxes of nearer actors for at least occl_cover of its area, the rule
+        by which the detector drops it; occl_cover None: 0.6), "edge" (seen, but its box is cut at the left or
+        right edge of the widest view), or None. occ_by: the nearer actor covering the largest share of it (when
+        cover > 0). cover: the covered share (0..1, capped). edge: "l", "r", "lr" or "". small: in a view's field
+        but below h_min in every such view. detectable, ground: as visibility()."""
+        R = self.camera(w, t)
+        acts = actors if actors is not None else w.actors_at(t)
+        thr = self.p["occl_cover"] or 0.6
+        x_lo = min(r[0] for _, r in self.views)
+        x_hi = max(r[2] for _, r in self.views)
+        cand = []
+        out = {}
+        for o in acts:
+            b = None if o["ref_x"] < 1.0 else self._box(R, o)
+            if b is not None:
+                cand.append((o["range"], o, b))
+            else:
+                out[o["id"]] = {"occ": "fov", "occ_by": None, "cover": 0.0, "edge": "", "in_fov": False,
+                                "small": False, "detectable": False, "ground": False}
+        cand.sort(key=lambda c: c[0])
+        hidden = []
+        for j, (_, o, b) in enumerate(cand):
+            a = max(1e-6, (b[2] - b[0]) * (b[3] - b[1]))
+            cov, best = 0.0, (0.0, None)
+            for k in range(j):
+                if hidden[k]:
+                    continue
+                c = cand[k][2]
+                ov = max(0.0, min(b[2], c[2]) - max(b[0], c[0])) * max(0.0, min(b[3], c[3]) - max(b[1], c[1]))
+                cov += ov
+                if ov > best[0]:
+                    best = (ov, cand[k][1]["id"])
+            cov = min(1.0, cov / a)
+            hidden.append(cov >= thr)
+            h = b[3] - b[1]
+            in_fov = det = gnd = False
+            for view, roi in self.views:
+                fw, fh = self._frac(b, roi)
+                if fw >= self.p["min_frac_w"] and fh >= self.p["min_frac_h"]:
+                    in_fov = True
+                    if h >= self.p["h_min"][view]:
+                        det = True
+                        gnd = gnd or b[3] < roi[3] - 1.0
+            edge = ("l" if b[0] <= x_lo + 1.0 else "") + ("r" if b[2] >= x_hi - 1.0 else "")
+            occ = "fov" if not in_fov else ("object" if hidden[-1] else ("edge" if edge else None))
+            out[o["id"]] = {"occ": occ, "occ_by": best[1] if cov > 0.0 else None, "cover": round(cov, 3),
+                            "edge": edge, "in_fov": in_fov, "small": in_fov and not det, "detectable": det,
+                            "ground": gnd}
         return out
 
     def generate(self, w):
@@ -750,6 +814,242 @@ def sc_stopped(speed, mode):
     return build
 
 
+# ---- tracker-core scenarios (association, occlusion, rows, queues): docs/VISUAL_RADAR_EVAL.md -----------------
+# Each spec carries `events` [(t s from the start, what)]: the designed moments (the measured ones, e.g. the
+# truth-occluded intervals, come from DetectorSim.occlusion); and `groups` {group id: kind}.
+def _travel(plan, t, dt=0.01):
+    """Distance an actor with speed plan `plan` covers from 0 to t (as ScenarioWorld integrates it)."""
+    if t <= 0.0:
+        return 0.0
+    tt = np.arange(0.0, t + 0.5 * dt, dt)
+    v = _plan(plan, tt)
+    return float(np.sum(0.5 * (v[1:] + v[:-1]) * dt))
+
+
+def _place(w, t, x, plan):
+    """s0 of an actor with speed plan `plan` whose footprint centre is x metres (along the road) ahead of the
+    camera at time t (s from the start)."""
+    return _ego_s(w, t) + x - _travel(plan, t)
+
+
+def sc_crossing_pair(seed, night):
+    """Association ambiguity, three acts on a straight road (ego 13 m/s, slowing to 6 m/s from 22 s):
+    (a) 0-14 s: pair_b drives ahead in the ego lane at 13 m/s (~40 m); pair_a overtakes it in the left lane at
+        16.5 m/s from 22 m: equal range side by side (3.5 m apart) at ~5 s, then it cuts into the ego lane in front
+        of pair_b (9-12 s): the two share a bearing at different ranges, pair_a hidden, until pair_b moves to the
+        right lane (15-17 s) and reveals it;
+    (b) 11-18 s: pair_c, an oncoming car (3.5 m left, 12 m/s), passes in front of pair_d, a car parked on the
+        far verge (6.6 m left): the two at the same bearing at ~16 s (ranges ~23 and ~44 m);
+    (c) 27-37 s: ped_a and ped_b cross the road ~26 m ahead in opposite directions (1.4 and 1.25 m/s, 0.8 m apart
+        along the road) and pass each other in the middle at ~32 s."""
+    rng = random.Random(seed * 101 + 11)
+    events = []
+
+    def actors(w):
+        a = []
+        pb = [(0, 13.0)]
+        a.append(Actor(901, "car", "pair_b", _place(w, 0.0, 40.0 + rng.uniform(-2, 2), pb), speed=pb,
+                       lateral=[(0, rng.gauss(0, 0.1)), (15.0, 0.0), (17.0, -LANE_W)]))
+        va = 16.5 + rng.uniform(-0.3, 0.3)
+        pa = [(0, va)]
+        a.append(Actor(900, "car", "pair_a", _place(w, 0.0, 22.0, pa), speed=pa,
+                       lateral=[(0, LANE_W), (9.0, LANE_W), (12.0, 0.0)]))
+        events.extend([(5.1, "pair_a / pair_b side by side at equal range (~40 m, 3.5 m apart)"),
+                       (9.0, "pair_a starts to cut in in front of pair_b"),
+                       (12.0, "pair_a in the ego lane beyond pair_b: same bearing, ranges ~40 / ~60 m (hidden)"),
+                       (15.0, "pair_b changes to the right lane: pair_a revealed")])
+        tc = 16.0
+        xd = 44.0 + rng.uniform(-2, 2)
+        qd = 6.6
+        a.append(Actor(903, "car", "pair_d", _ego_s(w, tc) + xd, lateral=[(0, qd)], yaw_rel=rng.gauss(0, 0.03)))
+        pc = [(0, -12.0 + rng.uniform(-0.5, 0.5))]
+        a.append(Actor(902, "car", "pair_c", _place(w, tc, xd * LANE_W / qd, pc), speed=pc, lateral=[(0, LANE_W)]))
+        events.append((tc, "oncoming pair_c in front of parked pair_d at the same bearing"))
+        tm = 32.0
+        sx = _ego_s(w, tm) + 26.0
+        va, vb = 1.4, 1.25
+        ha, hb = 6.0 / va, 6.0 / vb
+        a.append(Actor(904, "human", "ped_a", sx, lateral=[(0, -6.0), (tm - ha, -6.0), (tm + ha, 6.0)]))
+        a.append(Actor(905, "human", "ped_b", sx + 0.8, lateral=[(0, 6.0), (tm - hb, 6.0), (tm + hb, -6.0)]))
+        events.append((tm, "ped_a / ped_b pass each other in the middle of the road"))
+        events.sort()
+        return a
+    return dict(T=40.0, speed=[(0, 13.0), (22, 13.0), (26, 6.0)], curv=[(0, 0.0)], actors=actors, events=events,
+                groups={}, lead_range_m=70.0 if night else 100.0)
+
+
+def sc_occlusion(seed, night):
+    """Objects hidden behind others and re-appearing (ego 15 m/s, 9 m/s from 17 s), three acts:
+    (a) 0-11 s: occ_lead drives ahead in the ego lane (15 m/s, ~36 m); occ_truck (8 x 2.5 x 3.4 m) overtakes on
+        the left at 18.5 m/s from beside the car, cuts in between the ego and the lead (2.5-4.5 s), drives there
+        at 15 m/s and pulls back out to the left (7-9 s) and away at 22 m/s: the lead hidden for ~4 s;
+    (b) 15-30 s: occ_ped walks away from the car on the right pavement (5.6 m right, 1.3 m/s), beyond a short row
+        of a parked car and a van (occ_row, 3.0 m right) ~20 m nearer: it goes behind the row at ~22.6 s and comes
+        out in front of it at ~27.9 s (the row slides past its line of sight);
+    (c) 24-45 s: edge_car drives in the left lane beside and behind the car (out of the image), moves ahead into
+        the image (cut at its left edge first) from ~33 s, drops back out of it (~37-38 s) and overtakes again
+        (back in the image ~42 s)."""
+    rng = random.Random(seed * 101 + 12)
+    events = []
+    ego = [(0, 15.0), (14, 15.0), (17, 9.0)]
+
+    def actors(w):
+        a = []
+        pl = [(0, 15.0)]
+        a.append(Actor(910, "car", "occ_lead", _place(w, 0.0, 36.0 + rng.uniform(-1.5, 1.5), pl), speed=pl,
+                       lateral=[(0, rng.gauss(0, 0.1))]))
+        pt = [(0, 18.5), (3.5, 18.5), (5.0, 15.0), (7.5, 15.0), (9.5, 22.0)]
+        a.append(Actor(911, "truck", "occ_truck", _place(w, 0.0, 4.0, pt), speed=pt,
+                       lateral=[(0, LANE_W), (2.5, LANE_W), (4.5, 0.0), (7.0, 0.0), (9.0, LANE_W)]))
+        events.extend([(2.5, "occ_truck starts to cut in between the ego and occ_lead"),
+                       (7.0, "occ_truck pulls back out to the left: occ_lead revealed")])
+        # (b) the row and the pedestrian behind it
+        t_ref = 22.0
+        x0 = 50.0 + rng.uniform(-0.5, 0.5)
+        kinds = ["car", "van"]
+        x = x0
+        for k, kd in enumerate(kinds):
+            dims = (6.0, 2.1, 2.6) if kd == "van" else None
+            ln = dims[0] if dims else DIMS["car"][0]
+            a.append(Actor(920 + k, "truck" if dims else "car", "occ_row", _ego_s(w, t_ref) + x + ln / 2,
+                           lateral=[(0, -3.0 + rng.gauss(0, 0.1))], yaw_rel=rng.gauss(0, 0.03), dims=dims,
+                           group="occ_row", group_kind="row"))
+            x += ln + rng.uniform(1.0, 1.4)
+        pp = [(0, 1.3)]
+        a.append(Actor(912, "human", "occ_ped", _place(w, t_ref, 70.0, pp), speed=pp, lateral=[(0, -5.6)]))
+        events.extend([(22.6, "occ_ped (walking away, beyond occ_row) goes behind occ_row"),
+                       (27.9, "occ_ped re-emerges in front of occ_row")])
+        # (c) the car beside: the ego's own speed plan up to 30 s, about 6 m behind the camera
+        pe = [(0, 9.0), (30.0, 9.0), (31.0, 13.0), (35.5, 13.0), (36.5, 6.0), (40.5, 6.0), (41.5, 13.0)]
+        a.append(Actor(913, "car", "edge_car", _place(w, 30.0, -6.0, pe), speed=pe, lateral=[(0, LANE_W)], t_on=24.0))
+        events.extend([(30.0, "edge_car beside and behind the car (outside the image) moves ahead"),
+                       (37.0, "edge_car drops back out of the image (left edge)"), (41.5, "edge_car overtakes again")])
+        events.sort()
+        return a
+    return dict(T=45.0, speed=ego, curv=[(0, 0.0)], actors=actors, events=events, groups={"occ_row": "row"},
+                lead_range_m=70.0 if night else 100.0)
+
+
+def sc_parked_row(seed, night):
+    """Rows of parked cars on a one-way street at 10 m/s, a gentle right curve (R 250 m) from 230 to 380 m:
+    row_r1: 10 slots parallel on the right (2.9 m right, 5.5-6.5 m pitch), one slot empty, at 55-115 m;
+    row_l1: 14 bays perpendicular on the left (4.4 m left, 2.6 m pitch, yaw_rel +-90 deg), one bay empty, 70-106 m;
+    row_r2: 8 cars parallel on the right in the curve at 255-305 m; its 6th car (role pull_out) pulls out into the
+    ego lane at 24 s, ~44 m ahead of the car, and drives off at 11 m/s (it leaves the group when it moves)."""
+    rng = random.Random(seed * 101 + 13)
+    events = []
+
+    def actors(w):
+        a = []
+        s_e0 = _ego_s(w, 0.0)
+        s = s_e0 + 55.0
+        gap = rng.randrange(2, 8)
+        for k in range(10):
+            pitch = rng.uniform(5.5, 6.5)
+            if k != gap:
+                a.append(Actor(1000 + k, "car", "parked_par", s + 2.25, lateral=[(0, -2.9 + rng.gauss(0, 0.1))],
+                               yaw_rel=rng.gauss(0, 0.03), group="row_r1", group_kind="row"))
+            s += pitch
+        s = s_e0 + 70.0
+        gap = rng.randrange(3, 11)
+        for k in range(14):
+            if k != gap:
+                a.append(Actor(1100 + k, "car", "parked_bay", s, lateral=[(0, 4.4 + rng.gauss(0, 0.15))],
+                               yaw_rel=rng.choice((-1, 1)) * math.pi / 2 + rng.gauss(0, 0.04),
+                               group="row_l1", group_kind="row"))
+            s += 2.6
+        s = s_e0 + 255.0
+        t_pull = 24.0
+        for k in range(8):
+            q = -2.9 + rng.gauss(0, 0.1)
+            if k == 5:
+                sp = [(0, 0.0), (t_pull, 0.0), (t_pull + 4.0, 8.0), (t_pull + 6.0, 11.0)]
+                a.append(Actor(1205, "car", "pull_out", s + 2.25, speed=sp,
+                               lateral=[(0, q), (t_pull + 0.3, q), (t_pull + 3.8, 0.0)], yaw_rel=rng.gauss(0, 0.03),
+                               group="row_r2", group_kind="row", group_t=(-1e9, t_pull)))
+            else:
+                a.append(Actor(1200 + k, "car", "parked_par", s + 2.25, lateral=[(0, q)], yaw_rel=rng.gauss(0, 0.03),
+                               group="row_r2", group_kind="row"))
+            s += rng.uniform(5.5, 6.5)
+        events.extend([(5.0, "row_r1 / row_l1 begin ~50 m ahead"), (12.0, "the car passes row_r1 / row_l1"),
+                       (21.0, "the curve: row_r2 ahead on the right"),
+                       (t_pull, "pull_out (row_r2's 6th car) pulls out ~44 m ahead")])
+        return a
+    return dict(T=40.0, speed=[(0, 10.0)], curv=[(0, 0.0), (230, 0.0), (230, -1 / 250.0), (380, -1 / 250.0), (380, 0.0)],
+                actors=actors, events=events, groups={"row_r1": "row", "row_l1": "row", "row_r2": "row"},
+                lead_range_m=70.0 if night else 100.0)
+
+
+def sc_queue(seed, night):
+    """A queue at a light in a gentle left bend (R 150 m, starting 4 m ahead of where the ego stops): the ego
+    (12 m/s) brakes from 6 s and stops 6 m behind the last of 5 standing vehicles (q1 the front ... q5 the last,
+    6.2-7.2 m pitch, q2 a van that shows above the cars; on the straight approach the farther ones are hidden
+    behind the nearer ones, in the bend they come out to the left one by one), waits 8 s; the queue pulls away front to back from 0.5 s after the ego stands (q1 first,
+    each next 1.5 s later, 0 -> 8 m/s in ~5.3 s: the accordion; q5 6.5 s after the stop) and the ego follows
+    (8 m/s). Group "queue1" (kind queue) for the whole run."""
+    rng = random.Random(seed * 101 + 14)
+    events = []
+    approach = [(0, 12.0), (6, 12.0), (10, 0.0)]
+    w0 = World(seed=1, scenario=dict(T=40.0, speed=approach, curv=[(0, 0.0)]), targets=[], statics=False,
+               accel_lim=2.5)
+    i0 = int(np.argmax((w0.t - w0.t0 > 6.0) & (w0.v < 0.05)))
+    t_stop = float(w0.t[i0] - w0.t0)
+    s_bend = float(w0.s[i0]) + CAM_TO_AXLE + 4.0        # the light stands in a gentle left bend (R 150 m)
+    spec = dict(T=40.0, speed=approach + [(t_stop + 8.0, 0.0), (t_stop + 13.0, 8.0)],
+                curv=[(0, 0.0), (s_bend, 0.0), (s_bend + 15.0, 1 / 150.0), (s_bend + 250.0, 1 / 150.0)],
+                accel_lim=2.5, events=events, groups={"queue1": "queue"}, lead_range_m=70.0 if night else 100.0)
+
+    def actors(w):
+        i_stop = int(np.argmax((w.t - w.t0 > 6.0) & (w.v < 0.05)))
+        s_stop = float(w.s[i_stop]) + CAM_TO_AXLE
+        a = []
+        s = s_stop + 6.0 + 2.0 + DIMS["car"][0] / 2         # 6 m from the car's front (2 m ahead of the camera)
+        n = 5
+        for k in range(n):                                   # k = 0: the last vehicle (q5), nearest
+            qn = n - k
+            van = qn == 2
+            dims = (6.0, 2.1, 2.6) if van else None
+            ln = dims[0] if dims else DIMS["car"][0]
+            t_go = t_stop + 0.5 + 1.5 * (qn - 1)
+            a.append(Actor(1300 + qn - 1, "truck" if van else "car", "q%d" % qn, s + (ln - DIMS["car"][0]) / 2,
+                           speed=[(0, 0.0), (t_go, 0.0), (t_go + 5.3 + rng.uniform(-0.5, 0.5), 8.0)],
+                           lateral=[(0, rng.gauss(0, 0.3))], yaw_rel=rng.gauss(0, 0.02), dims=dims, group="queue1",
+                           group_kind="queue"))
+            s += ln + rng.uniform(1.7, 2.7)
+        events.extend([(round(t_stop, 2), "the ego stands 6 m behind q5"), (round(t_stop + 0.5, 2), "q1 (front) pulls away"),
+                       (round(t_stop + 6.5, 2), "q5 (nearest) pulls away"), (round(t_stop + 8.0, 2), "the ego follows")])
+        return a
+    spec["actors"] = actors
+    return spec
+
+
+def sc_platoon(seed, night):
+    """A platoon: 4 vehicles (p1 the nearest ... p4; p3 a van) ahead in the ego lane at 20 m/s +- 0.25 m/s with
+    12-20 m gaps, the ego following p1 at ~25 m, on a gently curved road (left R 350 m, then right R 400 m): on
+    the straight the farther ones hide behind the nearer ones, the curves open them. Group "platoon1"."""
+    rng = random.Random(seed * 101 + 15)
+    events = [(7.5, "left curve begins"), (22.5, "right curve begins")]
+
+    def actors(w):
+        a = []
+        x = 25.0 + rng.uniform(-2, 2)
+        for k in range(4):
+            van = k == 2
+            dims = (6.0, 2.1, 2.6) if van else None
+            ln = dims[0] if dims else DIMS["car"][0]
+            d = rng.uniform(-0.25, 0.25)
+            sp = [(0, 20.0 + d), (12, 20.0 - d), (24, 20.0 + d), (35, 20.0)]
+            a.append(Actor(1400 + k, "truck" if van else "car", "p%d" % (k + 1), _place(w, 0.0, x + ln / 2, sp),
+                           speed=sp, lateral=[(0, rng.gauss(0, 0.15))], dims=dims, group="platoon1",
+                           group_kind="platoon"))
+            x += ln + rng.uniform(13.0, 18.0)
+        return a
+    return dict(T=35.0, speed=[(0, 20.0)],
+                curv=[(0, 0.0), (150, 0.0), (150, 1 / 350.0), (420, 1 / 350.0), (450, -1 / 400.0), (650, -1 / 400.0),
+                      (680, 0.0)], actors=actors, events=events, groups={"platoon1": "platoon"},
+                lead_range_m=70.0 if night else 100.0)
+
+
 SCENARIOS = {
     "parked_street": sc_parked_street,
     "oncoming": sc_oncoming,
@@ -757,7 +1057,13 @@ SCENARIOS = {
     "adjacent": sc_adjacent,
     "slow_lead": sc_slow_lead,
     "curve_parked": sc_curve_parked,
+    "crossing_pair": sc_crossing_pair,
+    "occlusion": sc_occlusion,
+    "parked_row": sc_parked_row,
+    "queue": sc_queue,
+    "platoon": sc_platoon,
 }
+CORE_SCENARIOS = ("crossing_pair", "occlusion", "parked_row", "queue", "platoon")
 ALERT_SCENARIOS = {}
 for _v in (14, 25, 33):
     for _m in ("brake", "lane"):
