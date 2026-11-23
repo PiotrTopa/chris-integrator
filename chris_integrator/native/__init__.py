@@ -31,7 +31,7 @@ import json
 import os
 
 PARTS = ("json", "round", "interp", "ekf", "lanes", "radar")
-VERSION = 3                    # of the compiled module's functions: a module of another version is not used
+VERSION = 4                    # of the compiled module's functions: a module of another version is not used
 _dumps_py, _loads_py = json.dumps, json.loads
 _SEP = (",", ":")
 

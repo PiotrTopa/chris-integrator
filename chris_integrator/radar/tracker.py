@@ -39,10 +39,16 @@ from collections import deque
 
 import numpy as np
 
+from .. import native as _native
 from ..core import classvote
 from ..core.objects import assign as _hungarian
 from . import models as M
 from .models import CA, CV, N, PX, PY, STAND, VX, VY
+from .sensors import kind_code
+
+# the native core's radar part (chris_native.c), or None: the switch for the functions of this module that have a
+# native twin (the advance, peek and stillness of the objects, one scan's association and update)
+_NR = _native.radar
 
 CFG = dict(
     gate={1: 9.0, 2: 13.8, 3: 16.3, 4: 18.5},          # chi-square gates (99.7 %) by measurement dimension: the first sieve
@@ -161,20 +167,68 @@ def marginals(ratio, iters=30, tol=1e-4):
     return val / (1.0 + val.sum(axis=1, keepdims=True))
 
 
-class Obj:
-    __slots__ = ("id", "xs", "Ps", "mu", "t", "t0", "logodds", "hits", "state", "sources", "last_seen", "vote",
-                 "history", "checks", "consistency", "pred_err", "n_checks", "nis", "verdict", "coast_s", "x", "P",
-                 "velocity_seen", "merge_t", "flags", "last_cover", "dp0", "gain", "last_box", "xf", "Pf", "scores", "range_t")
+# An object's numbers live in one row of the tracker's state array (`State`): the hypotheses (xs, Ps), their
+# probabilities (mu), the free estimate (xf, Pf) and the combination (x, P). The object's attributes are views
+# of its row; the native calls read and write the rows of a scan's objects directly.
+_LAY = (("xs", (3, N)), ("Ps", (3, N, N)), ("mu", (3,)), ("xf", (N,)), ("Pf", (N, N)), ("x", (N,)), ("P", (N, N)))
+_OFF = {}
+_o = 0
+for _k, _sh in _LAY:
+    _OFF[_k] = (_o, _sh)
+    _o += int(np.prod(_sh))
+ROW = _o                         # numbers per object
 
-    def __init__(self, oid, x0, P0, mu, t, src, exist, coast_s):
+
+class State:
+    """The rows of the objects' numbers (an array (capacity, ROW)) and which rows are free."""
+
+    def __init__(self, cap=96):
+        self.a = np.zeros((cap, ROW))
+        self.free = list(range(cap - 1, -1, -1))
+
+    def take(self, live):
+        if not self.free:                                # full: twice the rows, every live object re-pointed
+            cap = len(self.a)
+            a = np.zeros((2 * cap, ROW))
+            a[:cap] = self.a
+            self.a = a
+            self.free = list(range(2 * cap - 1, cap - 1, -1))
+            for o in live:
+                o.bind(self)
+        return self.free.pop()
+
+    def give(self, slot):
+        self.free.append(slot)
+
+
+def _view(name):
+    def get(self):
+        return getattr(self, "_" + name)
+
+    def put(self, v):
+        getattr(self, "_" + name)[...] = v
+    return property(get, put)
+
+
+class Obj:
+    __slots__ = ("id", "slot", "_xs", "_Ps", "_mu", "_xf", "_Pf", "_x", "_P", "t", "t0", "logodds", "hits", "state",
+                 "sources", "last_seen", "vote", "history", "checks", "consistency", "pred_err", "n_checks", "nis",
+                 "verdict", "coast_s", "velocity_seen", "merge_t", "flags", "last_cover", "dp0", "gain", "last_box",
+                 "scores", "range_t")
+    xs, Ps, mu, xf, Pf, x, P = (_view(k) for k, _ in _LAY)
+
+    def __init__(self, oid, x0, P0, mu, t, src, exist, coast_s, store=None, live=()):
         self.id = oid
-        self.xs = np.repeat(x0[None], len(M.MODELS), axis=0)          # (3, N): one state per hypothesis
-        self.Ps = np.repeat(P0[None], len(M.MODELS), axis=0)          # (3, N, N)
-        self.xs[STAND][VX:VY + 3] = 0.0          # velocity and acceleration of the standing hypothesis
+        store = store or State(1)
+        self.slot = store.take(live)
+        self.bind(store)
+        self.xs = x0[None]                       # (3, N): one state per hypothesis
+        self.Ps = P0[None]                       # (3, N, N)
+        self._xs[STAND][VX:VY + 3] = 0.0         # velocity and acceleration of the standing hypothesis
         # the free estimate: a steady-velocity filter of its own, fed the same detections, never mixed with the
         # hypotheses. What it knows of the velocity is what the sightings have shown, no more.
-        self.xf, self.Pf = x0.copy(), P0.copy()
-        self.mu = np.array(mu, float)
+        self.xf, self.Pf = x0, P0
+        self.mu = mu
         self.t = self.t0 = t
         self.logodds = math.log(exist / (1.0 - exist))
         self.hits = 1
@@ -201,6 +255,12 @@ class Obj:
         self.range_t = t             # the last time a detection said how far it is (not a bearing alone)
         self.x, self.P = M.combine(self.xs, self.Ps, self.mu)
 
+    def bind(self, store):
+        """Point the object's arrays at its row of the state array."""
+        row = store.a[self.slot]
+        for k, (o, sh) in _OFF.items():
+            setattr(self, "_" + k, row[o:o + int(np.prod(sh))].reshape(sh))
+
     @property
     def exist(self):
         return 1.0 / (1.0 + math.exp(-self.logodds))
@@ -224,6 +284,7 @@ class Tracker:
 
     def reset(self):
         self.objects = []
+        self.store = State()         # the objects' numbers, one row each
         self.stats = {}              # sensor id -> counters
         self.sensors = {}            # sensor id -> (last model, time)
         self.bias = {}               # sensor id -> [bias, variance]: what all its objects share (a camera's pitch)
@@ -251,6 +312,18 @@ class Tracker:
         """Bring the objects to time t (committed)."""
         objs = [o for o in objs if abs(t - o.t) >= 1e-6]
         if not objs:
+            return
+        if _NR is not None:
+            noise, nz = {}, []
+            for o in objs:
+                if o.t not in noise:
+                    noise[o.t] = self.ego.motion_noise(o.t, t)
+                nz.append(noise[o.t])
+            pose = self.ego.pose_at(t) if any(a > 0.0 or b > 0.0 for a, b in nz) else (0.0, 0.0, 0.0)
+            _NR.radar_advance(self.store.a, [o.slot for o in objs], [float(t) - o.t for o in objs],
+                              [M._KIN4.get(o.label) or M._KIN4[None] for o in objs], M._native_par(self.mcfg), nz, pose)
+            for o in objs:
+                o.t = t
             return
         xs, Ps, mu, dt, xf, Pf = self._evolve(objs, [t] * len(objs), free=True)
         pose = None
@@ -284,6 +357,12 @@ class Tracker:
         """Where each object is believed to be at its time, without changing it: [(x, P, mu)]."""
         if not objs:
             return []
+        if _NR is not None:
+            B = len(objs)
+            x, P, mu = np.empty((B, N)), np.empty((B, N, N)), np.empty((B, 3))
+            _NR.radar_peek(self.store.a, [o.slot for o in objs], [float(tm) - o.t for tm, o in zip(times, objs)],
+                           [M._KIN4.get(o.label) or M._KIN4[None] for o in objs], M._native_par(self.mcfg), x, P, mu)
+            return [(x[k], P[k], mu[k]) for k in range(B)]
         xs, Ps, mu, dt, x, P = self._evolve(objs, times, combine=True)
         return [(o.x, o.P, o.mu) if abs(dt[k]) < 1e-6 else (x[k], P[k], mu[k]) for k, o in enumerate(objs)]
 
@@ -345,6 +424,8 @@ class Tracker:
     def p_still_many(self, objs):
         if not objs:
             return []
+        if _NR is not None:
+            return _NR.radar_still(self.store.a, [o.slot for o in objs], [(M._KIN4.get(o.label) or M._KIN4[None])[3] for o in objs])
         return M.p_still_many([o.xs for o in objs], [o.Ps for o in objs], [o.mu for o in objs], [o.label for o in objs])
 
     def _pose(self, t):
@@ -412,14 +493,136 @@ class Tracker:
             objs.append(o)
         self._advance_all(objs, t)
         self.t = t if self.t is None else max(self.t, t)
+        cph, sph = math.cos(pose[2]), math.sin(pose[2])
+        if getattr(sensor, "extraneous", None) is not None:
+            sensor.extraneous = max(sensor.extraneous, self.new_rate.get(src, 0.0))
+        Rs = [np.diag(np.asarray(d["R"], float)) for d in dets]
+        native = _NR is not None and hasattr(sensor, "native")
+        if native:
+            D = self._det_rows(dets)
+            pairs, pds, cover = self._associate_native(src, t, sensor, pose, objs, D)
+        else:
+            pairs, pds, cover = self._associate(src, t, sensor, pose, objs, dets)
+        hit, used = set(), set()
+        if self._common(sensor, src, pose, objs, dets, Rs, pairs) and native:
+            D = self._det_rows(dets, Rs)
+        if native and pairs:
+            res = _NR.radar_update(self.store.a, [objs[i].slot for i, *_ in pairs], sensor.native(), pose,
+                                   D[[j for _, j, *_ in pairs]], [(pds[i], lam, pr, objs[i].hits) for i, _, _, pr, lam in pairs],
+                                   (c["mu_hold_hits"], c["mu_floor"]))
+        for k, (i, j, g, pr, lam) in enumerate(pairs):
+            objs[i].gain = g
+            if native:
+                self._after_update(objs[i], dets[j], sensor, src, t, *res[k])
+            else:
+                self._update(objs[i], dets[j], Rs[j], sensor, pose, src, t, pds[i], lam, pr)
+            if dets[j].get("w"):
+                objs[i].last_box = (t, src, dets[j]["w"])
+            hit.add(i)
+            used.add(j)
+            st["assigned"] += 1
+        if hit:                                          # written down now, checked when the time has come
+            who = [objs[i] for i in sorted(hit)]
+            hz = c["check_horizons"]
+            ahead = self.peek_many([o for o in who for _ in hz], [t + h for _ in who for h in hz])
+            for k, (xp, Pp, _) in enumerate(ahead):
+                who[k // len(hz)].checks.append((t + hz[k % len(hz)], float(xp[PX]), float(xp[PY]), Pp[:2, :2].copy()))
+        for i, o in enumerate(objs):
+            pd = pds[i]
+            if cover[i] > 0.0:
+                o.last_cover = t
+            if i in hit:
+                o.last_cover = t
+                continue
+            if pd > 0.0:
+                o.logodds += math.log(max(1.0 - pd, 1e-3))
+        free = 0
+        mem = self.unexplained.setdefault(src, deque())
+        times = self.scan_times.setdefault(src, deque())
+        times.append(t)
+        while times and times[0] < t - c["map_s"]:
+            times.popleft()
+        while mem and mem[0][0] < t - c["map_s"]:
+            mem.popleft()
+        for j, d in enumerate(dets):
+            if j in used or len(self.objects) >= c["max_objects"]:
+                continue
+            label = classvote.norm_label((d.get("attrs") or {}).get("class"))
+            s0 = sensor.start(d, pose, label)
+            if s0 is None:
+                continue
+            free += 1
+            x0, P0 = s0
+            k = M.kin(label)
+            if sensor.velocity:                          # the speed along the line of sight is measured
+                moving = math.hypot(x0[VX], x0[VY]) > 1.0
+                mu = [0.05, 0.8, 0.15] if moving else [0.7, 0.25, 0.05]
+            else:
+                ps = k["p_stand"]
+                dxo, dyo = x0[PX] - pose[0], x0[PY] - pose[1]
+                pa = c["p_any_side"] if abs(-sph * dxo + cph * dyo) > c["side_m"] else self.mcfg["p_ca0"]
+                mu = [ps, (1.0 - ps) * (1.0 - pa), (1.0 - ps) * pa]
+            o = Obj(self.next_id, x0, P0, mu, t, src, c["new_exist"], sensor.coast_s, self.store, self.objects)
+            self.next_id += 1
+            sc = self._score(d)
+            o.logodds += self._score_odds(src, sc)
+            if sc is not None:
+                o.scores.append((src, sc))
+            if not sensor.velocity:
+                # What a new object may be doing, before anything is known, is not one blur around "no speed":
+                # it stands (its own hypothesis), or it drives with the traffic (the steady hypothesis: about
+                # the car's own velocity, along the road the car is on), or it comes the other way (the
+                # manoeuvring hypothesis: about the car's velocity reversed, and wider across). The faster
+                # the car itself drives, the more that says about the traffic's speed; standing, nothing.
+                # A vehicle whose box shows it side-on does neither: it crosses.
+                U = np.array([[cph, -sph], [sph, cph]])
+                lat = min(k["v0_lat"], k["v0_std"]) ** 2
+                big = k["v0_std"] ** 2
+                at = d.get("attrs") or {}
+                ps = M.side_on(label, at.get("aspect"), float(d["z"][sensor.rows(d)[0]])) if at.get("aspect") else None
+                ve = min(math.hypot(pose[3], pose[4]), k["v_max"]) if "wl" in k else 0.0
+                if ps is None:
+                    ps = 0.0 if "wl" in k else None
+                if ps is None:                           # a kind without a direction of its own (a person)
+                    Pv, mv = U @ np.diag([big, lat]) @ U.T, np.zeros(2)
+                else:
+                    w_ = max(c["with_rel"] * ve + c["with_std"], k["v0_std"] - ve) ** 2
+                    Pv = U @ np.diag([(1.0 - ps) * w_ + ps * lat + ps * (1.0 - ps) * ve * ve,
+                                      (1.0 - ps) * lat + ps * big]) @ U.T
+                    mv = (1.0 - ps) * ve * np.array([cph, sph])
+                o.xs[CV][VX:VY + 1] = mv
+                if ps is not None:
+                    lat2 = min(2.0 * k["v0_lat"], k["v0_std"]) ** 2
+                    o.xs[CA][VX:VY + 1] = -mv
+                    o.Ps[CA][VX:VY + 1, VX:VY + 1] = U @ np.diag([(1.0 - ps) * w_ + ps * lat2 + ps * (1.0 - ps) * ve * ve,
+                                                                   (1.0 - ps) * lat2 + ps * big]) @ U.T
+                o.Ps[CV][VX:VY + 1, VX:VY + 1] = Pv
+                o.Pf[VX:VY + 1, VX:VY + 1] = U @ np.diag([big, lat if not ps else (1.0 - ps) * lat + ps * big]) @ U.T
+                o.x, o.P = M.combine(o.xs, o.Ps, o.mu)
+            o.velocity_seen = sensor.velocity
+            self._vote(o, d, src, t)
+            o.history.append((t, float(x0[PX]), float(x0[PY]), 0.0, 0.0))
+            if d.get("w"):
+                o.last_box = (t, src, d["w"])
+            if (d.get("kind") or "").endswith("s"):      # its first box already says how fast it comes nearer
+                self._first_rate(o, d, sensor, pose)
+            mem.append((t, (d.get("kind") or "").rstrip("s"), np.asarray(d["z"], float), o.id))
+            self.objects.append(o)
+            st["started"] += 1
+        r0 = self.new_rate.get(src, 0.0)
+        self.new_rate[src] = r0 + c["new_rate_gain"] * (free - r0)
+
+    def _associate(self, src, t, sensor, pose, objs, dets):
+        """Which detection is whose: [(object, detection, gain, the pairing's probability, the other story's
+        density over the box feature)], each object's probability of being reported, the sensor's coverage at its
+        place."""
+        c = self.cfg
         nt, nd = len(objs), len(dets)
         cph, sph = math.cos(pose[2]), math.sin(pose[2])
         car = []                                         # each object's place in the car frame at the scan
         for o in objs:
             dx, dy = o.x[PX] - pose[0], o.x[PY] - pose[1]
             car.append((cph * dx + sph * dy, -sph * dx + cph * dy))
-        if getattr(sensor, "extraneous", None) is not None:
-            sensor.extraneous = max(sensor.extraneous, self.new_rate.get(src, 0.0))
         # Which detection is whose. A detection's fit to an object is the likelihood the object's hypotheses give
         # it, each with its own prediction and weight (one blurred Gaussian over "it stands here" and "it may be
         # driving at any speed" would let a standing car claim its neighbour's box). It is weighed against the
@@ -430,7 +633,6 @@ class Tracker:
         ratio = np.zeros((nt, nd))
         feat = {}
         pds = [sensor.p_detect(car[i][0], car[i][1], o.x) for i, o in enumerate(objs)]
-        Rs = [np.diag(np.asarray(d["R"], float)) for d in dets]
         if nd and nt:
             lam0 = np.array([sensor.density(d) for d in dets])
             loc = [self._local_density(src, d) for d in dets]
@@ -510,110 +712,51 @@ class Tracker:
                         if g > 0.0:
                             gain[i, jj] = g
                             feat[(i, jj)] = lam / F[a_]
-        hit, used = set(), set()
         pair = marginals(ratio)
-        pairs = assign(gain)
-        self._common(sensor, src, pose, objs, dets, Rs, pairs, pair)
-        for i, j in pairs:
-            objs[i].gain = float(gain[i, j])
-            self._update(objs[i], dets[j], Rs[j], sensor, pose, src, t, pds[i], feat[(i, j)], float(pair[i, j]))
-            if dets[j].get("w"):
-                objs[i].last_box = (t, src, dets[j]["w"])
-            hit.add(i)
-            used.add(j)
-            st["assigned"] += 1
-        if hit:                                          # written down now, checked when the time has come
-            who = [objs[i] for i in sorted(hit)]
-            hz = c["check_horizons"]
-            ahead = self.peek_many([o for o in who for _ in hz], [t + h for _ in who for h in hz])
-            for k, (xp, Pp, _) in enumerate(ahead):
-                who[k // len(hz)].checks.append((t + hz[k % len(hz)], float(xp[PX]), float(xp[PY]), Pp[:2, :2].copy()))
-        for i, o in enumerate(objs):
-            pd = pds[i]
-            if sensor.coverage(*car[i]) > 0.0:
-                o.last_cover = t
-            if i in hit:
-                o.last_cover = t
-                continue
-            if pd > 0.0:
-                o.logodds += math.log(max(1.0 - pd, 1e-3))
-        free = 0
-        mem = self.unexplained.setdefault(src, deque())
-        times = self.scan_times.setdefault(src, deque())
-        times.append(t)
-        while times and times[0] < t - c["map_s"]:
-            times.popleft()
-        while mem and mem[0][0] < t - c["map_s"]:
-            mem.popleft()
-        for j, d in enumerate(dets):
-            if j in used or len(self.objects) >= c["max_objects"]:
-                continue
-            label = classvote.norm_label((d.get("attrs") or {}).get("class"))
-            s0 = sensor.start(d, pose, label)
-            if s0 is None:
-                continue
-            free += 1
-            x0, P0 = s0
-            k = M.kin(label)
-            if sensor.velocity:                          # the speed along the line of sight is measured
-                moving = math.hypot(x0[VX], x0[VY]) > 1.0
-                mu = [0.05, 0.8, 0.15] if moving else [0.7, 0.25, 0.05]
-            else:
-                ps = k["p_stand"]
-                dxo, dyo = x0[PX] - pose[0], x0[PY] - pose[1]
-                pa = c["p_any_side"] if abs(-sph * dxo + cph * dyo) > c["side_m"] else self.mcfg["p_ca0"]
-                mu = [ps, (1.0 - ps) * (1.0 - pa), (1.0 - ps) * pa]
-            o = Obj(self.next_id, x0, P0, mu, t, src, c["new_exist"], sensor.coast_s)
-            self.next_id += 1
-            sc = self._score(d)
-            o.logodds += self._score_odds(src, sc)
-            if sc is not None:
-                o.scores.append((src, sc))
-            if not sensor.velocity:
-                # What a new object may be doing, before anything is known, is not one blur around "no speed":
-                # it stands (its own hypothesis), or it drives with the traffic (the steady hypothesis: about
-                # the car's own velocity, along the road the car is on), or it comes the other way (the
-                # manoeuvring hypothesis: about the car's velocity reversed, and wider across). The faster
-                # the car itself drives, the more that says about the traffic's speed; standing, nothing.
-                # A vehicle whose box shows it side-on does neither: it crosses.
-                U = np.array([[cph, -sph], [sph, cph]])
-                lat = min(k["v0_lat"], k["v0_std"]) ** 2
-                big = k["v0_std"] ** 2
-                at = d.get("attrs") or {}
-                ps = M.side_on(label, at.get("aspect"), float(d["z"][sensor.rows(d)[0]])) if at.get("aspect") else None
-                ve = min(math.hypot(pose[3], pose[4]), k["v_max"]) if "wl" in k else 0.0
-                if ps is None:
-                    ps = 0.0 if "wl" in k else None
-                if ps is None:                           # a kind without a direction of its own (a person)
-                    Pv, mv = U @ np.diag([big, lat]) @ U.T, np.zeros(2)
-                else:
-                    w_ = max(c["with_rel"] * ve + c["with_std"], k["v0_std"] - ve) ** 2
-                    Pv = U @ np.diag([(1.0 - ps) * w_ + ps * lat + ps * (1.0 - ps) * ve * ve,
-                                      (1.0 - ps) * lat + ps * big]) @ U.T
-                    mv = (1.0 - ps) * ve * np.array([cph, sph])
-                o.xs[CV][VX:VY + 1] = mv
-                if ps is not None:
-                    lat2 = min(2.0 * k["v0_lat"], k["v0_std"]) ** 2
-                    o.xs[CA][VX:VY + 1] = -mv
-                    o.Ps[CA][VX:VY + 1, VX:VY + 1] = U @ np.diag([(1.0 - ps) * w_ + ps * lat2 + ps * (1.0 - ps) * ve * ve,
-                                                                   (1.0 - ps) * lat2 + ps * big]) @ U.T
-                o.Ps[CV][VX:VY + 1, VX:VY + 1] = Pv
-                o.Pf[VX:VY + 1, VX:VY + 1] = U @ np.diag([big, lat if not ps else (1.0 - ps) * lat + ps * big]) @ U.T
-                o.x, o.P = M.combine(o.xs, o.Ps, o.mu)
-            o.velocity_seen = sensor.velocity
-            self._vote(o, d, src, t)
-            o.history.append((t, float(x0[PX]), float(x0[PY]), 0.0, 0.0))
-            if d.get("w"):
-                o.last_box = (t, src, d["w"])
-            if (d.get("kind") or "").endswith("s"):      # its first box already says how fast it comes nearer
-                self._first_rate(o, d, sensor, pose)
-            mem.append((t, (d.get("kind") or "").rstrip("s"), np.asarray(d["z"], float), o.id))
-            self.objects.append(o)
-            st["started"] += 1
-        r0 = self.new_rate.get(src, 0.0)
-        self.new_rate[src] = r0 + c["new_rate_gain"] * (free - r0)
+        cover = [sensor.coverage(*car[i]) for i in range(nt)]
+        return [(i, j, float(gain[i, j]), float(pair[i, j]), feat[(i, j)]) for i, j in assign(gain)], pds, cover
 
-    def _common(self, sensor, src, pose, objs, dets, Rs, pairs, pair):
+    def _det_rows(self, dets, Rs=None):
+        """The scan's detections as the native core reads them (chris_native.c `RDET`): kind, scale-rate baseline,
+        group (kind and baseline: what is predicted alike), vehicle (1) / person (-1) / not known (0), box width,
+        z, the variances (R's diagonal)."""
+        D = np.zeros((len(dets), 13))
+        kinds = {}
+        for j, d in enumerate(dets):
+            k = d.get("kind")
+            lab = classvote.norm_label((d.get("attrs") or {}).get("class"))
+            z = d["z"]
+            m = len(z)
+            D[j, :5] = (kind_code(k), float(d.get("sdt") or 0.0), kinds.setdefault((k, d.get("sdt")), len(kinds)),
+                        0 if lab is None else (1 if lab in M.VEHICLES else -1), float(d.get("w") or 0.0))
+            D[j, 5:5 + m] = z
+            D[j, 9:9 + m] = d["R"] if Rs is None else np.diag(Rs[j])
+        return D
+
+    def _associate_native(self, src, t, sensor, pose, objs, D):
+        """_associate in one native call (chris_native.c `radar_scan`)."""
+        c = self.cfg
+        oi = []
+        for o in objs:
+            la, lb = o.label, o.last_box
+            oi.append((0 if la is None else (1 if la in M.VEHICLES else -1),
+                       lb[2] if lb is not None and o.hits >= 2 and lb[1] == src and t - lb[0] <= c["feat_max_s"] else math.nan,
+                       o.id))
+        mem = self.unexplained.get(src)
+        rows = None
+        if mem:
+            real = self.real_ids
+            rows = [(len(zz), zz[0], zz[1], zz[2] if len(zz) > 2 else 0.0, oid) for (_, _, zz, oid) in mem if oid in real] or None
+        g, bw = c["gate"], c["map_bw"]
+        nt = len(objs)
+        pds, cover = np.empty(nt), np.empty(nt)
+        pairs = _NR.radar_scan(self.store.a, [o.slot for o in objs], sensor.native(), pose, oi, D, rows,
+                               float(len(self.scan_times.get(src) or ())),
+                               (g.get(1, 16.0), g.get(2, 16.0), g.get(3, 16.0), g.get(4, 16.0), c["feat_sigma"],
+                                c["feat_same"], c["feat_span"], bw[0], bw[1], bw[2]), pds, cover, None, None, None)
+        return pairs, pds.tolist(), cover.tolist()
+
+    def _common(self, sensor, src, pose, objs, dets, Rs, pairs):
         """What all objects of one scan share: the camera body's pitch at that moment. Every box of the scan
         then stands higher or lower by the same angle, which no object's own history predicts and which, left
         in, moves every range at once. The settled objects of the scan say what it was (the middle one of their
@@ -622,19 +765,19 @@ class Tracker:
         out of the scan's angles."""
         c = self.cfg
         if not getattr(sensor, "has_bias", False) or len(pairs) < c["common_min"]:
-            return
+            return False
         v, w = [], []
-        for i, j in pairs:
+        for i, j, _, pr, _ in pairs:
             o, d = objs[i], dets[j]
             if (d.get("kind") or "").rstrip("s") not in ("rb", "rbh") or o.state not in ("confirmed", "coast") or o.hits < 4 \
-                    or pair[i, j] < c["common_pair"]:
+                    or pr < c["common_pair"]:
                 continue
             zp, H = sensor.h(o.x, pose, d)
             s00 = float(H[0] @ o.P @ H[0]) + float(Rs[j][0, 0])
             v.append(float(d["z"][0]) - float(zp[0]))
             w.append(1.0 / s00)
         if len(v) < c["common_min"]:
-            return
+            return False
         v, w = np.array(v), np.array(w)
         k = np.argsort(v)
         cw = np.cumsum(w[k])
@@ -653,6 +796,7 @@ class Tracker:
                 d["z"] = np.array(d["z"], float)
                 d["z"][0] -= fast
                 Rs[j][0, 0] = max(Rs[j][0, 0] - jit + left, 0.25 * Rs[j][0, 0])
+        return True
 
     def _first_rate(self, o, d, sensor, pose):
         """A new object's first box came with a scale rate: how fast its image grows. That is its speed along
@@ -763,7 +907,6 @@ class Tracker:
         S = H @ o.P @ H.T + R
         d2 = float(nu @ np.linalg.solve(S, nu))
         n = d2 / len(nu)
-        o.nis[src] = n if o.nis.get(src) is None else o.nis[src] + 0.2 * (n - o.nis[src])
         tot = float((o.mu * like).sum())
         w = o.mu * (pd * like + other)                   # each hypothesis: "mine and it fits" or "not mine"
         # The hypotheses are weighed by how well each PREDICTED the detection. A moving hypothesis cannot predict
@@ -783,7 +926,16 @@ class Tracker:
             o.mu[1:] = np.clip(mv * w[1:] / float(w[1:].sum()), c["mu_floor"], None)
             o.mu /= o.mu.sum()
         like_all = max(tot, 1e-30)
-        o.logodds += min(max(math.log(max(sensor.p_d * like_all / sensor.density(d), 1e-9)), math.log(1.5)), math.log(20.0))
+        dl = min(max(math.log(max(sensor.p_d * like_all / sensor.density(d), 1e-9)), math.log(1.5)), math.log(20.0))
+        o.x, o.P = M.combine(o.xs, o.Ps, o.mu)
+        self._after_update(o, d, sensor, src, t, n, dl)
+
+    def _after_update(self, o, d, sensor, src, t, n, dl):
+        """What a detection does to an object besides its numbers: its record (NIS n), its existence (dl: what the
+        fit adds to its log odds), score, sightings, class vote, the checks of its predictions, its trajectory."""
+        c = self.cfg
+        o.nis[src] = n if o.nis.get(src) is None else o.nis[src] + 0.2 * (n - o.nis[src])
+        o.logodds += dl
         sc = self._score(d)
         o.logodds += self._score_odds(src, sc)
         if sc is not None:
@@ -792,7 +944,6 @@ class Tracker:
             else:
                 self._score_learn([(src, sc)], True)
         o.logodds = max(-12.0, min(12.0, o.logodds))
-        o.x, o.P = M.combine(o.xs, o.Ps, o.mu)
         o.hits += 1
         if (d.get("kind") or "rb").rstrip("s") not in ("b", "bt"):
             o.range_t = t            # a box cut at the bottom gives a direction, and a range only by the top edge
@@ -889,6 +1040,9 @@ class Tracker:
         for o in self.objects:                           # never confirmed and gone: its boxes were false ones
             if o.id not in kept and o.state == "tentative" and o.scores:
                 self._score_learn(o.scores, False)
+        for o in self.objects:
+            if o.id not in kept:
+                self.store.give(o.slot)
         self.objects = keep
         if len(self.real_ids) > 4096:
             self.real_ids = {o.id for o in keep if o.state != "tentative"}
@@ -1009,4 +1163,7 @@ class Tracker:
                     old.state = new.state
                 dead.add(new.id)
         if dead:
+            for o in obs:
+                if o.id in dead:
+                    self.store.give(o.slot)
             self.objects = [o for o in obs if o.id not in dead]

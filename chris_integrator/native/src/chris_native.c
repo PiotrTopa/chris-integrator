@@ -31,7 +31,7 @@
 #include <stdint.h>
 #include <string.h>
 
-#define NATIVE_VERSION 3
+#define NATIVE_VERSION 4
 
 static PyObject *Fallback;          /* raised where the pure-Python path must decide */
 static PyObject *builtin_round;
@@ -2602,6 +2602,1537 @@ done:
     return res;
 }
 
+/* ---- the radar, phase 2: the objects' rows, the sensors' measurement functions, one scan's association
+ * (gate, likelihoods of the hypotheses, the box as a feature, the pairing's probabilities, the assignment),
+ * the update of every pair of a scan, and the output's per-object numbers. radar/tracker.py, sensors.py and
+ * box.py are the reference; the same formulas, sums of products in index order, small systems solved by
+ * Gaussian elimination with partial pivoting (numpy hands them to LAPACK): results agree to rounding. ---- */
+
+/* an object's row in the tracker's state array (tracker.py `_LAY`) */
+enum { RO_XS = 0, RO_PS = 24, RO_MU = 216, RO_XF = 219, RO_PF = 227, RO_X = 291, RO_P = 299, RROW = 363 };
+
+/* the state array (capacity, RROW), writable */
+static int store_get(PyObject *o, View *v, Py_ssize_t *cap)
+{
+    v->held = 0;
+    if (PyObject_GetBuffer(o, &v->b, PyBUF_C_CONTIGUOUS | PyBUF_FORMAT | PyBUF_WRITABLE) < 0)
+        return -1;
+    v->held = 1;
+    const char *f = v->b.format ? v->b.format : "B";
+    if (*f == '@' || *f == '=' || *f == '<')
+        f++;
+    if (!(f[0] == 'd' && f[1] == 0 && v->b.itemsize == 8) || v->b.len % (RROW * (Py_ssize_t)sizeof(double)) != 0) {
+        view_drop(v);
+        PyErr_Format(PyExc_TypeError, "radar: the state array must be a writable C-contiguous float64 array of rows of %d", RROW);
+        return -1;
+    }
+    *cap = v->b.len / (RROW * (Py_ssize_t)sizeof(double));
+    return 0;
+}
+
+/* a list / tuple of B row numbers, each < cap, into a new array (PyMem) */
+static Py_ssize_t *idx_get(PyObject *o, Py_ssize_t cap, Py_ssize_t *B)
+{
+    int is_list = PyList_Check(o);
+    if (!(is_list || PyTuple_Check(o))) {
+        PyErr_SetString(PyExc_TypeError, "radar: the rows must be a list of ints");
+        return NULL;
+    }
+    Py_ssize_t n = is_list ? PyList_Size(o) : PyTuple_Size(o);
+    Py_ssize_t *out = (Py_ssize_t *)PyMem_Malloc((size_t)(n ? n : 1) * sizeof(Py_ssize_t));
+    if (out == NULL) {
+        PyErr_NoMemory();
+        return NULL;
+    }
+    for (Py_ssize_t i = 0; i < n; i++) {
+        Py_ssize_t k = PyLong_AsSsize_t(seq_item(o, is_list, i));
+        if (k == -1 && PyErr_Occurred()) {
+            PyMem_Free(out);
+            return NULL;
+        }
+        if (k < 0 || k >= cap) {
+            PyMem_Free(out);
+            PyErr_SetString(PyExc_IndexError, "radar: a row outside the state array");
+            return NULL;
+        }
+        out[i] = k;
+    }
+    *B = n;
+    return out;
+}
+
+/* a float64 buffer of exactly n values (any shape), or a list / tuple of n numbers, into out */
+static int nums_get(PyObject *o, Py_ssize_t n, double *out, const char *what)
+{
+    return rows_get(o, n, 1, out, what);
+}
+
+/* ---- the sensors (sensors.py): what a scan measures of a state ---- */
+enum { SEN_CAMERA = 0, SEN_MICROWAVE = 1 };
+enum { K_B = 0, K_RB = 1, K_RBH = 2, K_BT = 3, K_NONE = 4, K_SCALE = 8 };
+#define RSENS 24
+
+typedef struct {
+    int type;
+    /* camera */
+    double hc, logf, bias;
+    int cover;
+    double bmin, bmax, gmin, max_range, p_d, p_cut, h_min, h_full, p_small, near, extra, vol[4], srspan, lhspan,
+        born, born_s;
+    /* microwave */
+    double mx, my, yaw, fov, clutter;
+} RSens;
+
+/* sensors.py `Sensor.native()`: 24 numbers */
+static int sens_get(PyObject *o, RSens *s)
+{
+    double v[RSENS];
+    if (nums_get(o, RSENS, v, "sensor") < 0)
+        return -1;
+    memset(s, 0, sizeof(*s));
+    s->type = (int)v[0];
+    if (s->type == SEN_CAMERA) {
+        s->hc = v[1]; s->logf = v[2]; s->bias = v[3]; s->cover = v[4] != 0.0; s->bmin = v[5]; s->bmax = v[6];
+        s->gmin = v[7]; s->max_range = v[8]; s->p_d = v[9]; s->p_cut = v[10]; s->h_min = v[11]; s->h_full = v[12];
+        s->p_small = v[13]; s->near = v[14]; s->extra = v[15];
+        for (int k = 0; k < 4; k++)
+            s->vol[k] = v[16 + k];
+        s->srspan = v[20]; s->lhspan = v[21]; s->born = v[22]; s->born_s = v[23];
+    } else if (s->type == SEN_MICROWAVE) {
+        s->mx = v[1]; s->my = v[2]; s->yaw = v[3]; s->fov = v[4]; s->max_range = v[5]; s->p_d = v[6]; s->clutter = v[7];
+    } else {
+        PyErr_SetString(PyExc_ValueError, "radar: a sensor of a kind the native core does not know");
+        return -1;
+    }
+    return 0;
+}
+
+/* math.hypot of two numbers as CPython computes it (Modules/mathmodule.c `vector_norm`: a scaled, compensated
+ * sum of squares with one correction step); libm's hypot differs from it in the last bit now and then */
+static double py_hypot(double a, double b)
+{
+    double v[2] = {fabs(a), fabs(b)};
+    double mx = 0.0;
+    int nan = 0;
+    for (int i = 0; i < 2; i++) {
+        nan |= isnan(v[i]);
+        if (v[i] > mx)
+            mx = v[i];
+    }
+    if (isinf(mx))
+        return mx;
+    if (nan)
+        return NAN;
+    if (mx == 0.0)
+        return mx;
+    int e;
+    frexp(mx, &e);
+    if (e < -1023) {                                    /* subnormal: scaled up first, as CPython does */
+        return 2.2250738585072014e-308 * py_hypot(v[0] / 2.2250738585072014e-308, v[1] / 2.2250738585072014e-308);
+    }
+    double scale = ldexp(1.0, -e), csum = 1.0, frac1 = 0.0, frac2 = 0.0;
+    for (int i = 0; i < 2; i++) {
+        double x = v[i] * scale;
+        double hi = x * x, lo = fma(x, x, -hi);
+        double sh = csum + hi, sl = (csum - sh) + hi;
+        csum = sh;
+        frac1 += lo;
+        frac2 += sl;
+    }
+    double h = sqrt(csum - 1.0 + (frac1 + frac2));
+    double hi = -h * h, lo = fma(-h, h, -hi);
+    double sh = csum + hi, sl = (csum - sh) + hi;
+    csum = sh;
+    frac1 += lo;
+    frac2 += sl;
+    double x = csum - 1.0 + (frac1 + frac2);
+    h += x / (2.0 * h);
+    return h / scale;
+}
+
+static inline double pymax(double a, double b) { return b > a ? b : a; }     /* Python's max(a, b) */
+static inline double np_maximum(double a, double b) { return isnan(a) ? a : isnan(b) ? b : (a >= b ? a : b); }
+static inline double np_minimum(double a, double b) { return isnan(a) ? a : isnan(b) ? b : (a <= b ? a : b); }
+static inline double pymin(double a, double b) { return b < a ? b : a; }     /* Python's min(a, b) */
+
+/* the measurement row that is an angle (wrapped), or -1 (sensors.py `rows`) */
+static int r_angle_row(const RSens *s, int kind)
+{
+    if (s->type == SEN_MICROWAVE)
+        return 1;
+    int b = kind & 7;
+    return (b == K_B || b == K_BT) ? 0 : b == K_NONE ? -1 : 1;
+}
+
+/* CameraBoxes._scale_row */
+static double r_scale_row(const double *x, const double *pose, double sdt, double *row)
+{
+    double dx = x[R_PX] - pose[0], dy = x[R_PY] - pose[1];
+    double c = cos(pose[2]), s = sin(pose[2]);
+    double depth = pymax(c * dx + s * dy, 0.5);
+    double w = pose[5];
+    double rate = (c * (x[R_VX] - pose[3]) + s * (x[R_VY] - pose[4])) + w * (-s * dx + c * dy);
+    double dt = pymax(sdt, 1e-3);
+    double u = pymax(1.0 - rate * dt / depth, 0.05);
+    for (int k = 0; k < RN; k++)
+        row[k] = 0.0;
+    row[R_VX] = -c / (u * depth);
+    row[R_VY] = -s / (u * depth);
+    row[R_PX] = (w * s / depth + rate * c / (depth * depth)) / u;
+    row[R_PY] = (-w * c / depth + rate * s / (depth * depth)) / u;
+    return log(u) / dt;
+}
+
+/* sensor.h(x, pose, det): the predicted measurement z (m) and its Jacobian H (m x N); returns m */
+static int r_h(const RSens *s, int kind, double sdt, const double *x, const double *pose, double *z, double *H)
+{
+    memset(H, 0, 4 * RN * sizeof(double));
+    if (s->type == SEN_MICROWAVE) {
+        double c = cos(pose[2]), sn = sin(pose[2]);
+        double ox = c * s->mx - sn * s->my, oy = sn * s->mx + c * s->my;
+        double sx = pose[0] + ox, sy = pose[1] + oy, svx = pose[3] - pose[5] * oy, svy = pose[4] + pose[5] * ox;
+        double dx = x[R_PX] - sx, dy = x[R_PY] - sy;
+        double r = pymax(py_hypot(dx, dy), 0.5);
+        double rvx = x[R_VX] - svx, rvy = x[R_VY] - svy;
+        double rr = (dx * rvx + dy * rvy) / r;
+        H[R_PX] = dx / r;
+        H[R_PY] = dy / r;
+        H[RN + R_PX] = -dy / (r * r);
+        H[RN + R_PY] = dx / (r * r);
+        H[2 * RN + R_PX] = rvx / r - rr * dx / (r * r);
+        H[2 * RN + R_PY] = rvy / r - rr * dy / (r * r);
+        H[2 * RN + R_VX] = dx / r;
+        H[2 * RN + R_VY] = dy / r;
+        z[0] = r;
+        z[1] = wrap_pi(atan2(dy, dx) - pose[2] - s->yaw);
+        z[2] = rr;
+        return 3;
+    }
+    int base = kind & 7, m = 0;
+    if (base != K_NONE) {
+        double dx = x[R_PX] - pose[0], dy = x[R_PY] - pose[1];
+        double r = pymax(py_hypot(dx, dy), 0.5);
+        double brow[RN] = {0};
+        brow[R_PX] = -dy / (r * r);
+        brow[R_PY] = dx / (r * r);
+        double b = wrap_pi(atan2(dy, dx) - pose[2]);
+        double hc = s->hc;
+        if (base == K_B) {
+            z[0] = b;
+            memcpy(H, brow, sizeof(brow));
+            m = 1;
+        } else if (base == K_BT) {
+            double ho = exp(x[R_LH]);
+            double dh = hc - ho;
+            double q = r * r + dh * dh;
+            z[0] = b;
+            memcpy(H, brow, sizeof(brow));
+            H[RN + R_PX] = -dh / q * dx / r;
+            H[RN + R_PY] = -dh / q * dy / r;
+            H[RN + R_LH] = -ho * r / q;
+            z[1] = atan2(dh, r) + s->bias;
+            m = 2;
+        } else {
+            double g = -hc / (r * r + hc * hc);
+            H[R_PX] = g * dx / r;
+            H[R_PY] = g * dy / r;
+            H[R_DP] = 1.0;
+            z[0] = atan2(hc, r) + s->bias + x[R_DP];
+            z[1] = b;
+            memcpy(H + RN, brow, sizeof(brow));
+            m = 2;
+            if (base != K_RB) {
+                double c = cos(pose[2]), sn = sin(pose[2]);
+                double depth = pymax(c * dx + sn * dy, 0.5);
+                H[2 * RN + R_PX] = -c / depth;
+                H[2 * RN + R_PY] = -sn / depth;
+                H[2 * RN + R_LH] = 1.0;
+                z[2] = s->logf + x[R_LH] - log(depth);
+                m = 3;
+            }
+        }
+    }
+    if (kind & K_SCALE) {
+        z[m] = r_scale_row(x, pose, sdt, H + m * RN);
+        m++;
+    }
+    return m;
+}
+
+/* CameraBoxes.coverage / MicrowaveRadar.coverage at a place of the car frame */
+static double r_coverage(const RSens *s, double xc, double yc)
+{
+    if (s->type == SEN_MICROWAVE) {
+        double dx = xc - s->mx, dy = yc - s->my;
+        double r = py_hypot(dx, dy);
+        if (r < 0.5 || r > s->max_range || fabs(wrap_pi(atan2(dy, dx) - s->yaw)) > s->fov)
+            return 0.0;
+        return s->p_d;
+    }
+    if (xc <= 0.5)
+        return 0.0;
+    if (s->cover) {
+        double a = atan2(yc, xc);
+        if (!(s->bmin <= a && a <= s->bmax))
+            return 0.0;
+    }
+    if (py_hypot(xc, yc) > s->max_range)
+        return 0.0;
+    return s->p_d;
+}
+
+/* sensor.p_detect(xc, yc, x) */
+static double r_p_detect(const RSens *s, double xc, double yc, const double *x)
+{
+    double p = r_coverage(s, xc, yc);
+    if (s->type == SEN_MICROWAVE)
+        return p;
+    if (p > 0.0 && s->cover && py_hypot(xc, yc) < s->gmin)
+        p *= s->p_cut;
+    if (p <= 0.0 || isnan(s->h_min))
+        return p;
+    double h = exp(s->logf + x[R_LH]) / pymax(xc, 0.5);
+    double ramp = (h / s->h_min - 1.0) / (s->h_full - 1.0);
+    return p * pymin(1.0, pymax(s->p_small, ramp));
+}
+
+/* sensor.density(det) */
+static double r_density(const RSens *s, int kind, const double *z)
+{
+    if (s->type == SEN_MICROWAVE)
+        return s->clutter;
+    int b = kind & 7;
+    if (b == K_NONE)                                    /* the reference has no volume for this: never asked */
+        return NAN;
+    double d = s->extra / s->vol[b];
+    if (kind & K_SCALE)
+        d /= s->srspan;
+    if (b != K_RBH)
+        return d;
+    double u = z[2] - ((s->h_min != 0.0 && isfinite(s->h_min)) ? log(s->h_min) : z[2]);
+    double born = exp(-pymax(u, 0.0) / s->born_s) / s->born_s;
+    return d * s->lhspan * ((1.0 - s->born) / s->lhspan + s->born * born);
+}
+
+/* ---- small dense algebra (m <= 4) ---- */
+/* S = H P H^T (m x m) and HP = H P (m x N) */
+static void r_hph(const double *H, int m, const double *P, double *HP, double *S)
+{
+    for (int i = 0; i < m; i++)
+        for (int j = 0; j < RN; j++) {
+            double acc = 0.0;
+            for (int k = 0; k < RN; k++)
+                acc = k ? acc + H[i * RN + k] * P[k * RN + j] : H[i * RN + k] * P[k * RN + j];
+            HP[i * RN + j] = acc;
+        }
+    for (int i = 0; i < m; i++)
+        for (int l = 0; l < m; l++) {
+            double acc = 0.0;
+            for (int k = 0; k < RN; k++)
+                acc = k ? acc + HP[i * RN + k] * H[l * RN + k] : HP[i * RN + k] * H[l * RN + k];
+            S[i * m + l] = acc;
+        }
+}
+
+/* LU with partial pivoting of A (m x m) in place; piv; returns 0, or -1 for a zero pivot (singular: numpy's
+ * LinAlgError) */
+static int r_lu(double *A, int m, int *piv)
+{
+    for (int c = 0; c < m; c++) {
+        int p = c;
+        double best = fabs(A[c * m + c]);
+        for (int r = c + 1; r < m; r++)
+            if (fabs(A[r * m + c]) > best) {
+                best = fabs(A[r * m + c]);
+                p = r;
+            }
+        piv[c] = p;
+        if (p != c)
+            for (int j = 0; j < m; j++) {
+                double t = A[c * m + j];
+                A[c * m + j] = A[p * m + j];
+                A[p * m + j] = t;
+            }
+        double d = A[c * m + c];
+        if (d == 0.0)
+            return -1;
+        for (int r = c + 1; r < m; r++) {
+            double f = A[r * m + c] / d;
+            A[r * m + c] = f;
+            for (int j = c + 1; j < m; j++)
+                A[r * m + j] -= f * A[c * m + j];
+        }
+    }
+    return 0;
+}
+
+/* solve with an LU: b (m) in place */
+static void r_lu_solve(const double *LU, int m, const int *piv, double *b)
+{
+    for (int c = 0; c < m; c++) {
+        if (piv[c] != c) {
+            double t = b[c];
+            b[c] = b[piv[c]];
+            b[piv[c]] = t;
+        }
+    }
+    for (int r = 1; r < m; r++) {
+        double acc = b[r];
+        for (int k = 0; k < r; k++)
+            acc -= LU[r * m + k] * b[k];
+        b[r] = acc;
+    }
+    for (int r = m - 1; r >= 0; r--) {
+        double acc = b[r];
+        for (int k = r + 1; k < m; k++)
+            acc -= LU[r * m + k] * b[k];
+        b[r] = acc / LU[r * m + r];
+    }
+}
+
+/* numpy's det from an LU: sign * exp(sum log |u_ii|) */
+static double r_lu_det(const double *LU, int m, const int *piv)
+{
+    double sign = 1.0, logdet = 0.0;
+    for (int c = 0; c < m; c++) {
+        double d = LU[c * m + c];
+        if (piv[c] != c)
+            sign = -sign;
+        if (d < 0.0)
+            sign = -sign;
+        logdet += log(fabs(d));
+    }
+    return sign * exp(logdet);
+}
+
+/* nu^T S^-1 nu (S: m x m, not changed); -1: singular. det of S into *det if det */
+static int r_mahal(const double *S, int m, const double *nu, double *d2, double *det)
+{
+    double A[16], b[4];
+    int piv[4];
+    memcpy(A, S, (size_t)(m * m) * sizeof(double));
+    if (r_lu(A, m, piv) < 0)
+        return -1;
+    memcpy(b, nu, (size_t)m * sizeof(double));
+    r_lu_solve(A, m, piv, b);
+    double acc = 0.0;
+    for (int k = 0; k < m; k++)
+        acc = k ? acc + nu[k] * b[k] : nu[k] * b[k];
+    *d2 = acc;
+    if (det)
+        *det = r_lu_det(A, m, piv);
+    return 0;
+}
+
+/* the inverse of S (m x m) and its det; -1: singular */
+static int r_inv(const double *S, int m, double *Si, double *det)
+{
+    double A[16];
+    int piv[4];
+    memcpy(A, S, (size_t)(m * m) * sizeof(double));
+    if (r_lu(A, m, piv) < 0)
+        return -1;
+    for (int j = 0; j < m; j++) {
+        double e[4] = {0.0, 0.0, 0.0, 0.0};
+        e[j] = 1.0;
+        r_lu_solve(A, m, piv, e);
+        for (int i = 0; i < m; i++)
+            Si[i * m + j] = e[i];
+    }
+    *det = r_lu_det(A, m, piv);
+    return 0;
+}
+
+/* numpy's sum of a contiguous row (pairwise summation, as np.add.reduce does) */
+static double np_sum(const double *a, Py_ssize_t n, Py_ssize_t stride)
+{
+    if (n < 8) {
+        double r = 0.0;
+        for (Py_ssize_t i = 0; i < n; i++)
+            r += a[i * stride];
+        return r;
+    }
+    if (n <= 128) {
+        double r[8];
+        Py_ssize_t i;
+        for (int k = 0; k < 8; k++)
+            r[k] = a[k * stride];
+        for (i = 8; i < n - (n % 8); i += 8)
+            for (int k = 0; k < 8; k++)
+                r[k] += a[(i + k) * stride];
+        double res = ((r[0] + r[1]) + (r[2] + r[3])) + ((r[4] + r[5]) + (r[6] + r[7]));
+        for (; i < n; i++)
+            res += a[i * stride];
+        return res;
+    }
+    Py_ssize_t n2 = n / 2;
+    n2 -= n2 % 8;
+    return np_sum(a, n2, stride) + np_sum(a + n2 * stride, n - n2, stride);
+}
+
+/* ---- marginals (tracker.py): loopy belief propagation on the assignment graph. L (nt x nd) -> out ---- */
+static int r_marginals(const double *L, Py_ssize_t nt, Py_ssize_t nd, double *out)
+{
+    Py_ssize_t n = nt * nd;
+    int any = 0;
+    for (Py_ssize_t k = 0; k < n; k++)
+        if (L[k] != 0.0)
+            any = 1;
+    if (!any) {
+        for (Py_ssize_t k = 0; k < n; k++)
+            out[k] = 0.0;
+        return 0;
+    }
+    double *buf = (double *)PyMem_Malloc((size_t)(3 * n + nt + nd) * sizeof(double));
+    if (buf == NULL) {
+        PyErr_NoMemory();
+        return -1;
+    }
+    double *nu = buf, *val = buf + n, *mu = buf + 2 * n, *rs = buf + 3 * n, *cs = rs + nt;
+    for (Py_ssize_t k = 0; k < n; k++)
+        nu[k] = 1.0;
+    for (int it = 0; it < 30; it++) {
+        for (Py_ssize_t k = 0; k < n; k++)
+            val[k] = L[k] * nu[k];
+        for (Py_ssize_t i = 0; i < nt; i++)
+            rs[i] = np_sum(val + i * nd, nd, 1);
+        for (Py_ssize_t i = 0; i < nt; i++)
+            for (Py_ssize_t j = 0; j < nd; j++)
+                mu[i * nd + j] = L[i * nd + j] / (1.0 + rs[i] - val[i * nd + j]);
+        /* the column sums: row by row (numpy reduces a non-contiguous axis that way), pairwise for one column */
+        if (nd == 1)
+            cs[0] = np_sum(mu, nt, 1);
+        else {
+            for (Py_ssize_t j = 0; j < nd; j++)
+                cs[j] = 0.0 + mu[j];
+            for (Py_ssize_t i = 1; i < nt; i++)
+                for (Py_ssize_t j = 0; j < nd; j++)
+                    cs[j] += mu[i * nd + j];
+        }
+        double worst = 0.0;
+        int nan = 0;
+        for (Py_ssize_t i = 0; i < nt; i++)
+            for (Py_ssize_t j = 0; j < nd; j++) {
+                double nw = 1.0 / (1.0 + cs[j] - mu[i * nd + j]);
+                double d = fabs(nw - nu[i * nd + j]);
+                if (isnan(d))
+                    nan = 1;
+                else if (d > worst)
+                    worst = d;
+                nu[i * nd + j] = nw;
+            }
+        if (!nan && worst < 1e-4)
+            break;
+    }
+    for (Py_ssize_t k = 0; k < n; k++)
+        val[k] = L[k] * nu[k];
+    for (Py_ssize_t i = 0; i < nt; i++) {
+        double r = 1.0 + np_sum(val + i * nd, nd, 1);
+        for (Py_ssize_t j = 0; j < nd; j++)
+            out[i * nd + j] = val[i * nd + j] / r;
+    }
+    PyMem_Free(buf);
+    return 0;
+}
+
+/* ---- assign (tracker.py) with core/objects.py `assign` (Hungarian) for the groups that compete ---- */
+/* core.objects.assign on cost (n x m, INFINITY: forbidden): pairs appended to (pi, pj), count returned */
+static Py_ssize_t r_hungarian(const double *cost, Py_ssize_t n, Py_ssize_t m, Py_ssize_t *pi, Py_ssize_t *pj)
+{
+    Py_ssize_t cnt = 0;
+    int anyf = 0;
+    for (Py_ssize_t k = 0; k < n * m; k++)
+        if (isfinite(cost[k]))
+            anyf = 1;
+    if (!anyf)
+        return 0;
+    /* the common case: no two rows compete: each row's best column is the optimum */
+    {
+        Py_ssize_t *best = (Py_ssize_t *)PyMem_Malloc((size_t)n * sizeof(Py_ssize_t));
+        if (best == NULL)
+            return -1;
+        Py_ssize_t nr = 0;
+        int uniq = 1;
+        for (Py_ssize_t i = 0; i < n; i++) {
+            Py_ssize_t b = -1;
+            double bv = INFINITY;
+            int fin = 0;
+            for (Py_ssize_t j = 0; j < m; j++) {
+                double c = cost[i * m + j];
+                if (isfinite(c)) {
+                    fin = 1;
+                    if (b < 0 || c < bv) {
+                        bv = c;
+                        b = j;
+                    }
+                }
+            }
+            if (!fin)
+                continue;
+            best[nr] = b;
+            pi[nr] = i;
+            nr++;
+        }
+        /* argmin of np.where(fin, cost, inf): the first finite minimum (a row with finite entries all inf-equal
+         * cannot occur: finite entries are below inf) */
+        for (Py_ssize_t a = 0; a < nr && uniq; a++) {
+            for (Py_ssize_t b2 = a + 1; b2 < nr; b2++)
+                if (best[a] == best[b2]) {
+                    uniq = 0;
+                    break;
+                }
+            if (uniq) {
+                int cntf = 0;
+                for (Py_ssize_t i = 0; i < n; i++)
+                    cntf += isfinite(cost[i * m + best[a]]) ? 1 : 0;
+                if (cntf != 1)
+                    uniq = 0;
+            }
+        }
+        if (uniq) {
+            for (Py_ssize_t a = 0; a < nr; a++)
+                pj[a] = best[a];
+            PyMem_Free(best);
+            return nr;
+        }
+        PyMem_Free(best);
+    }
+    const double big = 1e6;
+    Py_ssize_t k = n > m ? n : m;
+    double *a = (double *)PyMem_Malloc((size_t)(k * k + 3 * (k + 1)) * sizeof(double));
+    Py_ssize_t *p = (Py_ssize_t *)PyMem_Malloc((size_t)(2 * (k + 1)) * sizeof(Py_ssize_t));
+    char *used = (char *)PyMem_Malloc((size_t)(k + 1));
+    if (a == NULL || p == NULL || used == NULL) {
+        PyMem_Free(a);
+        PyMem_Free(p);
+        PyMem_Free(used);
+        return -1;
+    }
+    double *u = a + k * k, *v = u + k + 1, *minv = v + k + 1;
+    Py_ssize_t *way = p + k + 1;
+    for (Py_ssize_t i = 0; i < k; i++)
+        for (Py_ssize_t j = 0; j < k; j++)
+            a[i * k + j] = (i < n && j < m && isfinite(cost[i * m + j])) ? cost[i * m + j] : big;
+    for (Py_ssize_t j = 0; j <= k; j++) {
+        u[j] = v[j] = 0.0;
+        p[j] = way[j] = 0;
+    }
+    for (Py_ssize_t i = 1; i <= k; i++) {
+        p[0] = i;
+        Py_ssize_t j0 = 0;
+        for (Py_ssize_t j = 0; j <= k; j++) {
+            minv[j] = INFINITY;
+            used[j] = 0;
+        }
+        for (;;) {
+            used[j0] = 1;
+            Py_ssize_t i0 = p[j0], j1 = 0;
+            double delta = INFINITY;
+            for (Py_ssize_t j = 1; j <= k; j++)
+                if (!used[j]) {
+                    double cur = a[(i0 - 1) * k + j - 1] - u[i0] - v[j];
+                    if (cur < minv[j]) {
+                        minv[j] = cur;
+                        way[j] = j0;
+                    }
+                    if (minv[j] < delta) {
+                        delta = minv[j];
+                        j1 = j;
+                    }
+                }
+            for (Py_ssize_t j = 0; j <= k; j++) {
+                if (used[j]) {
+                    u[p[j]] += delta;
+                    v[j] -= delta;
+                } else
+                    minv[j] -= delta;
+            }
+            j0 = j1;
+            if (p[j0] == 0)
+                break;
+        }
+        for (;;) {
+            Py_ssize_t j1 = way[j0];
+            p[j0] = p[j1];
+            j0 = j1;
+            if (j0 == 0)
+                break;
+        }
+    }
+    for (Py_ssize_t j = 1; j <= k; j++) {
+        Py_ssize_t i = p[j] - 1;
+        if (i < n && j - 1 < m && isfinite(cost[i * m + j - 1])) {
+            pi[cnt] = i;
+            pj[cnt] = j - 1;
+            cnt++;
+        }
+    }
+    PyMem_Free(a);
+    PyMem_Free(p);
+    PyMem_Free(used);
+    return cnt;
+}
+
+/* tracker.assign: the pairs (object, detection) of the largest total gain (gain -inf: not allowed), settled per
+ * group of objects and detections that compete. pairs appended to (pi, pj); count returned, -1 on error */
+static Py_ssize_t r_assign(const double *gain, Py_ssize_t nt, Py_ssize_t nd, Py_ssize_t *pi, Py_ssize_t *pj)
+{
+    Py_ssize_t cnt = 0;
+    char *seen_t = (char *)PyMem_Calloc((size_t)(nt + nd + 1), 1);
+    char *in_t = (char *)PyMem_Calloc((size_t)(nt + nd + 1), 1);
+    Py_ssize_t *stack = (Py_ssize_t *)PyMem_Malloc((size_t)(2 * (nt + nd) + 2) * sizeof(Py_ssize_t));
+    Py_ssize_t *ts = (Py_ssize_t *)PyMem_Malloc((size_t)(nt + nd + 2) * sizeof(Py_ssize_t));
+    double *cst = NULL;
+    Py_ssize_t *hi = NULL, *hj = NULL;
+    if (seen_t == NULL || in_t == NULL || stack == NULL || ts == NULL) {
+        PyErr_NoMemory();
+        cnt = -1;
+        goto out;
+    }
+    char *in_d = in_t + nt;
+    Py_ssize_t *ds = ts + nt + 1;
+    (void)ds;
+    for (Py_ssize_t i0 = 0; i0 < nt; i0++) {
+        int any = 0;
+        for (Py_ssize_t j = 0; j < nd; j++)
+            if (isfinite(gain[i0 * nd + j]))
+                any = 1;
+        if (!any || seen_t[i0])
+            continue;
+        memset(in_t, 0, (size_t)(nt + nd));
+        Py_ssize_t sp = 0;
+        in_t[i0] = 1;
+        stack[sp++] = i0;                                /* objects as i, detections as nt + j */
+        while (sp) {
+            Py_ssize_t k = stack[--sp];
+            if (k < nt) {
+                for (Py_ssize_t j = 0; j < nd; j++)
+                    if (isfinite(gain[k * nd + j]) && !in_d[j]) {
+                        in_d[j] = 1;
+                        stack[sp++] = nt + j;
+                    }
+            } else {
+                Py_ssize_t j = k - nt;
+                for (Py_ssize_t i = 0; i < nt; i++)
+                    if (isfinite(gain[i * nd + j]) && !in_t[i]) {
+                        in_t[i] = 1;
+                        stack[sp++] = i;
+                    }
+            }
+        }
+        Py_ssize_t nts = 0, nds = 0;
+        Py_ssize_t *T = ts, *D = stack;                  /* the stack is free now */
+        for (Py_ssize_t i = 0; i < nt; i++)
+            if (in_t[i]) {
+                seen_t[i] = 1;
+                T[nts++] = i;
+            }
+        for (Py_ssize_t j = 0; j < nd; j++)
+            if (in_d[j])
+                D[nds++] = j;
+        if (nts == 1) {                                  /* max(ds, key=gain): the first largest */
+            Py_ssize_t bj = D[0];
+            for (Py_ssize_t b = 1; b < nds; b++)
+                if (gain[T[0] * nd + D[b]] > gain[T[0] * nd + bj])
+                    bj = D[b];
+            pi[cnt] = T[0];
+            pj[cnt] = bj;
+            cnt++;
+            continue;
+        }
+        if (nds == 1) {
+            Py_ssize_t bi = T[0];
+            for (Py_ssize_t a = 1; a < nts; a++)
+                if (gain[T[a] * nd + D[0]] > gain[bi * nd + D[0]])
+                    bi = T[a];
+            pi[cnt] = bi;
+            pj[cnt] = D[0];
+            cnt++;
+            continue;
+        }
+        /* every object may also stay without a detection (its own column, cost 0) */
+        Py_ssize_t w = nds + nts;
+        cst = (double *)PyMem_Malloc((size_t)(nts * w) * sizeof(double));
+        hi = (Py_ssize_t *)PyMem_Malloc((size_t)(nts + w + 1) * 2 * sizeof(Py_ssize_t));
+        if (cst == NULL || hi == NULL) {
+            PyErr_NoMemory();
+            cnt = -1;
+            goto out;
+        }
+        hj = hi + nts + w + 1;
+        for (Py_ssize_t a = 0; a < nts; a++) {
+            for (Py_ssize_t b = 0; b < w; b++)
+                cst[a * w + b] = INFINITY;
+            for (Py_ssize_t b = 0; b < nds; b++) {
+                double g = gain[T[a] * nd + D[b]];
+                if (isfinite(g))
+                    cst[a * w + b] = -g;
+            }
+            cst[a * w + nds + a] = 0.0;
+        }
+        Py_ssize_t h = r_hungarian(cst, nts, w, hi, hj);
+        if (h < 0) {
+            PyErr_NoMemory();
+            cnt = -1;
+            goto out;
+        }
+        for (Py_ssize_t q = 0; q < h; q++)
+            if (hj[q] < nds && isfinite(cst[hi[q] * w + hj[q]])) {
+                pi[cnt] = T[hi[q]];
+                pj[cnt] = D[hj[q]];
+                cnt++;
+            }
+        PyMem_Free(cst);
+        PyMem_Free(hi);
+        cst = NULL;
+        hi = NULL;
+    }
+out:
+    PyMem_Free(seen_t);
+    PyMem_Free(in_t);
+    PyMem_Free(stack);
+    PyMem_Free(ts);
+    PyMem_Free(cst);
+    PyMem_Free(hi);
+    return cnt;
+}
+
+/* ---- one scan's association (Tracker.process) ---- */
+#define RDET 13                  /* a detection: kind, sdt, group, vehicle (-1, 0, 1), box width, z[4], R[4] */
+#define RSCFG 10                 /* gate for 1..4 rows, feat_sigma, feat_same, feat_span, map_bw[3] */
+
+/* radar_scan(S, rows, sensor, pose, objs, dets, mem, nscan, cfg, pd_out, cov_out, ratio_out|None,
+ *            gain_out|None, feat_out|None) -> [(i, j, gain, pair, lam)]
+ *   objs: (nt, 3) [kind of the object's label (-1 a person or bike, 0 unknown, 1 a vehicle), width of its last
+ *         box if the box feature applies (NaN if not), id];  dets: (nd, RDET);  mem: (nm, 5) the map's entries that
+ *         count [rows, z0, z1, z2, object id] or None;  nscan: scans in the map's memory.
+ * Every object's probability of being reported (pd_out) and the sensor's coverage at its place (cov_out); the
+ * pairs of the scan's assignment with their gain, their probability in the scan as a whole (marginals) and the
+ * other story's density over the box feature (tracker `feat`). */
+static PyObject *n_radar_scan(PyObject *self, PyObject *args)
+{
+    PyObject *oS, *orows, *osen, *opose, *oobj, *odet, *omem, *ocfg, *opd, *ocov, *orat, *ogain, *ofeat;
+    double nscan;
+    if (!PyArg_ParseTuple(args, "OOOOOOOdOOOOOO", &oS, &orows, &osen, &opose, &oobj, &odet, &omem, &nscan, &ocfg,
+                          &opd, &ocov, &orat, &ogain, &ofeat))
+        return NULL;
+    PyObject *res = NULL;
+    View vS, vpd, vcov, vrat, vgain, vfeat;
+    vS.held = vpd.held = vcov.held = vrat.held = vgain.held = vfeat.held = 0;
+    Py_ssize_t cap, nt = 0, nd, nm = 0, *rows = NULL, *pi = NULL, *pj = NULL;
+    double *ob = NULL, *dt = NULL, *mem = NULL, *wk = NULL;
+    double pose[6], cfg[RSCFG], *pd, *cov, *rat, *gain, *feat;
+    RSens sen;
+    if (store_get(oS, &vS, &cap) < 0 || (rows = idx_get(orows, cap, &nt)) == NULL || sens_get(osen, &sen) < 0 ||
+        nums_get(opose, 6, pose, "pose") < 0 || nums_get(ocfg, RSCFG, cfg, "cfg") < 0)
+        goto done;
+    nd = batch_len(odet);
+    if (nd < 0)
+        goto done;
+    if (omem != Py_None) {
+        nm = batch_len(omem);
+        if (nm < 0)
+            goto done;
+    }
+    ob = (double *)PyMem_Malloc((size_t)(3 * nt + RDET * nd + 5 * nm + 1) * sizeof(double));
+    /* work: ratio, gain, feat, own (nt x nd each) if not given; lam0, loc (nd); car (2 nt) */
+    wk = (double *)PyMem_Malloc((size_t)(4 * nt * nd + 2 * nd + 2 * nt + 1) * sizeof(double));
+    pi = (Py_ssize_t *)PyMem_Malloc((size_t)(2 * (nt + nd) + 2) * sizeof(Py_ssize_t));
+    if (ob == NULL || wk == NULL || pi == NULL) {
+        PyErr_NoMemory();
+        goto done;
+    }
+    pj = pi + nt + nd + 1;
+    dt = ob + 3 * nt;
+    mem = dt + RDET * nd;
+    if ((nt && rows_get(oobj, nt, 3, ob, "objs") < 0) || (nd && rows_get(odet, nd, RDET, dt, "dets") < 0) ||
+        (nm && rows_get(omem, nm, 5, mem, "mem") < 0) ||
+        out_get(opd, &vpd, nt, 0, &pd, "pd_out") < 0 || out_get(ocov, &vcov, nt, 0, &cov, "cov_out") < 0 ||
+        out_get(orat, &vrat, nt * nd, 1, &rat, "ratio_out") < 0 || out_get(ogain, &vgain, nt * nd, 1, &gain, "gain_out") < 0 ||
+        out_get(ofeat, &vfeat, nt * nd, 1, &feat, "feat_out") < 0)
+        goto done;
+    {
+    double *own = wk + 3 * nt * nd, *lam0 = wk + 4 * nt * nd, *loc = lam0 + nd, *car = loc + nd;
+    if (rat == NULL)
+        rat = wk;
+    if (gain == NULL)
+        gain = wk + nt * nd;
+    if (feat == NULL)
+        feat = wk + 2 * nt * nd;
+    double *A = (double *)vS.b.buf;
+    double cph = cos(pose[2]), sph = sin(pose[2]);
+    for (Py_ssize_t i = 0; i < nt; i++) {
+        const double *x = A + rows[i] * RROW + RO_X;
+        double dx = x[R_PX] - pose[0], dy = x[R_PY] - pose[1];
+        car[2 * i] = cph * dx + sph * dy;
+        car[2 * i + 1] = -sph * dx + cph * dy;
+        pd[i] = r_p_detect(&sen, car[2 * i], car[2 * i + 1], x);
+        cov[i] = r_coverage(&sen, car[2 * i], car[2 * i + 1]);
+    }
+    for (Py_ssize_t k = 0; k < nt * nd; k++) {
+        rat[k] = 0.0;
+        gain[k] = -INFINITY;
+        feat[k] = 0.0;
+        own[k] = 0.0;
+    }
+    if (nd && nt) {
+        int ng = 0;
+        for (Py_ssize_t j = 0; j < nd; j++) {
+            const double *d = dt + j * RDET;
+            lam0[j] = r_density(&sen, (int)d[0], d + 5);
+            if ((int)d[2] + 1 > ng)
+                ng = (int)d[2] + 1;
+            /* the map: unexplained detections that became objects, near this one (tracker `_local_density`) */
+            loc[j] = 0.0;
+            int base = (int)d[0] & 7;
+            if (sen.type != SEN_CAMERA || !(base == K_RB || base == K_RBH) || nm == 0)
+                continue;
+            int n = base == K_RB ? 2 : 3;
+            double norm = pymax(nscan, 1.0);
+            for (int a = 0; a < n; a++)
+                norm *= cfg[7 + a] * 2.5066;
+            for (Py_ssize_t e = 0; e < nm; e++) {
+                const double *me = mem + 5 * e;
+                if (me[0] < n)
+                    continue;
+                double q = 0.0;
+                for (int a = 0; a < n; a++)
+                    q += pow((d[5 + a] - me[1 + a]) / cfg[7 + a], 2.0);
+                if (q < 25.0) {
+                    double v = exp(-0.5 * q) / norm;
+                    loc[j] += v;
+                    for (Py_ssize_t i = 0; i < nt; i++)
+                        if (ob[3 * i + 2] == me[4])
+                            own[i * nd + j] += v;
+                }
+            }
+        }
+        Py_ssize_t *J = pi;                              /* a group's detections (pi is free until the end) */
+        int *ok = (int *)PyMem_Malloc((size_t)nd * sizeof(int));
+        double *qs = (double *)PyMem_Malloc((size_t)(3 * nd) * sizeof(double));
+        if (ok == NULL || qs == NULL) {
+            PyMem_Free(ok);
+            PyMem_Free(qs);
+            PyErr_NoMemory();
+            goto done;
+        }
+        double *dets = qs + nd, *lk = dets + nd;
+        double zp[4], H[4 * RN], HP[4 * RN], S[16], zm[4], Hm[4 * RN], HPm[4 * RN], Sm[16];
+        for (Py_ssize_t i = 0; i < nt; i++) {
+            if (pd[i] <= 0.0)
+                continue;
+            const double *row = A + rows[i] * RROW;
+            const double *x = row + RO_X, *P = row + RO_P, *mu = row + RO_MU;
+            double ov = ob[3 * i], lbw = ob[3 * i + 1];
+            for (int g = 0; g < ng; g++) {
+                Py_ssize_t nJ = 0;
+                for (Py_ssize_t j = 0; j < nd; j++)
+                    if ((int)dt[j * RDET + 2] == g)
+                        J[nJ++] = j;
+                if (nJ == 0)
+                    continue;
+                const double *d0 = dt + J[0] * RDET;
+                int kind = (int)d0[0];
+                double sdt = d0[1];
+                if (sen.type == SEN_CAMERA && sen.cover && ((kind & 7) == K_B || (kind & 7) == K_BT) &&
+                    !(py_hypot(car[2 * i], car[2 * i + 1]) <= sen.near * sen.gmin))
+                    continue;                            /* CameraBoxes.takes */
+                int anyok = 0;
+                for (Py_ssize_t a = 0; a < nJ; a++) {
+                    ok[a] = dt[J[a] * RDET + 3] * ov >= 0.0;    /* a pedestrian's box does not continue a vehicle */
+                    anyok |= ok[a];
+                }
+                if (!anyok)
+                    continue;
+                /* the gate: the object as a whole */
+                int m = r_h(&sen, kind, sdt, x, pose, zp, H);
+                int ar = r_angle_row(&sen, kind);
+                double gate = (m >= 1 && m <= 4) ? cfg[m - 1] : 16.0;
+                r_hph(H, m, P, HP, S);
+                int sing = 0;
+                anyok = 0;
+                for (Py_ssize_t a = 0; a < nJ; a++) {
+                    const double *d = dt + J[a] * RDET;
+                    double nuj[4], Sj[16], q;
+                    for (int r = 0; r < m; r++)
+                        nuj[r] = r == ar ? wrap_pi(d[5 + r] - zp[r]) : d[5 + r] - zp[r];
+                    memcpy(Sj, S, sizeof(double) * (size_t)(m * m));
+                    for (int r = 0; r < m; r++)
+                        Sj[r * m + r] = S[r * m + r] + d[9 + r];
+                    if (r_mahal(Sj, m, nuj, &q, NULL) < 0) {
+                        sing = 1;                        /* numpy: LinAlgError for the whole group */
+                        break;
+                    }
+                    ok[a] = ok[a] && q <= gate;
+                    anyok |= ok[a];
+                }
+                if (sing || !anyok)
+                    continue;
+                /* what each hypothesis, with its own prediction and weight, gives the detection */
+                for (Py_ssize_t a = 0; a < nJ; a++)
+                    lk[a] = 0.0;
+                double c2 = pow(2.0 * PI, (double)m);
+                for (int mm = 0; mm < 3; mm++) {
+                    if (mu[mm] < 1e-4)
+                        continue;
+                    r_h(&sen, kind, sdt, row + RO_XS + mm * RN, pose, zm, Hm);
+                    r_hph(Hm, m, row + RO_PS + mm * RNN, HPm, Sm);
+                    int bad = 0;
+                    for (Py_ssize_t a = 0; a < nJ; a++) {
+                        if (!ok[a])
+                            continue;
+                        const double *d = dt + J[a] * RDET;
+                        double nuj[4], Sj[16];
+                        for (int r = 0; r < m; r++)
+                            nuj[r] = r == ar ? wrap_pi(d[5 + r] - zm[r]) : d[5 + r] - zm[r];
+                        memcpy(Sj, Sm, sizeof(double) * (size_t)(m * m));
+                        for (int r = 0; r < m; r++)
+                            Sj[r * m + r] = Sm[r * m + r] + d[9 + r];
+                        if (r_mahal(Sj, m, nuj, &qs[a], &dets[a]) < 0) {
+                            bad = 1;
+                            break;
+                        }
+                    }
+                    if (bad)
+                        continue;
+                    for (Py_ssize_t a = 0; a < nJ; a++)
+                        if (ok[a] && qs[a] < 60.0 && dets[a] > 0.0)
+                            lk[a] += mu[mm] * exp(-0.5 * pymin(qs[a], 60.0)) / sqrt(c2 * dets[a]);
+                }
+                for (Py_ssize_t a = 0; a < nJ; a++) {
+                    if (!ok[a] || lk[a] <= 0.0)
+                        continue;
+                    const double *d = dt + J[a] * RDET;
+                    Py_ssize_t j = J[a];
+                    double F = 1.0;
+                    if (!isnan(lbw) && d[4] > 0.0 && ar >= 0) {      /* the box as a feature */
+                        double e = fabs(wrap_pi(d[5 + ar] - zp[ar])) / np_maximum(0.5 * (d[4] + lbw), 1e-4);
+                        double sg = cfg[4], t = np_minimum(e / sg, 12.0);
+                        F = cfg[6] * (cfg[5] * 0.7979 / sg * exp(-0.5 * (t * t)) + (1.0 - cfg[5]) / cfg[6]);
+                    }
+                    /* the other story's density here: not counting this object's own first detection */
+                    double lam = pymax(lam0[j], loc[j] - own[i * nd + j]);
+                    double r = pd[i] * lk[a] * F / ((1.0 - pd[i]) * lam);
+                    rat[i * nd + j] = r;
+                    double gg = log(r);
+                    if (gg > 0.0) {
+                        gain[i * nd + j] = gg;
+                        feat[i * nd + j] = lam / F;
+                    }
+                }
+            }
+        }
+        PyMem_Free(ok);
+        PyMem_Free(qs);
+    }
+    /* the pairing's probabilities in the scan as a whole, and the assignment */
+    double *pair = own;                                  /* free now */
+    if (r_marginals(rat, nt, nd, pair) < 0)
+        goto done;
+    Py_ssize_t np_ = r_assign(gain, nt, nd, pi, pj);
+    if (np_ < 0)
+        goto done;
+    res = PyList_New(np_);
+    if (res == NULL)
+        goto done;
+    for (Py_ssize_t q = 0; q < np_; q++) {
+        Py_ssize_t k = pi[q] * nd + pj[q];
+        PyObject *t = Py_BuildValue("(nnddd)", pi[q], pj[q], gain[k], pair[k], feat[k]);
+        if (t == NULL) {
+            Py_CLEAR(res);
+            goto done;
+        }
+        PyList_SetItem(res, q, t);
+    }
+    }
+done:
+    PyMem_Free(rows);
+    PyMem_Free(ob);
+    PyMem_Free(wk);
+    PyMem_Free(pi);
+    view_drop(&vS); view_drop(&vpd); view_drop(&vcov); view_drop(&vrat); view_drop(&vgain); view_drop(&vfeat);
+    return res;
+}
+
+/* ---- the update of a scan's pairs (Tracker._update, its arithmetic) ---- */
+/* K = P H^T Si (N x m), from HP = H P (P symmetric is NOT assumed: P H^T computed as such) */
+static void r_gain(const double *P, const double *H, int m, const double *Si, double *K)
+{
+    double PH[RN * 4];
+    for (int i = 0; i < RN; i++)
+        for (int l = 0; l < m; l++) {
+            double acc = 0.0;
+            for (int k = 0; k < RN; k++)
+                acc = k ? acc + P[i * RN + k] * H[l * RN + k] : P[i * RN + k] * H[l * RN + k];
+            PH[i * m + l] = acc;
+        }
+    for (int i = 0; i < RN; i++)
+        for (int l = 0; l < m; l++) {
+            double acc = 0.0;
+            for (int k = 0; k < m; k++)
+                acc = k ? acc + PH[i * m + k] * Si[k * m + l] : PH[i * m + k] * Si[k * m + l];
+            K[i * m + l] = acc;
+        }
+}
+
+/* one hypothesis (or the free estimate) takes the detection with weight beta: x, P in place */
+static void r_take(double *x, double *P, const double *K, const double *S, const double *nu, int m, double beta)
+{
+    double dx[RN], KS[RN * 4], Pn[RNN];
+    for (int i = 0; i < RN; i++) {
+        double acc = 0.0;
+        for (int k = 0; k < m; k++)
+            acc = k ? acc + K[i * m + k] * nu[k] : K[i * m + k] * nu[k];
+        dx[i] = acc;
+    }
+    for (int i = 0; i < RN; i++)
+        for (int l = 0; l < m; l++) {
+            double acc = 0.0;
+            for (int k = 0; k < m; k++)
+                acc = k ? acc + K[i * m + k] * S[k * m + l] : K[i * m + k] * S[k * m + l];
+            KS[i * m + l] = acc;
+        }
+    double bb = beta * (1.0 - beta);
+    for (int i = 0; i < RN; i++)
+        for (int j = 0; j < RN; j++) {
+            double acc = 0.0;
+            for (int k = 0; k < m; k++)
+                acc = k ? acc + KS[i * m + k] * K[j * m + k] : KS[i * m + k] * K[j * m + k];
+            Pn[i * RN + j] = P[i * RN + j] - beta * acc + bb * (dx[i] * dx[j]);
+        }
+    for (int i = 0; i < RN; i++)
+        x[i] = x[i] + beta * dx[i];
+    for (int i = 0; i < RN; i++)
+        for (int j = 0; j < RN; j++)
+            P[i * RN + j] = 0.5 * (Pn[i * RN + j] + Pn[j * RN + i]);
+}
+
+static inline double clamp_dp(double v)          /* min(0.05, max(-0.05, v)) as Python takes it */
+{
+    return pymin(0.05, pymax(-0.05, v));
+}
+
+/* nu = z - h(x) wrapped, S = H P H^T + diag(R); returns m */
+static int r_innov(const RSens *s, int kind, double sdt, const double *x, const double *P, const double *pose,
+                   const double *z, const double *R, double *nu, double *H, double *S)
+{
+    double zp[4], HP[4 * RN];
+    int m = r_h(s, kind, sdt, x, pose, zp, H);
+    int ar = r_angle_row(s, kind);
+    for (int r = 0; r < m; r++)
+        nu[r] = r == ar ? wrap_pi(z[r] - zp[r]) : z[r] - zp[r];
+    r_hph(H, m, P, HP, S);
+    for (int r = 0; r < m; r++)
+        S[r * m + r] = S[r * m + r] + R[r];
+    return m;
+}
+
+#define RPAIR 4                  /* a pair: p_detect, lam (feat), pair probability (NaN: none), the object's hits */
+
+/* radar_update(S, rows, sensor, pose, dets, pairs, cfg) -> [(nis, dlogodds)]
+ *   rows: the objects' rows (one per pair);  dets: (np, RDET) each pair's detection (as `_common` left it);
+ *   pairs: (np, RPAIR);  cfg: (mu_hold_hits, mu_floor).
+ * Every pair's detection into its object: the hypotheses, the free estimate, the probabilities of the hypotheses
+ * and the combination are written into the object's row; returned per pair: the normalized innovation of the
+ * object as a whole (before the update) and what the detection adds to the object's log odds of existing. */
+static PyObject *n_radar_update(PyObject *self, PyObject *args)
+{
+    PyObject *oS, *orows, *osen, *opose, *odet, *opair, *ocfg;
+    if (!PyArg_ParseTuple(args, "OOOOOOO", &oS, &orows, &osen, &opose, &odet, &opair, &ocfg))
+        return NULL;
+    PyObject *res = NULL;
+    View vS;
+    vS.held = 0;
+    Py_ssize_t cap, np_ = 0, *rows = NULL;
+    double *buf = NULL, pose[6], cfg[2];
+    RSens sen;
+    if (store_get(oS, &vS, &cap) < 0 || (rows = idx_get(orows, cap, &np_)) == NULL || sens_get(osen, &sen) < 0 ||
+        nums_get(opose, 6, pose, "pose") < 0 || nums_get(ocfg, 2, cfg, "cfg") < 0)
+        goto done;
+    buf = (double *)PyMem_Malloc((size_t)((RDET + RPAIR) * np_ + 1) * sizeof(double));
+    if (buf == NULL) {
+        PyErr_NoMemory();
+        goto done;
+    }
+    if (np_ && (rows_get(odet, np_, RDET, buf, "dets") < 0 || rows_get(opair, np_, RPAIR, buf + RDET * np_, "pairs") < 0))
+        goto done;
+    for (Py_ssize_t q = 0; q < np_; q++)
+        for (Py_ssize_t q2 = q + 1; q2 < np_; q2++)
+            if (rows[q] == rows[q2]) {
+                PyErr_SetString(PyExc_ValueError, "radar_update: one object in two pairs");
+                goto done;
+            }
+    res = PyList_New(np_);
+    if (res == NULL)
+        goto done;
+    double *A = (double *)vS.b.buf;
+    for (Py_ssize_t q = 0; q < np_; q++) {
+        const double *d = buf + q * RDET, *pp = buf + RDET * np_ + q * RPAIR;
+        double *row = A + rows[q] * RROW;
+        double *mu = row + RO_MU;
+        int kind = (int)d[0];
+        double sdt = d[1], pd = pp[0], lam = pp[1], pair = pp[2], hits = pp[3];
+        double other = pymax((1.0 - pd) * lam, 1e-300);
+        double like[3], Hs[3][4 * RN], nus[3][4], Ss[3][16], Sis[3][16];
+        int m = 0;
+        for (int j = 0; j < 3; j++) {
+            double det;
+            m = r_innov(&sen, kind, sdt, row + RO_XS + j * RN, row + RO_PS + j * RNN, pose, d + 5, d + 9, nus[j], Hs[j], Ss[j]);
+            if (r_inv(Ss[j], m, Sis[j], &det) < 0) {
+                PyErr_SetString(PyExc_ValueError, "radar_update: a singular innovation covariance");   /* numpy: LinAlgError */
+                Py_CLEAR(res);
+                goto done;
+            }
+            double t[4], d2 = 0.0;
+            for (int c = 0; c < m; c++) {
+                double acc = 0.0;
+                for (int r = 0; r < m; r++)
+                    acc = r ? acc + nus[j][r] * Sis[j][r * m + c] : nus[j][r] * Sis[j][r * m + c];
+                t[c] = acc;
+            }
+            for (int c = 0; c < m; c++)
+                d2 = c ? d2 + t[c] * nus[j][c] : t[c] * nus[j][c];
+            like[j] = exp(-0.5 * pymin(d2, 400.0)) / sqrt(pymax(pow(2.0 * PI, (double)m) * det, 1e-30));
+        }
+        /* whose the detection is: one question for the whole object, shrunk by the pairing's probability */
+        double lo = (mu[0] * like[0] + mu[1] * like[1]) + mu[2] * like[2];
+        double beta_o = pd * lo / (pd * lo + other);
+        double comp = (isnan(pair) || beta_o <= 0.0) ? 1.0 : pymin(1.0, pair / beta_o);
+        beta_o *= comp;
+        /* the object as a whole, before the update (its NIS) */
+        double nu0[4], H0[4 * RN], S0[16], d20;
+        int m0 = r_innov(&sen, kind, sdt, row + RO_X, row + RO_P, pose, d + 5, d + 9, nu0, H0, S0);
+        if (r_mahal(S0, m0, nu0, &d20, NULL) < 0) {
+            PyErr_SetString(PyExc_ValueError, "radar_update: a singular innovation covariance");
+            Py_CLEAR(res);
+            goto done;
+        }
+        for (int j = 0; j < 3; j++) {
+            double K[RN * 4];
+            double *x = row + RO_XS + j * RN, *P = row + RO_PS + j * RNN;
+            double beta = pymax(comp * pd * like[j] / (pd * like[j] + other), beta_o);
+            r_gain(P, Hs[j], m, Sis[j], K);
+            r_take(x, P, K, Ss[j], nus[j], m, beta);
+            if (j == R_STAND)
+                for (int k = R_VX; k <= R_AY; k++)
+                    x[k] = 0.0;
+            x[R_DP] = clamp_dp(x[R_DP]);
+        }
+        /* the free estimate takes it the same way */
+        {
+            double nu[4], H[4 * RN], Sf[16], Si[16], det, K[RN * 4];
+            double *x = row + RO_XF, *P = row + RO_PF;
+            int mf = r_innov(&sen, kind, sdt, x, P, pose, d + 5, d + 9, nu, H, Sf);
+            if (r_inv(Sf, mf, Si, &det) < 0) {
+                PyErr_SetString(PyExc_ValueError, "radar_update: a singular innovation covariance");
+                Py_CLEAR(res);
+                goto done;
+            }
+            double t[4], d2 = 0.0;
+            for (int c = 0; c < mf; c++) {
+                double acc = 0.0;
+                for (int r = 0; r < mf; r++)
+                    acc = r ? acc + nu[r] * Si[r * mf + c] : nu[r] * Si[r * mf + c];
+                t[c] = acc;
+            }
+            for (int c = 0; c < mf; c++)
+                d2 = c ? d2 + t[c] * nu[c] : t[c] * nu[c];
+            double lf = exp(-0.5 * pymin(d2, 400.0)) / sqrt(pymax(pow(2.0 * PI, (double)mf) * det, 1e-30));
+            double beta = pymax(comp * pd * lf / (pd * lf + other), beta_o);
+            r_gain(P, H, mf, Si, K);
+            r_take(x, P, K, Sf, nu, mf, beta);
+            x[R_DP] = clamp_dp(x[R_DP]);
+        }
+        /* the hypotheses weighed by how well each predicted the detection */
+        double tot = (mu[0] * like[0] + mu[1] * like[1]) + mu[2] * like[2];
+        double w[3];
+        for (int j = 0; j < 3; j++)
+            w[j] = mu[j] * (pd * like[j] + other);
+        if (tot > 0.0 && (sen.type == SEN_MICROWAVE || hits >= cfg[0] || (kind & K_SCALE))) {
+            double ws = (w[0] + w[1]) + w[2], nm[3];
+            for (int j = 0; j < 3; j++) {
+                double v = w[j] / ws;
+                nm[j] = (isnan(v) || v >= cfg[1]) ? v : cfg[1];
+            }
+            double s2 = (nm[0] + nm[1]) + nm[2];
+            for (int j = 0; j < 3; j++)
+                mu[j] = nm[j] / s2;
+        } else if (tot > 0.0 && w[1] + w[2] > 0.0) {
+            double mv = mu[1] + mu[2], ws = w[1] + w[2];
+            for (int j = 1; j < 3; j++) {
+                double v = mv * w[j] / ws;
+                mu[j] = (isnan(v) || v >= cfg[1]) ? v : cfg[1];
+            }
+            double s2 = (mu[0] + mu[1]) + mu[2];
+            for (int j = 0; j < 3; j++)
+                mu[j] = mu[j] / s2;
+        }
+        double like_all = pymax(tot, 1e-30);
+        double dl = pymin(pymax(log(pymax(sen.p_d * like_all / r_density(&sen, kind, d + 5), 1e-9)), log(1.5)), log(20.0));
+        r_combine(row + RO_XS, row + RO_PS, mu, row + RO_X, row + RO_P);
+        PyObject *t = Py_BuildValue("(dd)", d20 / m0, dl);
+        if (t == NULL) {
+            Py_CLEAR(res);
+            goto done;
+        }
+        PyList_SetItem(res, q, t);
+    }
+done:
+    PyMem_Free(rows);
+    PyMem_Free(buf);
+    view_drop(&vS);
+    return res;
+}
+
+/* ---- the motion model on the objects' rows ---- */
+/* one object's hypotheses and free estimate after dt (Tracker._evolve): into xs1 (3N), Ps1 (3NN), c (3), and
+ * the free estimate into xf1, Pf1 when given */
+static void r_evolve_row(const double *row, double dt, const double *K, const RPar *par, double *xs1, double *Ps1,
+                         double *c, double *xf1, double *Pf1)
+{
+    double T[9], xm[3 * RN], Pm[3 * RNN];
+    const double *X = row + RO_XS, *P = row + RO_PS;
+    double q0 = r_still(X + RN, P + RNN, K[3]), q1 = r_still(X + 2 * RN, P + 2 * RNN, K[3]);
+    r_transition(dt, q0, q1, par, T);
+    r_mix(X, P, row + RO_MU, T, row + RO_XF, row + RO_PF, xm, Pm, c);
+    for (int j = 0; j < 3; j++)
+        r_predict(j, xm + j * RN, Pm + j * RNN, dt, K[0], K[1], K[2], par, xs1 + j * RN, Ps1 + j * RNN);
+    if (xf1)
+        r_predict(R_CV, row + RO_XF, row + RO_PF, dt, K[0], K[1], K[2], par, xf1, Pf1);
+}
+
+/* radar_advance(S, rows, dt, kin, par, noise, pose) -> None. Tracker._advance_all for B objects, committed in
+ * their rows: interaction, prediction (and the free estimate's), the probabilities only where dt > 0, what the
+ * car's own movement is not sure about added to where each is (noise: (sa, sp) per object, pose (X, Y, psi) at
+ * the target time; the object's place before the step), the combination. */
+static PyObject *n_radar_advance(PyObject *self, PyObject *args)
+{
+    PyObject *oS, *orows, *odt, *okin, *opar, *onoise, *opose;
+    if (!PyArg_ParseTuple(args, "OOOOOOO", &oS, &orows, &odt, &okin, &opar, &onoise, &opose))
+        return NULL;
+    PyObject *res = NULL;
+    View vS;
+    vS.held = 0;
+    Py_ssize_t cap, B = 0, *rows = NULL;
+    double *dk = NULL, pose[3];
+    RPar par;
+    if (store_get(oS, &vS, &cap) < 0 || (rows = idx_get(orows, cap, &B)) == NULL || rpar_get(opar, &par) < 0 ||
+        nums_get(opose, 3, pose, "pose") < 0)
+        goto done;
+    dk = (double *)PyMem_Malloc((size_t)(B ? B : 1) * 7 * sizeof(double));
+    if (dk == NULL) {
+        PyErr_NoMemory();
+        goto done;
+    }
+    if (rows_get(odt, B, 1, dk, "dt") < 0 || rows_get(okin, B, 4, dk + B, "kin") < 0 ||
+        rows_get(onoise, B, 2, dk + 5 * B, "noise") < 0)
+        goto done;
+    double *A = (double *)vS.b.buf;
+    double ch = cos(pose[2]), sh = sin(pose[2]);
+    for (Py_ssize_t b = 0; b < B; b++) {
+        double *row = A + rows[b] * RROW;
+        double dt = dk[b], sa = dk[5 * B + 2 * b], sp = dk[5 * B + 2 * b + 1];
+        double xs1[3 * RN], Ps1[3 * RNN], c[3], xf1[RN], Pf1[RNN];
+        r_evolve_row(row, dt, dk + B + 4 * b, &par, xs1, Ps1, c, xf1, Pf1);
+        if (dt > 0.0)
+            memcpy(row + RO_MU, c, sizeof(c));
+        if (sa > 0.0 || sp > 0.0) {
+            /* the car's travel error lies along its heading; its heading error swings the object about the car */
+            double dx = row[RO_X + R_PX] - pose[0], dy = row[RO_X + R_PY] - pose[1];
+            double a2 = sa * sa, p2 = sp * sp;
+            double e00 = a2 * (ch * ch) + p2 * (dy * dy), e01 = a2 * (ch * sh) + p2 * (-dx * dy),
+                   e11 = a2 * (sh * sh) + p2 * (dx * dx);
+            for (int j = 0; j < 4; j++) {
+                double *P = j < 3 ? Ps1 + j * RNN : Pf1;
+                P[0] += e00;
+                P[1] += e01;
+                P[RN] += e01;
+                P[RN + 1] += e11;
+            }
+        }
+        memcpy(row + RO_XS, xs1, sizeof(xs1));
+        memcpy(row + RO_PS, Ps1, sizeof(Ps1));
+        memcpy(row + RO_XF, xf1, sizeof(xf1));
+        memcpy(row + RO_PF, Pf1, sizeof(Pf1));
+        r_combine(row + RO_XS, row + RO_PS, row + RO_MU, row + RO_X, row + RO_P);
+    }
+    res = Py_None;
+    Py_INCREF(res);
+done:
+    PyMem_Free(rows);
+    PyMem_Free(dk);
+    view_drop(&vS);
+    return res;
+}
+
+/* radar_peek(S, rows, dt, kin, par, x_out, P_out, mu_out) -> None. Tracker.peek_many: where each object is
+ * believed to be after its dt (an object whose |dt| < 1e-6: its row as it is), nothing committed */
+static PyObject *n_radar_peek(PyObject *self, PyObject *args)
+{
+    PyObject *oS, *orows, *odt, *okin, *opar, *o1, *o2, *o3;
+    if (!PyArg_ParseTuple(args, "OOOOOOOO", &oS, &orows, &odt, &okin, &opar, &o1, &o2, &o3))
+        return NULL;
+    PyObject *res = NULL;
+    View vS, v1, v2, v3;
+    vS.held = v1.held = v2.held = v3.held = 0;
+    Py_ssize_t cap, B = 0, *rows = NULL;
+    double *dk = NULL, *xo, *Po, *muo;
+    RPar par;
+    if (store_get(oS, &vS, &cap) < 0 || (rows = idx_get(orows, cap, &B)) == NULL || rpar_get(opar, &par) < 0)
+        goto done;
+    dk = (double *)PyMem_Malloc((size_t)(B ? B : 1) * 5 * sizeof(double));
+    if (dk == NULL) {
+        PyErr_NoMemory();
+        goto done;
+    }
+    if (rows_get(odt, B, 1, dk, "dt") < 0 || rows_get(okin, B, 4, dk + B, "kin") < 0 ||
+        out_get(o1, &v1, B * RN, 0, &xo, "x_out") < 0 || out_get(o2, &v2, B * RNN, 0, &Po, "P_out") < 0 ||
+        out_get(o3, &v3, B * 3, 0, &muo, "mu_out") < 0)
+        goto done;
+    double *A = (double *)vS.b.buf;
+    for (Py_ssize_t b = 0; b < B; b++) {
+        const double *row = A + rows[b] * RROW;
+        double dt = dk[b];
+        if (fabs(dt) < 1e-6) {
+            memcpy(xo + b * RN, row + RO_X, RN * sizeof(double));
+            memcpy(Po + b * RNN, row + RO_P, RNN * sizeof(double));
+            memcpy(muo + 3 * b, row + RO_MU, 3 * sizeof(double));
+            continue;
+        }
+        double xs1[3 * RN], Ps1[3 * RNN];
+        r_evolve_row(row, dt, dk + B + 4 * b, &par, xs1, Ps1, muo + 3 * b, NULL, NULL);
+        r_combine(xs1, Ps1, muo + 3 * b, xo + b * RN, Po + b * RNN);
+    }
+    res = Py_None;
+    Py_INCREF(res);
+done:
+    PyMem_Free(rows);
+    PyMem_Free(dk);
+    view_drop(&vS); view_drop(&v1); view_drop(&v2); view_drop(&v3);
+    return res;
+}
+
+/* radar_still(S, rows, v_still) -> [p_still] (Tracker.p_still_many on the objects' rows) */
+static PyObject *n_radar_still(PyObject *self, PyObject *args)
+{
+    PyObject *oS, *orows, *ov;
+    if (!PyArg_ParseTuple(args, "OOO", &oS, &orows, &ov))
+        return NULL;
+    PyObject *res = NULL;
+    View vS;
+    vS.held = 0;
+    Py_ssize_t cap, B = 0, *rows = NULL;
+    double *v0 = NULL;
+    if (store_get(oS, &vS, &cap) < 0 || (rows = idx_get(orows, cap, &B)) == NULL)
+        goto done;
+    v0 = (double *)PyMem_Malloc((size_t)(B ? B : 1) * sizeof(double));
+    if (v0 == NULL) {
+        PyErr_NoMemory();
+        goto done;
+    }
+    if (rows_get(ov, B, 1, v0, "v_still") < 0)
+        goto done;
+    res = PyList_New(B);
+    if (res == NULL)
+        goto done;
+    double *A = (double *)vS.b.buf;
+    for (Py_ssize_t b = 0; b < B; b++) {
+        const double *row = A + rows[b] * RROW;
+        const double *X = row + RO_XS, *P = row + RO_PS, *m = row + RO_MU;
+        double q0 = r_still(X + RN, P + RNN, v0[b]), q1 = r_still(X + 2 * RN, P + 2 * RNN, v0[b]);
+        double s = (m[0] + m[1] * q0) + m[2] * q1;
+        PyObject *f = PyFloat_FromDouble(s > 1.0 ? 1.0 : s);
+        if (f == NULL) {
+            Py_CLEAR(res);
+            goto done;
+        }
+        PyList_SetItem(res, b, f);
+    }
+done:
+    PyMem_Free(rows);
+    PyMem_Free(v0);
+    view_drop(&vS);
+    return res;
+}
+
+/* radar_h(sensor, kind, sdt, x, pose, z_out (4), H_out (4 x N)) -> m: sensor.h */
+static PyObject *n_radar_h(PyObject *self, PyObject *args)
+{
+    PyObject *osen, *ox, *opose, *oz, *oH;
+    int kind;
+    double sdt, pose[6], x[RN], *z, *H;
+    if (!PyArg_ParseTuple(args, "OidOOOO", &osen, &kind, &sdt, &ox, &opose, &oz, &oH))
+        return NULL;
+    RSens sen;
+    View vz, vH;
+    vz.held = vH.held = 0;
+    PyObject *res = NULL;
+    if (sens_get(osen, &sen) < 0 || nums_get(ox, RN, x, "x") < 0 || nums_get(opose, 6, pose, "pose") < 0 ||
+        out_get(oz, &vz, 4, 0, &z, "z_out") < 0 || out_get(oH, &vH, 4 * RN, 0, &H, "H_out") < 0)
+        goto done;
+    res = PyLong_FromLong(r_h(&sen, kind, sdt, x, pose, z, H));
+done:
+    view_drop(&vz);
+    view_drop(&vH);
+    return res;
+}
+
+/* radar_marginals(ratio (nt, nd), out (nt, nd)) -> None: tracker.marginals */
+static PyObject *n_radar_marginals(PyObject *self, PyObject *args)
+{
+    PyObject *oL, *oo;
+    if (!PyArg_ParseTuple(args, "OO", &oL, &oo))
+        return NULL;
+    View vL, vo;
+    vL.held = vo.held = 0;
+    PyObject *res = NULL;
+    if (view_get(oL, &vL, 0, 'd', 2, "ratio") < 0)
+        goto done;
+    Py_ssize_t nt = vL.b.shape[0], nd = vL.b.shape[1];
+    double *out;
+    if (out_get(oo, &vo, nt * nd, 0, &out, "out") < 0 || r_marginals(DATA(vL), nt, nd, out) < 0)
+        goto done;
+    res = Py_None;
+    Py_INCREF(res);
+done:
+    view_drop(&vL);
+    view_drop(&vo);
+    return res;
+}
+
+/* radar_assign(gain (nt, nd)) -> [(i, j)]: tracker.assign */
+static PyObject *n_radar_assign(PyObject *self, PyObject *og)
+{
+    View vg;
+    vg.held = 0;
+    PyObject *res = NULL;
+    Py_ssize_t *pi = NULL;
+    if (view_get(og, &vg, 0, 'd', 2, "gain") < 0)
+        goto done;
+    Py_ssize_t nt = vg.b.shape[0], nd = vg.b.shape[1];
+    pi = (Py_ssize_t *)PyMem_Malloc((size_t)(2 * (nt + nd) + 2) * sizeof(Py_ssize_t));
+    if (pi == NULL) {
+        PyErr_NoMemory();
+        goto done;
+    }
+    Py_ssize_t n = r_assign(DATA(vg), nt, nd, pi, pi + nt + nd + 1);
+    if (n < 0)
+        goto done;
+    res = PyList_New(n);
+    for (Py_ssize_t q = 0; res && q < n; q++) {
+        PyObject *t = Py_BuildValue("(nn)", pi[q], pi[nt + nd + 1 + q]);
+        if (t == NULL) {
+            Py_CLEAR(res);
+            break;
+        }
+        PyList_SetItem(res, q, t);
+    }
+done:
+    PyMem_Free(pi);
+    view_drop(&vg);
+    return res;
+}
+
 /* ==================================================================================================== */
 static PyMethodDef methods[] = {
     {"dumps", n_dumps, METH_O, "json.dumps(obj, separators=(',', ':')); raises Fallback where json must decide"},
@@ -2623,6 +4154,14 @@ static PyMethodDef methods[] = {
     {"radar_evolve", n_radar_evolve, METH_VARARGS, "Tracker._evolve (+ combine_b, + the free estimate's prediction) for B objects"},
     {"radar_combine", n_radar_combine, METH_VARARGS, "combine_b for B objects into given arrays"},
     {"radar_p_still", n_radar_p_still, METH_VARARGS, "Tracker.p_still_many: a list of floats"},
+    {"radar_advance", n_radar_advance, METH_VARARGS, "Tracker._advance_all on the objects' rows"},
+    {"radar_peek", n_radar_peek, METH_VARARGS, "Tracker.peek_many on the objects' rows into given arrays"},
+    {"radar_still", n_radar_still, METH_VARARGS, "Tracker.p_still_many on the objects' rows"},
+    {"radar_h", n_radar_h, METH_VARARGS, "a sensor's measurement function (sensors.py h) into given arrays"},
+    {"radar_marginals", n_radar_marginals, METH_VARARGS, "tracker.marginals into a given array"},
+    {"radar_assign", n_radar_assign, METH_O, "tracker.assign"},
+    {"radar_scan", n_radar_scan, METH_VARARGS, "one scan's association (Tracker.process): pairs, p_detect, coverage"},
+    {"radar_update", n_radar_update, METH_VARARGS, "the update of a scan's pairs (Tracker._update's arithmetic)"},
     {NULL, NULL, 0, NULL}};
 
 static struct PyModuleDef moduledef = {PyModuleDef_HEAD_INIT, "_chris_native",

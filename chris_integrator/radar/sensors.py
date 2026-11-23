@@ -31,7 +31,13 @@ import math
 
 import numpy as np
 
+from .. import native as _native
 from .models import DP, LH, N, PX, PY, VX, VY, kin
+
+# The measurement functions in the native core (chris_native.c `r_h`), when its radar part is in use: the sensor
+# hands its constants over as 24 numbers (`native()`), a detection its kind as a code (`kind_code`)
+_NR = _native.radar
+_KCODE = {"b": 0, "rb": 1, "rbh": 2, "bt": 3, "": 4}
 
 
 def wrap(a):
@@ -79,6 +85,16 @@ class Sensor:
 
     def start(self, det, pose, label):
         return None
+
+
+def kind_code(kind):
+    """A detection kind as the native core takes it: the base kind (b 0, rb 1, rbh 2, bt 3, none 4; anything
+    else is measured as rbh, like `_h` does) + 8 for the scale-rate row."""
+    if not kind:
+        return 2
+    if kind.endswith("s"):
+        return _KCODE.get(kind[:-1], 2) + 8
+    return _KCODE.get(kind, 2) if kind else 2
 
 
 def base(kind):
@@ -205,7 +221,26 @@ class CameraBoxes(Sensor):
         row[PY] = (-w * c / depth + rate * s_ / (depth * depth)) / u
         return math.log(u) / dt, row
 
+    def native(self):
+        """The constants the native core's measurement, coverage and density functions read (24 numbers)."""
+        c, cv = self.cfg, self.cover
+        v = self.vol
+        return (0.0, self.hc, self.logf, self.bias, 1.0 if cv else 0.0, cv["bearing_min"] if cv else 0.0,
+                cv["bearing_max"] if cv else 0.0, cv["ground_min_m"] if cv else 0.0, c["max_range_m"], self.p_d,
+                c["p_cut"], math.nan if self.h_min is None else self.h_min, c["h_full_rel"], c["p_small"],
+                c["near_margin"], self.extraneous, v["b"], v["rb"], v["rbh"], v["bt"], c["scale_rate_span"],
+                c["logh_span"], c["born_small"], c["born_small_scale"])
+
     def h(self, x, pose, det=None):
+        if _NR is not None:
+            z, H = np.empty(4), np.empty((4, N))
+            m = _NR.radar_h(self.native(), kind_code(det["kind"] if det else "rb"),
+                            float((det.get("sdt") if det else 0.0) or 0.0), x, pose, z, H)
+            return z[:m], H[:m]
+        return self.h_py(x, pose, det)
+
+    def h_py(self, x, pose, det=None):
+        """h in Python: the reference."""
         k = det["kind"] if det else "rb"
         if k.endswith("s"):                               # the base kind's rows, then the scale rate
             zs, rs = self._scale_row(x, pose, det)
@@ -384,6 +419,9 @@ class MicrowaveRadar(Sensor):
         self.fov, self.max_range, self.sigma = fov, max_range, sigma
         self.clutter = false_per_scan / (max_range * 2.0 * fov * 60.0)
 
+    def native(self):
+        return (1.0, self.mx, self.my, self.yaw, self.fov, self.max_range, self.p_d, self.clutter) + (0.0,) * 16
+
     def _sensor(self, pose):
         X, Y, psi, vx, vy, w = pose
         c, s = math.cos(psi), math.sin(psi)
@@ -391,6 +429,14 @@ class MicrowaveRadar(Sensor):
         return X + ox, Y + oy, vx - w * oy, vy + w * ox
 
     def h(self, x, pose, det=None):
+        if _NR is not None:
+            z, H = np.empty(4), np.empty((4, N))
+            _NR.radar_h(self.native(), 0, 0.0, x, pose, z, H)
+            return z[:3], H[:3]
+        return self.h_py(x, pose, det)
+
+    def h_py(self, x, pose, det=None):
+        """h in Python: the reference."""
         sx, sy, svx, svy = self._sensor(pose)
         dx, dy = x[PX] - sx, x[PY] - sy
         r = max(math.hypot(dx, dy), 0.5)
