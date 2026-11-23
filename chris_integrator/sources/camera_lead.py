@@ -17,7 +17,7 @@ import math
 
 import numpy as np
 
-from ..native import round                  # builtins.round, native where built
+from ..native import round                  # builtins.round (its results; the native core)
 from ..core.objects import AX, VX, X, Y, Det, Scan, SensorModel, Track
 from ..core.registry import NS, Source, fin, all_fin
 

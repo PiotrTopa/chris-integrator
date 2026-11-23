@@ -838,10 +838,9 @@ What keeps it there, and what an extension has to respect:
   decide whether it wants a message (subscription, rate cap) before it touches `line`. The WebSocket channel
   serialises a stream only for a subscriber of it (`Api.subscribe(cb, topics)`), the socket channel makes its
   greeting lines when a client connects, the recorder asks after its rate cap.
-* **Lists of numbers are rounded and written in bulk** (`fastround`): `round_flat` gives exactly `round()`'s
-  results from a few numpy calls, `text_parts` the JSON text of the rounded numbers from a table of the texts
-  of k / 10^n. The recorder's `road` line is made this way and is byte for byte what `json.dumps` of the
-  rounded message gives.
+* **Lists of numbers are rounded and written in bulk** by the native core (docs/NATIVE.md): `round_list`,
+  `round_lists` give exactly `round()`'s (`np.round`'s) results, and the recorder's `road` line is written in
+  one pass from the message (`slim_road_line`), byte for byte what `json.dumps` of the rounded message gives.
 * **`road` is parsed without what the default boxes do not read** (`fastjson.trim_road`: most of the plan's
   arrays, the lines' heights; 40 % of the line). The line itself goes to every consumer whole, and
   `GET /v2/<topic>` serves the line. A stack with boxes of its own gets the whole message (`Stack.trim_road`,
@@ -849,17 +848,16 @@ What keeps it there, and what an extension has to respect:
 * On arrays of a few dozen values a numpy call costs more than the arithmetic: the trackers convert and test
   a frame's lists in one array, not one by one, and avoid `np.median` and friends on tiny inputs.
 
-* **The arithmetic and the text exist twice** (`chris_integrator/native`, docs/NATIVE.md): the filter's
-  prediction, scalar row and smoother step, the lane tracker's arrays, `json.dumps` / `json.loads`, `round`
-  and the display box's table walk are also in one C file, used where the compiled module is present. The
-  Python is the reference: a change to either side is a change to both, and `tests/test_native.py` holds them
-  together (text and the lane tracker bit for bit; the filter to rounding, because numpy leaves the order of
-  its sums of products to BLAS). On the reference phone's little core the per-message path costs 7.9 instead
-  of 15.3 ms per road frame on the bench and 8.7 instead of 21.0 ms with a car's feed replayed; live, 17 ms
-  of CPU per road frame instead of 25 (26 % of the core instead of 38 %). About four fifths of what remains is Python
-  byte code in the estimator's bookkeeping, the trackers' decisions and the mixer (lane report L50).
+* **The arithmetic and the text are native** (`chris_integrator/native`, docs/NATIVE.md): the filter's
+  prediction, scalar row and smoother step, the lane tracker's arrays, the road geometry's centre line, the
+  view's drawn lines, `json.dumps` / `json.loads`, the `road` line's trim and the recorder's reduced form and
+  `round` are in one C file, which the package requires. Each exists once; `tests/test_native.py` holds them to
+  CPython's json and round and to the results of the pure-Python references they replaced (frozen golden data:
+  bit for bit where the steps are elementwise, the filter's sums of products to rounding). On the reference
+  phone's little core the native core of lane L50 took the per-message path from 15.3 to 7.9 ms per road frame
+  on the bench; lane cost-rest took a further part of the rest (its report has the numbers). Most of what remains
+  is Python byte code in the estimator's bookkeeping, the trackers' decisions and the mixer.
 
-`tools/native_bench.py` prices every native function against its reference on the machine in hand;
 `tools/cost_capture.py` records what a running daemon is fed, `tools/cost_bench.py` replays it through the
 daemon's whole per-message path (cost by stage, and a dump of every output for comparing two trees line by
 line), `tools/cost_live.py` measures a running unit.

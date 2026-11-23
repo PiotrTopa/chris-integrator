@@ -11,7 +11,7 @@ import math
 import os
 import re
 
-from ..native import round                  # builtins.round, native where built
+from ..native import round                  # builtins.round (its results; the native core)
 from ..contract import LocalEgo
 
 RULES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rules")

@@ -21,7 +21,7 @@ junction list unless `lights_junction` is off). Pure module, no I/O; see chris-r
 import collections
 import re
 
-from ..native import round                  # builtins.round, native where built
+from ..native import round                  # builtins.round (its results; the native core)
 from .speedlimit import SpeedLimit, load_rules, NS
 
 RULES_CFG = {

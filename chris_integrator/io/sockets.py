@@ -19,7 +19,7 @@ def parse_line(raw):
     line = raw.decode("utf-8", "replace").strip()
     if not line:
         return None, None
-    msg = loads(line)                      # json.loads, native where built
+    msg = loads(line)                      # json.loads (the native reader; json.loads what it leaves to json)
     return (msg, line) if isinstance(msg, dict) else (None, None)
 
 

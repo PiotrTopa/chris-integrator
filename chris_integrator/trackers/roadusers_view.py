@@ -25,7 +25,7 @@ measurement topic.
 """
 import math
 
-from ..native import round                  # builtins.round, native where built
+from ..native import round                  # builtins.round (its results; the native core)
 from ..core import classvote
 
 NS = 1e9

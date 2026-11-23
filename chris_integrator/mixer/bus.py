@@ -45,7 +45,7 @@ class Envelope:
     @property
     def line(self):
         if self._line is None:
-            self._line = dumps(self.msg)       # json.dumps(msg, separators=(",", ":")), native where built
+            self._line = dumps(self.msg)       # json.dumps(msg, separators=(",", ":")) (the native writer)
         return self._line
 
 

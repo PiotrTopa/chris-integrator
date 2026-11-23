@@ -58,7 +58,7 @@ import math
 
 import numpy as np
 
-from ..native import round                  # builtins.round, native where built
+from ..native import round                  # builtins.round (its results; the native core)
 from .projection import Projector
 
 HOUSING_M = 0.9

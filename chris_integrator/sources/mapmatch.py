@@ -38,7 +38,7 @@ import math
 
 import numpy as np
 
-from ..native import round                  # builtins.round, native where built
+from ..native import round                  # builtins.round (its results; the native core)
 from ..core import ego as E
 from ..core.ego import AuxState
 from ..core.registry import NS, Meas, Source, fin

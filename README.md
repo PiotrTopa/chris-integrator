@@ -100,15 +100,16 @@ running order with their health and cost. Design, with the alternatives that wer
 
 ## Installing
 
-Python 3.10 or newer and numpy. The HTTP / WebSocket API needs aiohttp; the map box needs chris-mapper. A C
-compiler is optional (the native core, below).
+Python 3.11 or newer and numpy. The HTTP / WebSocket API needs aiohttp; the map box needs chris-mapper. The
+native core (below) is compiled at install: a C compiler and the Python headers are needed (or a module built
+for the host elsewhere: `native/cross-build.sh`).
 
 ```sh
 git clone https://github.com/PiotrTopa/chris-integrator
 git clone https://github.com/PiotrTopa/chris-mapper          # optional: the map box
 python3 -m venv .venv && . .venv/bin/activate
 pip install ./chris-mapper                                    # optional, before the integrator
-pip install "./chris-integrator[http]"                        # builds the native core if a compiler is there
+pip install "./chris-integrator[http]"                        # builds the native core
 ```
 
 chris-mapper is not on PyPI; the `map` extra (`chris-integrator[map]`) only names the dependency, so install
@@ -316,30 +317,28 @@ docs/DESIGN.md sections 5-5b.
 Not detectable with one camera, one speed chain and one receiver: which of two disagreeing sources is wrong
 when no third exists, two sources wrong the same way, a wrong camera lead range, a slow drift of the receiver.
 
-## The native core and the pure-Python fallback
+## The native core
 
-The package is pure Python + numpy and complete as such. The per-message hot path's arithmetic and text work
-(the filter's prediction, scalar update and smoother step, the lane tracker's arrays, JSON in and out,
-`round`, the display box's table walk) also exists in one C file using the CPython limited API
-(`chris_integrator/native/src/chris_native.c`). Where the compiled module is present and loads it is used; where
-it is not, the same functions run in Python. The Python is the reference: text and the lane tracker give the
-same bits, the filter agrees to rounding (numpy leaves the order of its sums of products to BLAS), and
-`tests/test_native.py` holds the two together.
+The per-message hot path's arithmetic and text work (the filter's prediction, scalar update and smoother step,
+the lane tracker's arrays, the road geometry's centre line, the view's drawn lines, JSON in and out, the `road`
+line's trim and the recorder's reduced form, `round`) is written in one C file using the CPython limited API
+(`chris_integrator/native/src/chris_native.c`). The compiled module is part of the package: without it (or with
+one of another version) the package does not import and says how to build it. Each of those functions exists
+once, in C; CPython's own `json` and `round` decide the inputs the C code leaves to them. `tests/test_native.py`
+holds every function to known results: CPython's json and round, and the results of the pure-Python references
+that were removed, frozen as golden data.
 
 ```sh
-pip install .                       # builds the module when a C compiler and the Python headers are there
-CHRIS_NATIVE_BUILD=0 pip install .  # pure Python on purpose
+pip install .                       # builds the module (a C compiler and the Python headers)
 sh native/build.sh                  # build it in the source tree (used at the next import)
 sh native/cross-build.sh            # a module for an aarch64 musl phone, built in a container (docker + qemu)
-python3 -m chris_integrator.native  # which implementation runs here, and a self-test against the reference
-CHRIS_NATIVE=0 python3 -m chris_integrator ...   # run pure Python although the module is there
+python3 -m chris_integrator.native  # the module in use here, and its self-test
 ```
 
-Wheels are `cp311-abi3` (one binary for every CPython >= 3.11 of a platform); on 3.10 the package is pure
-Python. Compiled modules are never committed: `native/dist/` and `*.so` are build output. On the reference
-phone the native core halves the cost of the per-message path (below). [docs/NATIVE.md](docs/NATIVE.md) has the
-contract of each function, why the exact parts are exact, the parser's memory safety and how to write a native
-plug-in.
+Wheels are `cp311-abi3` (one binary for every CPython >= 3.11 of a platform). Compiled modules are build output
+(`native/dist/` and `*.so`); a release commits the target's cross-built module under `native/dist/`.
+[docs/NATIVE.md](docs/NATIVE.md) has the contract of each function, why the exact parts are exact, the
+parser's memory safety and how to write a native plug-in.
 
 ## Status and limits
 
@@ -388,7 +387,7 @@ strings in those messages. A deployment without those detectors runs without the
 
 Numbers in the documents often name where they were measured: "lane Lnn" is a work report in chris-roadsense's
 [`docs/lanes/`](https://github.com/PiotrTopa/roadsense/tree/main/docs/lanes), and `tools/...` names a
-chris-roadsense tool unless it is one of this repository's own `tools/` (cost and native benchmarks). Those
+chris-roadsense tool unless it is one of this repository's own `tools/` (cost benchmarks). Those
 reports describe the code as it was when they were written; this repository's documents describe it as it is.
 
 ## Reference deployment
