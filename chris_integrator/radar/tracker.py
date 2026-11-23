@@ -495,7 +495,12 @@ class Tracker:
                 o.last_box = (t, src, d["w"])
             if (d.get("kind") or "").endswith("s"):      # its first box already says how fast it comes nearer
                 self._first_rate(o, d, sensor, pose)
-            mem.append((t, (d.get("kind") or "").rstrip("s"), np.asarray(d["z"], float), o.id))
+            kb = (d.get("kind") or "").rstrip("s")
+            if kb in ("rb", "rbh"):
+                # the map lives in the space of the ground angle, the bearing and the log height: a box with a
+                # scale-rate row enters without it (its third number would be read as a height), a box cut at the
+                # bottom (its rows are another space) not at all
+                mem.append((t, kb, np.asarray(d["z"], float)[:len(kb)], o.id))
             self.objects.append(o)
             st["started"] += 1
         r0 = self.new_rate.get(src, 0.0)
@@ -802,7 +807,9 @@ class Tracker:
             if mt:                                       # a pair that is no longer near stops counting
                 for key in list(mt):
                     j = index.get(key)
-                    if j is not None and j > i and (i, j) not in nearset and key not in dead and obs[i].id not in dead:
+                    if j is None:                        # the other object is gone: nothing left to count
+                        mt.pop(key, None)
+                    elif j > i and (i, j) not in nearset and key not in dead and obs[i].id not in dead:
                         mt.pop(key, None)
             for j, same in nearj.get(i, ()):
                 a, b = obs[i], obs[j]
@@ -832,3 +839,6 @@ class Tracker:
                 if o.id in dead:
                     self.store.give(o.slot)
             self.objects = [o for o in obs if o.id not in dead]
+            for o in self.objects:
+                for key in [k for k in o.merge_t if k in dead]:
+                    del o.merge_t[key]

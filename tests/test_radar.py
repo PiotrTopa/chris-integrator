@@ -390,6 +390,37 @@ class Tracking(unittest.TestCase):
         self.assertTrue(ar and all(0.0 <= e["a"] < 1.0 for e in ar))
         self.assertEqual(rd.around(12 * NS, None), [])
 
+    def test_the_map_of_unexplained_boxes_holds_ground_boxes_only_and_merge_counts_do_not_outlive_objects(self):
+        rd = Radar()
+        box = lambda u, v0, h: [u - 0.6 * h, v0 - h, u + 0.6 * h, v0]
+        for i in range(120):
+            t = 10.0 + i * 0.05
+            rd.on_ego({"ts_mono_ns": int(t * NS), "speed_mps": 8.0, "yaw_rate_rps": 0.0})
+            if i % 4 == 0:
+                objs = []
+                for k, (rng, b) in enumerate(((40.0 - 8.0 * (t - 10.0), 3.0), (41.5 - 8.0 * (t - 10.0), 3.4), (9.0, -20.0))):
+                    if rng < 3.0:
+                        continue
+                    o = {"class": "car", "class_conf": 0.7, "bearing_deg": b, "bearing_std_deg": 0.4,
+                         "box": box(640.0 - 975.0 * math.tan(math.radians(b)), 400.0, 975.0 * 1.5 / rng),
+                         "scale_rate": 8.0 / rng, "scale_rate_std": 0.05, "scale_dt_s": 0.2}
+                    if k == 2:
+                        o["clip"] = "b"                                      # cut at the bottom: a direction only
+                    else:
+                        o["range_m"], o["range_std_m"] = rng, 0.1 * rng
+                    objs.append(o)
+                rd.on_road_users({"type": "road_users", "sensor": "cam", "ts_mono_ns": int(t * NS), "objects": objs})
+            rd.frame(int(t * NS))
+            tr = rd.tracker
+            for mem in tr.unexplained.values():
+                self.assertTrue(mem)
+                for _, kind, z, _ in mem:
+                    self.assertIn(kind, ("rb", "rbh"))
+                    self.assertEqual(len(z), len(kind))                    # the scale-rate row is not in the map
+            live = {o.id for o in tr.objects}
+            for o in tr.objects:
+                self.assertLessEqual(set(o.merge_t), live)                 # no count kept for an object that is gone
+
     def test_one_box_is_not_an_object(self):
         rd = Radar()
         for i in range(40):
