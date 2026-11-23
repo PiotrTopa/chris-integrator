@@ -592,7 +592,8 @@ def test_radar_golden():
         if c["hyp_after"] is not None:
             assert G.same(hyp, codec.dec(c["hyp_after"]), where + " hypotheses") is None
     need = ("Hyp.scan", "Hyp.drop", "radar_h", "radar_peek_pos", "radar_life", "radar_merge", "radar_frame", "radar_check",
-            "radar_register", "radar_combine_rows", "radar_marginals", "radar_assign", "radar_kbest")
+            "radar_register", "radar_combine_rows", "radar_marginals", "radar_assign", "radar_kbest", "Hyp.smooth",
+            "radar_groups", "radar_group_support", "radar_cells")
     assert all(seen.get(k, 0) >= 3 for k in need), seen
 
 
@@ -670,7 +671,7 @@ def test_radar_single_hypothesis_functions():
         dt = float(g.choice([0.05, 0.4, 2.0]))
         out, births, dead, bias = H.scan(st.a, [h], [(dt, 0.0, 0.0) + tuple(kin) + (0.0, 1.0, 1.0)], dt,
                                          (0.0, 0.0, 0.0, 0.0, 0.0, 0.0), sen, 1, np.zeros((0, 20)), None, None, 0.0,
-                                         (9.0, 13.8, 16.3, 18.5, 0.25, 0.9, 3.0, 0.01, 0.03, 0.4, 1.0, 3.0, 0.8, 1.0, 0.25, 0.65, 0.03, 0.3),
+                                         (9.0, 13.8, 16.3, 18.5, 0.25, 0.9, 3.0, 0.01, 0.03, 0.4, 1.0, 3.0, 0.8, 1.0, 0.25, 0.65, 0.03, 0.3, 0.12),
                                          M._native_par(M.CFG), (2.0, 0.01), (0.2, 0.5, 2.5, 0.3, 3.0, 0.15, 0.01, 0.0), None)
         r1 = out[0][1]
         assert out[0][0] and r1 != r0 and H.chain(h) == [r1, r0]
@@ -722,7 +723,7 @@ def test_radar_update_keeps_the_covariance_symmetric_and_positive():
     g = np.random.default_rng(7)
     cam = CameraBoxes({"bearing_min": -0.6, "bearing_max": 0.6, "ground_min_m": 12.0}, None, 975.0, 1.22, 14.0)
     mw = MicrowaveRadar((2.0, 0.0, 0.0))
-    acfg = (1e9, 1e9, 1e9, 1e9, 0.25, 0.9, 3.0, 0.01, 0.03, 0.4, 1.0, 3.0, 0.8, 0.0, 0.25, 0.65, 0.03, 0.3)     # no gate: every pair may be
+    acfg = (1e9, 1e9, 1e9, 1e9, 0.25, 0.9, 3.0, 0.01, 0.03, 0.4, 1.0, 3.0, 0.8, 0.0, 0.25, 0.65, 0.03, 0.3, 0.12)     # no gate: every pair may be
     worst, taken = 0.0, 0
     for it in range(200):
         st = T.State(64)

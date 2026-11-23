@@ -224,3 +224,129 @@ centre does not use the body's turn); alternative partitions of the returns kept
 scan: the objects' rectangles, then distance); the returns of the far sides and of the underbody. With the
 simulator's clutter (three static returns per scan beside the road) 30 to 110 false tracks a minute are still
 confirmed with the extended radar (before: 125 to 460); the camera-only rate is unchanged.
+
+## 5. Standing or moving: why parked cars were called moving, and what was changed
+
+Found on the two recorded night drives of 2026-11-22 (docs/RADAR_TRUTH.md; the per-update traces of the four
+labelled cases are in the lane's report). Parked cars were called `moving` for 13.9 of 41 labelled parked
+seconds. Two mechanisms, both in the measurement model, neither in the hypotheses' vote:
+
+1. **The camera's pitch moves, and the model did not say so (9.8 s of the 13.9 s).** While the car drives, the
+   camera's pitch against the road moves by 0.33 to 0.40 degrees within 0.4 s and 0.5 to 0.63 degrees within
+   0.8 s (the road model's own pitch on these drives; standing: 0.05 to 0.14): bumps, braking, the road's waves.
+   The model had a white 0.1 degrees per frame and a slow walk. At 25 to 40 m, 20 mrad of ground angle is ten
+   metres of range: "it stands" lost by three to four sigma and the moving hypotheses explained the error as
+   speed. The guard "moving only once the sightings by themselves show a speed" did not hold, because the free
+   estimate takes the same angles with the same too-small variance. A fit of the same boxes without the ground
+   angle (bearing and box height only) says "stands" with chi-square per degree of freedom 0.14 to 0.53.
+   **Change:** the pitch's fast part is a Gauss-Markov process (`pitch_gm_deg` 0.5 while driving, 0.1 standing,
+   `pitch_gm_tau_s` 1 s) kept per camera beside the slow bias: what the last scan's common angle (`h_common`)
+   found of it is carried to the next scan with its memory, taken out of the scan's ground angles, and what it no
+   longer says is their variance (`Hyp.scan`; `Tracker.bias[src]` is now `[slow, variance, fast, variance, time]`).
+   A scan with enough settled objects still measures its own common angle and takes it out, as before.
+2. **A bearing linearised over a place that is not known (4.1 s).** A new object's moving hypotheses carry a
+   velocity prior of 12 to 15 m/s along the car's heading; a second later that is tens of metres of place, and
+   linearised at the mean a bearing "spread" of 22 to 45 degrees: a box on the other side of the street passed
+   the gate and paired with probability 0.63 to 0.65, though no car drives fifteen metres sideways in a second.
+   **Change:** a hypothesis whose bearing is unsure by more than `split_rel` (0.12 rad) is cut along the direction
+   in which its place is least known into five narrower Gaussians (same mean and covariance together), each
+   linearised where it is; its likelihood is their sum, its update their moment-matched posterior (`r_split`,
+   `r_take_parts`). With the hypotheses over scans (section 1) a wrong pairing of this kind is also no longer
+   blended into the object.
+
+Not the cause, measured: the detector's scale rate (absent from these recordings; switching it off changes
+nothing); a time offset between the car's feed and the camera (the yaw rates of the two agree to within 40 ms;
+shifting the feed by up to 200 ms moves the result by 2 s at most); the yaw rate's scale (the camera's and the
+car's differ by 5.5 %, which side is wrong is not known; scaling by 5 % changes nothing); the hypotheses' priors
+and switching rates (every setting that helps parked cars costs the cars that drive).
+
+Real drives, the scorer of docs/RADAR_TRUTH.md (seconds stationary / moving / unknown):
+
+| | parked | driving with the car | wrong verdicts |
+|---|---|---|---|
+| before the lane (a36d860) | 11.0 / 13.9 / 16.0 | 0 / 35.8 / 0.9 | 18 % |
+| hypotheses over scans, extent (neither change) | 22.2 / 9.5 / 20.2 | 0 / 36.3 / 0 | 12 % |
+| + the split only | 26.0 / 8.7 / 17.3 | 0 / 36.8 / 0 | 11 % |
+| + the pitch process only | 30.6 / 2.8 / 19.8 | 0 / 36.8 / 0 | 4 % |
+| both | 29.3 / 2.0 / 21.2 | 0 / 36.6 / 0 | 3 % |
+
+Simulator: `tests/test_radar.py::ParkedCars` drives past six parked cars with a camera pitch of 0.6 degrees and
+1 s: 30 s of `moving` in 406 s without the pitch process, none with it. The traffic scenarios' moving objects are
+as before (tools/visual_radar_eval.py). What remains in the simulator's dense parked streets (12 s per run at
+night against 16 s before) is objects fed by the boxes of two neighbouring cars in turn.
+
+**Still open: one track fed by neighbouring cars of a row.** Traced on the simulator (`curve_parked`, seed 1, day;
+`tools/radar_trace.py --object 1`): a car parked on the outside of a curve gets two boxes at 44 m, is then not
+boxed for 0.8 s, and the next box is of the car two places further down the row, where a car driving with the
+traffic would be by then. "The same car, driving with us" explains that box with a normalised innovation of 0.1
+per row, "it stands" with 3.2; the hypotheses give "the same object" 0.992 against "it was missed and this is
+another car" 0.006, the standing hypothesis falls to 0.01, and the object is `moving` at 13 to 17 m/s with a stated
+velocity spread of 4 to 6 m/s until, 0.8 s later, the box comes nearer at the car's speed and the story is taken
+back (`unknown` at 20 m, the next car of the row then `stationary` from 52 m on). The free estimate's velocity is
+that sure because an object's own unknowns (its size, its angle offset) are constant, so that two boxes of ONE
+object tell a displacement far better than a place: two boxes of two alike cars defeat exactly that. From one
+camera and with no row known yet, the two stories differ only in their priors: how often a new car appears at
+that place (the model: 0.15 new objects per scan over the whole field; in a parked street at 13 m/s: one every
+half second at the detector's horizon) against how likely a thing beside the road drives with the traffic. Not
+solved here. What would: the density of new objects following the structure (section 7: along the extension of a
+known row and at the horizon of the detector), an appearance feature that tells two cars apart, or a sensor that
+measures range rate (a microwave radar's first return settles it).
+
+## 6. The past, smoothed
+
+The filtered state is the estimate from the detections up to now; it is what the message carries as the present.
+The past can be known better: the chain of nodes from an object's primary back is one story's history, each node
+holding the motion hypotheses after its scan and the step that led into it (switching matrix, dt, what the car's
+own movement added). `Hyp.smooth` runs a backward pass over it after every sighting, as far back as `smooth_s`
+(2 s): per motion hypothesis a Rauch-Tung-Striebel step (the gain from a Cholesky factor of the predicted
+covariance), with the hypotheses mixed backwards (the smoother of the interacting multiple model filter: each
+hypothesis of a node receives the child's smoothed hypotheses in proportion to what it handed them), and a plain
+RTS pass for the free estimate. Nothing is written back into the nodes: the filter's rows stay the filter's.
+
+What uses it:
+* `vs` in the message: the velocity `smooth_lag_s` (0.5 s) ago from the detections since as well, with `vs_std`
+  and `vs_age_s`;
+* the verdict: "moving" needs the sightings by themselves to show a speed; that test now reads the free
+  estimate's SMOOTHED velocity at the lag (`shown_moving`);
+* the trajectory (`Obj.history`): the smoothed places and velocities as far back as the smoother reaches.
+
+Because the history is the primary's story, a pairing revised by the hypotheses (section 1) is revised in the
+trajectory too. Measured (`tests/test_radar.py::PastAndStructure`): a car braking in a radar with 0.8 m/s range
+rate noise, the smoothed velocity of half a second ago is under three quarters of the filtered velocity's error
+at that time, while the filtered present follows the braking.
+
+Approximations: the backward mixing ignores that a standing hypothesis hands the FREE estimate (not itself) to
+the moving ones; a hypothesis that received nothing stays as filtered; the extent is not smoothed. `smooth: false`
+switches it off (`vs` null, the verdict on the filtered free estimate, the trajectory filtered).
+
+## 7. Structure: rows, queues, platoons
+
+`radar_groups` (after every upkeep): two objects are linked when both stand, or both drive at like velocity
+(`group_dv`), and the free room between their rectangles along the line that joins them is under the gap (7.5 m
+standing, 30 m driving). A linked set whose centres lie on one line (the farthest one off taken out while they do
+not: `group_line_m` + 3 % of the length) is a group of at least three; standing with its nearest member ahead in
+the car's own lane: a **queue** (two are enough); standing beside: a **row**; driving: a **platoon**. A group keeps
+its id while it keeps two members. The message has `grp` and `grp_kind` per object and `groups` (id, kind, the
+members in their order along the line).
+
+What a group does for its members:
+* **A row or a queue holds its members standing and in line** (`radar_group_support`, every `group_s`): each
+  member's standing hypothesis takes "I stand on the line the OTHERS make" as a measurement across the line
+  (`group_sigma_m` and the line's own scatter), and standing is `group_gain` times likelier for it than for a thing
+  by itself. A member whose own sightings show a speed is not of the group (the test of section 6), and its own
+  detections weigh far more than the gain: a car that pulls out of the row is `moving` and out of the group
+  (`PastAndStructure`).
+* **A hidden member of a queue persists**: hidden by the queue's own vehicles (section 3) it is kept as long as a
+  remembered object (`memory_s`), not `hidden_s`.
+
+Knobs: `groups`, `group_support`, the gaps and tolerances (`tracker.CFG`).
+
+Measured on the simulator (seed 1, day; share of the truth group's member time with a group id shared with
+another member): with the extended radar a row 0.90 to 0.98 (the bay-parked row at 2.6 m pitch 0.08: its cars are
+not resolved), the queue 0.80, the platoon 0.94; with the camera alone 0.16 to 0.25, because the night detector
+follows one or two members of a group at a time. Roadside clutter in a line is a row to it (false grouping 0.49
+with the simulator's static radar clutter).
+
+Not built: a group as an estimated object of its own (a shared velocity for a platoon, a pitch between the slots
+of a row from which a hidden slot could be predicted, births along a row: section 5's open case); groups do not
+constrain moving members.

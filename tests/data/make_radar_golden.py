@@ -14,6 +14,7 @@ writes
 Run it on the development machine (x86-64, glibc) with the native core built (`sh native/build.sh`), and say in
 the commit why the results changed."""
 import json
+import math
 import os
 import random
 import sys
@@ -24,7 +25,7 @@ HERE = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(HERE, "tests"))
 
-PER_FN = {"Hyp.scan": 16, "Hyp.drop": 6, "radar_frame": 8}
+PER_FN = {"Hyp.scan": 16, "Hyp.drop": 6, "Hyp.smooth": 8, "radar_frame": 8}
 DEFAULT_N = 6
 MAX_ROWS = 40                   # a case's state array has at most this many rows in use
 
@@ -92,7 +93,7 @@ class HypTrace:
 
     def __getattr__(self, name):
         v = getattr(self._H, name)
-        if name in ("scan", "drop"):
+        if name in ("scan", "drop", "smooth"):
             return lambda *a: self._tr.call("Hyp." + name, v, self._H, a)
         return v
 
@@ -114,6 +115,7 @@ def drives(trace):
         for name in ("crossing_pair", "parked_row"):
             radar_score.run(name, seed=1, cfg={"tracker": {"hyp_keep_steps": 8}})
         radar_score.run("occlusion", seed=1, radar="point", cfg={"tracker": {"hyp_keep_steps": 8}})
+        radar_score.run("platoon", seed=1, radar="extended", cfg={"tracker": {"hyp_keep_steps": 8}})
     finally:
         models.NR, tracker._NR, box._NR, sensors._NR = saved[:4]
         tracker.CFG.clear()
@@ -125,8 +127,8 @@ def extra(trace):
     from chris_integrator.radar import tracker as T
     g = np.random.default_rng(3)
     cam = [0.0, 1.3, 6.88, 0.004, 1.0, -0.6, 0.55, 8.0, 80.0, 0.55, 0.4, 14.0, 2.0, 0.1, 1.25, 0.2, 1.15, 0.1666, 0.4997,
-           0.575, 1.5, 3.0, 0.7, 0.5, 1e-4, 1e-5, 3e-6, 1e-6, 2.5, 0.45]
-    mw = [1.0, 2.0, 0.3, 0.05, 0.9, 160.0, 0.9, 1e-4] + [0.0] * 22
+           0.575, 1.5, 3.0, 0.7, 0.5, 1e-4, 1e-5, 3e-6, 1e-6, 2.5, 0.45, 7e-5, 1.0]
+    mw = [1.0, 2.0, 0.3, 0.05, 0.9, 160.0, 0.9, 1e-4] + [0.0] * 24
     for sen, kind in ((cam, 0), (cam, 1), (cam, 2), (cam, 3), (cam, 10), (mw, 2)):
         x = g.standard_normal(8) * [5, 3, 8, 3, 1, 1, 0.01, 0.1] + [25, 0, 0, 0, 0, 0, 0, 0.4]
         trace.radar_h(sen, kind, 0.4, x, [1.0, -0.5, 0.05, 9.0, 0.4, 0.02], np.zeros(4), np.zeros((4, 8)))
@@ -145,6 +147,9 @@ def extra(trace):
             S[r, 24:216] = np.concatenate([(q @ q.T).ravel() for q in a])
             S[r, 216:219] = (0.2, 0.5, 0.3)
         trace.radar_combine_rows(S, [0, 1])
+        S[:, 219:227] = S[:, 0:8]
+        S[:, 227:291] = S[:, 24:88]
+        trace.radar_group_support(S, [0, 1], (0.3, -0.2, math.cos(0.1 * it), math.sin(0.1 * it)), 0.8, 2.0, 0.01)
 
 
 def selftest(C):
@@ -168,8 +173,8 @@ def selftest(C):
         C.radar_peek_pos(S, [0], [dt], [R._KIN4.get(label) or R._KIN4[None]], R._native_par(R.CFG), out)
         ev.append((S[0, :363].tolist(), dt, label, out[0].tolist()))
     sens = ([0.0, 1.3, 6.882437470997847, 0.004, 1.0, -0.6, 0.55, 8.0, 80.0, 0.55, 0.4, 14.0, 2.0, 0.1, 1.25, 0.2, 1.15,
-             0.1665698348469775, 0.49970950454093244, 0.575, 1.5, 3.0, 0.7, 0.5] + [0.0] * 6,
-            [1.0, 2.0, 0.3, 0.05, 0.9, 160.0, 0.9, 1e-4] + [0.0] * 22, [2.0, 1.0, 70.0, 0.85, 1e-4] + [0.0] * 25)
+             0.1665698348469775, 0.49970950454093244, 0.575, 1.5, 3.0, 0.7, 0.5] + [0.0] * 8,
+            [1.0, 2.0, 0.3, 0.05, 0.9, 160.0, 0.9, 1e-4] + [0.0] * 24, [2.0, 1.0, 70.0, 0.85, 1e-4] + [0.0] * 27)
     for sen, kind in ((sens[0], 10), (sens[0], 3), (sens[0], 1), (sens[1], 2), (sens[2], 2)):
         x = (g.standard_normal(8) * [5, 3, 8, 3, 1, 1, 0.01, 0.1] + [25, 0, 0, 0, 0, 0, 0, 0.4]).tolist()
         pose = [1.0, -0.5, 0.05, 9.0, 0.4, 0.02]

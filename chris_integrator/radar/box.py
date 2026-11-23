@@ -41,6 +41,13 @@ y LEFT, origin the reference camera):
     ctr [x, y]                                      the object's centre; x_m, y_m (and predict) are its NEAR FACE
     len, wid, hdg, ext_std [len, wid, hdg]          its rectangle: length, width (m), where its front points (rad,
                                                     car frame, left positive; held when it stands) and their 1 sigma
+    vs [vx, vy], vs_std, vs_age_s                   its velocity over the ground vs_age_s ago, smoothed (from the
+                                                    sightings since as well), car axes of now; null before a second sighting
+    grp, grp_kind                                   the group it is of (id; null) and its kind: "row" (standing in a
+                                                    line beside the road) | "queue" (standing in the car's lane) |
+                                                    "platoon" (driving one behind the other); the message's `groups`
+                                                    lists them with their members in order
+    hyp                                             how many hypotheses the tracker holds of it (1: no doubt)
     vis, occ, occ_by                                how much of it its last scan's sensor could see (0..1); what
                                                     hides it ("object" | "edge" | "fov" | null) and the hiding
                                                     object's id (docs/RADAR.md)
@@ -352,6 +359,17 @@ class Radar:
                               self._in_since, self._threat_since, T,
                               (c["in_path_hold_s"], c["threat_p"], c["threat_range_s"], c["threat_hold_s"],
                                c["parked_offset_m"]))
+        ch, sh = math.cos(psi), math.sin(psi)
+        for o, d in zip(shown, out):                     # the smoothed velocity (car axes) and the group
+            vs = o.vs
+            if vs is None:
+                d["vs"] = d["vs_std"] = d["vs_age_s"] = None
+            else:
+                d["vs"] = [round(ch * vs[0] + sh * vs[1], 2), round(-sh * vs[0] + ch * vs[1], 2)]
+                d["vs_std"] = round(math.hypot(vs[2], vs[3]), 2)
+                d["vs_age_s"] = round(vs[4] + T - o.t, 2)
+            d["grp"], d["grp_kind"] = o.grp, o.grp_kind
+            d["hyp"] = o.nleaf
         live = {o.id for o in tr.objects}
         for k in [k for k in self._in_since if k not in live]:
             del self._in_since[k]
@@ -369,6 +387,7 @@ class Radar:
                 "ego": {"speed_mps": round(v_ego, 2), "yaw_rate_rps": round(w_ego, 4), "accel_mps2": round(es[5], 2),
                         "stands": self.ego.stands_at(T), "ground_frame": self.ego.frame},
                 "path": None if self.path is None else "plan", "sensors": sensors,
+                "groups": [{"id": g, "kind": v["kind"], "members": v["members"]} for g, v in sorted(tr.groups.items())],
                 "counts": {"objects": len(tr.objects), "listed": len(out), "queued": len(self.queue), "dropped": self.dropped}}
 
     def health(self):

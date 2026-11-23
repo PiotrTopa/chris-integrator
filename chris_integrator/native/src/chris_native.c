@@ -4924,7 +4924,7 @@ static int rnums_get(PyObject *o, Py_ssize_t n, double *out, const char *what)
 /* ---- the sensors (sensors.py): what a scan measures of a state ---- */
 enum { SEN_CAMERA = 0, SEN_MICROWAVE = 1, SEN_POSITION = 2 };
 enum { K_B = 0, K_RB = 1, K_RBH = 2, K_BT = 3, K_NONE = 4, K_SCALE = 8 };
-#define RSENS 30
+#define RSENS 32
 
 typedef struct {
     int type;
@@ -4933,7 +4933,7 @@ typedef struct {
     int cover;
     double bmin, bmax, gmin, max_range, p_d, p_cut, h_min, h_full, p_small, near, extra, vol[4], srspan, lhspan,
         born, born_s;
-    double bias_var, dp_var, jit2, bias_floor2, top_rel, top_range;
+    double bias_var, dp_var, jit2, bias_floor2, top_rel, top_range, gm_var, gm_tau;
     /* microwave */
     double mx, my, yaw, fov, clutter, extended;
 } RSens;
@@ -4954,6 +4954,7 @@ static int sens_get(PyObject *o, RSens *s)
             s->vol[k] = v[16 + k];
         s->srspan = v[20]; s->lhspan = v[21]; s->born = v[22]; s->born_s = v[23];
         s->bias_var = v[24]; s->dp_var = v[25]; s->jit2 = v[26]; s->bias_floor2 = v[27]; s->top_rel = v[28]; s->top_range = v[29];
+        s->gm_var = v[30]; s->gm_tau = v[31];
     } else if (s->type == SEN_MICROWAVE) {
         s->mx = v[1]; s->my = v[2]; s->yaw = v[3]; s->fov = v[4]; s->max_range = v[5]; s->p_d = v[6]; s->clutter = v[7];
         s->extended = v[8];
@@ -7682,10 +7683,65 @@ static int murty(Arena *ar, const double *c, int n, int m, int k, int *out_col, 
                                     and the scatter of their places about the mean (sxx, sxy, syy; sensor axes); 1 if
                                     both sides of the box are in the picture (its width is the object's) */
 enum { D_KIND, D_SDT, D_GROUP, D_VEH, D_W, D_Z, D_R = 9, D_SCORE = 13, D_ASPECT, D_NRET, D_SXX, D_SXY, D_SYY, D_WOK };
-#define RSCFG 18                 /* gate for 1..4 rows, feat_sigma, feat_same, feat_span, map_bw[3], feat_max_s,
+#define RSCFG 19                 /* gate for 1..4 rows, feat_sigma, feat_same, feat_span, map_bw[3], feat_max_s,
                                     common_min, common_pair, occlusion (0: off), the share hidden from which the
                                     chance of a report falls and at which it is lowest, that lowest chance for a
-                                    camera and for a microwave radar */
+                                    camera and for a microwave radar; from which spread of its bearing a hypothesis'
+                                    bearing is so unsure (rad) that its likelihood is taken as a sum of parts (0: never) */
+
+/* ---- where a measurement is not linear over what is not known of the place ----
+ * A bearing is a linear function of the place only over a small part of the range. A hypothesis whose place is
+ * unsure by a good share of its range (a new object that "may be driving at any speed", a second after its first
+ * box; an object coasted for seconds) is not a Gaussian in the picture: linearised at its mean it claims bearings
+ * it cannot reach (driving along the road it does not cross to the other side of the street) and misses ones it
+ * can. Such a hypothesis is cut along the direction in which its place is least known into five narrower
+ * Gaussians of the same mean and covariance together, each linearised where it is; its likelihood is their sum and
+ * its update their moment-matched posterior. */
+#define RSPLIT 5
+static const double SPLIT_W[RSPLIT] = {0.0763216491, 0.2474417860, 0.3524731300, 0.2474417860, 0.0763216491};
+static const double SPLIT_M[RSPLIT] = {-1.6899729111, -0.8009283834, 0.0, 0.8009283834, 1.6899729111};
+/* the spread of the parts' means; each part keeps the rest of the variance (the parts together: exactly 1) */
+#define SPLIT_VM (2.0 * (0.0763216491 * 1.6899729111 * 1.6899729111 + 0.2474417860 * 0.8009283834 * 0.8009283834))
+
+/* (x, P) as parts: xk (RSPLIT x N) the parts' means, Pk (N x N) their common covariance; returns how many (1: the
+ * hypothesis as it is). (ox, oy): where the sensor is; rel: the share of the range from which it is cut. */
+static int r_split(const double *x, const double *P, double ox, double oy, double rel, double *xk, double *Pk)
+{
+    memcpy(xk, x, RN * sizeof(double));
+    memcpy(Pk, P, RNN * sizeof(double));
+    if (!(rel > 0.0))
+        return 1;
+    double a = P[0], b = 0.5 * (P[1] + P[RN]), d = P[RN + 1], lam = r_eig2(a, b, d);
+    /* cut when the BEARING is unsure by more than `rel` radians: the place's spread across the line of sight */
+    double dx = x[R_PX] - ox, dy = x[R_PY] - oy, r = pymax(hypot(dx, dy), 1.0), ux = -dy / r, uy = dx / r;
+    double across = ux * ux * a + 2.0 * ux * uy * b + uy * uy * d;
+    if (!(lam > 0.0) || !isfinite(lam) || !(sqrt(pymax(across, 0.0)) > rel * r))
+        return 1;
+    double vx = lam - d, vy = b;
+    if (fabs(vx) + fabs(vy) < 1e-12 * lam) {
+        vx = b;
+        vy = lam - a;
+    }
+    double vn = hypot(vx, vy);
+    if (!(vn > 0.0)) {
+        vx = 1.0;
+        vy = 0.0;
+        vn = 1.0;
+    }
+    vx /= vn;
+    vy /= vn;
+    double c[RN], sl = sqrt(lam);
+    for (int k = 0; k < RN; k++)
+        c[k] = P[k * RN] * vx + P[k * RN + 1] * vy;
+    for (int q = 0; q < RSPLIT; q++)
+        for (int k = 0; k < RN; k++)
+            xk[q * RN + k] = x[k] + c[k] / sl * SPLIT_M[q];
+    double f = SPLIT_VM / lam;
+    for (int i = 0; i < RN; i++)
+        for (int j = i; j < RN; j++)
+            Pk[i * RN + j] = Pk[j * RN + i] = 0.5 * (P[i * RN + j] + P[j * RN + i]) - f * c[i] * c[j];
+    return RSPLIT;
+}
 
 typedef struct {
     const RSens *sen;
@@ -7847,31 +7903,36 @@ static void ras_row(const RAs *q, const double *row, double pd, double cx, doubl
         for (int mm = 0; mm < 3; mm++) {
             if (mu[mm] < 1e-4)
                 continue;
-            r_h(sen, kind, sdt, row + RO_XS + mm * RN, pose, zm, Hm, row + RO_E);
-            r_hph(Hm, m, row + RO_PS + mm * RNN, HPm, Sm);
-            int bad = 0;
-            for (Py_ssize_t a = 0; a < nJ; a++) {
-                if (!ok[a])
-                    continue;
-                double dc[RDET], Rf[4];
-                const double *d = ras_det(q, row, J[a], dc);
-                double nuj[4], Sj[16];
-                r_reff(sen, kind, row, pose, d + D_R, Rf);
-                for (int r = 0; r < m; r++)
-                    nuj[r] = r == ar ? wrap_pi(d[D_Z + r] - zm[r]) : d[D_Z + r] - zm[r];
-                memcpy(Sj, Sm, sizeof(double) * (size_t)(m * m));
-                for (int r = 0; r < m; r++)
-                    Sj[r * m + r] = Sm[r * m + r] + Rf[r];
-                if (r_mahal(Sj, m, nuj, &qs[a], &dets[a]) < 0) {
-                    bad = 1;
-                    break;
+            double xk[RSPLIT * RN], Pk[RNN];
+            int np = r_split(row + RO_XS + mm * RN, row + RO_PS + mm * RNN, pose[0], pose[1], cfg[18], xk, Pk);
+            for (int part = 0; part < np; part++) {
+                double wpart = np == 1 ? 1.0 : SPLIT_W[part];
+                r_h(sen, kind, sdt, xk + part * RN, pose, zm, Hm, row + RO_E);
+                r_hph(Hm, m, Pk, HPm, Sm);
+                int bad = 0;
+                for (Py_ssize_t a = 0; a < nJ; a++) {
+                    if (!ok[a])
+                        continue;
+                    double dc[RDET], Rf[4];
+                    const double *d = ras_det(q, row, J[a], dc);
+                    double nuj[4], Sj[16];
+                    r_reff(sen, kind, row, pose, d + D_R, Rf);
+                    for (int r = 0; r < m; r++)
+                        nuj[r] = r == ar ? wrap_pi(d[D_Z + r] - zm[r]) : d[D_Z + r] - zm[r];
+                    memcpy(Sj, Sm, sizeof(double) * (size_t)(m * m));
+                    for (int r = 0; r < m; r++)
+                        Sj[r * m + r] = Sm[r * m + r] + Rf[r];
+                    if (r_mahal(Sj, m, nuj, &qs[a], &dets[a]) < 0) {
+                        bad = 1;
+                        break;
+                    }
                 }
+                if (bad)
+                    continue;
+                for (Py_ssize_t a = 0; a < nJ; a++)
+                    if (ok[a] && qs[a] < 60.0 && dets[a] > 0.0)
+                        lk[a] += mu[mm] * wpart * exp(-0.5 * pymin(qs[a], 60.0)) / sqrt(c2 * dets[a]);
             }
-            if (bad)
-                continue;
-            for (Py_ssize_t a = 0; a < nJ; a++)
-                if (ok[a] && qs[a] < 60.0 && dets[a] > 0.0)
-                    lk[a] += mu[mm] * exp(-0.5 * pymin(qs[a], 60.0)) / sqrt(c2 * dets[a]);
         }
         for (Py_ssize_t a = 0; a < nJ; a++) {
             if (!ok[a] || lk[a] <= 0.0)
@@ -7903,60 +7964,87 @@ static inline double clamp_dp(double v)          /* min(0.05, max(-0.05, v)) as 
     return pymin(0.05, pymax(-0.05, v));
 }
 
+static int r_take_parts(double *x, double *P, const RSens *sen, int kind, double sdt, const double *pose, const double *z,
+                        const double *Rf, const double *e, double rel, double *like)
+{
+    double xk[RSPLIT * RN], Pk[RNN], Pq[RSPLIT][RNN], lq[RSPLIT], tot = 0.0;
+    int np = r_split(x, P, pose[0], pose[1], rel, xk, Pk);
+    for (int q = 0; q < np; q++) {
+        double nu[4], H[4 * RN], S[16], Si[16], K[RN * 4], det, t[4], d2 = 0.0;
+        int m = r_innov(sen, kind, sdt, xk + q * RN, Pk, pose, z, Rf, nu, H, S, e);
+        if (r_inv(S, m, Si, &det) < 0)
+            return -1;
+        for (int c = 0; c < m; c++) {
+            double acc = 0.0;
+            for (int r = 0; r < m; r++)
+                acc += nu[r] * Si[r * m + c];
+            t[c] = acc;
+        }
+        for (int c = 0; c < m; c++)
+            d2 += t[c] * nu[c];
+        lq[q] = (np == 1 ? 1.0 : SPLIT_W[q]) * exp(-0.5 * pymin(d2, 400.0)) / sqrt(pymax(pow(2.0 * PI, (double)m) * det, 1e-30));
+        tot += lq[q];
+        memcpy(Pq[q], Pk, sizeof(Pk));
+        r_gain(Pk, H, m, Si, K);
+        r_take(xk + q * RN, Pq[q], K, H, Rf, nu, m, 1.0);
+    }
+    *like = tot;
+    if (np == 1 || !(tot > 0.0)) {
+        int best = 0;                                    /* (no part fits at all: the middle one's update) */
+        if (np > 1)
+            best = RSPLIT / 2;
+        memcpy(x, xk + best * RN, RN * sizeof(double));
+        memcpy(P, Pq[best], RNN * sizeof(double));
+        return 0;
+    }
+    /* the parts' posteriors as one Gaussian again */
+    double xn[RN];
+    for (int k = 0; k < RN; k++) {
+        double acc = 0.0;
+        for (int q = 0; q < np; q++)
+            acc += lq[q] / tot * xk[q * RN + k];
+        xn[k] = acc;
+    }
+    for (int i = 0; i < RN; i++)
+        for (int j = i; j < RN; j++) {
+            double acc = 0.0;
+            for (int q = 0; q < np; q++)
+                acc += lq[q] / tot * (Pq[q][i * RN + j] + (xk[q * RN + i] - xn[i]) * (xk[q * RN + j] - xn[j]));
+            P[i * RN + j] = P[j * RN + i] = acc;
+        }
+    memcpy(x, xn, sizeof(xn));
+    return 0;
+}
+
 /* The row takes detection d of the sensor at `pose`: every motion hypothesis and the free estimate in full (Joseph
- * form), the hypotheses weighed by how well each had predicted it (from `hold` sightings on, unless the sensor
- * measures speed or the detection a scale rate; between the moving ones always; never below `floor`), the
- * combination. *nis: the object's normalised innovation before the update; *dl: what the fit adds to the log
- * odds that the object exists. -1: an innovation covariance is singular (nothing changed). */
+ * form; a hypothesis whose place is too unsure for one linearisation as a sum of parts: r_split), the hypotheses
+ * weighed by how well each had predicted it (from `hold` sightings on, unless the sensor measures speed or the
+ * detection a scale rate; between the moving ones always; never below `floor`), the combination. *nis: the
+ * object's normalised innovation before the update; *dl: what the fit adds to the log odds that the object
+ * exists. -1: an innovation covariance is singular (nothing changed). */
 static int r_update_full(double *row, const RSens *sen, const double *pose, const double *d, double hold, double floor_,
-                         double *nis, double *dl)
+                         double rel, double *nis, double *dl)
 {
     double *mu = row + RO_MU;
     int kind = (int)d[D_KIND];
     double sdt = d[D_SDT], hits = row[RO_M + M_HITS];
-    double like[3], Hs[3][4 * RN], nus[3][4], Ss[3][16], Sis[3][16], Rf[4];
-    int m = 0;
+    double like[3], Rf[4], lf;
     r_reff(sen, kind, row, pose, d + D_R, Rf);
-    for (int j = 0; j < 3; j++) {
-        double det;
-        m = r_innov(sen, kind, sdt, row + RO_XS + j * RN, row + RO_PS + j * RNN, pose, d + D_Z, Rf, nus[j], Hs[j], Ss[j], row + RO_E);
-        if (r_inv(Ss[j], m, Sis[j], &det) < 0)
-            return -1;
-        double t[4], d2 = 0.0;
-        for (int c = 0; c < m; c++) {
-            double acc = 0.0;
-            for (int r = 0; r < m; r++)
-                acc += nus[j][r] * Sis[j][r * m + c];
-            t[c] = acc;
-        }
-        for (int c = 0; c < m; c++)
-            d2 += t[c] * nus[j][c];
-        like[j] = exp(-0.5 * pymin(d2, 400.0)) / sqrt(pymax(pow(2.0 * PI, (double)m) * det, 1e-30));
-    }
-    double nu0[4], H0[4 * RN], S0[16], d20, nuf[4], Hf[4 * RN], Sf[16], Sif[16], detf;
+    double nu0[4], H0[4 * RN], S0[16], d20;
     int m0 = r_innov(sen, kind, sdt, row + RO_X, row + RO_P, pose, d + D_Z, Rf, nu0, H0, S0, row + RO_E);
     if (r_mahal(S0, m0, nu0, &d20, NULL) < 0)
         return -1;
-    int mf = r_innov(sen, kind, sdt, row + RO_XF, row + RO_PF, pose, d + D_Z, Rf, nuf, Hf, Sf, row + RO_E);
-    if (r_inv(Sf, mf, Sif, &detf) < 0)
-        return -1;
     for (int j = 0; j < 3; j++) {
-        double K[RN * 4];
         double *x = row + RO_XS + j * RN, *P = row + RO_PS + j * RNN;
-        r_gain(P, Hs[j], m, Sis[j], K);
-        r_take(x, P, K, Hs[j], Rf, nus[j], m, 1.0);
+        if (r_take_parts(x, P, sen, kind, sdt, pose, d + D_Z, Rf, row + RO_E, rel, &like[j]) < 0)
+            like[j] = 0.0;
         if (j == R_STAND)
             for (int k = R_VX; k <= R_AY; k++)
                 x[k] = 0.0;
         x[R_DP] = clamp_dp(x[R_DP]);
     }
-    {
-        double K[RN * 4];
-        double *x = row + RO_XF, *P = row + RO_PF;
-        r_gain(P, Hf, mf, Sif, K);
-        r_take(x, P, K, Hf, Rf, nuf, mf, 1.0);
-        x[R_DP] = clamp_dp(x[R_DP]);
-    }
+    if (r_take_parts(row + RO_XF, row + RO_PF, sen, kind, sdt, pose, d + D_Z, Rf, row + RO_E, rel, &lf) == 0)
+        row[RO_XF + R_DP] = clamp_dp(row[RO_XF + R_DP]);
     double tot = (mu[0] * like[0] + mu[1] * like[1]) + mu[2] * like[2];
     double w[3] = {mu[0] * like[0], mu[1] * like[1], mu[2] * like[2]};
     if (tot > 0.0 && (sen->type == SEN_MICROWAVE || hits >= hold || (kind & K_SCALE))) {
@@ -9260,19 +9348,22 @@ static int h_common(Scan *s, double *bias)
         return 0;
     double m = r_wmedian(v, w, ns, ko, cw);
     double var_m = 1.57 / cw[ns - 1];                    /* the variance of a weighted median */
-    double jit = s->sen.jit2, tot = bias[1] + jit + var_m;
+    /* the fast part's variance: what the pitch's own movement left unknown of it at this scan (bias[3]) */
+    double jit = bias[3], tot = bias[1] + jit + var_m;
     double slow = m * bias[1] / tot, fast = m * jit / tot;
     bias[0] += slow;
     bias[1] = pymax(bias[1] * (1.0 - bias[1] / tot), s->sen.bias_floor2);
     s->sen.bias = bias[0];
     s->sen.bias_var = bias[1];
     double left = jit * (1.0 - jit / tot);              /* what is still not known of this scan's own pitch */
+    bias[2] += fast;
+    bias[3] = left;
     for (int j = 0; j < nd; j++) {
         double *d = s->D + (size_t)j * RDET;
-        int base = (int)d[D_KIND] & 7;
-        if (base == K_RB || base == K_RBH) {
-            d[D_Z] -= fast;
-            d[D_R] = pymax(d[D_R] - jit + left, 0.25 * d[D_R]);
+        int base = (int)d[D_KIND] & 7, r = base == K_BT ? 1 : 0;
+        if (base == K_RB || base == K_RBH || base == K_BT) {
+            d[D_Z + r] -= fast;
+            d[D_R + r] = pymax(d[D_R + r] - jit + left, 0.25 * d[D_R + r]);
         }
     }
     return 1;
@@ -9296,7 +9387,7 @@ static int32_t h_detchild(Scan *s, int a, int j)
     int base = (int)d[D_KIND] & 7;
     memcpy(dc, d, sizeof(dc));
     r_cell_centre(row, &s->sen, s->pose, dc);
-    if (r_update_full(row, &s->sen, s->pose, dc, s->ucfg[0], s->ucfg[1], &nis, &dl) == 0)
+    if (r_update_full(row, &s->sen, s->pose, dc, s->ucfg[0], s->ucfg[1], s->acfg[18], &nis, &dl) == 0)
         r_extent_update(row, &s->sen, d, s->pose, s->ti + (size_t)s->lk[a] * HTI + 3);
     M[M_L] = pymax(-12.0, pymin(12.0, M[M_L] + dl + d[D_SCORE]));
     M[M_HITS] += 1.0;
@@ -9584,12 +9675,12 @@ static PyObject *hyp_scan(PyObject *self, PyObject *args)
     s.nscan = nscan;
     s.src = src;
     Py_ssize_t cap, n = 0, *th = NULL, nm = 0;
-    double bias[2] = {0.0, 0.0};
+    double bias[5] = {0.0, 0.0, 0.0, 0.0, -1e18};
     int has_bias = obias != Py_None, took = 0;
     if (store_get(oS, &vS, &cap) < 0 || (th = idx_get(otr, 1 << 30, &n)) == NULL || sens_get(osen, &s.sen) < 0 ||
         rnums_get(opose, 6, s.pose, "pose") < 0 || rnums_get(oacfg, RSCFG, s.acfg, "acfg") < 0 ||
         rpar_get(opar, &s.par) < 0 || rnums_get(oucfg, 2, s.ucfg, "ucfg") < 0 || rnums_get(obcfg, RBCFG, s.bcfg, "bcfg") < 0 ||
-        (has_bias && rnums_get(obias, 2, bias, "bias") < 0))
+        (has_bias && rnums_get(obias, 5, bias, "bias") < 0))
         goto done;
     if (cap < H->cap) {
         PyErr_SetString(PyExc_ValueError, "Hyp.scan: the state array is smaller than the rows in use");
@@ -9718,6 +9809,30 @@ static PyObject *hyp_scan(PyObject *self, PyObject *args)
         if (h_occluders(&s) < 0) {
             PyErr_NoMemory();
             goto fail;
+        }
+        if (has_bias && s.sen.type == SEN_CAMERA) {
+            /* The camera body's pitch against the road moves while the car drives (bumps, braking, the road's own
+             * waves): a Gauss-Markov process of spread sqrt(gm_var) that forgets within gm_tau. Its value at the
+             * last scan (bias[2], known to bias[3]) says less and less about this scan's; what it still says is
+             * taken out of the scan's ground angles, what it no longer says is their variance. (Before: a white
+             * 0.1 degrees per frame, an eighth of what a driving car's camera does; a standing car a pitch bump
+             * away then looked like one that drives.) */
+            double dtb = t - bias[4];
+            double rho = (dtb >= 0.0 && dtb < 1e6 && s.sen.gm_tau > 0.0) ? exp(-dtb / s.sen.gm_tau) : 0.0;
+            double pp = rho * bias[2], pvp = rho * rho * bias[3] + s.sen.gm_var * (1.0 - rho * rho);
+            for (int j = 0; j < nd; j++) {
+                double *d = s.D + (size_t)j * RDET;
+                int base = (int)d[D_KIND] & 7, r = base == K_BT ? 1 : 0;
+                if (base == K_RB || base == K_RBH || base == K_BT) {
+                    d[D_Z + r] -= pp;
+                    d[D_R + r] += pvp;
+                }
+            }
+            if (dtb >= 0.0) {
+                bias[2] = pp;
+                bias[3] = pvp;
+                bias[4] = t;
+            }
         }
         h_ratios(&s);
         if (has_bias && nd) {
@@ -9875,8 +9990,8 @@ static PyObject *hyp_scan(PyObject *self, PyObject *args)
             }
             Py_DECREF(o);
         }
-        if (took)
-            bias_o = Py_BuildValue("(dd)", bias[0], bias[1]);
+        if (has_bias)
+            bias_o = Py_BuildValue("(ddddd)", bias[0], bias[1], bias[2], bias[3], bias[4]);
         else {
             bias_o = Py_None;
             Py_INCREF(bias_o);
@@ -10346,10 +10461,281 @@ static PyObject *hyp_load(PyObject *self, PyObject *d)
     Py_RETURN_NONE;
 }
 
+
+/* ---- the past of a story, smoothed (fixed lag) ----
+ * The chain of nodes from an object's primary back is one story's history: at each node the motion hypotheses
+ * as they were after that scan (filtered), and the step that led into it (the switching matrix, dt, what the
+ * car's own movement added). A backward pass over the chain gives, for every node, the estimate from ALL the
+ * detections of the story, the later ones included: a Rauch-Tung-Striebel pass per motion hypothesis with the
+ * hypotheses mixed backwards (the smoother of the interacting multiple model filter: Nadarajah, Tharmarasa,
+ * McDonald, Kirubarajan 2012), and a plain RTS pass for the free estimate. docs/RADAR.md, section 6. */
+
+/* the transition of one hypothesis over dt, dense (r_predict's F) */
+static void r_trans(int model, double dt, const RPar *p, double *F)
+{
+    memset(F, 0, RNN * sizeof(double));
+    for (int i = 0; i < RN; i++)
+        F[i * RN + i] = 1.0;
+    if (model == R_STAND) {
+        for (int i = R_VX; i <= R_AY; i++)
+            F[i * RN + i] = 0.0;
+    } else if (model == R_CV) {
+        F[R_PX * RN + R_VX] = F[R_PY * RN + R_VY] = dt;
+        F[R_AX * RN + R_AX] = F[R_AY * RN + R_AY] = 0.0;
+    } else {
+        double rho = exp(-fabs(dt) / p->tau);
+        F[R_PX * RN + R_VX] = F[R_PY * RN + R_VY] = dt;
+        F[R_PX * RN + R_AX] = F[R_PY * RN + R_AY] = 0.5 * dt * dt;
+        F[R_VX * RN + R_AX] = F[R_VY * RN + R_AY] = dt;
+        F[R_AX * RN + R_AX] = F[R_AY * RN + R_AY] = rho;
+    }
+}
+
+/* the Cholesky factor of a symmetric positive matrix A (N x N): L lower; -1 where A is not positive */
+static int r_chol8(const double *A, double *L)
+{
+    memset(L, 0, RNN * sizeof(double));
+    for (int i = 0; i < RN; i++)
+        for (int j = 0; j <= i; j++) {
+            double acc = A[i * RN + j];
+            for (int k = 0; k < j; k++)
+                acc -= L[i * RN + k] * L[j * RN + k];
+            if (i == j) {
+                if (!(acc > 0.0) || !isfinite(acc))
+                    return -1;
+                L[i * RN + i] = sqrt(acc);
+            } else
+                L[i * RN + j] = acc / L[j * RN + j];
+        }
+    return 0;
+}
+
+/* One step back over a prediction: from the filtered (x, P) at a node and the smoothed (xs, Ps) at its child, the
+ * smoothed (x, P) at the node (in place). model, dt, kin, par: the step; e: what the car's own movement added to
+ * the place at the child (e00, e01, e11). */
+static void r_rts(int model, double *x, double *P, const double *xs, const double *Ps, double dt, const double *kin,
+                  const RPar *par, const double *e)
+{
+    double xp[RN], Pp[RNN], F[RNN], C[RNN], L[RNN], G[RNN];
+    r_predict(model, x, P, dt, kin[0], kin[1], kin[2], par, xp, Pp);
+    Pp[0] += e[0];
+    Pp[1] += e[1];
+    Pp[RN] += e[1];
+    Pp[RN + 1] += e[2];
+    r_trans(model, dt, par, F);
+    for (int i = 0; i < RN; i++)                         /* C = P F^T */
+        for (int j = 0; j < RN; j++) {
+            double acc = 0.0;
+            for (int k = 0; k < RN; k++)
+                acc += P[i * RN + k] * F[j * RN + k];
+            C[i * RN + j] = acc;
+        }
+    if (r_chol8(Pp, L) < 0)
+        return;                                          /* (a prediction that is not positive: the node stays filtered) */
+    for (int i = 0; i < RN; i++) {                       /* G = C Pp^-1: each row solved against L L^T */
+        double y[RN];
+        for (int j = 0; j < RN; j++) {
+            double acc = C[i * RN + j];
+            for (int k = 0; k < j; k++)
+                acc -= L[j * RN + k] * y[k];
+            y[j] = acc / L[j * RN + j];
+        }
+        for (int j = RN - 1; j >= 0; j--) {
+            double acc = y[j];
+            for (int k = j + 1; k < RN; k++)
+                acc -= L[k * RN + j] * G[i * RN + k];
+            G[i * RN + j] = acc / L[j * RN + j];
+        }
+    }
+    double dx[RN], D[RNN], GD[RNN];
+    for (int i = 0; i < RN; i++)
+        dx[i] = xs[i] - xp[i];
+    for (int i = 0; i < RNN; i++)
+        D[i] = Ps[i] - Pp[i];
+    for (int i = 0; i < RN; i++) {
+        double acc = 0.0;
+        for (int k = 0; k < RN; k++)
+            acc += G[i * RN + k] * dx[k];
+        x[i] += acc;
+    }
+    for (int i = 0; i < RN; i++)
+        for (int j = 0; j < RN; j++) {
+            double acc = 0.0;
+            for (int k = 0; k < RN; k++)
+                acc += G[i * RN + k] * D[k * RN + j];
+            GD[i * RN + j] = acc;
+        }
+    for (int i = 0; i < RN; i++)
+        for (int j = i; j < RN; j++) {
+            double acc = 0.0;
+            for (int k = 0; k < RN; k++)
+                acc += GD[i * RN + k] * G[j * RN + k];
+            double v = 0.5 * (P[i * RN + j] + P[j * RN + i]) + acc;
+            P[i * RN + j] = P[j * RN + i] = v;
+        }
+    for (int i = 0; i < RN; i++)                         /* (a variance does not go below nothing by rounding) */
+        if (P[i * RN + i] < 0.0)
+            P[i * RN + i] = 0.0;
+}
+
+/* Hyp.smooth(S, handle, par, max_steps, max_s, lag_s) ->
+ *     ([(t, x, y, vx, vy, p_stand)], (vx, vy, svx, svy, age), (fvx, fvy, f00, f01, f11), p_stand at the lag) | None
+ * The primary's story smoothed backwards over at most max_steps nodes and max_s seconds: the smoothed place and
+ * velocity (ground frame) and probability of "it stands" at every node, the newest first (the first is the
+ * filtered state itself); the smoothed velocity with its 1 sigma at the first node at least lag_s back (or the
+ * oldest reached) and that node's age; the free estimate's smoothed velocity and its covariance there. Nothing
+ * is written into the rows. None: the story has one node. */
+static PyObject *hyp_smooth(PyObject *self, PyObject *args)
+{
+    Hyp *H = (Hyp *)self;
+    PyObject *oS, *opar;
+    long h;
+    int max_steps;
+    double max_s, lag_s;
+    if (!PyArg_ParseTuple(args, "OlOidd", &oS, &h, &opar, &max_steps, &max_s, &lag_s))
+        return NULL;
+    HTrack *t = h_get(H, h);
+    if (t == NULL)
+        return NULL;
+    View vS;
+    Py_ssize_t cap;
+    RPar par;
+    if (store_get(oS, &vS, &cap) < 0)
+        return NULL;
+    PyObject *res = NULL, *hist = NULL;
+    if (rpar_get(opar, &par) < 0 || cap < H->cap) {
+        if (!PyErr_Occurred())
+            PyErr_SetString(PyExc_ValueError, "Hyp.smooth: a state array that is too small");
+        goto done;
+    }
+    const double *A = (const double *)vS.b.buf;
+    int32_t c = t->primary;
+    if (c < 0 || H->parent[c] < 0) {
+        res = Py_None;
+        Py_INCREF(res);
+        goto done;
+    }
+    {
+        const double *row = A + (Py_ssize_t)c * RROW;
+        double xs[3 * RN], Ps[3 * RNN], mu[3], xf[RN], Pf[RNN], t0 = row[RO_M + M_T];
+        memcpy(xs, row + RO_XS, sizeof(xs));
+        memcpy(Ps, row + RO_PS, sizeof(Ps));
+        memcpy(mu, row + RO_MU, sizeof(mu));
+        memcpy(xf, row + RO_XF, sizeof(xf));
+        memcpy(Pf, row + RO_PF, sizeof(Pf));
+        hist = PyList_New(0);
+        if (hist == NULL)
+            goto done;
+        double lag[5] = {row[RO_X + R_VX], row[RO_X + R_VY], sqrt(pymax(row[RO_P + R_VX * RN + R_VX], 0.0)),
+                         sqrt(pymax(row[RO_P + R_VY * RN + R_VY], 0.0)), 0.0};
+        double fl[5] = {xf[R_VX], xf[R_VY], Pf[R_VX * RN + R_VX], Pf[R_VX * RN + R_VY], Pf[R_VY * RN + R_VY]}, pl = mu[R_STAND];
+        int have_lag = 0;
+        {
+            PyObject *o = Py_BuildValue("(dddddd)", t0, row[RO_X + R_PX], row[RO_X + R_PY], row[RO_X + R_VX], row[RO_X + R_VY],
+                                        mu[R_STAND]);
+            if (o == NULL || PyList_Append(hist, o) < 0) {
+                Py_XDECREF(o);
+                goto done;
+            }
+            Py_DECREF(o);
+        }
+        for (int step = 0; step < max_steps; step++) {
+            int32_t p = H->parent[c];
+            if (p < 0)
+                break;
+            const double *rc = A + (Py_ssize_t)c * RROW, *rp = A + (Py_ssize_t)p * RROW;
+            if (t0 - rp[RO_M + M_T] > max_s)
+                break;
+            const double *T = rc + RO_ST, *e = rc + RO_ST + ST_E, *kin = t->kin;
+            double dt = rc[RO_ST + ST_DT];
+            const double *mp = rp + RO_MU;
+            /* the hypotheses mixed backwards: what the node's hypothesis j became at the child */
+            double cc[3], d[3], xn[3 * RN], Pn[3 * RNN], mn[3];
+            for (int i = 0; i < 3; i++)
+                cc[i] = T[i] * mp[0] + T[3 + i] * mp[1] + T[6 + i] * mp[2];
+            for (int j = 0; j < 3; j++) {
+                double b[3], xb[RN], Pb[RNN];
+                d[j] = 0.0;
+                for (int i = 0; i < 3; i++) {
+                    b[i] = cc[i] > 1e-12 ? T[3 * j + i] * mu[i] / cc[i] : 0.0;
+                    d[j] += b[i];
+                }
+                memcpy(xn + j * RN, rp + RO_XS + j * RN, RN * sizeof(double));
+                memcpy(Pn + j * RNN, rp + RO_PS + j * RNN, RNN * sizeof(double));
+                if (!(d[j] > 1e-12))
+                    continue;                            /* (nothing of it went on: it stays as it was filtered) */
+                for (int k = 0; k < RN; k++)
+                    xb[k] = (b[0] * xs[k] + b[1] * xs[RN + k] + b[2] * xs[2 * RN + k]) / d[j];
+                for (int r = 0; r < RN; r++)
+                    for (int q = r; q < RN; q++) {
+                        double acc = 0.0;
+                        for (int i = 0; i < 3; i++)
+                            acc += b[i] * (Ps[i * RNN + r * RN + q] + (xs[i * RN + r] - xb[r]) * (xs[i * RN + q] - xb[q]));
+                        Pb[r * RN + q] = Pb[q * RN + r] = acc / d[j];
+                    }
+                r_rts(j, xn + j * RN, Pn + j * RNN, xb, Pb, dt, kin, &par, e);
+                if (j == R_STAND)
+                    for (int k = R_VX; k <= R_AY; k++)
+                        xn[j * RN + k] = 0.0;
+            }
+            double ms = 0.0;
+            for (int j = 0; j < 3; j++) {
+                mn[j] = mp[j] * d[j];
+                ms += mn[j];
+            }
+            if (ms > 0.0)
+                for (int j = 0; j < 3; j++)
+                    mn[j] /= ms;
+            else
+                memcpy(mn, mp, sizeof(mn));
+            /* the free estimate: one steady-velocity filter, a plain pass */
+            double xfn[RN], Pfn[RNN];
+            memcpy(xfn, rp + RO_XF, sizeof(xfn));
+            memcpy(Pfn, rp + RO_PF, sizeof(Pfn));
+            r_rts(R_CV, xfn, Pfn, xf, Pf, dt, kin, &par, e);
+            memcpy(xs, xn, sizeof(xs));
+            memcpy(Ps, Pn, sizeof(Ps));
+            memcpy(mu, mn, sizeof(mu));
+            memcpy(xf, xfn, sizeof(xf));
+            memcpy(Pf, Pfn, sizeof(Pf));
+            double x[RN], P[RNN], tp = rp[RO_M + M_T];
+            r_combine(xs, Ps, mu, x, P);
+            PyObject *o = Py_BuildValue("(dddddd)", tp, x[R_PX], x[R_PY], x[R_VX], x[R_VY], mu[R_STAND]);
+            if (o == NULL || PyList_Append(hist, o) < 0) {
+                Py_XDECREF(o);
+                goto done;
+            }
+            Py_DECREF(o);
+            if (!have_lag) {
+                lag[0] = x[R_VX];
+                lag[1] = x[R_VY];
+                lag[2] = sqrt(pymax(P[R_VX * RN + R_VX], 0.0));
+                lag[3] = sqrt(pymax(P[R_VY * RN + R_VY], 0.0));
+                lag[4] = t0 - tp;
+                fl[0] = xf[R_VX];
+                fl[1] = xf[R_VY];
+                fl[2] = Pf[R_VX * RN + R_VX];
+                fl[3] = Pf[R_VX * RN + R_VY];
+                fl[4] = Pf[R_VY * RN + R_VY];
+                pl = mu[R_STAND];
+                have_lag = t0 - tp >= lag_s;
+            }
+            c = p;
+        }
+        res = Py_BuildValue("(O(ddddd)(ddddd)d)", hist, lag[0], lag[1], lag[2], lag[3], lag[4], fl[0], fl[1], fl[2], fl[3],
+                            fl[4], pl);
+    }
+done:
+    Py_XDECREF(hist);
+    view_drop(&vS);
+    return res;
+}
+
 static PyMethodDef hyp_methods[] = {
     {"scan", hyp_scan, METH_VARARGS, "one scan: the hypotheses of every cluster, the objects' primaries"},
     {"drop", hyp_drop, METH_VARARGS, "an object taken out"},
     {"rows", hyp_rows_of, METH_O, "every row of an object, the primary first"},
+    {"smooth", hyp_smooth, METH_VARARGS, "the primary's story smoothed backwards (fixed lag)"},
     {"chain", hyp_chain, METH_O, "the primary's rows from now back"},
     {"leaves", hyp_leaves, METH_O, "an object's hypotheses and their probabilities"},
     {"start", hyp_start, METH_VARARGS, "an object put in from outside"},
@@ -10500,6 +10886,214 @@ done:
     return res;
 }
 
+
+/* ---- structure: objects that stand in a row, wait in a queue, drive as a platoon ----
+ * radar_groups(S, rows, info (n, 2): motion class (1 stands, 2 drives, 0 neither), 1 if it may found a group;
+ *              pose (X, Y, psi), cfg: gap_stand, gap_move, dv, line_m, line_rel, lane_m, min_n)
+ *   -> [(kind (1 row, 2 queue, 3 platoon), [members], (px, py, ux, uy), across spread)]
+ * Two objects are linked when both stand, or both drive at like velocity, and the free room between their
+ * rectangles along the line that joins them is under the gap. A linked set of at least min_n whose centres lie on
+ * one line (the worst one taken out while they do not, within line_m + line_rel x its length) is a group: its
+ * line (a point and a direction, ground frame) and how far the members lie off it (rms). Standing on a line that
+ * begins in the car's own lane ahead (its nearest member within lane_m of the car's axis): a queue (two are
+ * enough); standing beside: a row; driving: a platoon. */
+#define RGCFG 7
+static PyObject *n_radar_groups(PyObject *self, PyObject *args)
+{
+    PyObject *oS, *orows, *oinfo, *opose, *ocfg;
+    if (!PyArg_ParseTuple(args, "OOOOO", &oS, &orows, &oinfo, &opose, &ocfg))
+        return NULL;
+    View vS;
+    vS.held = 0;
+    PyObject *res = NULL;
+    Py_ssize_t cap, n = 0, *rows = NULL;
+    double pose[3], cfg[RGCFG], *info = NULL;
+    int *lab = NULL;
+    if (store_get(oS, &vS, &cap) < 0 || (rows = idx_get(orows, cap, &n)) == NULL || rnums_get(opose, 3, pose, "pose") < 0 ||
+        rnums_get(ocfg, RGCFG, cfg, "cfg") < 0)
+        goto done;
+    info = (double *)PyMem_Malloc((size_t)(2 * n + 1) * sizeof(double));
+    lab = (int *)PyMem_Malloc((size_t)(3 * n + 1) * sizeof(int));
+    if (info == NULL || lab == NULL) {
+        PyErr_NoMemory();
+        goto done;
+    }
+    if (n && rows_get(oinfo, n, 2, info, "info") < 0)
+        goto done;
+    const double *A = (const double *)vS.b.buf;
+    int *mem = lab + n, *in = mem + n;
+    for (Py_ssize_t i = 0; i < n; i++)
+        lab[i] = (int)i;
+    for (Py_ssize_t i = 0; i < n; i++) {
+        const double *ri = A + rows[i] * RROW, *xi = ri + RO_X, *ei = ri + RO_E;
+        int ci = (int)info[2 * i];
+        if (ci == 0)
+            continue;
+        for (Py_ssize_t j = i + 1; j < n; j++) {
+            const double *rj = A + rows[j] * RROW, *xj = rj + RO_X, *ej = rj + RO_E;
+            if ((int)info[2 * j] != ci)
+                continue;
+            double dx = xj[R_PX] - xi[R_PX], dy = xj[R_PY] - xi[R_PY], dist = hypot(dx, dy), los = atan2(dy, dx);
+            double room = dist - r_half_depth(ei, los, NULL) - r_half_depth(ej, los, NULL);
+            if (ci == 2 && hypot(xj[R_VX] - xi[R_VX], xj[R_VY] - xi[R_VY]) > cfg[2])
+                continue;
+            if (room > (ci == 1 ? cfg[0] : cfg[1]))
+                continue;
+            int a = uf_find(lab, (int)i), b = uf_find(lab, (int)j);
+            if (a != b)
+                lab[a > b ? a : b] = a > b ? b : a;
+        }
+    }
+    res = PyList_New(0);
+    for (Py_ssize_t r0 = 0; res && r0 < n; r0++) {
+        if (uf_find(lab, (int)r0) != (int)r0 || (int)info[2 * r0] == 0)
+            continue;
+        int m = 0, cls = (int)info[2 * r0];
+        for (Py_ssize_t j = r0; j < n; j++)
+            if (uf_find(lab, (int)j) == (int)r0)
+                mem[m++] = (int)j;
+        double px = 0.0, py = 0.0, ux = 1.0, uy = 0.0, rms = 0.0, len = 0.0;
+        while (m >= 2) {
+            px = py = 0.0;
+            for (int k = 0; k < m; k++) {
+                px += A[rows[mem[k]] * RROW + RO_X + R_PX];
+                py += A[rows[mem[k]] * RROW + RO_X + R_PY];
+            }
+            px /= m;
+            py /= m;
+            double sxx = 0.0, sxy = 0.0, syy = 0.0;
+            for (int k = 0; k < m; k++) {
+                double ax = A[rows[mem[k]] * RROW + RO_X + R_PX] - px, ay = A[rows[mem[k]] * RROW + RO_X + R_PY] - py;
+                sxx += ax * ax;
+                sxy += ax * ay;
+                syy += ay * ay;
+            }
+            double th = 0.5 * atan2(2.0 * sxy, sxx - syy);
+            ux = cos(th);
+            uy = sin(th);
+            double worst = -1.0, lo = INFINITY, hi = -INFINITY, ss = 0.0;
+            int wk = -1;
+            for (int k = 0; k < m; k++) {
+                double ax = A[rows[mem[k]] * RROW + RO_X + R_PX] - px, ay = A[rows[mem[k]] * RROW + RO_X + R_PY] - py;
+                double al = ux * ax + uy * ay, ac = fabs(-uy * ax + ux * ay);
+                lo = pymin(lo, al);
+                hi = pymax(hi, al);
+                ss += ac * ac;
+                if (ac > worst) {
+                    worst = ac;
+                    wk = k;
+                }
+            }
+            len = hi - lo;
+            rms = sqrt(ss / m);
+            if (worst <= cfg[3] + cfg[4] * len)
+                break;
+            mem[wk] = mem[--m];                          /* the one farthest off the line is not of it */
+        }
+        /* the line against the car: does it pass through the car's own lane? */
+        /* in the car's own lane? the member nearest the car is ahead of it and within lane_m of its axis, and the
+         * line runs on from there along the car's direction (a row beside the road starts beside the car's axis) */
+        double best = INFINITY, ny = 0.0, nx = 0.0, cp = cos(pose[2]), sp_ = sin(pose[2]);
+        for (int k = 0; k < m; k++) {
+            double ax = A[rows[mem[k]] * RROW + RO_X + R_PX] - pose[0], ay = A[rows[mem[k]] * RROW + RO_X + R_PY] - pose[1];
+            if (hypot(ax, ay) < best) {
+                best = hypot(ax, ay);
+                nx = cp * ax + sp_ * ay;
+                ny = -sp_ * ax + cp * ay;
+            }
+        }
+        double along_car = fabs(ux * cp + uy * sp_);
+        int kind = cls == 2 ? 3 : (nx > 0.0 && fabs(ny) <= cfg[5] && along_car > 0.8) ? 2 : 1;
+        int need = kind == 2 ? 2 : (int)cfg[6], founders = 0;
+        for (int k = 0; k < m; k++)
+            founders += info[2 * mem[k] + 1] != 0.0;
+        if (m < need || founders < 2)
+            continue;
+        /* the members in their order along the line */
+        for (int k = 1; k < m; k++) {
+            int v = mem[k], q = k;
+            double av = ux * (A[rows[v] * RROW + RO_X + R_PX] - px) + uy * (A[rows[v] * RROW + RO_X + R_PY] - py);
+            while (q > 0 && ux * (A[rows[mem[q - 1]] * RROW + RO_X + R_PX] - px) + uy * (A[rows[mem[q - 1]] * RROW + RO_X + R_PY] - py) > av) {
+                mem[q] = mem[q - 1];
+                q--;
+            }
+            mem[q] = v;
+        }
+        PyObject *ml = PyList_New(m);
+        if (ml == NULL) {
+            Py_CLEAR(res);
+            break;
+        }
+        for (int k = 0; k < m; k++)
+            PyList_SetItem(ml, k, PyLong_FromLong(mem[k]));
+        PyObject *g = Py_BuildValue("(iN(dddd)d)", kind, ml, px, py, ux, uy, rms);
+        if (g == NULL || PyList_Append(res, g) < 0) {
+            Py_XDECREF(g);
+            Py_CLEAR(res);
+            break;
+        }
+        Py_DECREF(g);
+    }
+    (void)in;
+done:
+    PyMem_Free(rows);
+    PyMem_Free(info);
+    PyMem_Free(lab);
+    view_drop(&vS);
+    return res;
+}
+
+/* radar_group_support(S, rows, line (px, py, ux, uy), sigma, gain, floor) -> None
+ * What a row of standing things says about one of its members (rows: every leaf of that member; the line fitted to
+ * the OTHER members): the member stands on the line (a measurement of its place across the line, 1 sigma `sigma`,
+ * taken by its standing hypothesis), and standing is likelier for it than for a thing by itself (the standing
+ * hypothesis' probability times `gain`, the others never below `floor`: a member that pulls out is still found by
+ * its own detections, which weigh far more). */
+static PyObject *n_radar_group_support(PyObject *self, PyObject *args)
+{
+    PyObject *oS, *orows, *oline;
+    double sigma, gain, floor_;
+    if (!PyArg_ParseTuple(args, "OOOddd", &oS, &orows, &oline, &sigma, &gain, &floor_))
+        return NULL;
+    View vS;
+    vS.held = 0;
+    Py_ssize_t cap, n = 0, *rows = NULL;
+    double ln[4];
+    PyObject *res = NULL;
+    if (store_get(oS, &vS, &cap) < 0 || (rows = idx_get(orows, cap, &n)) == NULL || rnums_get(oline, 4, ln, "line") < 0)
+        goto done;
+    for (Py_ssize_t k = 0; k < n; k++) {
+        double *row = (double *)vS.b.buf + rows[k] * RROW, *x = row + RO_XS, *P = row + RO_PS, *mu = row + RO_MU;
+        double H[RN] = {0}, R = sigma * sigma;
+        H[R_PX] = -ln[3];
+        H[R_PY] = ln[2];
+        double nu = -(H[R_PX] * (x[R_PX] - ln[0]) + H[R_PY] * (x[R_PY] - ln[1]));
+        double S = H[R_PX] * (H[R_PX] * P[0] + H[R_PY] * P[RN]) + H[R_PY] * (H[R_PX] * P[1] + H[R_PY] * P[RN + 1]) + R;
+        if (S > 0.0 && isfinite(S) && nu * nu <= 9.0 * S) {
+            double K[RN], Si = 1.0 / S, Hm[4 * RN] = {0}, nv[4] = {nu, 0.0, 0.0, 0.0};
+            memcpy(Hm, H, sizeof(H));
+            r_gain(P, Hm, 1, &Si, K);
+            r_take(x, P, K, Hm, &R, nv, 1, 1.0);
+            for (int q = R_VX; q <= R_AY; q++)
+                x[q] = 0.0;
+        }
+        double w[3] = {mu[0] * gain, mu[1], mu[2]}, ws = w[0] + w[1] + w[2], s2 = 0.0;
+        for (int j = 0; j < 3; j++) {
+            w[j] = pymax(w[j] / ws, floor_);
+            s2 += w[j];
+        }
+        for (int j = 0; j < 3; j++)
+            mu[j] = w[j] / s2;
+        r_combine(row + RO_XS, row + RO_PS, mu, row + RO_X, row + RO_P);
+    }
+    res = Py_None;
+    Py_INCREF(res);
+done:
+    PyMem_Free(rows);
+    view_drop(&vS);
+    return res;
+}
+
 /* radar_kbest(cost (n, m), k) -> [(cost, [column of each row])]: the k cheapest assignments of n rows to m >= n
  * columns in order (the hypotheses' ranked assignment, for tests and tools); a pair that may not be: >= 1e17 */
 static PyObject *n_radar_kbest(PyObject *self, PyObject *args)
@@ -10583,6 +11177,8 @@ static PyMethodDef methods[] = {
     {"radar_assign", n_radar_assign, METH_O, "tracker.assign"},
     {"radar_peek_models", n_radar_peek_models, METH_VARARGS, "one row's motion hypotheses after dt, each by itself"},
     {"radar_cells", n_radar_cells, METH_VARARGS, "an extended sensor's returns grouped into cells"},
+    {"radar_groups", n_radar_groups, METH_VARARGS, "rows, queues and platoons among the objects"},
+    {"radar_group_support", n_radar_group_support, METH_VARARGS, "what a standing row says about one member"},
     {"radar_kbest", n_radar_kbest, METH_VARARGS, "the k cheapest assignments in order (Murty)"},
     {"radar_frame", n_radar_frame, METH_VARARGS, "the output's per-object numbers (box.py Radar.frame)"},
     {"radar_life", n_radar_life, METH_VARARGS, "Tracker.manage's numbers: stillness, finiteness, out-of-view place"},
@@ -10610,7 +11206,7 @@ PyMODINIT_FUNC PyInit__chris_native(void)
         goto fail;
     Py_INCREF(Fallback);
     if (PyModule_AddObject(m, "Fallback", Fallback) < 0 || PyModule_AddIntConstant(m, "VERSION", NATIVE_VERSION) < 0 ||
-        PyModule_AddIntConstant(m, "RADAR_ROW", RROW) < 0)
+        PyModule_AddIntConstant(m, "RADAR_ROW", RROW) < 0 || PyModule_AddIntConstant(m, "RADAR_SENS", RSENS) < 0)
         goto fail;
     if ((NisWinType = PyType_FromSpec(&niswin_spec)) == NULL || (TrendType = PyType_FromSpec(&trend_spec)) == NULL)
         goto fail;

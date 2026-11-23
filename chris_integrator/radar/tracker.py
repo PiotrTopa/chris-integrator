@@ -64,6 +64,8 @@ CFG = dict(
     score_bins=10, score_prior=((0.62, 0.14), (0.50, 0.14), 30.0), score_gain=0.6, score_max=1.2, score_keep=3000.0,
     confirm_exist=0.95, confirm_hits=3, delete_exist=0.04,
     max_objects=64,
+    split_rel=0.12,              # a hypothesis whose bearing is unsure by this much (rad) is not linearised in one
+                                 # piece (docs/RADAR.md, section 5); 0: always in one piece
     # the hypotheses (chris_native.c `Hyp`; docs/RADAR.md). Each is a knob of cost against quality, the default
     # the full setting: how many scans back a doubtful pairing stays open (0: decided at once, the best
     # assignment of each scan), how many global hypotheses a cluster of competing objects keeps, how many leaves
@@ -72,6 +74,17 @@ CFG = dict(
     hyp_n_scan=5, hyp_k_best=32, hyp_max_leaves=12, hyp_prune_ln=math.log(1e4), hyp_max_cluster=16,
     hyp_keep_steps=40, hyp_keep_s=2.0,   # each story's history kept this far back (the smoother's reach)
     rows=1024,                   # of the state array at the start (it grows as needed)
+    # the past, smoothed (docs/RADAR.md, section 6): a backward pass over each story after every sighting, as far
+    # back as smooth_s; the velocity that is put out as `vs` and judged is the one smooth_lag_s ago
+    smooth=True, smooth_s=2.0, smooth_lag_s=0.5,
+    # structure (docs/RADAR.md, section 7): rows of standing things, queues, platoons. The free room between two
+    # members (standing / driving), how alike two drivers' velocities are, how straight the line is (m + share
+    # of its length), how near the car's own line a queue's passes, members needed (a queue: two)
+    groups=True, group_gap_stand_m=7.5, group_gap_move_m=30.0, group_dv=2.5, group_line_m=1.2, group_line_rel=0.03,
+    group_lane_m=1.6, group_min=3, group_move_mps=3.0, group_still_m2=4.0,
+    # what a row or a queue says about a member, once per group_s: it stands on the others' line to group_sigma_m,
+    # and "it stands" is group_gain times likelier
+    group_support=True, group_s=0.5, group_sigma_m=0.8, group_gain=2.0,
     # what a sensor can see: an object behind another one, or cut by the edge of the field, is not expected to be
     # reported (docs/RADAR.md, section 3). occlusion False: every object in the field counts as in the open. The
     # chance of a report falls from `occl_from` of the silhouette hidden to its lowest at `occl_full`
@@ -211,7 +224,7 @@ class Obj:
     __slots__ = ("id", "h", "slot", "_xs", "_Ps", "_mu", "_xf", "_Pf", "_x", "_P", "_e", "_Pe", "_st", "_m", "t0", "state",
                  "sources", "last_seen", "vote", "history", "checks", "consistency", "pred_err", "n_checks", "nis",
                  "verdict", "coast_s", "velocity_seen", "merge_t", "flags", "last_cover", "dp0", "scores", "cls", "kin",
-                 "store", "pe", "pp", "nleaf", "in_map", "label_code", "hidden_t")
+                 "store", "pe", "pp", "nleaf", "in_map", "label_code", "hidden_t", "vs", "fs", "ps_lag", "grp", "grp_kind")
     xs, Ps, mu, xf, Pf, x, P, e, Pe, st, m = (_view(k) for k, _ in _LAY)
     t = _meta(M_T)                   # the time its numbers are of
     logodds = _meta(M_L)             # that it exists, in the primary's story (`exist`: over all stories)
@@ -249,6 +262,11 @@ class Obj:
         self.in_map = True           # it is in the best hypothesis of its cluster
         self.label_code = 0.0
         self.hidden_t = -1e18        # the last time a scan could not see it for another object or the field's edge
+        self.vs = None               # its velocity a lag ago, smoothed: (vx, vy, 1 sigma x, y, how long ago), ground frame
+        self.fs = None               # the free estimate's smoothed velocity and its covariance (vx, vy, 00, 01, 11)
+        self.ps_lag = None           # the smoothed probability of "it stands" at the lag
+        self.grp = None              # the group it is of (id), and the group's kind: row | queue | platoon
+        self.grp_kind = None
 
     def bind(self, store, slot=None):
         """Point the object's arrays at its (primary) row of the state array."""
@@ -291,6 +309,9 @@ class Tracker:
         self.hyp = _NR.Hyp(c["rows"], c["hyp_n_scan"], c["hyp_k_best"], c["hyp_max_leaves"], c["hyp_prune_ln"],
                            c["hyp_keep_steps"], c["hyp_keep_s"], c["hyp_max_cluster"])
         self.by_h = {}               # handle -> object
+        self.groups = {}             # group id -> {"kind", "members" (object ids, in order along the line), "line", "rms"}
+        self.group_t = None
+        self.next_group = 1
         self.src_code = {}           # sensor id -> its number in the rows' records
         self.stats = {}              # sensor id -> counters
         self.sensors = {}            # sensor id -> (last model, time)
@@ -314,12 +335,17 @@ class Tracker:
     def shown_moving(o):
         """How far the object's sightings by themselves show that it moves: the distance of "no speed" from the
         free estimate of its velocity, in that estimate's own uncertainty (squared; 9 is one chance in a
-        hundred for a thing that stands)."""
-        v, S = o.xf[VX:VY + 1], o.Pf[VX:VY + 1, VX:VY + 1]
-        det = S[0, 0] * S[1, 1] - S[0, 1] * S[1, 0]
+        hundred for a thing that stands). The free estimate a lag ago, smoothed, where there is one (what the
+        later sightings say of the velocity then is far firmer than the newest sighting's own)."""
+        if o.fs is not None:
+            vx, vy, s00, s01, s11 = o.fs
+        else:
+            v, S = o.xf[VX:VY + 1], o.Pf[VX:VY + 1, VX:VY + 1]
+            vx, vy, s00, s01, s11 = v[0], v[1], S[0, 0], S[0, 1], S[1, 1]
+        det = s00 * s11 - s01 * s01
         if det <= 0.0:
             return 0.0
-        return float((S[1, 1] * v[0] * v[0] - 2.0 * S[0, 1] * v[0] * v[1] + S[0, 0] * v[1] * v[1]) / det)
+        return float((s11 * vx * vx - 2.0 * s01 * vx * vy + s00 * vy * vy) / det)
 
     def _pose(self, t):
         p = self.ego.pose_at(t)
@@ -383,7 +409,8 @@ class Tracker:
         self.sensors[src] = (sensor, t)
         b = None
         if getattr(sensor, "has_bias", False):
-            b = self.bias.setdefault(src, [0.0, sensor.bias_var])
+            # the camera's pitch error: its slow part (value, variance) and its fast part (value, variance, time)
+            b = self.bias.setdefault(src, [0.0, sensor.bias_var, 0.0, 0.0, -1e18])
             sensor.bias, sensor.bias_var = b[0], b[1]
         pose = self._pose(t)
         if pose is None:
@@ -398,6 +425,11 @@ class Tracker:
         if getattr(sensor, "extraneous", None) is not None:
             sensor.extraneous = max(sensor.extraneous, self.new_rate.get(src, 0.0))
         code = self.src_code.setdefault(src, len(self.src_code) + 1)
+        if b is not None:                                # how much the camera's pitch moves: by how fast the car drives
+            cc = sensor.cfg
+            f = min(math.hypot(pose[3], pose[4]) / cc["pitch_gm_full_mps"], 1.0)
+            sensor.gm = (math.radians(cc["pitch_gm_stand_deg"] + f * (cc["pitch_gm_deg"] - cc["pitch_gm_stand_deg"])) ** 2,
+                         cc["pitch_gm_tau_s"])
         if getattr(sensor, "extended", None):
             dets = self._cells(sensor, pose, t, objs, dets)
             st["dets"] += len(dets)
@@ -420,7 +452,8 @@ class Tracker:
         g, bw = c["gate"], c["map_bw"]
         acfg = (g.get(1, 16.0), g.get(2, 16.0), g.get(3, 16.0), g.get(4, 16.0), c["feat_sigma"], c["feat_same"],
                 c["feat_span"], bw[0], bw[1], bw[2], c["feat_max_s"], c["common_min"], c["common_pair"],
-                1.0 if c["occlusion"] else 0.0, c["occl_from"], c["occl_full"], c["occl_floor"], c["occl_floor_radar"])
+                1.0 if c["occlusion"] else 0.0, c["occl_from"], c["occl_full"], c["occl_floor"], c["occl_floor_radar"],
+                c["split_rel"])
         bcfg = (c["new_exist"], c["p_any_side"], c["side_m"], c["with_rel"], c["with_std"], self.mcfg["p_ca0"],
                 c["mu_floor"], max(0, c["max_objects"] - len(self.objects)))
         args = ([o.h for o in objs], info, float(t), pose, sensor.native(), code, D, KB, rows,
@@ -433,9 +466,9 @@ class Tracker:
                 o.bind(self.store)
             res = self.hyp.scan(self.store.a, *args)
         out, births, dead, bias = res
-        if bias is not None:                             # the scan's common angle: its slow part is the sensor's
-            b[0], b[1] = bias
-            sensor.bias, sensor.bias_var = bias
+        if bias is not None:                             # the sensor's pitch error after the scan
+            b[:] = bias
+            sensor.bias, sensor.bias_var = bias[0], bias[1]
         store = self.store
         hit = []
         for o, (alive, prim, pd, cover, pe, pp, nleaf, in_map) in zip(objs, out):
@@ -469,6 +502,9 @@ class Tracker:
                                [o.kin for o in hit for _ in hz], M._native_par(self.mcfg), ahead)
             for k, r in enumerate(ahead.tolist()):
                 hit[k // len(hz)].checks.append((t + hz[k % len(hz)], r[0], r[1], r[2:]))
+        if c["smooth"]:
+            for o in hit:
+                self._smooth(o)
         memq = self.unexplained.setdefault(src, deque())
         times = self.scan_times.setdefault(src, deque())
         times.append(t)
@@ -508,6 +544,21 @@ class Tracker:
                                 sensor.native(), pose, margin) if returns else ()
         return [{"z": np.array([r, az, rr]), "R": np.array([sr * sr / n, sa * sa / n, sv * sv / n]), "attrs": {},
                  "cell": (float(n), sxx, sxy, syy)} for r, az, rr, n, sxx, sxy, syy in cells]
+
+    def _smooth(self, o):
+        """The object's past as its present story tells it, smoothed (Hyp.smooth: a backward pass over the story's
+        nodes): its trajectory (`history`) and its velocity a lag ago (`vs`), from the detections that came after
+        as well. The filtered state stays what is put out for now."""
+        c = self.cfg
+        r = self.hyp.smooth(self.store.a, o.h, M._native_par(self.mcfg), c["hyp_keep_steps"], c["smooth_s"], c["smooth_lag_s"])
+        if r is None:
+            return
+        hist, o.vs, o.fs, o.ps_lag = r
+        t_old = hist[-1][0]
+        keep = [h for h in o.history if h[0] < t_old - 1e-6]     # older than the smoother reaches: as it was
+        o.history.clear()
+        o.history.extend(keep)
+        o.history.extend(h[:5] for h in reversed(hist))
 
     def _det_rows(self, src, dets):
         """The scan's detections as the native core reads them (chris_native.c `RDET`: kind, scale-rate baseline,
@@ -614,7 +665,9 @@ class Tracker:
                 hid = o.hidden_t > last
                 if T - max(last, o.hidden_t) > max(o.coast_s, c["seen_max_s"]):
                     continue
-                if hid and (T - last > c["hidden_s"] or (sd is not None and sd > c["hidden_std_m"])):
+                # (a member of a queue hidden by the queue itself is kept as long as a remembered object)
+                if hid and (T - last > (c["memory_s"] if o.grp_kind == "queue" else c["hidden_s"])
+                            or (sd is not None and sd > c["hidden_std_m"])):
                     continue                             # hidden for too long: where it is is no longer known
                 if o.state == "tentative":
                     if o.exist >= c["confirm_exist"] and o.hits >= c["confirm_hits"] and o.in_map:
@@ -647,6 +700,62 @@ class Tracker:
             self.real_ids = {o.id for o in keep if o.state != "tentative"}
         self._merge(T)
         self._register(T)
+        self._groups(T, pose)
+
+    def _groups(self, T, pose):
+        """Structure among the objects (radar_groups): standing things in a line beside the road are a row, in the
+        car's own lane a queue, things driving one behind the other at one speed a platoon. A group keeps its id
+        while it keeps two of its members. A row or a queue supports its members (radar_group_support, once per
+        `group_s`): each stands on the line the OTHERS make, and standing is likelier for it than for a thing by
+        itself; a member whose own sightings show a speed is not of the group."""
+        c = self.cfg
+        objs = [o for o in self.objects if o.state != "tentative"]
+        prev = {o.id: o.grp for o in objs if o.grp is not None}
+        for o in self.objects:
+            o.grp = o.grp_kind = None
+        if not c["groups"] or len(objs) < 2 or pose is None:
+            self.groups = {}
+            return
+        info = []
+        for o in objs:
+            sm = self.shown_moving(o)
+            stands = o.verdict == "stationary" or (o.verdict != "moving" and sm < c["group_still_m2"] and o.mu[STAND] > 0.3)
+            drives = o.verdict == "moving" and o.speed > c["group_move_mps"]
+            info.append((1.0 if stands else 2.0 if drives else 0.0, 1.0 if o.state in ("confirmed", "coast", "memory") else 0.0))
+        found = _NR.radar_groups(self.store.a, [o.slot for o in objs], info, pose,
+                                 (c["group_gap_stand_m"], c["group_gap_move_m"], c["group_dv"], c["group_line_m"],
+                                  c["group_line_rel"], c["group_lane_m"], c["group_min"]))
+        support = self.group_t is None or T - self.group_t >= c["group_s"]
+        groups, used = {}, set()
+        for kind, mem, line, rms in found:
+            votes = {}
+            for k in mem:
+                g = prev.get(objs[k].id)
+                if g is not None and g not in used:
+                    votes[g] = votes.get(g, 0) + 1
+            gid = max(votes, key=lambda g: (votes[g], -g)) if votes and max(votes.values()) >= 2 else None
+            if gid is None:
+                gid = self.next_group
+                self.next_group += 1
+            used.add(gid)
+            name = ("row", "queue", "platoon")[kind - 1]
+            groups[gid] = {"kind": name, "members": [objs[k].id for k in mem], "line": line, "rms": rms}
+            for k in mem:
+                objs[k].grp, objs[k].grp_kind = gid, name
+            if support and kind != 3 and len(mem) >= 3 and c["group_support"]:
+                a = self.store.a
+                for k in mem:
+                    o = objs[k]
+                    if o.verdict == "moving" or self.shown_moving(o) >= c["group_still_m2"]:
+                        continue
+                    # the line the others make (a member does not support itself)
+                    xs = [(float(objs[q].x[PX]), float(objs[q].x[PY])) for q in mem if q != k]
+                    mx, my = sum(p[0] for p in xs) / len(xs), sum(p[1] for p in xs) / len(xs)
+                    _NR.radar_group_support(a, self.hyp.rows(o.h), (mx, my, line[2], line[3]),
+                                            math.hypot(c["group_sigma_m"], rms), c["group_gain"], c["mu_floor"])
+        if support:
+            self.group_t = T
+        self.groups = groups
 
     def _drop(self, o):
         """The object taken out of the hypotheses (it is no longer in `objects`); what ends with it ends too."""
@@ -728,6 +837,8 @@ class Tracker:
         obs = self.objects
         n = len(obs)
         if n < 2:
+            for o in obs:
+                o.merge_t.clear()
             return
         # the pairs worth a look: nearer than the limit can be at any range in reach, with room for what a
         # difference of the two objects' times may have moved one of them; and whether each is at one place and

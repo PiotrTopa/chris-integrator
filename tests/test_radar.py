@@ -709,5 +709,149 @@ class Seeing(unittest.TestCase):
         self.assertLess(abs(end["wid"] - 1.8), 0.4)                        # its width is what the box shows
 
 
+class PastAndStructure(unittest.TestCase):
+    def test_the_past_is_smoothed_and_the_present_is_not_delayed(self):
+        """A car ahead brakes from 14 to 6 m/s (microwave radar, noisy range rate). The smoothed velocity `vs` is of
+        half a second ago and nearer the truth of then than the filtered velocity was at that time; the filtered
+        velocity is of now."""
+        rng = random.Random(3)
+        rd = Radar()
+        x, filt, smooth, hist = 40.0, {}, [], None
+        for i in range(200):
+            t, s = 20 + i * 0.05, i * 0.05
+            v = 14.0 if s < 3.0 else max(6.0, 14.0 - 4.0 * (s - 3.0))
+            x += (v - 14.0) * 0.05
+            rd.on_ego({"ts_mono_ns": int(t * NS), "speed_mps": 14.0, "yaw_rate_rps": 0.0})
+            if i % 2 == 0:
+                rd.on_objects({"type": "objects", "kind": "radar", "sensor": "front", "ts_mono_ns": int(t * NS),
+                               "mount": {"x_m": 2.0, "y_m": 0.0, "yaw_deg": 0.0},
+                               "objects": [{"range_m": x - 2.0 + rng.gauss(0, 0.4), "azimuth_deg": rng.gauss(0, 0.3),
+                                            "range_rate_mps": v - 14.0 + rng.gauss(0, 0.8), "class": "bike", "prob": 0.9}]})
+            m = rd.frame(int(t * NS))
+            for o in m["objects"]:
+                filt[round(s, 2)] = (o["vx_mps"], v)
+                if o["vs"] is not None and s > 2.0:
+                    then = round(s - o["vs_age_s"], 2)
+                    v_then = 14.0 if then < 3.0 else max(6.0, 14.0 - 4.0 * (then - 3.0))
+                    f_then = min(filt.items(), key=lambda kv: abs(kv[0] - then))[1][0]
+                    smooth.append((abs(o["vs"][0] - v_then), abs(f_then - v_then), o["vs_age_s"], abs(o["vx_mps"] - v)))
+            hist = rd.tracker.objects[0].history if rd.tracker.objects else hist
+        self.assertGreater(len(smooth), 100)
+        es, ef = sum(a for a, _, _, _ in smooth) / len(smooth), sum(b for _, b, _, _ in smooth) / len(smooth)
+        self.assertLess(es, 0.75 * ef, (es, ef))                           # the smoothed past beats the filtered past
+        self.assertTrue(all(0.3 <= a <= 0.75 for _, _, a, _ in smooth))    # ... and is half a second old
+        self.assertLess(sum(d for _, _, _, d in smooth) / len(smooth), 1.2)   # the filtered present follows the braking
+        ts = [h[0] for h in hist]
+        self.assertEqual(ts, sorted(ts))                                   # the trajectory: in order, smoothed
+        self.assertGreater(len(ts), 20)
+
+    @staticmethod
+    def scene(things, v_ego=0.0, T=6.0, cfg=None, hide=lambda s: ()):
+        rd = Radar({"tracker": cfg or {}})
+        m = None
+        for i in range(int(T / 0.05)):
+            t, s = 20 + i * 0.05, i * 0.05
+            rd.on_ego({"ts_mono_ns": int(t * NS), "speed_mps": v_ego, "yaw_rate_rps": 0.0, "standstill": v_ego == 0.0})
+            if i % 4 == 0:
+                rd.on_road_users(cam_boxes(t, {k: (x - v_ego * s + (vx * s), y, w, h, c) for k, (x, y, w, h, c, vx) in things.items()},
+                                           hide=hide(s)))
+            m = rd.frame(int(t * NS))
+        return rd, m
+
+    def test_a_row_of_parked_cars_a_queue_and_a_platoon_are_groups(self):
+        row = {"p%d" % k: (14.0 + 6.5 * k, -4.0 - 0.6 * k, 1.8, 1.5, "car", 0.0) for k in range(4)}    # beside the road
+        rd, m = self.scene(dict(row, lone=(30.0, 7.0, 1.8, 1.5, "car", 0.0)), v_ego=0.0)
+        by = {round(o["y_m"]): o for o in m["objects"]}
+        self.assertEqual(len(m["groups"]), 1)
+        g = m["groups"][0]
+        self.assertEqual((g["kind"], len(g["members"])), ("row", 4))
+        members = [o for o in m["objects"] if o["grp"] == g["id"]]
+        self.assertEqual(sorted(o["id"] for o in members), sorted(g["members"]))
+        self.assertTrue(all(o["grp_kind"] == "row" and o["motion"] == "stationary" for o in members))
+        self.assertIsNone(by[7]["grp"])                                    # the one across the road is by itself
+        # two cars standing ahead in the car's own lane: a queue
+        rd, m = self.scene({"q1": (12.0, 0.1, 1.8, 1.5, "car", 0.0), "q2": (30.0, 4.2, 1.8, 1.5, "car", 0.0),
+                            "q3": (19.0, 0.2, 2.0, 2.4, "truck", 0.0)}, v_ego=0.0)
+        kinds = {o["grp_kind"] for o in m["objects"] if abs(o["y_m"]) < 1.0}
+        self.assertEqual(kinds, {"queue"})
+        # three cars driving ahead at the car's speed: a platoon
+        rd, m = self.scene({"a": (15.0, 0.0, 1.8, 1.5, "car", 10.0), "b": (33.0, 3.5, 1.8, 1.5, "car", 10.0),
+                            "c": (52.0, 7.5, 1.8, 1.5, "car", 10.0)}, v_ego=10.0, T=9.0)
+        self.assertEqual({o["grp_kind"] for o in m["objects"]}, {"platoon"})
+        self.assertEqual(len(m["groups"][0]["members"]), 3)
+        rd, m = self.scene(row, cfg={"groups": False})
+        self.assertEqual((m["groups"], {o["grp"] for o in m["objects"]}), ([], {None}))
+
+    def test_a_row_holds_its_members_in_line_and_standing_but_not_one_that_pulls_out(self):
+        row = {"p%d" % k: (14.0 + 6.5 * k, -4.0, 1.8, 1.5, "car", 0.0) for k in range(5)}
+        res = {}
+        for name, cfg in (("with", {}), ("without", {"group_support": False})):
+            rd, m = self.scene(row, v_ego=0.0, T=5.0, cfg=cfg)
+            objs = [o for o in rd.tracker.objects if o.grp is not None]
+            self.assertEqual(len(objs), 5, name)
+            res[name] = (sum(float(o.mu[0]) for o in objs) / 5, max(abs(float(o.xs[0][1]) + 4.0 - 0.0) for o in objs),
+                         max(math.sqrt(float(o.Ps[0][1, 1])) for o in objs))
+        self.assertGreater(res["with"][0], res["without"][0])              # standing is believed more
+        self.assertLess(res["with"][2], res["without"][2])                 # their places across the line are known better
+        # the third car pulls out of the row at 3 s and drives off across the road: found moving, and out of the group
+        rd = Radar()
+        seen = []
+        for i in range(200):
+            t, s = 20 + i * 0.05, i * 0.05
+            rd.on_ego({"ts_mono_ns": int(t * NS), "speed_mps": 0.0, "yaw_rate_rps": 0.0, "standstill": True})
+            if i % 4 == 0:
+                things = {k: v[:5] for k, v in row.items()}
+                things["p2"] = (27.0, -4.0 + 2.5 * max(0.0, s - 3.0), 1.8, 1.5, "car")
+                rd.on_road_users(cam_boxes(t, things))
+            m = rd.frame(int(t * NS))
+            seen.extend((s, o["motion"], o["grp"], o["y_m"]) for o in m["objects"] if abs(o["x_m"] - 27.0) < 3.0)
+        early = [q for q in seen if 2.0 < q[0] < 3.0]
+        late = [q for q in seen if q[0] > 6.5]
+        self.assertTrue(early and all(q[2] is not None and q[1] == "stationary" for q in early))
+        self.assertTrue(late and all(q[2] is None and q[1] == "moving" for q in late), late[:3])
+        self.assertGreater(late[-1][3], 3.0)                               # it has left for the other side
+
+
+class ParkedCars(unittest.TestCase):
+    """The defect of the real drives (docs/RADAR.md, section 5): parked cars called moving."""
+
+    @staticmethod
+    def drive(seed, cam_cfg, sigma_deg=0.6, tau=1.0):
+        """The car passes six parked cars at 9 m/s while its camera's pitch moves as real ones do (a Gauss-Markov
+        process, 0.6 degrees, 1 s: every box of a frame moves up or down together, and a ground range read through
+        it moves by metres). Seconds of the verdicts moving / stationary over the parked cars."""
+        rng = random.Random(seed)
+        rd = Radar({"camera": cam_cfg})
+        p = mv = st = 0.0
+        cars = [(45.0 + 18.0 * k, -3.2 if k % 2 else 3.4) for k in range(6)]
+        for i in range(300):
+            t, s = 20 + i * 0.05, i * 0.05
+            rd.on_ego({"ts_mono_ns": int(t * NS), "speed_mps": 9.0, "yaw_rate_rps": 0.0})
+            rho = math.exp(-0.05 / tau)
+            p = rho * p + math.sqrt(1 - rho * rho) * rng.gauss(0, math.radians(sigma_deg))
+            if i % 4 == 0:
+                things = {k: (gx - 9.0 * s, gy, 1.8, 1.5, "car") for k, (gx, gy) in enumerate(cars)
+                          if 9.0 < gx - 9.0 * s < 70.0 and rng.random() > 0.3}
+                m = cam_boxes(t, things)
+                for o in m["objects"]:
+                    o["box"][1] += F_PX * p
+                    o["box"][3] += F_PX * p
+                    o["range_m"] = HC * F_PX / max(o["box"][3] - CY, 1.0)      # the ground point as projected
+                rd.on_road_users(m)
+            for o in rd.frame(int(t * NS))["objects"]:
+                if o["state"] in ("confirmed", "coast"):
+                    mv += 0.05 * (o["motion"] == "moving")
+                    st += 0.05 * (o["motion"] == "stationary")
+        return mv, st
+
+    def test_a_pitching_camera_does_not_make_parked_cars_drive(self):
+        seeds = range(6)
+        with_model = [self.drive(s, {}) for s in seeds]
+        white_only = [self.drive(s, {"pitch_gm_deg": 0.0, "pitch_gm_stand_deg": 0.0}) for s in seeds]
+        self.assertLess(sum(a for a, _ in with_model), 1.0)                # (12 seeds: 0.0 s of 406 s)
+        self.assertGreater(sum(b for _, b in with_model), 150.0)
+        self.assertGreater(sum(a for a, _ in white_only), 5.0)             # the defect, reproduced (12 seeds: 30 s)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -721,7 +721,15 @@ none renamed or removed. Per object:
 "occ": "object",                  // null | "object" (hidden behind another object) | "edge" (cut by the edge of the
                                   //   field) | "fov" (outside the field)
 "occ_by": 12,                     // the id of the object that hides it, or null
+"vs": [13.1, 0.2],                // its velocity over the ground vs_age_s ago, smoothed (the sightings since included),
+"vs_std": 0.6, "vs_age_s": 0.55,  //   car axes of now, with its 1 sigma (m/s); null before a second sighting
+"grp": 3, "grp_kind": "row",      // the group it is of (null: none): "row" (standing in a line beside the road) |
+                                  //   "queue" (standing in the car's own lane) | "platoon" (driving one behind the other)
+"hyp": 1,                         // how many hypotheses the tracker holds of it (1: no doubt about its pairings)
 ```
+
+and at the message's top level `"groups": [{"id": 3, "kind": "row", "members": [12, 15, 19]}]` (the members' ids in
+their order along the group's line).
 
 `state` keeps its four values; an object hidden behind another one is `coast` (inside a field, not reported for
 the moment), with `exist` not falling. `exist` is the probability over all hypotheses of the object's cluster

@@ -79,7 +79,7 @@ def selftest(n=20000, seed=1):
             break
     for sen, kind, sdt, x, pose, zr, Hr in RADAR_H:
         z, H = np.empty(4), np.empty((4, 8))
-        m = _n.radar_h(list(sen) + [0.0] * (30 - len(sen)), kind, sdt, x, pose, z, H)
+        m = _n.radar_h((list(sen) + [0.0] * _n.RADAR_SENS)[:_n.RADAR_SENS], kind, sdt, x, pose, z, H)
         if not (close(z[:m], zr) and close(H[:m], Hr)):
             bad.append("radar_h differs from the reference's measurement function")
             break

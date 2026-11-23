@@ -133,6 +133,7 @@ class CameraBoxes(Sensor):
         self.bias = 0.0                                   # the camera's pitch error (rad) as known now, and how
         self.bias_var = math.radians(c["bias_std0_deg"]) ** 2    # well (set by the tracker before every scan)
         self.dp_obj_var = math.radians(c["dp_obj_std_deg"]) ** 2
+        self.gm = (0.0, 0.0)                              # the pitch's fast part: variance, memory (set by the tracker)
         span = max((cover["bearing_max"] - cover["bearing_min"]) if cover else 1.0, 0.1)
         gmin = cover["ground_min_m"] if cover else 12.0
         # the measurement space of one scan: bearings x ground angles x (log) box heights
@@ -156,7 +157,7 @@ class CameraBoxes(Sensor):
                 c["near_margin"], self.extraneous, v["b"], v["rb"], v["rbh"], v["bt"], c["scale_rate_span"],
                 c["logh_span"], c["born_small"], c["born_small_scale"], self.bias_var, self.dp_obj_var,
                 math.radians(c["pitch_jitter_deg"]) ** 2, math.radians(c["bias_floor_deg"]) ** 2, c["top_start_rel"],
-                c["top_start_rel_range"])
+                c["top_start_rel_range"], self.gm[0], self.gm[1])
 
     def h(self, x, pose, det=None):
         return Sensor.h(self, x, pose, det or {"kind": "rb"})
@@ -185,7 +186,11 @@ CAMERA_CFG = dict(
     bias_floor_deg=0.05,
     dp_obj_std_deg=0.2,          # each object's own offset on top (slope under it, where the edge sits)
     bottom_px=3.0, bottom_rel=0.04,   # the bottom edge from frame to frame: px + share of the box height
-    pitch_jitter_deg=0.1,        # the body's pitch from frame to frame
+    pitch_jitter_deg=0.1,        # the body's pitch from frame to frame (vibration: white)
+    # the body's pitch against the road while driving (bumps, braking, the road's waves): a process of this spread
+    # that forgets within tau (measured on the drives of 2026-11-22 from the road model's pitch: 0.33-0.40 degrees
+    # over 0.4 s, 0.5-0.63 over 0.8 s; standing 0.05-0.14), reached from `pitch_gm_full_mps` on
+    pitch_gm_deg=0.5, pitch_gm_tau_s=1.0, pitch_gm_stand_deg=0.1, pitch_gm_full_mps=3.0,
     # the box's centre and height
     bearing_rel=0.11, bearing_floor_deg=0.15,   # centre: share of the box width + floor
     height_std_px=3.6, height_std_rel=0.05,     # height: px + share of it (top and bottom edge together)
@@ -210,7 +215,7 @@ class MicrowaveRadar(Sensor):
 
     def native(self):
         return (1.0, self.mx, self.my, self.yaw, self.fov, self.max_range, self.p_d, self.clutter,
-                1.0 if self.extended else 0.0) + (0.0,) * 21
+                1.0 if self.extended else 0.0) + (0.0,) * 23
 
 
 class Position(Sensor):
@@ -224,4 +229,4 @@ class Position(Sensor):
         self.clutter = false_per_scan / (max_range * max_range)
 
     def native(self):
-        return (2.0, self.fov, self.max_range, self.p_d, self.clutter) + (0.0,) * 25
+        return (2.0, self.fov, self.max_range, self.p_d, self.clutter) + (0.0,) * 27
