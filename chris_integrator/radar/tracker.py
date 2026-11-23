@@ -1041,7 +1041,7 @@ class Tracker:
                 m2, e = r
             else:
                 ex, ey = o.x[PX] - o.x[VX] * back - px, o.x[PY] - o.x[VY] * back - py
-                S = Pp + o.P[:2, :2] + np.eye(2) * 0.05
+                S = np.reshape(Pp, (2, 2)) + o.P[:2, :2] + np.eye(2) * 0.05
                 try:
                     m2 = float(np.array([ex, ey]) @ np.linalg.solve(S, np.array([ex, ey]))) / 2.0
                 except np.linalg.LinAlgError:
