@@ -599,32 +599,8 @@ class Tracker:
         (for "it stands" it is a range: the car's own speed over the distance), and how well each had expected
         it weighs them at once: a thing that grows as the car's speed says stands; one that does not grow
         drives with the traffic."""
-        c = self.cfg
-        z = float(d["z"][-1])
-        R = float(d["R"][-1])
-        sd = {"kind": "s", "sdt": d.get("sdt")}
-        like = np.zeros(len(M.MODELS))
-        for j in range(len(M.MODELS) + 1):
-            x, P = (o.xf, o.Pf) if j == len(M.MODELS) else (o.xs[j], o.Ps[j])
-            zp, H = sensor.h(x, pose, sd)
-            S = float(H[0] @ P @ H[0]) + R
-            nu = z - float(zp[0])
-            K = P @ H[0] / S
-            xn = x + K * nu
-            Pn = P - np.outer(K, K) * S
-            Pn = 0.5 * (Pn + Pn.T)
-            if j == len(M.MODELS):
-                o.xf, o.Pf = xn, Pn
-                break
-            like[j] = math.exp(-0.5 * min(nu * nu / S, 400.0)) / math.sqrt(2.0 * math.pi * S)
-            o.xs[j], o.Ps[j] = xn, Pn
-            if j == STAND:
-                o.xs[j][VX:VY + 3] = 0.0
-        w = o.mu * like
-        if float(w.sum()) > 0.0:
-            o.mu = np.clip(w / float(w.sum()), c["mu_floor"], None)
-            o.mu /= o.mu.sum()
-        o.combine()
+        _NR.radar_first_rate(self.store.a, o.slot, sensor.native(), pose, float(d.get("sdt") or 0.0), float(d["z"][-1]),
+                             float(d["R"][-1]), self.cfg["mu_floor"])
 
     def _vote(self, o, d, src, t):
         at = d.get("attrs") or {}

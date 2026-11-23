@@ -707,13 +707,11 @@ def test_radar_golden():
 
 
 RADAR_DIGEST_RUNS = (("parked_street", 1, True, False), ("adjacent", 1, False, False), ("junction", 1, False, True))
-# sha256 of the radar messages of RADAR_DIGEST_RUNS (json.dumps of the list) on the development machine (x86-64);
-# made when the radar's Python reference still existed, from the native core then (whose messages agreed with the
-# reference's to a last printed digit, in a handful of messages: lane report native-radar2). They change when
-# anything upstream of the radar changes its output on purpose: then write them anew (RADAR_DIGESTS=print shows them).
-RADAR_DIGESTS = {"parked_street:1:1:0": "951cac781ef48e369501918b4603cd6720e7bef0f0036d485e423305cdfd68b2",
-                 "adjacent:1:0:0": "c9103ca895e5bf8dffd9feb4a130e9ce79622fcb3800d9e9a6dae05002f625a1",
-                 "junction:1:0:1": "f6eb08c0c2ef1810df74413a83a58d3e7ecf40c75c7aab28ac5229723513d5dc"}
+# sha256 of the radar messages of RADAR_DIGEST_RUNS (json.dumps of the list) on the development machine (x86-64),
+# in tests/data/radar_digests.json. They change when the radar or anything upstream of it changes its output on
+# purpose: then record them anew with `python3 tests/data/make_radar_golden.py` and say why in the commit.
+with open(os.path.join(HERE, "tests", "data", "radar_digests.json")) as _f:
+    RADAR_DIGESTS = json.load(_f)
 
 
 def _radar_digests():
@@ -754,11 +752,9 @@ def _radar_digests():
 @needs_radar
 @pytest.mark.skipif(os.uname().machine != "x86_64", reason="the digests are of the development machine's arithmetic")
 def test_radar_messages_digests():
-    """The radar's messages on simulated drives, byte for byte as they were when the Python reference existed."""
-    got = _radar_digests()
-    if os.environ.get("RADAR_DIGESTS") == "print":
-        print(json.dumps(got, indent=1))
-    assert got == RADAR_DIGESTS
+    """The radar's messages on simulated drives, byte for byte as they were recorded
+    (tests/data/make_radar_golden.py)."""
+    assert _radar_digests() == RADAR_DIGESTS
 
 
 @needs_radar
@@ -812,3 +808,46 @@ def test_radar_object_gone_wrong_is_dropped():
     msg = rd.frame(ts)
     assert bad.id not in {o.id for o in rd.tracker.objects}
     assert all(math.isfinite(o["x_m"]) for o in msg["objects"])
+
+
+@needs_radar
+def test_radar_update_keeps_the_covariance_symmetric_and_positive():
+    """The update's covariance is in Joseph form: symmetric to the bit and positive semi-definite whatever the
+    detection's weight and however much of a variance it takes away (detections up to ten orders of magnitude more
+    precise than the state, far beyond any sensor: the form P - K S K^T subtracts nearly equal numbers there and
+    goes indefinite), also after many in a row."""
+    from chris_integrator.radar import models as M, tracker as T
+    from chris_integrator.radar.sensors import CameraBoxes, MicrowaveRadar
+    g = np.random.default_rng(7)
+    cam = CameraBoxes({"bearing_min": -0.6, "bearing_max": 0.6, "ground_min_m": 12.0}, None, 975.0, 1.22, 14.0)
+    mw = MicrowaveRadar((2.0, 0.0, 0.0))
+    worst = 0.0
+    for it in range(300):
+        st = T.State(1)
+        a = g.standard_normal((8, 8))
+        scale = np.array([10.0, 3.0, 8.0, 3.0, 1.0, 1.0, 0.01, 0.2]) * 10.0 ** g.uniform(-2, 1)
+        P = (a @ a.T + np.eye(8) * 1e-3) * np.outer(scale, scale)
+        x = np.array([g.uniform(8, 70), g.uniform(-8, 8), g.normal(0, 8), g.normal(0, 2), 0.0, 0.0, 0.0, math.log(1.5)])
+        st.a[0, 0:24], st.a[0, 24:216], st.a[0, 216:219] = np.tile(x, 3), np.tile(P.ravel(), 3), (0.3, 0.5, 0.2)
+        st.a[0, 219:227], st.a[0, 227:291] = x, P.ravel()
+        C.radar_combine_rows(st.a, [0])
+        pose = (0.0, 0.0, 0.0, 10.0, 0.0, 0.0)
+        for step in range(12):
+            r = math.hypot(x[0], x[1])
+            if it % 2:
+                sen, D = mw, [0.0, 0.0, 0.0, 0.0, 0.0, r + g.normal(0, 0.3), math.atan2(x[1], x[0]), -10.0, 0.0]
+                Rv = [10.0 ** g.uniform(-8, -1), 10.0 ** g.uniform(-11, -4), 10.0 ** g.uniform(-8, -1), 0.0]
+            else:
+                sen = cam
+                D = [2.0, 0.0, 0.0, 1.0, 0.05, math.atan2(1.22, r), math.atan2(x[1], x[0]), cam.logf + x[7] - math.log(max(x[0], 0.5)), 0.0]
+                Rv = [10.0 ** g.uniform(-11, -5), 10.0 ** g.uniform(-11, -5), 10.0 ** g.uniform(-9, -2), 0.0]
+            beta_pair = float(g.choice([float("nan"), 0.3, 0.9]))
+            C.radar_update(st.a, [0], sen.native(), pose, np.array([D + Rv]), [(0.55, 1e-3, beta_pair, 5.0)], (2.0, 0.01))
+            for lo, n in ((24, 3), (227, 1), (299, 1)):
+                for k in range(n):
+                    Pk = st.a[0, lo + 64 * k:lo + 64 * (k + 1)].reshape(8, 8)
+                    assert np.array_equal(Pk, Pk.T)
+                    d = np.sqrt(np.maximum(np.diag(Pk), 1e-300))
+                    worst = min(worst, float(np.linalg.eigvalsh(Pk / np.outer(d, d)).min()))
+                    assert (np.diag(Pk) >= 0.0).all()
+    assert worst > -1e-9, worst                          # of the correlation matrix: positive to rounding

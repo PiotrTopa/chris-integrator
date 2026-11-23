@@ -57,6 +57,7 @@ becomes a float of the same value: the monitors hold floats where the Python hel
 only `round()` of a value next to a decimal tie could differ, numpy rounding by its own rule); a state that is
 not float64 is made a float64 copy; a stream's value beyond 2^53 is read as the nearest double.
 | `radar` | `radar_scan` (one scan's association: p_detect, coverage, the map's density, gate, likelihoods of the hypotheses, the box feature, the pairings' probabilities by loopy belief propagation, the assignment), `radar_update` (every pair of a scan: hypotheses, free estimate, NIS, model probabilities, existence increment, combination), `radar_common`, `radar_check`, `radar_register` (radar/tracker) | the tracker's arithmetic for a scan | golden: pairs and assignment the same; numbers to rounding (below) |
+| `radar` | `radar_first_rate` (radar/tracker: a new object's first scale rate into its hypotheses) | one row into every hypothesis and the free estimate, the hypotheses weighed | the tracker's tests |
 | `radar` | `radar_advance`, `radar_peek`, `radar_peek_pos`, `radar_life`, `radar_merge`, `radar_combine_rows` (radar/tracker, on the rows of the tracker's state array) | the motion model and the objects' upkeep | golden: to rounding |
 | `radar` | `radar_frame` (radar/box) | the message's objects: their numbers, flags with their hysteresis, the dicts | golden: to rounding (printed digits the same but for a last digit now and then); digests of three drives' messages (x86-64) |
 | `radar` | `radar_h` (radar/sensors: camera kinds b, rb, rbh, bt with and without the scale-rate row, microwave radar, position), `radar_marginals`, `radar_assign`, `radar_predict1`, `radar_still1`, `radar_transition1` (radar/models: one hypothesis) | measurement functions, pairings' probabilities, assignment, one hypothesis' step | golden: marginals and assignment the bits, measurement functions to the last bit of libm |
@@ -94,6 +95,30 @@ messages byte for byte on the development machine; `python -m chris_integrator.n
 reference's answers on a target (`native/_radar_selftest.py`). A state that is not finite is computed like any
 other (no hand-over to a reference any more): NaN and inf go where the arithmetic takes them, and the upkeep
 drops such an object as before.
+
+### The radar's covariance arithmetic
+
+Every covariance the radar writes is symmetric to the bit and positive semi-definite by the way it is computed,
+not by a repair afterwards:
+
+* **A detection taken** (`r_take`: `radar_update`, `radar_first_rate`): Joseph form. With `A = I - K H` the new
+  covariance is `A P A^T + K R K^T`, and for a detection taken with weight beta
+  `(1 - beta) P + beta (A P A^T + K R K^T) + beta (1 - beta) dx dx^T`: a sum of positive semi-definite terms for
+  any gain, so an error in `K` or `S` cannot make it indefinite. The form used before, `P - K S K^T`, subtracts
+  nearly equal numbers where a detection takes most of a variance away (a box height that pins the size, a
+  range that pins the angle offset) and left small negative eigenvalues behind, which the next prediction
+  amplified. Only the upper triangle is computed; the lower one is its mirror.
+* **Prediction** (`r_predict`): `F P F^T + Q`, symmetrised. **Mixing and combination** (`r_mix`, `r_combine`,
+  `r_peek_part`): weighted sums of covariances and of outer products of mean differences, the upper triangle
+  computed and mirrored.
+
+What Joseph form does not give: with a detection more than about ten orders of magnitude more precise than the
+state (`R / (H P H^T)` below 1e-10), `A P A^T` itself cancels below the rounding of `P`, and a variance can come
+out negative at the level of 1e-16 of the largest one. No sensor of the stack is near that (a bearing of 0.15
+degrees against a place known to metres is 1e-6); a square-root (Cholesky factor or UD) filter would hold there
+too, at the price of re-factorising at every mixing step of the interacting hypotheses, and was judged not worth
+it. `tests/test_native.py::test_radar_update_keeps_the_covariance_symmetric_and_positive` holds the property over
+random states with detections up to 1e-10 of the state's variance, many in a row.
 
 ### Inputs the C code takes, and what it does with others
 

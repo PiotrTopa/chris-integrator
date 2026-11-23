@@ -4657,12 +4657,12 @@ static void r_mix(const double *xs, const double *Ps, const double *mu, const do
             d1[n] = sx[1][n] - x[n];
             d2[n] = sx[2][n] - x[n];
         }
-        for (int m = 0; m < RN; m++)
-            for (int n = 0; n < RN; n++) {
+        for (int m = 0; m < RN; m++)                     /* the upper triangle, mirrored: symmetric by construction */
+            for (int n = m; n < RN; n++) {
                 int k = m * RN + n;
                 double a = (w0 * sp[0][k] + w1 * sp[1][k]) + w2 * sp[2][k];
                 double b = ((w0 * d0[m]) * d0[n] + (w1 * d1[m]) * d1[n]) + (w2 * d2[m]) * d2[n];
-                P[k] = a + b;
+                P[k] = P[n * RN + m] = a + b;
             }
     }
 }
@@ -4814,12 +4814,12 @@ static void r_combine(const double *xs, const double *Ps, const double *mu, doub
     for (int i = 0; i < 3; i++)
         for (int n = 0; n < RN; n++)
             d[i][n] = xs[i * RN + n] - x[n];
-    for (int m = 0; m < RN; m++)
-        for (int n = 0; n < RN; n++) {
+    for (int m = 0; m < RN; m++)                         /* the upper triangle, mirrored */
+        for (int n = m; n < RN; n++) {
             int k = m * RN + n;
             double a = (mu[0] * Ps[k] + mu[1] * Ps[RNN + k]) + mu[2] * Ps[2 * RNN + k];
             double b = ((mu[0] * d[0][m]) * d[0][n] + (mu[1] * d[1][m]) * d[1][n]) + (mu[2] * d[2][m]) * d[2][n];
-            P[k] = a + b;
+            P[k] = P[n * RN + m] = a + b;
         }
 }
 
@@ -5942,36 +5942,53 @@ static void r_gain(const double *P, const double *H, int m, const double *Si, do
         }
 }
 
-/* one hypothesis (or the free estimate) takes the detection with weight beta: x, P in place */
-static void r_take(double *x, double *P, const double *K, const double *S, const double *nu, int m, double beta)
+/* One hypothesis (or the free estimate) takes the detection with weight beta: x, P in place. The covariance in
+ * Joseph form: with A = I - K H, the detection taken in full leaves A P A^T + K R K^T (a sum of two positive
+ * semi-definite terms for ANY gain, so rounding in K or S cannot make it indefinite; P - K S K^T subtracts
+ * nearly equal numbers where a detection takes most of a variance away), and taken with weight beta
+ * (1 - beta) P + beta (A P A^T + K R K^T) + beta (1 - beta) dx dx^T: every term positive semi-definite, the
+ * result symmetric by the way it is written out (the lower triangle is the upper one's mirror).
+ * H: (m x N); R: the detection's variances (the diagonal); nu: the innovation. */
+static void r_take(double *x, double *P, const double *K, const double *H, const double *R, const double *nu, int m,
+                   double beta)
 {
-    double dx[RN], KS[RN * 4], Pn[RNN];
+    double dx[RN], A[RNN], AP[RNN], Pn[RNN];
     for (int i = 0; i < RN; i++) {
         double acc = 0.0;
         for (int k = 0; k < m; k++)
-            acc = k ? acc + K[i * m + k] * nu[k] : K[i * m + k] * nu[k];
+            acc += K[i * m + k] * nu[k];
         dx[i] = acc;
     }
-    for (int i = 0; i < RN; i++)
-        for (int l = 0; l < m; l++) {
-            double acc = 0.0;
-            for (int k = 0; k < m; k++)
-                acc = k ? acc + K[i * m + k] * S[k * m + l] : K[i * m + k] * S[k * m + l];
-            KS[i * m + l] = acc;
-        }
-    double bb = beta * (1.0 - beta);
-    for (int i = 0; i < RN; i++)
+    for (int i = 0; i < RN; i++)                         /* A = I - K H */
         for (int j = 0; j < RN; j++) {
             double acc = 0.0;
             for (int k = 0; k < m; k++)
-                acc = k ? acc + KS[i * m + k] * K[j * m + k] : KS[i * m + k] * K[j * m + k];
-            Pn[i * RN + j] = P[i * RN + j] - beta * acc + bb * (dx[i] * dx[j]);
+                acc += K[i * m + k] * H[k * RN + j];
+            A[i * RN + j] = (i == j ? 1.0 : 0.0) - acc;
+        }
+    for (int i = 0; i < RN; i++)                         /* AP = A P */
+        for (int j = 0; j < RN; j++) {
+            double acc = 0.0;
+            for (int k = 0; k < RN; k++)
+                acc += A[i * RN + k] * P[k * RN + j];
+            AP[i * RN + j] = acc;
+        }
+    double bb = beta * (1.0 - beta), keep = 1.0 - beta;
+    for (int i = 0; i < RN; i++)
+        for (int j = i; j < RN; j++) {
+            double acc = 0.0, kr = 0.0;
+            for (int k = 0; k < RN; k++)                 /* (A P A^T)[i][j] */
+                acc += AP[i * RN + k] * A[j * RN + k];
+            for (int k = 0; k < m; k++)                  /* (K R K^T)[i][j] */
+                kr += K[i * m + k] * R[k] * K[j * m + k];
+            /* P is taken as its symmetric part (it is symmetric but for rounding) */
+            double v = keep * (0.5 * (P[i * RN + j] + P[j * RN + i])) + beta * (acc + kr) + bb * (dx[i] * dx[j]);
+            Pn[i * RN + j] = v;
+            Pn[j * RN + i] = v;
         }
     for (int i = 0; i < RN; i++)
         x[i] = x[i] + beta * dx[i];
-    for (int i = 0; i < RN; i++)
-        for (int j = 0; j < RN; j++)
-            P[i * RN + j] = 0.5 * (Pn[i * RN + j] + Pn[j * RN + i]);
+    memcpy(P, Pn, sizeof(Pn));
 }
 
 static inline double clamp_dp(double v)          /* min(0.05, max(-0.05, v)) as Python takes it */
@@ -6079,7 +6096,7 @@ static PyObject *n_radar_update(PyObject *self, PyObject *args)
             double *x = row + RO_XS + j * RN, *P = row + RO_PS + j * RNN;
             double beta = pymax(comp * pd * like[j] / (pd * like[j] + other), beta_o);
             r_gain(P, Hs[j], m, Sis[j], K);
-            r_take(x, P, K, Ss[j], nus[j], m, beta);
+            r_take(x, P, K, Hs[j], d + 9, nus[j], m, beta);
             if (j == R_STAND)
                 for (int k = R_VX; k <= R_AY; k++)
                     x[k] = 0.0;
@@ -6107,7 +6124,7 @@ static PyObject *n_radar_update(PyObject *self, PyObject *args)
             double lf = exp(-0.5 * pymin(d2, 400.0)) / sqrt(pymax(pow(2.0 * PI, (double)mf) * det, 1e-30));
             double beta = pymax(comp * pd * lf / (pd * lf + other), beta_o);
             r_gain(P, H, mf, Si, K);
-            r_take(x, P, K, Sf, nu, mf, beta);
+            r_take(x, P, K, H, d + 9, nu, mf, beta);
             x[R_DP] = clamp_dp(x[R_DP]);
         }
         /* the hypotheses weighed by how well each predicted the detection */
@@ -6147,6 +6164,67 @@ static PyObject *n_radar_update(PyObject *self, PyObject *args)
 done:
     PyMem_Free(rows);
     PyMem_Free(buf);
+    view_drop(&vS);
+    return res;
+}
+
+/* radar_first_rate(S, row, sensor, pose, sdt, z, R, mu_floor) -> None. A new object's first box came with a scale
+ * rate (Tracker._first_rate): every hypothesis and the free estimate take that one row in full (Joseph form), the
+ * hypotheses are weighed by how well each had expected it (never below mu_floor), the combination is written. */
+static PyObject *n_radar_first_rate(PyObject *self, PyObject *args)
+{
+    PyObject *oS, *osen, *opose;
+    Py_ssize_t slot;
+    double sdt, z, R, floor_;
+    if (!PyArg_ParseTuple(args, "OnOOdddd", &oS, &slot, &osen, &opose, &sdt, &z, &R, &floor_))
+        return NULL;
+    View vS;
+    Py_ssize_t cap;
+    if (store_get(oS, &vS, &cap) < 0)
+        return NULL;
+    PyObject *res = NULL;
+    double pose[6];
+    RSens sen;
+    if (slot < 0 || slot >= cap) {
+        PyErr_SetString(PyExc_IndexError, "radar: a row outside the state array");
+        goto done;
+    }
+    if (sens_get(osen, &sen) < 0 || rnums_get(opose, 6, pose, "pose") < 0)
+        goto done;
+    {
+        double *row = (double *)vS.b.buf + slot * RROW, *mu = row + RO_MU, like[3] = {0.0, 0.0, 0.0};
+        for (int j = 0; j < 4; j++) {
+            double *x = j == 3 ? row + RO_XF : row + RO_XS + j * RN, *P = j == 3 ? row + RO_PF : row + RO_PS + j * RNN;
+            double nu[4], H[4 * RN], S[16], K[RN * 4];
+            r_innov(&sen, K_NONE | K_SCALE, sdt, x, P, pose, &z, &R, nu, H, S);
+            if (!(S[0] > 0.0) || !isfinite(S[0]))
+                continue;                                /* nothing to learn from a row with no spread */
+            double Si = 1.0 / S[0];
+            r_gain(P, H, 1, &Si, K);
+            r_take(x, P, K, H, &R, nu, 1, 1.0);
+            if (j == 3)
+                break;
+            like[j] = exp(-0.5 * pymin(nu[0] * nu[0] / S[0], 400.0)) / sqrt(2.0 * PI * S[0]);
+            if (j == R_STAND)
+                for (int k = R_VX; k <= R_AY; k++)
+                    x[k] = 0.0;
+        }
+        double w[3] = {mu[0] * like[0], mu[1] * like[1], mu[2] * like[2]};
+        double ws = (w[0] + w[1]) + w[2];
+        if (ws > 0.0) {
+            double s2 = 0.0;
+            for (int j = 0; j < 3; j++) {
+                w[j] = pymax(w[j] / ws, floor_);
+                s2 += w[j];
+            }
+            for (int j = 0; j < 3; j++)
+                mu[j] = w[j] / s2;
+        }
+        r_combine(row + RO_XS, row + RO_PS, mu, row + RO_X, row + RO_P);
+    }
+    res = Py_None;
+    Py_INCREF(res);
+done:
     view_drop(&vS);
     return res;
 }
@@ -6205,11 +6283,11 @@ static void r_peek_part(const double *row, double dt, const double *K, const RPa
             d2[n] = sx[2][n] - xm[n];
         }
         for (int m = 0; m < 6; m++)
-            for (int n = 0; n < 6; n++) {
+            for (int n = m; n < 6; n++) {
                 int k = m * RN + n;
                 double a = (w0 * sp[0][k] + w1 * sp[1][k]) + w2 * sp[2][k];
                 double b = ((w0 * d0[m]) * d0[n] + (w1 * d1[m]) * d1[n]) + (w2 * d2[m]) * d2[n];
-                Pm[m][n] = a + b;
+                Pm[m][n] = Pm[n][m] = a + b;
             }
         /* r_predict: the transition's non-zero terms of rows 0..6, Q's top-left 4 x 4 */
         int nz[7], col[7][3];
@@ -6324,11 +6402,11 @@ static void r_peek_part(const double *row, double dt, const double *K, const RPa
         for (int n = 0; n < nb; n++)
             d[i][n] = x1[i][n] - xout[n];
     for (int m = 0; m < nb; m++)
-        for (int n = 0; n < nb; n++) {
+        for (int n = m; n < nb; n++) {
             int k = nb * m + n;
             double a = (c[0] * P1[0][k] + c[1] * P1[1][k]) + c[2] * P1[2][k];
             double b = ((c[0] * d[0][m]) * d[0][n] + (c[1] * d[1][m]) * d[1][n]) + (c[2] * d[2][m]) * d[2][n];
-            Pout[k] = a + b;
+            Pout[k] = Pout[nb * n + m] = a + b;
         }
     if (muout)
         memcpy(muout, c, sizeof(c));
@@ -7608,6 +7686,7 @@ static PyMethodDef methods[] = {
     {"radar_assign", n_radar_assign, METH_O, "tracker.assign"},
     {"radar_scan", n_radar_scan, METH_VARARGS, "one scan's association (Tracker.process): pairs, p_detect, coverage"},
     {"radar_update", n_radar_update, METH_VARARGS, "the update of a scan's pairs (Tracker._update's arithmetic)"},
+    {"radar_first_rate", n_radar_first_rate, METH_VARARGS, "a new object's first scale rate into its hypotheses (Tracker._first_rate)"},
     {"radar_frame", n_radar_frame, METH_VARARGS, "the output's per-object numbers (box.py Radar.frame)"},
     {"radar_life", n_radar_life, METH_VARARGS, "Tracker.manage's numbers: stillness, finiteness, out-of-view place"},
     {"radar_merge", n_radar_merge, METH_VARARGS, "Tracker._merge's geometry: the near pairs and their test"},
