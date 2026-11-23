@@ -7,7 +7,7 @@
 Everything here is configuration of the mixer; nothing here is needed to use the mixer or a plug-in alone.
 
 Configuration: one JSON file per plug-in in the configuration directory, named after the plug-in
-(`integrator.json` for the estimator, `road_users.json`, `lead.json`, `lanes.json`, `egolane.json`, `roadgeom.json`, `view.json`,
+(`integrator.json` for the estimator, `road_users.json`, `radar.json`, `decide.json`, `learnt.json`, `lead.json`, `lanes.json`, `egolane.json`, `roadgeom.json`, `view.json`,
 `lights.json`, `rules.json`, `fused.json`, `mapper.json`, `rates.json`, `predict.json`), and `mixer.json` for the wiring:
 
     {"disable": ["fused"],                                        plug-ins of the default stack to leave out
@@ -28,6 +28,8 @@ import os
 
 from .mixer import Mixer, Plugin, StreamSpec
 from .plugins.common import Rates
+from .learners import Learnt
+from .plugins.decide import Decide
 from .plugins.estimator import Estimator
 from .plugins.predict import Predict
 from .plugins.radar import Radar
@@ -176,6 +178,7 @@ def build(cfg=None, config_dir=None, datadir=None, clock=None, mapper="auto", ex
     view_cfg = conf("view")
     boxes = [RideWatch(), RoadUsers(conf("road_users") or None), Estimator(est_cfg)]
     boxes.append(Radar(conf("radar") or None))        # the objects around the car (chris_integrator/radar)
+    boxes.append(Decide(conf("decide") or None))      # how threatening each object is; the alerts (chris_integrator/decide)
     if external_map:
         st.add_channel("map_in", EXTERNAL_MAP, info="an external map matcher")
     elif mapper not in (None, False):
@@ -204,6 +207,14 @@ def build(cfg=None, config_dir=None, datadir=None, clock=None, mapper="auto", ex
         saved = store.load(s.name)
         if saved:
             s.plugin.state_load(saved)
+    # what the daemon learns while driving, kept across drives (learnt.py): priors for this start
+    lcfg = conf("learnt")
+    if "learnt" not in disable:
+        path = lcfg.get("path") or (os.path.join(datadir, "learnt.json") if datadir and os.path.isdir(datadir) else None)
+        keeper = Learnt(lcfg, path=path)
+        m.add(keeper)
+        keeper.attach(st)
+        m.services["learnt"] = keeper
     return st
 
 

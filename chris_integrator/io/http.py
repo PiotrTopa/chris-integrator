@@ -137,6 +137,32 @@ async def h_mixer(req):
     return _json(req.app["api"].mixer.describe())
 
 
+def _learnt(req):
+    return req.app["api"].mixer.services.get("learnt")
+
+
+async def h_learnt(req):
+    k = _learnt(req)
+    if k is None:
+        return _json({"error": "no store of learnt values in this stack"}, 404)
+    return _json({"health": k.health(), "records": k.store.describe()})
+
+
+async def h_learnt_reset(req):
+    """POST {"keys": [prefix, ...]} (none: all): the store forgets them and is written at once."""
+    k = _learnt(req)
+    if k is None:
+        return _json({"error": "no store of learnt values in this stack"}, 404)
+    try:
+        body = await req.json() if req.can_read_body else {}
+    except ValueError:
+        return _json({"error": "bad JSON"}, 400)
+    keys = (body or {}).get("keys")
+    if keys is not None and not (isinstance(keys, list) and all(isinstance(x, str) for x in keys)):
+        return _json({"error": "keys: a list of key prefixes"}, 400)
+    return _json({"forgot": k.reset_values(keys)})
+
+
 # ---- what belongs to one camera is forwarded to that camera's debug face -------------------------------
 async def _forward_json(req, path):
     base = req.app["roadsense_http"]
@@ -306,6 +332,9 @@ def make_app(stack, readers=None, datadir=None, feed=None, recorder=None, roadse
             ("GET", "tracks", _topic("tracks", "no input yet")),
             ("GET", "lanes", _topic("lanes", "no road message yet")),
             ("GET", "view", _topic("view", "no road message yet")),
+            ("GET", "decide", _topic("decide", "no radar message yet")),
+            ("GET", "learnt", h_learnt),
+            ("POST", "learnt/reset", h_learnt_reset),
             ("GET", "calib", _topic("calib", "no calib message yet")),
             ("GET", "gnss", _topic("gnss", "no gnss message yet")),
             ("GET", "roadgeom", h_roadgeom),

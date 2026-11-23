@@ -16,6 +16,7 @@
  *   geom_centre, geom_reach    the road geometry's centre line from the camera (trackers/roadgeom.py)
  *   ekf_predict, ekf_project, ekf_update, ekf_sym, ekf_rts     the estimator's filter (core/ekf.py,
  *                              core/ego.py); elementwise steps exact, sums of products in index order
+ *   decide_*                   the decision layer's threat measures (decide.c, included below)
  *   radar_*                    the radar (radar/): its motion model, the sensors' measurement functions, a scan's
  *                              association and update, the objects' upkeep and the message's objects; held to
  *                              what its Python reference gave before it was removed (tests/data/radar_golden.npz)
@@ -7572,6 +7573,7 @@ done:
 }
 
 #include "predict.c"                 /* the `predict` part (chris_integrator/predict): its functions are PREDICT_METHODS */
+#include "decide.c"          /* the decision layer's numerics (chris_integrator/decide) */
 
 /* ==================================================================================================== */
 static PyMethodDef methods[] = {
@@ -7617,6 +7619,9 @@ static PyMethodDef methods[] = {
     {"radar_register", n_radar_register, METH_VARARGS, "Tracker._register for one sensor: the shared offset, taken out"},
     {"radar_common", n_radar_common, METH_VARARGS, "Tracker._common's numbers: the scan's angle innovations, their weighted median"},
     PREDICT_METHODS
+    {"decide_eval", n_decide_eval, METH_VARARGS, "the decision layer's threat measures per object, mode and ego mode (decide.c)"},
+    {"decide_inst_prob", n_decide_inst_prob, METH_VARARGS, "the exact probability that two footprints overlap at one time (decide.c)"},
+    {"decide_draws", n_decide_draws, METH_O, "the decision layer's fixed standard-normal draws (decide.c)"},
     {NULL, NULL, 0, NULL}};
 
 static struct PyModuleDef moduledef = {PyModuleDef_HEAD_INIT, "_chris_native",
