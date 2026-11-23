@@ -7,7 +7,7 @@ compiled to one module, `chris_integrator/native/_chris_native.abi3.so`. Where t
 it is used; where it is not, the same functions run in Python. Nothing else in the package knows which.
 
     python -m chris_integrator.native      which implementation runs here + a self-test against the reference
-    GET /v2/health  ->  "native": {"active": true, "implementation": "native", "parts": [...], "version": 3}
+    GET /v2/health  ->  "native": {"active": true, "implementation": "native", "parts": [...], "version": 4}
     the daemon's first log lines: "hot path NATIVE (json, round, interp, ekf, lanes, radar)"  |  "hot path pure Python: <why>"
 
 ## What is native, and what "the same" means for each part
@@ -19,7 +19,11 @@ it is used; where it is not, the same functions run in Python. Nothing else in t
 | `json` | `dumps` of `Rounded((list, n))` | `json.dumps([round(v, n) for v in list])` | the same text (the recorder's reduced `road`) |
 | `round` | `round(x, n)`, `round_list(list, n)` | `builtins.round` | the same value and type |
 | `interp` | `interp_all(xs, ys, qs)` | `trackers.view._interp_all_py` | the same values |
+| `interp` | `view_prep`, `view_blend` (a drawn line's points, reach, jump; its two smoothing stages) | `trackers.view._prep_py`, `_blend_py` | the same objects (the jump: CPython's compensated `sum`) |
+| `json` | `trim_road(line, ...)` | `fastjson._trim_road_py` | the same bytes |
+| `json` | `slim_road_line(road)` | `json.dumps(recorder.slim_road(road), separators=(",", ":"))` | the same text (what the native writer leaves to json goes to `json.dumps`, value by value) |
 | `lanes` | `lanes_measure`, `lanes_predict`, `lanes_fit`, `lanes_apply`, `round_lists` (the lane tracker's arrays) | numpy expressions in `trackers/lanes.py` | the same bits |
+| `lanes` | `geom_centre`, `geom_reach` (the road geometry's centre line from the camera, its reach) | `RoadGeometryFusion._centre_py`, `_centre_vision_py`, `_reach_py` in `trackers/roadgeom.py` | the same bits; the reach: the same object (a configured int stays one) |
 | `ekf` | `ekf_project`, `ekf_update`, `ekf_sym` (one scalar row of the filter) | numpy expressions in `core/ekf.py` | the same bits for rows of one state index (most rows); to rounding for rows over several states |
 | `ekf` | `ekf_predict` (the process model) | `EgoModel._predict_py` | state and transition: the same bits; covariance: to rounding |
 | `ekf` | `ekf_rts` (one smoother step) | `np.linalg.solve` + products in `core/ekf.py` | to rounding |
