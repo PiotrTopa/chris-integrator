@@ -53,6 +53,7 @@ Display filtering, and what it costs (the measurement topics are untouched):
 
 No I/O and no wall clock in here; times come from the messages (CLOCK_MONOTONIC ns).
 """
+import bisect
 import math
 
 from ..native import round                  # builtins.round, native where built
@@ -170,6 +171,57 @@ else:
             return _n(xs, ys, qs)
         except _fb:
             return _interp_all_py(xs, ys, qs)
+
+
+def _prep_py(gx, y, y_std, xs, reach_std, b):
+    """A drawn line's points over `xs`: None when the first two have no value, else (ys, reach, jump). reach: the
+    distance up to which the line is drawn (it ends before the first point without a value or with a std above
+    `reach_std` beyond 10 m); ys: the points beyond it carry the last value (never drawn); jump: how far the
+    near part (5-20 m) moved against `b`, the drawn line (None without one)."""
+    ys = _interp_all(gx, y, xs)
+    stds = _interp_all(gx, y_std, xs)
+    if ys[0] is None or ys[1] is None:
+        return None
+    reach = xs[-1]
+    for i, (x, s) in enumerate(zip(xs, stds)):
+        if ys[i] is None or (s is not None and s > reach_std and x > 10.0):
+            reach = xs[i - 1]
+            break
+    last = ys[0]
+    for i in range(len(ys)):
+        if ys[i] is None:
+            ys[i] = last
+        last = ys[i]
+    if b is None:
+        return ys, reach, None
+    near = [yy - bb for yy, bb, x in zip(ys, b, xs) if 5.0 <= x <= 20.0]
+    return ys, reach, abs(sum(near) / len(near))
+
+
+def _blend_py(a, b, dy, ys, ks, dt, shifting):
+    """The drawn line's two smoothing stages towards ys (gains ks) and its lateral rate: (a, b, dy)."""
+    a = [p + (y - p) * k for p, y, k in zip(a, ys, ks)]
+    prev = b
+    b = list(a) if shifting else [p + (y - p) * k for p, y, k in zip(b, a, ks)]
+    if dt > 0:
+        dy = [0.7 * d0 + 0.3 * (bb - p) / dt for d0, bb, p in zip(dy, b, prev)]
+    return a, b, dy
+
+
+if _native.view_prep is None:
+    _prep, _blend = _prep_py, _blend_py
+else:
+    def _prep(gx, y, y_std, xs, reach_std, b, _n=_native.view_prep, _fb=_native.Fallback):
+        try:
+            return _n(gx, y, y_std, xs, reach_std, b)
+        except _fb:
+            return _prep_py(gx, y, y_std, xs, reach_std, b)
+
+    def _blend(a, b, dy, ys, ks, dt, shifting, _n=_native.view_blend, _fb=_native.Fallback):
+        try:
+            return _n(a, b, dy, ys, ks, dt, shifting)
+        except _fb:
+            return _blend_py(a, b, dy, ys, ks, dt, shifting)
 
 
 class _Static:
@@ -667,27 +719,16 @@ class ViewBuilder:
             ok = isinstance(ln, dict) and ln.get("present") and isinstance(ln.get("y"), list)
             if ok:
                 gx = lanes["x"] if kind == "lane_line" else lanes.get("edges_x") or lanes["x"]
-                ys = _interp_all(gx, ln["y"], xs)
-                stds = _interp_all(gx, ln.get("y_std") or [], xs)
-                ok = ys[0] is not None and ys[1] is not None
+                fresh = st is None or not st.present and st.alpha == 0.0
+                r = _prep(gx, ln["y"], ln.get("y_std") or [], xs, c["line_reach_std_m"], None if fresh else st.b)
+                ok = r is not None
             if ok:
-                reach = xs[-1]
-                for i, (x, s) in enumerate(zip(xs, stds)):
-                    if ys[i] is None or (s is not None and s > c["line_reach_std_m"] and x > 10.0):
-                        reach = xs[i - 1]
-                        break
-                last = ys[0]
-                for i in range(len(ys)):                 # beyond the reach: carry the last value (never drawn)
-                    if ys[i] is None:
-                        ys[i] = last
-                    last = ys[i]
-                if st is None or not st.present and st.alpha == 0.0:
+                ys, reach, jump = r
+                if fresh:
                     st = self.lines[lid] = _Line(ys, ts)
                     self.seen.setdefault(lid, ts)
                 else:
                     # a restart on another marking moves the near part too; a turn sweeps only the far part
-                    near = [y - b for y, b, x in zip(ys, st.b, xs) if 5.0 <= x <= 20.0]
-                    jump = abs(sum(near) / len(near))
                     if jump > c["shift_m"] and st.shift_t is None:
                         st.shift_t = ts
                     k = None
@@ -707,10 +748,7 @@ class ViewBuilder:
                         st.a = list(st.b)
                         st.dy = rate
                     else:
-                        st.a = [p + (y - p) * k for p, y, k in zip(st.a, ys, ks)]
-                        st.b = [p + (y - p) * k for p, y, k in zip(st.b, st.a, ks)] if st.shift_t is None else list(st.a)
-                        if dt > 0:
-                            st.dy = [0.7 * d0 + 0.3 * (b - p) / dt for d0, b, p in zip(st.dy, st.b, prev)]
+                        st.a, st.b, st.dy = _blend(st.a, st.b, st.dy, ys, ks, dt, st.shift_t is not None)
                 st.present, st.reach, st.conf = True, reach, ln.get("conf")
                 st.alpha = min(1.0, st.alpha + fade)
             elif st is not None:
@@ -726,7 +764,7 @@ class ViewBuilder:
             phase = "leave" if not st.present else "appear" if st.alpha < 1.0 else \
                 "shift" if st.shift_t is not None else "coast" if (ln or {}).get("mode") == "coast" else "steady"
             # the points within reach, offsets then rates: rounded for all lines at once below
-            m = sum(1 for x in xs if x <= st.reach) if xs_rising else None
+            m = bisect.bisect_right(xs, st.reach) if xs_rising else None      # (xs in order: the count of x <= reach)
             o = {"id": lid, "kind": kind, "y": None, "dy": None,
                  "reach_m": st.reach, "conf": st.conf, "age_s": round((ts - self.seen.get(lid, st.t0)) / NS, 2),
                  "phase": phase, "alpha": round(st.alpha, 2)}

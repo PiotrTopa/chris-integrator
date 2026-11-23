@@ -31,7 +31,7 @@
 #include <stdint.h>
 #include <string.h>
 
-#define NATIVE_VERSION 3
+#define NATIVE_VERSION 4
 
 static PyObject *Fallback;          /* raised where the pure-Python path must decide */
 static PyObject *builtin_round;
@@ -1600,6 +1600,323 @@ done:
 }
 
 /* ====================================================================================================
+ * The view's drawn lines (trackers/view.py `ViewBuilder._lines`, the per-line steps; names follow it)
+ * ==================================================================================================== */
+
+/* sum(values) of CPython for a sequence of floats: Neumaier's compensated sum, the compensation added at the
+ * end when it is non-zero and finite (bltinmodule.c, builtin_sum_impl, since 3.12) */
+static double py_fsum_seq(const double *a, Py_ssize_t n)
+{
+    double f = 0.0, c = 0.0;
+    for (Py_ssize_t i = 0; i < n; i++) {
+        double x = a[i], t = f + x;
+        if (fabs(f) >= fabs(x))
+            c += (f - t) + x;
+        else
+            c += (x - t) + f;
+        f = t;
+    }
+    if (c != 0.0 && isfinite(c))
+        f += c;
+    return f;
+}
+
+/* The table (xs, ys) of a list or tuple each, as doubles; isnone[i]: ys[i] is None. Returns the length used
+ * (min of both), -1 with Fallback set where an entry is not a plain number. */
+typedef struct {
+    double X[64], Y[64];
+    char none[64];
+    Py_ssize_t n;
+    PyObject *y0;                  /* ys[0] (borrowed): what a query at or below xs[0] gives */
+} Table;
+
+static int table_get(PyObject *xs, PyObject *ys, Table *t)
+{
+    int lx = PyList_CheckExact(xs), ly = PyList_CheckExact(ys);
+    if ((!lx && !PyTuple_CheckExact(xs)) || (!ly && !PyTuple_CheckExact(ys))) {
+        PyErr_SetNone(Fallback);
+        return -1;
+    }
+    Py_ssize_t nx = lx ? PyList_Size(xs) : PyTuple_Size(xs), ny = ly ? PyList_Size(ys) : PyTuple_Size(ys);
+    Py_ssize_t n = nx < ny ? nx : ny;
+    if (n > 64) {
+        PyErr_SetNone(Fallback);
+        return -1;
+    }
+    t->n = n;
+    t->y0 = n > 0 ? seq_item(ys, ly, 0) : Py_None;
+    for (Py_ssize_t i = 0; i < n; i++) {
+        PyObject *y = seq_item(ys, ly, i);
+        t->none[i] = (y == Py_None);
+        t->Y[i] = 0.0;
+        if (!get_num(seq_item(xs, lx, i), &t->X[i]) || (!t->none[i] && !get_num(y, &t->Y[i]))) {
+            PyErr_SetNone(Fallback);
+            return -1;
+        }
+    }
+    return 0;
+}
+
+/* `_interp_all_py(xs, ys, qs)` into items (new references) and their values (val[q], none[q]) */
+static int table_interp(const Table *t, const double *Q, Py_ssize_t nq, PyObject **items, double *val, char *none)
+{
+    Py_ssize_t i = 1, n = t->n;
+    int have_prev = 0;
+    double prev = 0.0, y0v = 0.0;
+    int y0none = (t->y0 == Py_None);
+    if (n > 0 && !y0none)
+        y0v = t->Y[0];
+    for (Py_ssize_t q = 0; q < nq; q++) {
+        double x = Q[q];
+        if (n == 0) {                                  /* `if not xs or not ys`: every query None */
+            items[q] = Py_None;
+            none[q] = 1;
+        } else if (x <= t->X[0]) {
+            items[q] = t->y0;
+            none[q] = (char)y0none;
+            val[q] = y0v;
+        } else {
+            if (have_prev && !(x >= prev))
+                i = 1;
+            have_prev = 1;
+            prev = x;
+            while (i < n && !(x <= t->X[i]))
+                i++;
+            if (i >= n || t->none[i - 1] || t->none[i]) {
+                items[q] = Py_None;
+                none[q] = 1;
+            } else {
+                double a = t->Y[i - 1], b = t->Y[i];
+                double den = t->X[i] - t->X[i - 1];
+                if (den == 0.0)
+                    den = 1.0;
+                double tt = (x - t->X[i - 1]) / den;
+                val[q] = a + (b - a) * tt;
+                none[q] = 0;
+                items[q] = PyFloat_FromDouble(val[q]);
+                if (items[q] == NULL) {
+                    for (Py_ssize_t k = 0; k < q; k++)
+                        Py_DECREF(items[k]);
+                    return -1;
+                }
+                continue;
+            }
+        }
+        Py_INCREF(items[q]);
+    }
+    return 0;
+}
+
+/* view_prep(gx, y, y_std, xs, reach_std, b) -> None | (ys, reach, jump):
+ *     ys = _interp_all(gx, y, xs); stds = _interp_all(gx, y_std, xs)
+ *     None unless ys[0] and ys[1] are numbers; reach: xs[i - 1] of the first point i that has no value or a
+ *     std above reach_std beyond 10 m (else xs[-1]); ys with the points beyond the reach carrying the last
+ *     value; jump = abs(sum(near) / len(near)), near = [y - b for y, b, x in zip(ys, b, xs) if 5 <= x <= 20]
+ *     (None when b is None). Plain floats (or ints) only; anything else: Fallback. */
+static PyObject *n_view_prep(PyObject *self, PyObject *args)
+{
+    PyObject *gx, *y, *ystd, *xs, *b;
+    double reach_std;
+    if (!PyArg_ParseTuple(args, "OOOOdO", &gx, &y, &ystd, &xs, &reach_std, &b))
+        return NULL;
+    Table ty, ts;
+    if (table_get(gx, y, &ty) < 0 || table_get(gx, ystd, &ts) < 0)
+        return NULL;
+    int lq = PyList_CheckExact(xs);
+    if (!lq && !PyTuple_CheckExact(xs)) {
+        PyErr_SetNone(Fallback);
+        return NULL;
+    }
+    Py_ssize_t nq = lq ? PyList_Size(xs) : PyTuple_Size(xs);
+    if (nq > 64 || nq < 2) {
+        PyErr_SetNone(Fallback);
+        return NULL;
+    }
+    double Q[64], yv[64], sv[64];
+    char yn[64], sn[64];
+    PyObject *yi[64], *si[64];
+    for (Py_ssize_t q = 0; q < nq; q++)
+        if (!get_num(seq_item(xs, lq, q), &Q[q])) {
+            PyErr_SetNone(Fallback);
+            return NULL;
+        }
+    if (table_interp(&ty, Q, nq, yi, yv, yn) < 0)
+        return NULL;
+    if (table_interp(&ts, Q, nq, si, sv, sn) < 0) {
+        for (Py_ssize_t q = 0; q < nq; q++)
+            Py_DECREF(yi[q]);
+        return NULL;
+    }
+    for (Py_ssize_t q = 0; q < nq; q++)
+        Py_DECREF(si[q]);                              /* the stds' values are all that is needed */
+    PyObject *res = NULL, *ys = NULL;
+    if (yn[0] || yn[1]) {
+        res = Py_None;
+        Py_INCREF(res);
+        goto done;
+    }
+    Py_ssize_t ir = nq - 1;                            /* reach = xs[-1] */
+    for (Py_ssize_t q = 0; q < nq; q++)
+        if (yn[q] || (!sn[q] && sv[q] > reach_std && Q[q] > 10.0)) {
+            ir = q == 0 ? nq - 1 : q - 1;              /* (xs[i - 1] of i = 0 is xs[-1]) */
+            break;
+        }
+    ys = PyList_New(nq);
+    if (ys == NULL)
+        goto done;
+    PyObject *last = yi[0];
+    double lastv = yv[0];
+    for (Py_ssize_t q = 0; q < nq; q++) {             /* beyond the reach: carry the last value */
+        if (yn[q]) {
+            Py_DECREF(yi[q]);
+            Py_INCREF(last);
+            yi[q] = last;
+            yv[q] = lastv;
+            yn[q] = 0;
+        }
+        last = yi[q];
+        lastv = yv[q];
+    }
+    for (Py_ssize_t q = 0; q < nq; q++) {
+        PyList_SetItem(ys, q, yi[q]);                  /* steals */
+        yi[q] = NULL;
+    }
+    PyObject *jump;
+    if (b == Py_None) {
+        jump = Py_None;
+        Py_INCREF(jump);
+    } else {
+        int lb = PyList_CheckExact(b);
+        if (!lb && !PyTuple_CheckExact(b)) {
+            PyErr_SetNone(Fallback);
+            goto done;
+        }
+        Py_ssize_t nb = lb ? PyList_Size(b) : PyTuple_Size(b), m = nb < nq ? nb : nq, k = 0;
+        double near[64];
+        for (Py_ssize_t q = 0; q < m; q++) {
+            if (!(5.0 <= Q[q] && Q[q] <= 20.0))
+                continue;
+            PyObject *bo = seq_item(b, lb, q), *yo = PyList_GetItem(ys, q);
+            if (!PyFloat_CheckExact(bo) || !PyFloat_CheckExact(yo)) {   /* int - int stays an int in Python */
+                PyErr_SetNone(Fallback);
+                goto done;
+            }
+            near[k++] = PyFloat_AsDouble(yo) - PyFloat_AsDouble(bo);
+        }
+        if (k == 0) {
+            PyErr_SetString(PyExc_ZeroDivisionError, "division by zero");
+            goto done;
+        }
+        jump = PyFloat_FromDouble(fabs(py_fsum_seq(near, k) / (double)k));
+        if (jump == NULL)
+            goto done;
+    }
+    PyObject *reach = seq_item(xs, lq, ir);
+    res = Py_BuildValue("(OON)", ys, reach, jump);
+done:
+    for (Py_ssize_t q = 0; q < nq; q++)
+        Py_XDECREF(ys == NULL ? yi[q] : NULL);
+    Py_XDECREF(ys);
+    return res;
+}
+
+/* a list or tuple of plain numbers as doubles (at most 64); its length, or -1 with Fallback set */
+static Py_ssize_t num_row(PyObject *o, double *out)
+{
+    int l = PyList_CheckExact(o);
+    if (!l && !PyTuple_CheckExact(o)) {
+        PyErr_SetNone(Fallback);
+        return -1;
+    }
+    Py_ssize_t n = l ? PyList_Size(o) : PyTuple_Size(o);
+    if (n > 64) {
+        PyErr_SetNone(Fallback);
+        return -1;
+    }
+    for (Py_ssize_t i = 0; i < n; i++)
+        if (!get_num(seq_item(o, l, i), &out[i])) {
+            PyErr_SetNone(Fallback);
+            return -1;
+        }
+    return n;
+}
+
+static PyObject *float_list(const double *v, Py_ssize_t n)
+{
+    PyObject *out = PyList_New(n);
+    if (out == NULL)
+        return NULL;
+    for (Py_ssize_t i = 0; i < n; i++) {
+        PyObject *f = PyFloat_FromDouble(v[i]);
+        if (f == NULL) {
+            Py_DECREF(out);
+            return NULL;
+        }
+        PyList_SetItem(out, i, f);
+    }
+    return out;
+}
+
+/* view_blend(a, b, dy, ys, ks, dt, shifting) -> (a, b, dy): the drawn line's two smoothing stages
+ *     a = [p + (y - p) * k for p, y, k in zip(a, ys, ks)]
+ *     b = [p + (y - p) * k for p, y, k in zip(b, a, ks)]   (shifting: list(a))
+ *     dy = [0.7 * d0 + 0.3 * (b1 - b0) / dt for d0, b1, b0 in zip(dy, b, old b)] when dt > 0 (else dy itself)
+ * Plain numbers only (the results are floats: every k is a float); anything else: Fallback. */
+static PyObject *n_view_blend(PyObject *self, PyObject *args)
+{
+    PyObject *oa, *ob, *ody, *oys, *oks;
+    double dt;
+    int shifting;
+    if (!PyArg_ParseTuple(args, "OOOOOdp", &oa, &ob, &ody, &oys, &oks, &dt, &shifting))
+        return NULL;
+    double A[64], B[64], D[64], Y[64], K[64], A2[64], B2[64], D2[64];
+    Py_ssize_t na = num_row(oa, A), nb, nd, ny, nk;
+    if (na < 0 || (nb = num_row(ob, B)) < 0 || (ny = num_row(oys, Y)) < 0 || (nk = num_row(oks, K)) < 0)
+        return NULL;
+    for (Py_ssize_t k = 0; k < nk; k++)                /* (an int k would leave an int p as it is) */
+        if (!PyFloat_CheckExact(PyList_CheckExact(oks) ? PyList_GetItem(oks, k) : PyTuple_GetItem(oks, k))) {
+            PyErr_SetNone(Fallback);
+            return NULL;
+        }
+    Py_ssize_t m1 = na < ny ? na : ny;
+    m1 = m1 < nk ? m1 : nk;
+    for (Py_ssize_t i = 0; i < m1; i++)
+        A2[i] = A[i] + (Y[i] - A[i]) * K[i];
+    Py_ssize_t m2;
+    if (shifting) {
+        m2 = m1;
+        memcpy(B2, A2, sizeof(double) * (size_t)m1);
+    } else {
+        m2 = nb < m1 ? nb : m1;
+        m2 = m2 < nk ? m2 : nk;
+        for (Py_ssize_t i = 0; i < m2; i++)
+            B2[i] = B[i] + (A2[i] - B[i]) * K[i];
+    }
+    PyObject *ra = float_list(A2, m1), *rb = float_list(B2, m2), *rd = NULL;
+    if (ra == NULL || rb == NULL)
+        goto fail;
+    if (dt > 0.0) {
+        if ((nd = num_row(ody, D)) < 0)
+            goto fail;
+        Py_ssize_t m3 = nd < m2 ? nd : m2;
+        m3 = m3 < nb ? m3 : nb;
+        for (Py_ssize_t i = 0; i < m3; i++)
+            D2[i] = 0.7 * D[i] + 0.3 * (B2[i] - B[i]) / dt;
+        rd = float_list(D2, m3);
+        if (rd == NULL)
+            goto fail;
+    } else {
+        rd = ody;
+        Py_INCREF(rd);
+    }
+    return Py_BuildValue("(NNN)", ra, rb, rd);
+fail:
+    Py_XDECREF(ra);
+    Py_XDECREF(rb);
+    return NULL;
+}
+
+/* ====================================================================================================
  * The lane tracker's array work (trackers/lanes.py is the reference; names follow it). Elementwise
  * steps as numpy does them; `mean` over the gate points adds in numpy's order (seq_sum below).
  * ==================================================================================================== */
@@ -2610,6 +2927,8 @@ static PyMethodDef methods[] = {
     {"round", n_round, METH_VARARGS, "builtins.round"},
     {"round_list", n_round_list, METH_VARARGS, "[v if v is None else round(v, n) for v in values]"},
     {"interp_all", n_interp_all, METH_VARARGS, "trackers.view._interp_all for lists of floats"},
+    {"view_prep", n_view_prep, METH_VARARGS, "a drawn line's points, reach and jump (ViewBuilder._lines)"},
+    {"view_blend", n_view_blend, METH_VARARGS, "a drawn line's two smoothing stages (ViewBuilder._lines)"},
     {"ekf_predict", n_ekf_predict, METH_VARARGS, "EgoModel.predict into given arrays"},
     {"ekf_project", n_ekf_project, METH_VARARGS, "ph = P[:, idx] @ coef into ph; returns coef @ ph[idx]"},
     {"ekf_update", n_ekf_update, METH_VARARGS, "one scalar row applied to x and P in place"},

@@ -428,6 +428,72 @@ def test_interp_all_is_the_python_walk():
     assert V._interp_all([0.0, 10.0], [np.float64(0.0), 5.0], [5]) == ref([0.0, 10.0], [np.float64(0.0), 5.0], [5])   # the reference
 
 
+def _same(u, v):
+    if isinstance(u, (list, tuple)):
+        return isinstance(v, type(u)) and len(u) == len(v) and all(_same(a, b) for a, b in zip(u, v))
+    if isinstance(u, float) and isinstance(v, float):
+        return (u != u and v != v) or struct.pack("<d", u) == struct.pack("<d", v)
+    return type(u) is type(v) and u == v
+
+
+@needs_native
+def test_view_line_steps_are_the_python_ones():
+    """view_prep / view_blend (the view's drawn lines) against `_prep_py` / `_blend_py`: the same objects, bit
+    for bit, on random tables (Nones, NaN, ints, short and missing stds, both sides of the reach) and edges."""
+    from chris_integrator.trackers import view as V
+    rng = random.Random(17)
+    xs_v = V.DEFAULT_CFG["xs"]
+    seen_jump = seen_none = 0
+    for it in range(30000):
+        xs = xs_v if rng.random() < 0.7 else tuple(sorted(rng.choice([rng.uniform(-2, 130), float(rng.randrange(0, 130))])
+                                                         for _ in range(rng.randrange(2, 16))))
+        n = rng.randrange(0, 40)
+        gx = sorted(rng.uniform(-5, 150) for _ in range(n))
+        if n > 2 and rng.random() < 0.1:
+            gx[rng.randrange(1, n)] = gx[rng.randrange(0, n - 1)]
+        num = lambda: rng.choice([None, float("nan")]) if rng.random() < 0.03 else rng.uniform(-6, 6)  # noqa: E731
+        y = [num() for _ in range(rng.randrange(max(0, n - 3), n + 2))]
+        ys = rng.choice([[], [rng.uniform(0, 0.6) if rng.random() < 0.97 else None for _ in range(n)],
+                         [rng.uniform(0, 2.0) for _ in range(max(0, n - 5))]])
+        b = None if rng.random() < 0.3 else [rng.uniform(-6, 6) for _ in range(len(xs) - rng.choice([0, 0, 0, 1]))]
+        reach_std = rng.choice([0.3, 0.5, 1.0])
+        try:
+            want = V._prep_py(gx, y, ys, xs, reach_std, b)
+        except ZeroDivisionError:
+            with pytest.raises(ZeroDivisionError):
+                C.view_prep(gx, y, ys, xs, reach_std, b)
+            continue
+        got = C.view_prep(gx, y, ys, xs, reach_std, b)
+        assert _same(got, want), (gx, y, ys, xs, reach_std, b)
+        seen_none += want is None
+        seen_jump += want is not None and want[2] is not None
+        if want is None:
+            continue
+        nx = len(xs)
+        a0 = [rng.uniform(-6, 6) for _ in range(nx - rng.choice([0, 0, 1]))]
+        b0 = [rng.uniform(-6, 6) for _ in range(nx - rng.choice([0, 0, 1]))]
+        d0 = [rng.uniform(-3, 3) for _ in range(nx - rng.choice([0, 0, 1]))]
+        ks = rng.choice([[1.0 - math.exp(-0.05 / (0.2 + 0.01 * x)) for x in xs], [rng.random()] * nx, [1.0] * nx])
+        dt = rng.choice([0.0, -0.05, 0.05, rng.uniform(0.001, 0.2)])
+        sh = rng.random() < 0.2
+        assert _same(C.view_blend(a0, b0, d0, want[0], ks, dt, sh), V._blend_py(a0, b0, d0, want[0], ks, dt, sh))
+    assert seen_jump > 5000 and seen_none > 500
+    # ints in the table and the drawn line (a new line keeps an int from the table): both sides give the same
+    for args in (([0, 50, 100], [1, 2, 3], [], (0, 5, 20, 60), 0.5, None),
+                 ([0.0, 100.0], [1.0, 2.0], [0.1, 0.1], (0.0, 5.0, 20.0, 60.0), 0.5, [1, 1.0, 1.0, 1.0])):
+        try:
+            want = V._prep_py(*args)
+        except Exception as e:                         # noqa: BLE001
+            want = type(e)
+        try:
+            got = V._prep(*args)
+        except Exception as e:                         # noqa: BLE001
+            got = type(e)
+        assert _same(got, want)
+    assert _same(V._blend([1, 2], [1, 2], [0.0, 0.0], [2, 3], [0.5, 0.5], 0.05, False),
+                 V._blend_py([1, 2], [1, 2], [0.0, 0.0], [2, 3], [0.5, 0.5], 0.05, False))
+
+
 # ---- the estimator's linear algebra ------------------------------------------------------------------------
 def _cov(rng, n):
     a = rng.standard_normal((n, n))

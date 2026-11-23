@@ -31,7 +31,7 @@ import json
 import os
 
 PARTS = ("json", "round", "interp", "ekf", "lanes", "radar")
-VERSION = 3                    # of the compiled module's functions: a module of another version is not used
+VERSION = 4                    # of the compiled module's functions: a module of another version is not used
 _dumps_py, _loads_py = json.dumps, json.loads
 _SEP = (",", ":")
 
@@ -94,6 +94,8 @@ else:
 round = _n.round if "round" in ACTIVE else builtins.round
 round_list = _n.round_list if "round" in ACTIVE else None      # [v if v is None else round(v, n) for v in list]
 interp_all = _n.interp_all if "interp" in ACTIVE else None
+view_prep = _n.view_prep if "interp" in ACTIVE else None        # the view's drawn lines (trackers/view.py)
+view_blend = _n.view_blend if "interp" in ACTIVE else None
 ekf = _n if "ekf" in ACTIVE else None
 lanes = _n if "lanes" in ACTIVE else None
 radar = _n if "radar" in ACTIVE else None
