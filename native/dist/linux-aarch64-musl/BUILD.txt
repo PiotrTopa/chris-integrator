@@ -3,7 +3,7 @@ image: alpine:edge (linux/arm64)
 compiler: cc (Alpine 15.2.0) 15.2.0
 python headers: Python 3.14.10
 numpy in the test run: 2.5.5
-source sha256: aa538db2c74c6d17ac415bac7e3fae82f65efb874f31bb5a15e0593e5a5a5e4b
-binary sha256: 0c24694bc0194b9cfd0d3cfd63da0f2e2a71fec04d091545cc73e9b888e86ed9
-..................s..                                                    [100%]
-20 passed, 1 skipped in 346.73s (0:05:46)
+source sha256: 4eed7b05f714eda7ba7a214bf3820a991c2451dfdcc2728cc88933f4b42c20d6
+binary sha256: 4dae2c6309068829b2e43270c618721ff710bad12b0244ff6ac82bbdfbde82e2
+.....................s..                                                 [100%]
+23 passed, 1 skipped in 424.13s (0:07:04)
