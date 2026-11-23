@@ -1941,13 +1941,14 @@ static int not_num(const char *fn)
 }
 
 /* The table (xs, ys), lists or tuples, as doubles over min(len(xs), len(ys)) points; none[i]: ys[i] is None;
- * y0: ys[0] itself (what a query at or below xs[0] gives). The arrays live in `heap` (PyMem_Free it). */
+ * y0: ys[0] itself (what a query at or below xs[0] gives). The arrays live in `small` or `heap` (PyMem_Free it). */
 typedef struct {
     double *X, *Y;
     char *none;
     Py_ssize_t n;
     PyObject *y0;
-    void *heap;
+    void *heap;                    /* NULL while the points fit `small` */
+    double small[2 * 64 + 8];
 } Table;
 
 static int table_get(PyObject *xs, PyObject *ys, Table *t, const char *fn)
@@ -1958,12 +1959,16 @@ static int table_get(PyObject *xs, PyObject *ys, Table *t, const char *fn)
     if (seq_len(xs, fn, &nx, &lx) < 0 || seq_len(ys, fn, &ny, &ly) < 0)
         return -1;
     Py_ssize_t n = nx < ny ? nx : ny;
-    t->heap = PyMem_Malloc((size_t)(n > 0 ? n : 1) * (2 * sizeof(double) + 1));
-    if (t->heap == NULL) {
-        PyErr_NoMemory();
-        return -1;
+    if (n <= 64)
+        t->X = t->small;
+    else {
+        t->heap = PyMem_Malloc((size_t)n * (2 * sizeof(double) + 1));
+        if (t->heap == NULL) {
+            PyErr_NoMemory();
+            return -1;
+        }
+        t->X = (double *)t->heap;
     }
-    t->X = (double *)t->heap;
     t->Y = t->X + n;
     t->none = (char *)(t->Y + n);
     t->n = n;
