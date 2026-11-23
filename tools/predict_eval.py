@@ -94,7 +94,8 @@ class IdealTracker:
             objs.append({"id": a["id"], "state": "confirmed", "exist": 1.0, "x_m": round(x, 2), "y_m": round(y, 2),
                          "vx_mps": round(vx, 2), "vy_mps": round(vy, 2), "ax_mps2": round(ax, 2), "ay_mps2": round(ay, 2),
                          "speed_mps": round(math.hypot(vx, vy), 2), "std": [round(sx, 2), round(sy, 2), 0.3, 0.15],
-                         "p_stationary": 0.02 if a["moving"] else 0.97, "class": {"label": lab},
+                         "p_stationary": 0.02 if a["moving"] else 0.97, "motion": "moving" if a["moving"] else "stationary",
+                         "class": {"label": lab},
                          "flags": ["parked"] if a["stationary_label"] == "parked" else [],
                          "len": a["L"], "wid": a["W"], "hdg": [round(a["heading"], 3), 0.05]})
         return {"type": "radar", "ts_mono_ns": int(round(T * NS)), "frame": "car", "objects": objs, "ego": dict(ego)}
