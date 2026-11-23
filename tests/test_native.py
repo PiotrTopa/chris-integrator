@@ -742,3 +742,212 @@ def test_lane_tracker_messages_native_against_numpy(monkeypatch):
     assert len(a) == len(b) == 1500
     assert a == b
     assert sum(1 for s in a if '"present": true' in s) > 500
+
+
+# ---- the radar's motion model ------------------------------------------------------------------------------
+needs_radar = pytest.mark.skipif(N.radar is None, reason="the native radar part is not in use in this process")
+
+
+def _radar_batch(g, B):
+    """B objects' hypotheses with the corners in them: speeds above every kind's top speed and below 1 m/s,
+    probabilities with zeros and certainties, dt behind, at and ahead of the objects' time (and a dt so small
+    that nothing flows into a hypothesis), kinds known and not."""
+    from chris_integrator.radar import models as M
+
+    def cov():
+        a = g.standard_normal((8, 8)) * 10.0 ** g.uniform(-2, 1, 8)
+        P = a @ a.T + np.diag(10.0 ** g.uniform(-4, 1, 8))
+        return 0.5 * (P + P.T)
+    xs = g.standard_normal((B, 3, 8)) * np.array([30.0, 30.0, 10.0, 10.0, 2.0, 2.0, 0.01, 0.3])
+    r = g.random()
+    if r < 0.3:
+        xs[:, :, 2:4] *= 10.0
+    elif r < 0.6:
+        xs[:, :, 2:4] *= 0.05
+    Ps = np.array([[cov() for _ in range(3)] for _ in range(B)])
+    mu = g.random((B, 3))
+    for b in range(B):
+        r = g.random()
+        if r < 0.2:
+            mu[b, g.integers(3)] = 0.0
+        elif r < 0.35:
+            mu[b] = np.eye(3)[g.integers(3)]
+    mu /= mu.sum(axis=1, keepdims=True)
+    xf, Pf = g.standard_normal((B, 8)) * 10.0, np.array([cov() for _ in range(B)])
+    dt = g.choice([-0.3, -0.05, 0.0, 1e-14, 0.033, 0.1, 0.5, 1.0, 3.0], B) * (1.0 + 0.1 * g.random(B))
+    dt[g.random(B) < 0.15] = 0.0
+    kinds = list(M.KIN) + ["zeppelin"]
+    labels = [kinds[i] for i in g.integers(len(kinds), size=B)]
+    return xs, Ps, mu, xf, Pf, dt, labels
+
+
+def _to_rounding(ref, got, block):
+    """The largest difference of two batched arrays, relative to the largest magnitude of each object's (or
+    hypothesis') block (at least 1)."""
+    ref, got = np.asarray(ref), np.asarray(got)
+    lead = ref.shape[:block]
+    scale = np.maximum(np.abs(ref).reshape(lead + (-1,)).max(axis=-1), 1.0)
+    return float((np.abs(ref - got).reshape(lead + (-1,)).max(axis=-1) / scale).max())
+
+
+@needs_native
+def test_radar_evolve_agrees_with_numpy():
+    """Interaction, prediction (speed bound included), combination and the free estimate's prediction of the
+    native core against the numpy reference (models._evolve_py), on stacked arrays and on lists of per-object
+    arrays: to rounding (1e-12 of each block's size)."""
+    from chris_integrator.radar import models as M
+    g = np.random.default_rng(5)
+    par = M._native_par(M.CFG)
+    worst = 0.0
+    seen = {"over": 0, "low": 0, "back": 0, "still": 0}
+    for it in range(1500):
+        B = int(g.integers(1, 9))
+        xs, Ps, mu, xf, Pf, dt, labels = _radar_batch(g, B)
+        ref = M._evolve_py(xs, Ps, mu, xf, Pf, dt, labels, M.CFG, True, True)
+        got = (np.empty((B, 3, 8)), np.empty((B, 3, 8, 8)), np.empty((B, 3)), np.empty((B, 8)), np.empty((B, 8, 8)),
+               np.empty((B, 8)), np.empty((B, 8, 8)))
+        kin = [M._KIN4.get(l) or M._KIN4[None] for l in labels]
+        if it % 2:
+            C.radar_evolve(xs, Ps, mu, xf, Pf, dt, np.array(kin), np.array(par), *got)
+        else:
+            C.radar_evolve(list(xs), list(Ps), list(mu), list(xf), list(Pf), list(dt), kin, par, *got)
+        for a, b, blk in zip(ref, got, (2, 2, 1, 1, 1, 1, 1)):
+            worst = max(worst, _to_rounding(a, b, blk))
+        vmax = np.array([k[2] for k in kin])
+        seen["over"] += int((np.hypot(ref[0][:, 1:, 2], ref[0][:, 1:, 3]) >= vmax[:, None] * (1 - 1e-12)).any())
+        seen["low"] += int(((dt > 0) & (dt < 1e-12) & (mu.min(axis=1) == 0.0)).any())
+        seen["back"] += int((dt < 0).any())
+        seen["still"] += int((np.hypot(xs[:, 1:, 2], xs[:, 1:, 3]) < 1.0).any())
+    assert worst < 1e-12, worst
+    assert min(seen.values()) > 20, seen
+    # without the optional outputs: the same hypotheses
+    xs, Ps, mu, xf, Pf, dt, labels = _radar_batch(g, 4)
+    a = M.evolve_b(xs, Ps, mu, xf, Pf, dt, labels)
+    assert a[3] is None and a[5] is None
+    b = M._evolve_py(xs, Ps, mu, xf, Pf, dt, labels)
+    assert _to_rounding(b[1], a[1], 2) < 1e-12 and _to_rounding(b[0], a[0], 2) < 1e-12
+
+
+@needs_native
+def test_radar_p_still_and_combine_agree_with_numpy():
+    from chris_integrator.radar import models as M
+    g = np.random.default_rng(6)
+    for _ in range(500):
+        B = int(g.integers(1, 9))
+        xs, Ps, mu, xf, Pf, dt, labels = _radar_batch(g, B)
+        v0 = M.kin_arrays(labels)[3]
+        q = M.still_b(xs[:, 1:], Ps[:, 1:], v0[:, None])
+        ref = np.minimum(1.0, mu[:, 0] + mu[:, 1] * q[:, 0] + mu[:, 2] * q[:, 1])
+        got = C.radar_p_still(list(xs), list(Ps), list(mu), list(v0))
+        assert isinstance(got, list) and len(got) == B
+        assert float(np.max(np.abs(ref - np.array(got)))) < 1e-12
+        x0, P0 = M.combine_b(xs, Ps, mu)
+        x1, P1 = np.empty((B, 8)), np.empty((B, 8, 8))
+        C.radar_combine(xs, Ps, mu, x1, P1)
+        assert _to_rounding(x0, x1, 1) < 1e-12 and _to_rounding(P0, P1, 1) < 1e-12
+        x2, P2 = M.combine(xs[0], Ps[0], mu[0])
+        assert _to_rounding(x0[:1], x2[None], 1) < 1e-12 and _to_rounding(P0[:1], P2[None], 1) < 1e-12
+
+
+@needs_native
+def test_radar_leaves_what_is_not_finite_to_the_reference():
+    """A state that is not finite (an object gone wrong) is the reference's: the native call says so and the
+    switch point runs numpy, whose NaN and inf are what the tracker checks for."""
+    from chris_integrator.radar import models as M
+    g = np.random.default_rng(7)
+    xs, Ps, mu, xf, Pf, dt, labels = _radar_batch(g, 3)
+    Ps[1, 2, 0, 0] = np.inf
+    xs[2, 1, 3] = np.nan
+    out = (np.empty((3, 3, 8)), np.empty((3, 3, 8, 8)), np.empty((3, 3)), None, None, None, None)
+    with pytest.raises(C.Fallback):
+        C.radar_evolve(xs, Ps, mu, xf, Pf, dt, [M._KIN4["car"]] * 3, M._native_par(M.CFG), *out)
+    with pytest.raises(C.Fallback):
+        C.radar_p_still(xs, Ps, mu, [0.7] * 3)
+    with np.errstate(invalid="ignore", over="ignore"):
+        ref = M._evolve_py(xs, Ps, mu, xf, Pf, dt, labels, M.CFG, True, True)
+        got = M.evolve_b(xs, Ps, mu, xf, Pf, dt, labels, M.CFG, True, True)
+    for a, b in zip(ref, got):
+        assert np.array_equal(a, b, equal_nan=True)
+    # arrays it does not take (not float64, not contiguous): the reference, through the switch point
+    with np.errstate(invalid="ignore", over="ignore"):
+        got = M.evolve_b(xs.astype(np.float32), Ps, mu, xf, Pf, dt, labels)
+        ref = M._evolve_py(xs.astype(np.float32), Ps, mu, xf, Pf, dt, labels)
+    assert np.array_equal(got[0], ref[0], equal_nan=True)
+
+
+RADAR = r"""
+import json, sys
+sys.path.insert(0, %r)
+from chris_integrator import native
+from chris_integrator.mixer import MessageClock
+from chris_integrator.sim import default_sensors
+from chris_integrator.sim import roaduser_sim as rs
+from chris_integrator.stack import build
+out = {"parts": native.status()["parts"], "runs": {}}
+for name, seed, night in (("parked_street", 1, True), ("adjacent", 1, False), ("stopped_brake_25", 1, False)):
+    w = rs.scenario(name, seed=seed, night=night)
+    det = rs.DetectorSim(seed=1000 + seed, night=night)
+    sensors = default_sensors(vehicle={"seed": 11 + 97 * seed}, vision={"seed": 21 + 97 * seed, "leads": True},
+                              gnss={"seed": 31 + 97 * seed}, map={"seed": 41 + 97 * seed})
+    sensors.append(det)
+    st = build(cfg={"estimator": {"sources": [{"kind": "road_users", "id": "*"}]}}, mapper=None, clock=MessageClock())
+    box = st.mixer.slots["radar"].plugin.box
+    msgs, frame = [], box.frame
+    def grab(ts, frame=frame, msgs=msgs):
+        m = frame(ts)
+        if m is not None:
+            msgs.append(m)
+        return m
+    box.frame = grab
+    sent = False
+    for _, m in w.messages(sensors):
+        if not sent:
+            st.deliver(det.calib_msg(m["ts_mono_ns"]))
+            sent = True
+        st.deliver(m)
+    out["runs"][name] = msgs
+print(json.dumps(out))
+"""
+
+
+def _msg_diffs(u, v, path, out):
+    if isinstance(u, dict) and isinstance(v, dict):
+        if list(u) != list(v):
+            out.append((path, "keys"))
+            return
+        for k in u:
+            _msg_diffs(u[k], v[k], path + "." + k, out)
+    elif isinstance(u, list) and isinstance(v, list):
+        if len(u) != len(v):
+            out.append((path, "length"))
+            return
+        for i, (a, b) in enumerate(zip(u, v)):
+            _msg_diffs(a, b, "%s[%d]" % (path, i), out)
+    elif type(u) is not type(v) or repr(u) != repr(v):
+        out.append((path, u, v))
+
+
+@needs_radar
+def test_radar_messages_native_against_reference():
+    """Simulated drives through the whole stack with the radar part native and not (every other part the same):
+    the radar's messages agree except, at most, in a last printed digit or the sign of a zero, in a handful of
+    messages (none on the development machine)."""
+    others = ",".join(p for p in N.PARTS if p != "radar" and p in N.ACTIVE)
+    res = {}
+    for env in (others or "none", others + ",radar" if others else "radar"):
+        out = subprocess.run([sys.executable, "-c", RADAR % HERE], cwd=HERE, env=dict(os.environ, CHRIS_NATIVE=env),
+                             capture_output=True, text=True, check=True).stdout
+        res["radar" in env.split(",")] = json.loads(out)
+    assert "radar" not in res[False]["parts"] and "radar" in res[True]["parts"]
+    for name, a in res[False]["runs"].items():
+        b = res[True]["runs"][name]
+        assert len(a) == len(b) and len(a) > 150, name
+        bad = 0
+        for u, v in zip(a, b):
+            d = []
+            _msg_diffs(u, v, "", d)
+            for item in d:
+                assert len(item) == 3 and isinstance(item[1], float) and isinstance(item[2], float), (name, item)
+                assert abs(item[1] - item[2]) <= 0.0011 * max(1.0, abs(item[1])), (name, item)
+            bad += bool(d)
+        assert bad <= max(3, len(a) // 100), (name, bad, len(a))

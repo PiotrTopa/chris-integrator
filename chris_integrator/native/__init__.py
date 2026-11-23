@@ -17,19 +17,21 @@ same contract, selected here at import. Nothing else in the package knows which 
                           Elementwise steps give numpy's bits; sums of products are taken in index order where
                           numpy hands them to BLAS (whose order is its own): results agree to rounding
                           (docs/NATIVE.md, "Equivalence").
+    radar                 the radar's motion model (radar/models.py: interaction, prediction and combination of
+                          the hypotheses, stillness), or None: agrees to rounding, like `ekf`.
 
 A native function that is not certain to give the reference's result for an input (a type it does not know, a
 number outside its exact path) says so (`Fallback`) and the reference runs for that call.
 
 `CHRIS_NATIVE` in the environment: unset or `1` = every part that is built; `0` = pure Python; a list
-(`json,round,interp,lanes,ekf`) = those parts only (for comparisons). `status()` is what `/v2/health` shows.
+(`json,round,interp,lanes,ekf,radar`) = those parts only (for comparisons). `status()` is what `/v2/health` shows.
 """
 import builtins
 import json
 import os
 
-PARTS = ("json", "round", "interp", "ekf", "lanes")
-VERSION = 2                    # of the compiled module's functions: a module of another version is not used
+PARTS = ("json", "round", "interp", "ekf", "lanes", "radar")
+VERSION = 3                    # of the compiled module's functions: a module of another version is not used
 _dumps_py, _loads_py = json.dumps, json.loads
 _SEP = (",", ":")
 
@@ -94,6 +96,7 @@ round_list = _n.round_list if "round" in ACTIVE else None      # [v if v is None
 interp_all = _n.interp_all if "interp" in ACTIVE else None
 ekf = _n if "ekf" in ACTIVE else None
 lanes = _n if "lanes" in ACTIVE else None
+radar = _n if "radar" in ACTIVE else None
 
 
 def status():

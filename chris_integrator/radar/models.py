@@ -29,6 +29,8 @@ import math
 
 import numpy as np
 
+from .. import native as _native
+
 N = 8
 PX, PY, VX, VY, AX, AY, DP, LH = range(N)
 MODELS = ("stand", "cv", "ca")
@@ -217,6 +219,13 @@ def combine_b(xs, Ps, mu):
 
 
 def combine(xs, Ps, mu):
+    if _NR is not None:                              # (the native core's combination, when in use: combine_many)
+        x, P = np.empty(N), np.empty((N, N))
+        try:
+            _NR.radar_combine((xs,), (Ps,), (mu,), x, P)
+            return x, P
+        except _NATIVE_SKIP:
+            pass
     x, P = combine_b(np.asarray(xs)[None], np.asarray(Ps)[None], np.asarray(mu, float)[None])
     return x[0], P[0]
 
@@ -253,6 +262,96 @@ def mix_b(xs, Ps, mu, PI, xf=None, Pf=None):
 def mix(xs, Ps, mu, PI):
     xo, Po, c = mix_b(np.asarray(xs)[None], np.asarray(Ps)[None], np.asarray(mu, float)[None], np.asarray(PI)[None])
     return xo[0], Po[0], c[0]
+
+
+# ---- the kernel in one call per batch ------------------------------------------------------------------------
+# What the tracker asks of the model, batched: the interaction and prediction of every hypothesis of B objects
+# (with their combination, or the free estimate's prediction), the combination alone, how still each object is.
+# The functions above are the reference; where the native core's `radar` part is in use (chris_integrator.native)
+# the same steps run in C (results to rounding: docs/NATIVE.md), else the reference runs, unchanged. The arrays
+# of an object (xs, Ps, mu, xf, Pf) may come as (B, ...) arrays or as lists of B per-object arrays.
+_NR = _native.radar
+_NATIVE_SKIP = (_native.Fallback, TypeError, ValueError, BufferError)
+_KIN4 = {l: (k["a_lon"], k["a_lat"], k["v_max"], k["v_still"]) for l, k in KIN.items()}
+_PAR = {}
+
+
+def _native_par(cfg):
+    """The model's constants as the native core reads them (chris_native.c `RPar`); per cfg dict, which the
+    tracker does not change after it is made."""
+    e = _PAR.get(id(cfg))
+    if e is None or e[0] is not cfg:
+        par = (cfg["dp_walk"] ** 2, cfg["stand_drift"] ** 2, cfg["stand_v_std"] ** 2, cfg["cv_noise"], cfg["ca_jerk"],
+               cfg["ca_tau_s"], 0.05 ** 2, cfg["r_stand_to_move"], cfg["r_move_to_stand"], cfg["r_move_to_stand_fast"],
+               cfg["r_cv_to_ca"], cfg["r_ca_to_cv"])
+        if len(_PAR) > 64:
+            _PAR.clear()
+        e = _PAR[id(cfg)] = (cfg, par)
+    return e[1]
+
+
+def evolve_b(xs, Ps, mu, xf, Pf, dt, labels, cfg=CFG, combine=False, free=False):
+    """The hypotheses of B objects after dt (each its own; <= 0: no switching): stillness of the moving ones
+    (`still_b`), switching (`transition_b`), interaction with the free estimate's hand-over (`mix_b`), prediction
+    (`predict_b`). Returns (xs, Ps, mu, x, P, xf, Pf): with `combine` (x, P) the moment-matched estimate of the
+    result (`combine_b` with the predicted probabilities), with `free` (xf, Pf) the free estimate predicted by
+    the steady hypothesis; None where not asked."""
+    if _NR is not None:
+        B = len(dt)
+        out = (np.empty((B, 3, N)), np.empty((B, 3, N, N)), np.empty((B, 3)),
+               np.empty((B, N)) if combine else None, np.empty((B, N, N)) if combine else None,
+               np.empty((B, N)) if free else None, np.empty((B, N, N)) if free else None)
+        try:
+            _NR.radar_evolve(xs, Ps, mu, xf, Pf, dt, [_KIN4.get(l) or _KIN4[None] for l in labels],
+                             _native_par(cfg), *out)
+            return out
+        except _NATIVE_SKIP:
+            pass
+    return _evolve_py(xs, Ps, mu, xf, Pf, dt, labels, cfg, combine, free)
+
+
+def _evolve_py(xs, Ps, mu, xf, Pf, dt, labels, cfg=CFG, combine=False, free=False):
+    """evolve_b in numpy: the reference."""
+    xs, Ps, mu, xf, Pf = np.asarray(xs, float), np.asarray(Ps, float), np.asarray(mu, float), np.asarray(xf, float), np.asarray(Pf, float)
+    dt = np.asarray(dt, float)
+    a_lon, a_lat, v_max, v0 = kin_arrays(labels)
+    q = still_b(xs[:, 1:], Ps[:, 1:], v0[:, None])
+    PI = transition_b(dt, q, cfg)                    # dt <= 0: no switching (the identity)
+    xs1, Ps1, mu1 = mix_b(xs, Ps, mu, PI, xf=xf, Pf=Pf)
+    xs1, Ps1 = predict_b(xs1, Ps1, dt, a_lon, a_lat, v_max, cfg)
+    x = P = xf1 = Pf1 = None
+    if combine:
+        x, P = combine_b(xs1, Ps1, mu1)
+    if free:
+        xf1, Pf1 = predict_b(np.repeat(xf[:, None], 3, axis=1), np.repeat(Pf[:, None], 3, axis=1), dt, a_lon, a_lat, v_max, cfg)
+        xf1, Pf1 = xf1[:, CV], Pf1[:, CV]
+    return xs1, Ps1, mu1, x, P, xf1, Pf1
+
+
+def combine_many(xs, Ps, mu):
+    """combine_b of B objects: (B, N), (B, N, N)."""
+    if _NR is not None:
+        B = len(mu)
+        x, P = np.empty((B, N)), np.empty((B, N, N))
+        try:
+            _NR.radar_combine(xs, Ps, mu, x, P)
+            return x, P
+        except _NATIVE_SKIP:
+            pass
+    return combine_b(np.asarray(xs, float), np.asarray(Ps, float), np.asarray(mu, float))
+
+
+def p_still_many(xs, Ps, mu, labels):
+    """Probability that each object does not move: "it stands", and the moving hypotheses as far as they have
+    found no speed (`still_b` with the kind's v_still). A list of floats."""
+    if _NR is not None:
+        try:
+            return _NR.radar_p_still(xs, Ps, mu, [(_KIN4.get(l) or _KIN4[None])[3] for l in labels])
+        except _NATIVE_SKIP:
+            pass
+    xs, Ps, mu = np.asarray(xs, float), np.asarray(Ps, float), np.asarray(mu, float)
+    q = still_b(xs[:, 1:], Ps[:, 1:], kin_arrays(labels)[3][:, None])
+    return np.minimum(1.0, mu[:, STAND] + mu[:, CV] * q[:, 0] + mu[:, CA] * q[:, 1]).tolist()
 
 
 def side_on(label, aspect, bearing):

@@ -235,32 +235,23 @@ class Tracker:
         self.t = None
 
     # ---- time ---------------------------------------------------------------------------------------------
-    def _evolve(self, objs, times):
+    def _evolve(self, objs, times, combine=False, free=False):
         """The hypotheses of each object as they will be at its target time (interaction, then each forward by
-        its own motion), nothing committed: (xs, Ps, mu, dt). A time behind an object's own (a late scan) takes
-        it back by the hypotheses' own motion, without switching."""
-        xs = np.stack([o.xs for o in objs])
-        Ps = np.stack([o.Ps for o in objs])
-        mu = np.stack([o.mu for o in objs])
-        dt = np.asarray(times, float) - np.array([o.t for o in objs])
-        a_lon, a_lat, v_max, v0 = M.kin_arrays([o.label for o in objs])
-        q = M.still_b(xs[:, 1:], Ps[:, 1:], v0[:, None])
-        PI = M.transition_b(dt, q, self.mcfg)            # dt <= 0: no switching (the identity)
-        xs, Ps, mu = M.mix_b(xs, Ps, mu, PI, xf=np.stack([o.xf for o in objs]), Pf=np.stack([o.Pf for o in objs]))
-        xs, Ps = M.predict_b(xs, Ps, dt, a_lon, a_lat, v_max, self.mcfg)
-        return xs, Ps, mu, dt
+        its own motion), nothing committed: (xs, Ps, mu, dt), with `combine` + (x, P) their combination, with
+        `free` + (xf, Pf) the free estimate's prediction (models.evolve_b). A time behind an object's own (a late
+        scan) takes it back by the hypotheses' own motion, without switching."""
+        dt = [float(t) - o.t for t, o in zip(times, objs)]
+        xs, Ps, mu, x, P, xf, Pf = M.evolve_b([o.xs for o in objs], [o.Ps for o in objs], [o.mu for o in objs],
+                                              [o.xf for o in objs], [o.Pf for o in objs], dt,
+                                              [o.label for o in objs], self.mcfg, combine, free)
+        return (xs, Ps, mu, dt) + ((x, P) if combine else ()) + ((xf, Pf) if free else ())
 
     def _advance_all(self, objs, t):
         """Bring the objects to time t (committed)."""
         objs = [o for o in objs if abs(t - o.t) >= 1e-6]
         if not objs:
             return
-        xs, Ps, mu, dt = self._evolve(objs, np.full(len(objs), t))
-        xf = np.stack([o.xf for o in objs])
-        Pf = np.stack([o.Pf for o in objs])
-        a_lon, a_lat, v_max, _ = M.kin_arrays([o.label for o in objs])
-        xf, Pf = M.predict_b(np.repeat(xf[:, None], 3, axis=1), np.repeat(Pf[:, None], 3, axis=1), dt, a_lon, a_lat, v_max, self.mcfg)
-        xf, Pf = xf[:, CV], Pf[:, CV]
+        xs, Ps, mu, dt, xf, Pf = self._evolve(objs, [t] * len(objs), free=True)
         pose = None
         noise = {}
         for k, o in enumerate(objs):
@@ -281,7 +272,7 @@ class Tracker:
             o.xs, o.Ps = xs[k], Ps[k]
             o.xf, o.Pf = xf[k], Pf[k]
             o.t = t
-        x, P = M.combine_b(xs, Ps, np.stack([o.mu for o in objs]))
+        x, P = M.combine_many(xs, Ps, [o.mu for o in objs])
         for k, o in enumerate(objs):
             o.x, o.P = x[k], P[k]
 
@@ -292,8 +283,7 @@ class Tracker:
         """Where each object is believed to be at its time, without changing it: [(x, P, mu)]."""
         if not objs:
             return []
-        xs, Ps, mu, dt = self._evolve(objs, times)
-        x, P = M.combine_b(xs, Ps, mu)
+        xs, Ps, mu, dt, x, P = self._evolve(objs, times, combine=True)
         return [(o.x, o.P, o.mu) if abs(dt[k]) < 1e-6 else (x[k], P[k], mu[k]) for k, o in enumerate(objs)]
 
     def peek(self, o, t):
@@ -354,9 +344,7 @@ class Tracker:
     def p_still_many(self, objs):
         if not objs:
             return []
-        xs, Ps, mu = np.stack([o.xs for o in objs]), np.stack([o.Ps for o in objs]), np.stack([o.mu for o in objs])
-        q = M.still_b(xs[:, 1:], Ps[:, 1:], M.kin_arrays([o.label for o in objs])[3][:, None])
-        return np.minimum(1.0, mu[:, STAND] + mu[:, CV] * q[:, 0] + mu[:, CA] * q[:, 1]).tolist()
+        return M.p_still_many([o.xs for o in objs], [o.Ps for o in objs], [o.mu for o in objs], [o.label for o in objs])
 
     def _pose(self, t):
         p = self.ego.pose_at(t)

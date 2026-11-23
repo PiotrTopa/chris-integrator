@@ -14,6 +14,8 @@
  *   ekf_predict, ekf_project, ekf_update, ekf_sym, ekf_rts     the estimator's linear algebra (core/ekf.py,
  *                              core/ego.py); elementwise steps give numpy's bits, sums of products are taken
  *                              in index order (numpy hands those to BLAS, whose order is its own)
+ *   radar_evolve, radar_combine, radar_p_still     the radar's motion model (radar/models.py, tracker.py):
+ *                              interaction, prediction, combination of the hypotheses; agree to rounding
  *
  * What is not certain to give the reference's result is never guessed: the function raises `Fallback` (or
  * calls the reference itself, `round`), and the caller takes the pure-Python path for that one call.
@@ -29,7 +31,7 @@
 #include <stdint.h>
 #include <string.h>
 
-#define NATIVE_VERSION 2
+#define NATIVE_VERSION 3
 
 static PyObject *Fallback;          /* raised where the pure-Python path must decide */
 static PyObject *builtin_round;
@@ -2017,6 +2019,589 @@ fail:
     return NULL;
 }
 
+/* ====================================================================================================
+ * The radar's motion model (radar/models.py is the reference: still_b, transition_b, mix_b, predict_b,
+ * combine_b; radar/tracker.py `_evolve`, `p_still_many`). State [px, py, vx, vy, ax, ay, dp, lh], three
+ * hypotheses (stand, cv, ca). The reference builds dense 8x8 transitions and multiplies them; here only the
+ * entries that are not zero are propagated (F has at most three per row), summed in index order. Elementwise
+ * steps are written in numpy's order of operations; sums of products differ from numpy's (BLAS, einsum) in
+ * the order of addition: the results agree to rounding. Inputs that are not finite are left to the reference
+ * (`Fallback`): a dense product turns 0 * inf into NaN where skipping the zero does not.
+ * ==================================================================================================== */
+enum { R_PX, R_PY, R_VX, R_VY, R_AX, R_AY, R_DP, R_LH, RN };
+enum { R_STAND, R_CV, R_CA };
+#define RNN (RN * RN)
+#define RNPAR 12
+
+typedef struct {
+    double dpw2, sd2, sv2, cvn, caj, tau, qacc, r_s2m, r_m2s, r_fast, r_cv2ca, r_ca2cv;
+} RPar;
+
+/* a C-contiguous float64 buffer of exactly n doubles (any shape) */
+static int dview_get(PyObject *o, View *v, int writable, Py_ssize_t n, const char *what)
+{
+    v->held = 0;
+    if (PyObject_GetBuffer(o, &v->b, PyBUF_C_CONTIGUOUS | PyBUF_FORMAT | (writable ? PyBUF_WRITABLE : 0)) < 0)
+        return -1;
+    v->held = 1;
+    const char *f = v->b.format ? v->b.format : "B";
+    if (*f == '@' || *f == '=' || *f == '<')
+        f++;
+    if (!(f[0] == 'd' && f[1] == 0 && v->b.itemsize == 8) || v->b.len != n * (Py_ssize_t)sizeof(double)) {
+        view_drop(v);
+        PyErr_Format(PyExc_TypeError, "%s: a C-contiguous float64 array of %zd values is needed", what, n);
+        return -1;
+    }
+    return 0;
+}
+
+/* a batch of B items of `len` doubles: one buffer of B * len, or a list / tuple of B buffers of len each */
+typedef struct {
+    View one;
+    View *items;
+    Py_ssize_t nitems;
+    const double **p;
+} Bat;
+
+static void bat_init(Bat *bt)
+{
+    bt->one.held = 0;
+    bt->items = NULL;
+    bt->nitems = 0;
+    bt->p = NULL;
+}
+
+static void bat_drop(Bat *bt)
+{
+    view_drop(&bt->one);
+    for (Py_ssize_t i = 0; i < bt->nitems; i++)
+        view_drop(&bt->items[i]);
+    PyMem_Free(bt->items);
+    PyMem_Free((void *)bt->p);
+    bat_init(bt);
+}
+
+static int bat_get(PyObject *o, Py_ssize_t B, Py_ssize_t len, Bat *bt, const char *what)
+{
+    bt->p = (const double **)PyMem_Malloc((size_t)(B ? B : 1) * sizeof(double *));
+    if (bt->p == NULL) {
+        PyErr_NoMemory();
+        return -1;
+    }
+    int is_list = PyList_Check(o);
+    if (is_list || PyTuple_Check(o)) {
+        Py_ssize_t n = is_list ? PyList_Size(o) : PyTuple_Size(o);
+        if (n != B) {
+            PyErr_Format(PyExc_ValueError, "%s: %zd items, %zd expected", what, n, B);
+            return -1;
+        }
+        bt->items = (View *)PyMem_Calloc((size_t)(B ? B : 1), sizeof(View));
+        if (bt->items == NULL) {
+            PyErr_NoMemory();
+            return -1;
+        }
+        for (Py_ssize_t b = 0; b < B; b++) {
+            if (dview_get(seq_item(o, is_list, b), &bt->items[b], 0, len, what) < 0)
+                return -1;
+            bt->nitems = b + 1;
+            bt->p[b] = (const double *)bt->items[b].b.buf;
+        }
+        return 0;
+    }
+    if (dview_get(o, &bt->one, 0, B * len, what) < 0)
+        return -1;
+    for (Py_ssize_t b = 0; b < B; b++)
+        bt->p[b] = (const double *)bt->one.b.buf + b * len;
+    return 0;
+}
+
+/* B rows of `width` numbers into out: a float64 buffer of B * width, or a list / tuple of B numbers
+ * (width 1) or of B sequences of `width` numbers */
+static int rows_get(PyObject *o, Py_ssize_t B, int width, double *out, const char *what)
+{
+    int is_list = PyList_Check(o);
+    if (is_list || PyTuple_Check(o)) {
+        Py_ssize_t n = is_list ? PyList_Size(o) : PyTuple_Size(o);
+        if (n != B) {
+            PyErr_Format(PyExc_ValueError, "%s: %zd items, %zd expected", what, n, B);
+            return -1;
+        }
+        for (Py_ssize_t b = 0; b < B; b++) {
+            PyObject *it = seq_item(o, is_list, b);
+            if (width == 1) {
+                double v = PyFloat_AsDouble(it);
+                if (v == -1.0 && PyErr_Occurred())
+                    return -1;
+                out[b] = v;
+                continue;
+            }
+            int il = PyList_Check(it);
+            if (!(il || PyTuple_Check(it)) || (il ? PyList_Size(it) : PyTuple_Size(it)) != width) {
+                PyErr_Format(PyExc_TypeError, "%s: rows of %d numbers are needed", what, width);
+                return -1;
+            }
+            for (int k = 0; k < width; k++) {
+                double v = PyFloat_AsDouble(seq_item(it, il, k));
+                if (v == -1.0 && PyErr_Occurred())
+                    return -1;
+                out[b * width + k] = v;
+            }
+        }
+        return 0;
+    }
+    View v;
+    if (dview_get(o, &v, 0, B * width, what) < 0)
+        return -1;
+    memcpy(out, v.b.buf, (size_t)(B * width) * sizeof(double));
+    view_drop(&v);
+    return 0;
+}
+
+/* the batch size: the length of a list / tuple, or of a float64 buffer of one value per item */
+static Py_ssize_t batch_len(PyObject *o)
+{
+    if (PyList_Check(o))
+        return PyList_Size(o);
+    if (PyTuple_Check(o))
+        return PyTuple_Size(o);
+    Py_buffer v;
+    if (PyObject_GetBuffer(o, &v, PyBUF_C_CONTIGUOUS | PyBUF_FORMAT) < 0)
+        return -1;
+    Py_ssize_t n = v.ndim >= 1 ? v.shape[0] : -1;
+    PyBuffer_Release(&v);
+    if (n < 0)
+        PyErr_SetString(PyExc_TypeError, "radar: a batch (an array of one row per object, or a list) is needed");
+    return n;
+}
+
+static int all_finite(const double *a, Py_ssize_t n)
+{
+    for (Py_ssize_t i = 0; i < n; i++)
+        if (!isfinite(a[i]))
+            return 0;
+    return 1;
+}
+
+/* still_b: the weight of the velocity (mean and uncertainty) inside exp(-|v|^2 / v0^2) */
+static double r_still(const double *x, const double *P, double v0)
+{
+    double v2 = v0 * v0;
+    double a00 = 2.0 * P[R_VX * RN + R_VX] + v2, a11 = 2.0 * P[R_VY * RN + R_VY] + v2, a01 = 2.0 * P[R_VX * RN + R_VY];
+    double det = a00 * a11 - a01 * (2.0 * P[R_VY * RN + R_VX]);
+    if (!(det > 0.0))
+        return 0.0;
+    double vx = x[R_VX], vy = x[R_VY];
+    double q = (a11 * vx * vx - 2.0 * a01 * vx * vy + a00 * vy * vy) / det;
+    double r = v2 / sqrt(det) * exp(-(q > 60.0 ? 60.0 : q));
+    return r > 1.0 ? 1.0 : r;
+}
+
+/* transition_b: switching probabilities over dt, T[from * 3 + to] */
+static void r_transition(double dt, double q0, double q1, const RPar *p, double *T)
+{
+    if (!(dt > 0.0))
+        dt = 0.0;
+    double R[9] = {0.0, p->r_s2m * 0.7, p->r_s2m * 0.3,
+                   p->r_fast + p->r_m2s * q0, 0.0, p->r_cv2ca,
+                   p->r_fast + p->r_m2s * q1, p->r_ca2cv, 0.0};
+    for (int k = 0; k < 9; k++)
+        T[k] = 1.0 - exp(-R[k] * dt);
+    for (int i = 0; i < 3; i++) {
+        double *t = T + 3 * i;
+        double off = (t[0] + t[1]) + t[2];
+        double s = off > 0.9 ? 0.9 / off : 1.0;
+        t[0] *= s;
+        t[1] *= s;
+        t[2] *= s;
+        double d = 1.0 - ((t[0] + t[1]) + t[2]);
+        t[i] = d;
+    }
+}
+
+/* mix_b with the free estimate: "it stands" hands (xf, Pf) to a moving hypothesis. Out: xo (3, N), Po (3, N, N),
+ * c (3) the predicted model probabilities */
+static void r_mix(const double *xs, const double *Ps, const double *mu, const double *T, const double *xf,
+                  const double *Pf, double *xo, double *Po, double *c)
+{
+    double w[9];
+    for (int j = 0; j < 3; j++)
+        c[j] = (T[j] * mu[0] + T[3 + j] * mu[1]) + T[6 + j] * mu[2];
+    for (int j = 0; j < 3; j++) {
+        int low = c[j] < 1e-12;
+        for (int i = 0; i < 3; i++)
+            w[3 * i + j] = low ? (i == j ? 1.0 : 0.0) : T[3 * i + j] * mu[i] / c[j];
+    }
+    for (int j = 0; j < 3; j++) {
+        const double *sx[3], *sp[3];
+        for (int i = 0; i < 3; i++) {
+            int hand = (i == R_STAND && j != R_STAND);
+            sx[i] = hand ? xf : xs + i * RN;
+            sp[i] = hand ? Pf : Ps + i * RNN;
+        }
+        double w0 = w[j], w1 = w[3 + j], w2 = w[6 + j];
+        double *x = xo + j * RN, *P = Po + j * RNN;
+        double d0[RN], d1[RN], d2[RN];
+        for (int n = 0; n < RN; n++)
+            x[n] = (w0 * sx[0][n] + w1 * sx[1][n]) + w2 * sx[2][n];
+        for (int n = 0; n < RN; n++) {
+            d0[n] = sx[0][n] - x[n];
+            d1[n] = sx[1][n] - x[n];
+            d2[n] = sx[2][n] - x[n];
+        }
+        for (int m = 0; m < RN; m++)
+            for (int n = 0; n < RN; n++) {
+                int k = m * RN + n;
+                double a = (w0 * sp[0][k] + w1 * sp[1][k]) + w2 * sp[2][k];
+                double b = ((w0 * d0[m]) * d0[n] + (w1 * d1[m]) * d1[n]) + (w2 * d2[m]) * d2[n];
+                P[k] = a + b;
+            }
+    }
+}
+
+/* _shape_b: (s00, s11, s01), q_lon along the travel and q_lat across it, isotropic below 1 m/s */
+static void r_shape(double ql, double qt, const double *x, double *s)
+{
+    double vx = x[R_VX], vy = x[R_VY];
+    double sp = hypot(vx, vy);
+    if (sp >= 1.0) {
+        double c = vx / sp, sn = vy / sp;
+        s[0] = c * c * ql + sn * sn * qt;
+        s[1] = sn * sn * ql + c * c * qt;
+        s[2] = c * sn * (ql - qt);
+    } else {
+        s[0] = s[1] = 0.5 * (ql + qt);
+        s[2] = 0.0;
+    }
+}
+
+/* qa * k into the 2x2 block (r, c) of Q, and its mirror (c, r) */
+static void r_qblock(double *Q, int r, int c, const double *s, double k)
+{
+    double a = s[0] * k, b = s[1] * k, o = s[2] * k;
+    Q[r * RN + c] = a;
+    Q[(r + 1) * RN + c + 1] = b;
+    Q[r * RN + c + 1] = o;
+    Q[(r + 1) * RN + c] = o;
+    if (r != c) {
+        Q[c * RN + r] = a;
+        Q[(c + 1) * RN + r + 1] = b;
+        Q[(c + 1) * RN + r] = o;
+        Q[c * RN + r + 1] = o;
+    }
+}
+
+/* predict_b for one hypothesis: (x, P) forward by dt into (xo, Po), with the kind's speed bound */
+static void r_predict(int model, const double *x, const double *P, double dt, double a_lon, double a_lat,
+                      double v_max, const RPar *p, double *xo, double *Po)
+{
+    double adt = fabs(dt);
+    int nz[RN], col[RN][3];
+    double val[RN][3];
+    double Q[RNN];
+    memset(Q, 0, sizeof(Q));
+    for (int i = 0; i < RN; i++) {
+        nz[i] = 1;
+        col[i][0] = i;
+        val[i][0] = 1.0;
+    }
+    Q[R_DP * RN + R_DP] = p->dpw2 * adt;
+    if (model == R_STAND) {
+        for (int i = R_VX; i <= R_AY; i++) {
+            nz[i] = 0;
+            Q[i * RN + i] = p->sv2;
+        }
+        Q[R_PX * RN + R_PX] = Q[R_PY * RN + R_PY] = p->sd2 * adt;
+    } else if (model == R_CV) {
+        double dt2 = adt * adt, dt3 = pow(adt, 3.0), s[3];
+        for (int i = 0; i < 2; i++) {
+            nz[R_PX + i] = 2;
+            col[R_PX + i][1] = R_VX + i;
+            val[R_PX + i][1] = dt;
+        }
+        nz[R_AX] = nz[R_AY] = 0;
+        double t1 = p->cvn * a_lon, t2 = p->cvn * a_lat;
+        r_shape(t1 * t1, t2 * t2, x, s);
+        r_qblock(Q, 0, 0, s, dt3 / 3.0);
+        r_qblock(Q, 0, 2, s, dt2 / 2.0);
+        r_qblock(Q, 2, 2, s, adt);
+        Q[R_AX * RN + R_AX] = Q[R_AY * RN + R_AY] = p->qacc;
+    } else {
+        double rho = exp(-adt / p->tau), s[3];
+        double dt2 = adt * adt, dt3 = pow(adt, 3.0), dt4 = pow(adt, 4.0), dt5 = pow(adt, 5.0);
+        for (int i = 0; i < 2; i++) {
+            nz[R_PX + i] = 3;
+            col[R_PX + i][1] = R_VX + i;
+            val[R_PX + i][1] = dt;
+            col[R_PX + i][2] = R_AX + i;
+            val[R_PX + i][2] = 0.5 * dt * adt;
+            nz[R_VX + i] = 2;
+            col[R_VX + i][1] = R_AX + i;
+            val[R_VX + i][1] = dt;
+            val[R_AX + i][0] = rho;
+        }
+        double t1 = p->caj * a_lon, t2 = p->caj * a_lat;
+        r_shape(t1 * t1, t2 * t2, x, s);
+        r_qblock(Q, 0, 0, s, dt5 / 20.0);
+        r_qblock(Q, 0, 2, s, dt4 / 8.0);
+        r_qblock(Q, 0, 4, s, dt3 / 6.0);
+        r_qblock(Q, 2, 2, s, dt3 / 3.0);
+        r_qblock(Q, 2, 4, s, dt2 / 2.0);
+        r_qblock(Q, 4, 4, s, adt);
+    }
+    /* coefficients that are exactly zero (dt = 0) are no terms */
+    for (int i = 0; i < RN; i++) {
+        int k = 0;
+        for (int e = 0; e < nz[i]; e++)
+            if (val[i][e] != 0.0) {
+                col[i][k] = col[i][e];
+                val[i][k] = val[i][e];
+                k++;
+            }
+        nz[i] = k;
+    }
+    double x1[RN], A[RNN], P1[RNN];
+    for (int i = 0; i < RN; i++) {
+        double acc = 0.0;
+        for (int e = 0; e < nz[i]; e++)
+            acc = e ? acc + val[i][e] * x[col[i][e]] : val[i][e] * x[col[i][e]];
+        x1[i] = acc;
+    }
+    for (int i = 0; i < RN; i++)                         /* A = F P */
+        for (int j = 0; j < RN; j++) {
+            double acc = 0.0;
+            for (int e = 0; e < nz[i]; e++)
+                acc = e ? acc + val[i][e] * P[col[i][e] * RN + j] : val[i][e] * P[col[i][e] * RN + j];
+            A[i * RN + j] = acc;
+        }
+    for (int i = 0; i < RN; i++)                         /* P1 = A F^T + Q */
+        for (int j = 0; j < RN; j++) {
+            double acc = 0.0;
+            for (int e = 0; e < nz[j]; e++)
+                acc = e ? acc + A[i * RN + col[j][e]] * val[j][e] : A[i * RN + col[j][e]] * val[j][e];
+            P1[i * RN + j] = acc + Q[i * RN + j];
+        }
+    if (model != R_STAND) {
+        double sp = hypot(x1[R_VX], x1[R_VY]);
+        if (sp > v_max) {
+            double f = v_max / sp, d = sp - v_max, ex = d * d;
+            x1[R_VX] *= f;
+            x1[R_VY] *= f;
+            P1[R_VX * RN + R_VX] += ex;
+            P1[R_VY * RN + R_VY] += ex;
+        }
+    }
+    memcpy(xo, x1, sizeof(x1));
+    for (int i = 0; i < RN; i++)
+        for (int j = 0; j < RN; j++)
+            Po[i * RN + j] = 0.5 * (P1[i * RN + j] + P1[j * RN + i]);
+}
+
+/* combine_b: the moment-matched single estimate of the three hypotheses */
+static void r_combine(const double *xs, const double *Ps, const double *mu, double *x, double *P)
+{
+    double d[3][RN];
+    for (int n = 0; n < RN; n++)
+        x[n] = (mu[0] * xs[n] + mu[1] * xs[RN + n]) + mu[2] * xs[2 * RN + n];
+    for (int i = 0; i < 3; i++)
+        for (int n = 0; n < RN; n++)
+            d[i][n] = xs[i * RN + n] - x[n];
+    for (int m = 0; m < RN; m++)
+        for (int n = 0; n < RN; n++) {
+            int k = m * RN + n;
+            double a = (mu[0] * Ps[k] + mu[1] * Ps[RNN + k]) + mu[2] * Ps[2 * RNN + k];
+            double b = ((mu[0] * d[0][m]) * d[0][n] + (mu[1] * d[1][m]) * d[1][n]) + (mu[2] * d[2][m]) * d[2][n];
+            P[k] = a + b;
+        }
+}
+
+static int rpar_get(PyObject *o, RPar *p)
+{
+    double v[RNPAR];
+    if (rows_get(o, RNPAR, 1, v, "par") < 0)           /* 12 numbers: a tuple or a buffer */
+        return -1;
+    if (!all_finite(v, RNPAR)) {
+        PyErr_SetString(Fallback, "radar: parameters not finite");
+        return -1;
+    }
+    p->dpw2 = v[0]; p->sd2 = v[1]; p->sv2 = v[2]; p->cvn = v[3]; p->caj = v[4]; p->tau = v[5]; p->qacc = v[6];
+    p->r_s2m = v[7]; p->r_m2s = v[8]; p->r_fast = v[9]; p->r_cv2ca = v[10]; p->r_ca2cv = v[11];
+    return 0;
+}
+
+/* an output buffer of n doubles, or None (*out = NULL) where `optional` */
+static int out_get(PyObject *o, View *v, Py_ssize_t n, int optional, double **out, const char *what)
+{
+    v->held = 0;
+    *out = NULL;
+    if (optional && o == Py_None)
+        return 0;
+    if (dview_get(o, v, 1, n, what) < 0)
+        return -1;
+    *out = (double *)v->b.buf;
+    return 0;
+}
+
+/* radar_evolve(xs, Ps, mu, xf, Pf, dt, kin, par, xs_out, Ps_out, mu_out, x_out | None, P_out | None,
+ *              xf_out | None, Pf_out | None)
+ * Tracker._evolve for B objects: stillness of the moving hypotheses, switching matrix, interaction with the
+ * free estimate's hand-over, prediction of the three hypotheses by dt[b]; with x_out, P_out also combine_b of
+ * the result with the predicted probabilities; with xf_out, Pf_out the free estimate predicted by the steady
+ * hypothesis (Tracker._advance_all).
+ *   xs (B, 3, N), Ps (B, 3, N, N), mu (B, 3), xf (B, N), Pf (B, N, N): one buffer each, or a list / tuple of B
+ *   per-object buffers;  dt: (B) buffer or list of numbers;  kin: (B, 4) buffer or list of
+ *   (a_lon, a_lat, v_max, v_still);  par: 12 numbers (models.py `_native_par`). Outputs: float64 buffers. */
+static PyObject *n_radar_evolve(PyObject *self, PyObject *args)
+{
+    PyObject *oxs, *oPs, *omu, *oxf, *oPf, *odt, *okin, *opar, *o1, *o2, *o3, *o4, *o5, *o6, *o7;
+    if (!PyArg_ParseTuple(args, "OOOOOOOOOOOOOOO", &oxs, &oPs, &omu, &oxf, &oPf, &odt, &okin, &opar, &o1, &o2, &o3,
+                          &o4, &o5, &o6, &o7))
+        return NULL;
+    PyObject *res = NULL;
+    Bat xs, Ps, mu, xf, Pf;
+    bat_init(&xs); bat_init(&Ps); bat_init(&mu); bat_init(&xf); bat_init(&Pf);
+    View v1, v2, v3, v4, v5, v6, v7;
+    v1.held = v2.held = v3.held = v4.held = v5.held = v6.held = v7.held = 0;
+    double *dk = NULL;
+    double *xso, *Pso, *muo, *xo, *Po, *xfo, *Pfo;
+    RPar par;
+    Py_ssize_t B = batch_len(odt);
+    if (B < 0 || rpar_get(opar, &par) < 0)
+        goto done;
+    dk = (double *)PyMem_Malloc((size_t)(B ? B : 1) * 5 * sizeof(double));
+    if (dk == NULL) {
+        PyErr_NoMemory();
+        goto done;
+    }
+    if (rows_get(odt, B, 1, dk, "dt") < 0 || rows_get(okin, B, 4, dk + B, "kin") < 0 ||
+        bat_get(oxs, B, 3 * RN, &xs, "xs") < 0 || bat_get(oPs, B, 3 * RNN, &Ps, "Ps") < 0 ||
+        bat_get(omu, B, 3, &mu, "mu") < 0 || bat_get(oxf, B, RN, &xf, "xf") < 0 ||
+        bat_get(oPf, B, RNN, &Pf, "Pf") < 0 ||
+        out_get(o1, &v1, B * 3 * RN, 0, &xso, "xs_out") < 0 || out_get(o2, &v2, B * 3 * RNN, 0, &Pso, "Ps_out") < 0 ||
+        out_get(o3, &v3, B * 3, 0, &muo, "mu_out") < 0 || out_get(o4, &v4, B * RN, 1, &xo, "x_out") < 0 ||
+        out_get(o5, &v5, B * RNN, 1, &Po, "P_out") < 0 || out_get(o6, &v6, B * RN, 1, &xfo, "xf_out") < 0 ||
+        out_get(o7, &v7, B * RNN, 1, &Pfo, "Pf_out") < 0)
+        goto done;
+    if ((xo == NULL) != (Po == NULL) || (xfo == NULL) != (Pfo == NULL)) {
+        PyErr_SetString(PyExc_ValueError, "radar_evolve: x_out and P_out (xf_out and Pf_out) go together");
+        goto done;
+    }
+    if (!all_finite(dk, B * 5))
+        goto fallback;
+    for (Py_ssize_t b = 0; b < B; b++)
+        if (!all_finite(xs.p[b], 3 * RN) || !all_finite(Ps.p[b], 3 * RNN) || !all_finite(mu.p[b], 3) ||
+            !all_finite(xf.p[b], RN) || !all_finite(Pf.p[b], RNN))
+            goto fallback;
+    for (Py_ssize_t b = 0; b < B; b++) {
+        const double *K = dk + B + 4 * b;            /* a_lon, a_lat, v_max, v_still */
+        double dt = dk[b], T[9], c[3], xm[3 * RN], Pm[3 * RNN];
+        const double *X = xs.p[b], *P = Ps.p[b];
+        double q0 = r_still(X + RN, P + RNN, K[3]), q1 = r_still(X + 2 * RN, P + 2 * RNN, K[3]);
+        r_transition(dt, q0, q1, &par, T);
+        r_mix(X, P, mu.p[b], T, xf.p[b], Pf.p[b], xm, Pm, c);
+        double *xb = xso + b * 3 * RN, *Pb = Pso + b * 3 * RNN;
+        for (int j = 0; j < 3; j++)
+            r_predict(j, xm + j * RN, Pm + j * RNN, dt, K[0], K[1], K[2], &par, xb + j * RN, Pb + j * RNN);
+        muo[3 * b] = c[0];
+        muo[3 * b + 1] = c[1];
+        muo[3 * b + 2] = c[2];
+        if (xo)
+            r_combine(xb, Pb, c, xo + b * RN, Po + b * RNN);
+        if (xfo)
+            r_predict(R_CV, xf.p[b], Pf.p[b], dt, K[0], K[1], K[2], &par, xfo + b * RN, Pfo + b * RNN);
+    }
+    res = Py_None;
+    Py_INCREF(res);
+    goto done;
+fallback:
+    PyErr_SetString(Fallback, "radar_evolve: an input is not finite");
+done:
+    PyMem_Free(dk);
+    bat_drop(&xs); bat_drop(&Ps); bat_drop(&mu); bat_drop(&xf); bat_drop(&Pf);
+    view_drop(&v1); view_drop(&v2); view_drop(&v3); view_drop(&v4); view_drop(&v5); view_drop(&v6); view_drop(&v7);
+    return res;
+}
+
+/* radar_combine(xs, Ps, mu, x_out, P_out): combine_b for B objects (inputs as in radar_evolve) */
+static PyObject *n_radar_combine(PyObject *self, PyObject *args)
+{
+    PyObject *oxs, *oPs, *omu, *o1, *o2;
+    if (!PyArg_ParseTuple(args, "OOOOO", &oxs, &oPs, &omu, &o1, &o2))
+        return NULL;
+    PyObject *res = NULL;
+    Bat xs, Ps, mu;
+    bat_init(&xs); bat_init(&Ps); bat_init(&mu);
+    View v1, v2;
+    v1.held = v2.held = 0;
+    double *xo, *Po;
+    Py_ssize_t B = batch_len(omu);
+    if (B < 0)
+        goto done;
+    if (bat_get(oxs, B, 3 * RN, &xs, "xs") < 0 || bat_get(oPs, B, 3 * RNN, &Ps, "Ps") < 0 ||
+        bat_get(omu, B, 3, &mu, "mu") < 0 || out_get(o1, &v1, B * RN, 0, &xo, "x_out") < 0 ||
+        out_get(o2, &v2, B * RNN, 0, &Po, "P_out") < 0)
+        goto done;
+    for (Py_ssize_t b = 0; b < B; b++)
+        if (!all_finite(xs.p[b], 3 * RN) || !all_finite(Ps.p[b], 3 * RNN) || !all_finite(mu.p[b], 3)) {
+            PyErr_SetString(Fallback, "radar_combine: an input is not finite");
+            goto done;
+        }
+    for (Py_ssize_t b = 0; b < B; b++)
+        r_combine(xs.p[b], Ps.p[b], mu.p[b], xo + b * RN, Po + b * RNN);
+    res = Py_None;
+    Py_INCREF(res);
+done:
+    bat_drop(&xs); bat_drop(&Ps); bat_drop(&mu);
+    view_drop(&v1); view_drop(&v2);
+    return res;
+}
+
+/* radar_p_still(xs, Ps, mu, v_still) -> [min(1, mu_stand + mu_cv q_cv + mu_ca q_ca)] (Tracker.p_still_many) */
+static PyObject *n_radar_p_still(PyObject *self, PyObject *args)
+{
+    PyObject *oxs, *oPs, *omu, *ov;
+    if (!PyArg_ParseTuple(args, "OOOO", &oxs, &oPs, &omu, &ov))
+        return NULL;
+    PyObject *res = NULL;
+    Bat xs, Ps, mu;
+    bat_init(&xs); bat_init(&Ps); bat_init(&mu);
+    double *v0 = NULL;
+    Py_ssize_t B = batch_len(ov);
+    if (B < 0)
+        goto done;
+    v0 = (double *)PyMem_Malloc((size_t)(B ? B : 1) * sizeof(double));
+    if (v0 == NULL) {
+        PyErr_NoMemory();
+        goto done;
+    }
+    if (rows_get(ov, B, 1, v0, "v_still") < 0 || bat_get(oxs, B, 3 * RN, &xs, "xs") < 0 ||
+        bat_get(oPs, B, 3 * RNN, &Ps, "Ps") < 0 || bat_get(omu, B, 3, &mu, "mu") < 0)
+        goto done;
+    for (Py_ssize_t b = 0; b < B; b++)
+        if (!isfinite(v0[b]) || !all_finite(xs.p[b] + RN, 2 * RN) || !all_finite(Ps.p[b] + RNN, 2 * RNN) ||
+            !all_finite(mu.p[b], 3)) {
+            PyErr_SetString(Fallback, "radar_p_still: an input is not finite");
+            goto done;
+        }
+    res = PyList_New(B);
+    if (res == NULL)
+        goto done;
+    for (Py_ssize_t b = 0; b < B; b++) {
+        const double *X = xs.p[b], *P = Ps.p[b], *m = mu.p[b];
+        double q0 = r_still(X + RN, P + RNN, v0[b]), q1 = r_still(X + 2 * RN, P + 2 * RNN, v0[b]);
+        double s = (m[0] + m[1] * q0) + m[2] * q1;
+        PyObject *f = PyFloat_FromDouble(s > 1.0 ? 1.0 : s);
+        if (f == NULL) {
+            Py_CLEAR(res);
+            goto done;
+        }
+        PyList_SetItem(res, b, f);
+    }
+done:
+    PyMem_Free(v0);
+    bat_drop(&xs); bat_drop(&Ps); bat_drop(&mu);
+    return res;
+}
+
 /* ==================================================================================================== */
 static PyMethodDef methods[] = {
     {"dumps", n_dumps, METH_O, "json.dumps(obj, separators=(',', ':')); raises Fallback where json must decide"},
@@ -2035,6 +2620,9 @@ static PyMethodDef methods[] = {
     {"lanes_fit", n_lanes_fit, METH_VARARGS, "measurement noise, gate, innovation and fit of every line"},
     {"lanes_apply", n_lanes_apply, METH_VARARGS, "the scalar-gain update of the fitted lines, in place"},
     {"round_lists", n_round_lists, METH_VARARGS, "np.round(a, decimals).tolist(), optionally of np.sqrt(a)"},
+    {"radar_evolve", n_radar_evolve, METH_VARARGS, "Tracker._evolve (+ combine_b, + the free estimate's prediction) for B objects"},
+    {"radar_combine", n_radar_combine, METH_VARARGS, "combine_b for B objects into given arrays"},
+    {"radar_p_still", n_radar_p_still, METH_VARARGS, "Tracker.p_still_many: a list of floats"},
     {NULL, NULL, 0, NULL}};
 
 static struct PyModuleDef moduledef = {PyModuleDef_HEAD_INIT, "_chris_native",
