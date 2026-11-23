@@ -3901,6 +3901,228 @@ static void r_evolve_row(const double *row, double dt, const double *K, const RP
         r_predict(R_CV, row + RO_XF, row + RO_PF, dt, K[0], K[1], K[2], par, xf1, Pf1);
 }
 
+/* where an object will be after dt, in part: the combination's x[0..6] (place, velocity, acceleration, offset)
+ * and the top-left nb x nb block of its covariance (nb 2: the place, 4: place and velocity), the same bits as
+ * r_evolve_row + r_combine give for those entries: only what they depend on is computed (the mixing of indices
+ * 0..6, the transition's rows 0..nb-1 and 4..6), each entry the same way. Out: x (7), P (nb x nb, row-major),
+ * the predicted probabilities (3) where muout. */
+static void r_peek_part(const double *row, double dt, const double *K, const RPar *par, int nb, double *xout,
+                        double *Pout, double *muout)
+{
+    double T[9], c[3], w[9];
+    const double *X = row + RO_XS, *P = row + RO_PS, *mu = row + RO_MU, *xf = row + RO_XF, *Pf = row + RO_PF;
+    double q0 = r_still(X + RN, P + RNN, K[3]), q1 = r_still(X + 2 * RN, P + 2 * RNN, K[3]);
+    r_transition(dt, q0, q1, par, T);
+    for (int j = 0; j < 3; j++)
+        c[j] = (T[j] * mu[0] + T[3 + j] * mu[1]) + T[6 + j] * mu[2];
+    for (int j = 0; j < 3; j++) {
+        int low = c[j] < 1e-12;
+        for (int i = 0; i < 3; i++)
+            w[3 * i + j] = low ? (i == j ? 1.0 : 0.0) : T[3 * i + j] * mu[i] / c[j];
+    }
+    double adt = fabs(dt), x1[3][7], P1[3][16];
+    for (int j = 0; j < 3; j++) {
+        /* the mixing for target j, indices 0..6 (x) and 0..5 (P: all that rows 0..3 of F reach) */
+        const double *sx[3], *sp[3];
+        for (int i = 0; i < 3; i++) {
+            int hand = (i == R_STAND && j != R_STAND);
+            sx[i] = hand ? xf : X + i * RN;
+            sp[i] = hand ? Pf : P + i * RNN;
+        }
+        double w0 = w[j], w1 = w[3 + j], w2 = w[6 + j], xm[7], d0[7], d1[7], d2[7], Pm[6][6];
+        for (int n = 0; n < 7; n++)
+            xm[n] = (w0 * sx[0][n] + w1 * sx[1][n]) + w2 * sx[2][n];
+        for (int n = 0; n < 6; n++) {
+            d0[n] = sx[0][n] - xm[n];
+            d1[n] = sx[1][n] - xm[n];
+            d2[n] = sx[2][n] - xm[n];
+        }
+        for (int m = 0; m < 6; m++)
+            for (int n = 0; n < 6; n++) {
+                int k = m * RN + n;
+                double a = (w0 * sp[0][k] + w1 * sp[1][k]) + w2 * sp[2][k];
+                double b = ((w0 * d0[m]) * d0[n] + (w1 * d1[m]) * d1[n]) + (w2 * d2[m]) * d2[n];
+                Pm[m][n] = a + b;
+            }
+        /* r_predict: the transition's non-zero terms of rows 0..6, Q's top-left 4 x 4 */
+        int nz[7], col[7][3];
+        double val[7][3], Q[4][4] = {{0}};
+        for (int i = 0; i < 7; i++) {
+            nz[i] = 1;
+            col[i][0] = i;
+            val[i][0] = 1.0;
+        }
+        double s[3] = {0.0, 0.0, 0.0}, xr[RN] = {0};
+        xr[R_VX] = xm[R_VX];
+        xr[R_VY] = xm[R_VY];
+        if (j == R_STAND) {
+            for (int i = R_VX; i <= R_AY; i++)
+                nz[i] = 0;
+            Q[0][0] = Q[1][1] = par->sd2 * adt;
+            Q[2][2] = Q[3][3] = par->sv2;
+        } else if (j == R_CV) {
+            double dt2 = adt * adt, dt3 = pow(adt, 3.0), t1 = par->cvn * K[0], t2 = par->cvn * K[1];
+            for (int i = 0; i < 2; i++) {
+                nz[R_PX + i] = 2;
+                col[R_PX + i][1] = R_VX + i;
+                val[R_PX + i][1] = dt;
+            }
+            nz[R_AX] = nz[R_AY] = 0;
+            r_shape(t1 * t1, t2 * t2, xr, s);
+            double ks[3] = {dt3 / 3.0, dt2 / 2.0, adt};          /* blocks (0,0), (0,2), (2,2) */
+            for (int bl = 0; bl < 3; bl++) {
+                int r0 = bl == 2 ? 2 : 0, c0 = bl == 0 ? 0 : 2;
+                double aa = s[0] * ks[bl], bb = s[1] * ks[bl], oo = s[2] * ks[bl];
+                Q[r0][c0] = Q[c0][r0] = aa;
+                Q[r0 + 1][c0 + 1] = Q[c0 + 1][r0 + 1] = bb;
+                Q[r0][c0 + 1] = Q[r0 + 1][c0] = Q[c0 + 1][r0] = Q[c0][r0 + 1] = oo;
+            }
+        } else {
+            double rho = exp(-adt / par->tau), dt2 = adt * adt, dt3 = pow(adt, 3.0), dt4 = pow(adt, 4.0),
+                   dt5 = pow(adt, 5.0), t1 = par->caj * K[0], t2 = par->caj * K[1];
+            for (int i = 0; i < 2; i++) {
+                nz[R_PX + i] = 3;
+                col[R_PX + i][1] = R_VX + i;
+                val[R_PX + i][1] = dt;
+                col[R_PX + i][2] = R_AX + i;
+                val[R_PX + i][2] = 0.5 * dt * dt;
+                nz[R_VX + i] = 2;
+                col[R_VX + i][1] = R_AX + i;
+                val[R_VX + i][1] = dt;
+                val[R_AX + i][0] = rho;
+            }
+            r_shape(t1 * t1, t2 * t2, xr, s);
+            double ks[3] = {dt5 / 20.0, dt4 / 8.0, dt3 / 3.0};
+            for (int bl = 0; bl < 3; bl++) {
+                int r0 = bl == 2 ? 2 : 0, c0 = bl == 0 ? 0 : 2;
+                double aa = s[0] * ks[bl], bb = s[1] * ks[bl], oo = s[2] * ks[bl];
+                Q[r0][c0] = Q[c0][r0] = aa;
+                Q[r0 + 1][c0 + 1] = Q[c0 + 1][r0 + 1] = bb;
+                Q[r0][c0 + 1] = Q[r0 + 1][c0] = Q[c0 + 1][r0] = Q[c0][r0 + 1] = oo;
+            }
+            (void)dt2;
+        }
+        for (int i = 0; i < 7; i++) {
+            int kk = 0;
+            for (int e = 0; e < nz[i]; e++)
+                if (val[i][e] != 0.0) {
+                    col[i][kk] = col[i][e];
+                    val[i][kk] = val[i][e];
+                    kk++;
+                }
+            nz[i] = kk;
+        }
+        double A[4][6], Pr[4][4];
+        for (int i = 0; i < 7; i++) {
+            double acc = 0.0;
+            for (int e = 0; e < nz[i]; e++)
+                acc = e ? acc + val[i][e] * xm[col[i][e]] : val[i][e] * xm[col[i][e]];
+            x1[j][i] = acc;
+        }
+        for (int i = 0; i < nb; i++)
+            for (int q = 0; q < 6; q++) {
+                double acc = 0.0;
+                for (int e = 0; e < nz[i]; e++)
+                    acc = e ? acc + val[i][e] * Pm[col[i][e]][q] : val[i][e] * Pm[col[i][e]][q];
+                A[i][q] = acc;
+            }
+        for (int i = 0; i < nb; i++)
+            for (int l = 0; l < nb; l++) {
+                double acc = 0.0;
+                for (int e = 0; e < nz[l]; e++)
+                    acc = e ? acc + A[i][col[l][e]] * val[l][e] : A[i][col[l][e]] * val[l][e];
+                Pr[i][l] = acc + Q[i][l];
+            }
+        if (j != R_STAND) {                              /* the kind's top speed */
+            double sp = hypot(x1[j][R_VX], x1[j][R_VY]);
+            if (sp > K[2]) {
+                double f = K[2] / sp, dd = sp - K[2], ex = dd * dd;
+                x1[j][R_VX] *= f;
+                x1[j][R_VY] *= f;
+                if (nb > 2) {
+                    Pr[R_VX][R_VX] += ex;
+                    Pr[R_VY][R_VY] += ex;
+                }
+            }
+        }
+        for (int i = 0; i < nb; i++)
+            for (int l = 0; l < nb; l++)
+                P1[j][i * nb + l] = 0.5 * (Pr[i][l] + Pr[l][i]);
+    }
+    /* r_combine of those entries, with the predicted probabilities */
+    double d[3][7];
+    for (int n = 0; n < 7; n++)
+        xout[n] = (c[0] * x1[0][n] + c[1] * x1[1][n]) + c[2] * x1[2][n];
+    for (int i = 0; i < 3; i++)
+        for (int n = 0; n < nb; n++)
+            d[i][n] = x1[i][n] - xout[n];
+    for (int m = 0; m < nb; m++)
+        for (int n = 0; n < nb; n++) {
+            int k = nb * m + n;
+            double a = (c[0] * P1[0][k] + c[1] * P1[1][k]) + c[2] * P1[2][k];
+            double b = ((c[0] * d[0][m]) * d[0][n] + (c[1] * d[1][m]) * d[1][n]) + (c[2] * d[2][m]) * d[2][n];
+            Pout[k] = a + b;
+        }
+    if (muout)
+        memcpy(muout, c, sizeof(c));
+}
+
+/* r_peek_part for the place: (x, y, P00, P01, P10, P11) */
+static void r_peek_pos(const double *row, double dt, const double *K, const RPar *par, double *out)
+{
+    double x[7], P[4];
+    r_peek_part(row, dt, K, par, 2, x, P, NULL);
+    out[0] = x[0];
+    out[1] = x[1];
+    memcpy(out + 2, P, sizeof(P));
+}
+
+/* radar_peek_pos(S, rows, dt, kin, par, out (B, 6)) -> None: where each object's place will be after its dt
+ * (Tracker.peek_many, the place only: x, y, P00, P01, P10, P11); |dt| < 1e-6: its row as it is */
+static PyObject *n_radar_peek_pos(PyObject *self, PyObject *args)
+{
+    PyObject *oS, *orows, *odt, *okin, *opar, *oo;
+    if (!PyArg_ParseTuple(args, "OOOOOO", &oS, &orows, &odt, &okin, &opar, &oo))
+        return NULL;
+    PyObject *res = NULL;
+    View vS, vo;
+    vS.held = vo.held = 0;
+    Py_ssize_t cap, B = 0, *rows = NULL;
+    double *dk = NULL, *out;
+    RPar par;
+    if (store_get(oS, &vS, &cap) < 0 || (rows = idx_get(orows, cap, &B)) == NULL || rpar_get(opar, &par) < 0)
+        goto done;
+    dk = (double *)PyMem_Malloc((size_t)(B ? B : 1) * 5 * sizeof(double));
+    if (dk == NULL) {
+        PyErr_NoMemory();
+        goto done;
+    }
+    if (rows_get(odt, B, 1, dk, "dt") < 0 || rows_get(okin, B, 4, dk + B, "kin") < 0 ||
+        out_get(oo, &vo, B * 6, 0, &out, "out") < 0)
+        goto done;
+    for (Py_ssize_t b = 0; b < B; b++) {
+        const double *row = (const double *)vS.b.buf + rows[b] * RROW;
+        double *o = out + 6 * b;
+        if (fabs(dk[b]) < 1e-6) {
+            o[0] = row[RO_X + R_PX];
+            o[1] = row[RO_X + R_PY];
+            o[2] = row[RO_P];
+            o[3] = row[RO_P + 1];
+            o[4] = row[RO_P + RN];
+            o[5] = row[RO_P + RN + 1];
+        } else
+            r_peek_pos(row, dk[b], dk + B + 4 * b, &par, o);
+    }
+    res = Py_None;
+    Py_INCREF(res);
+done:
+    PyMem_Free(rows);
+    PyMem_Free(dk);
+    view_drop(&vS);
+    view_drop(&vo);
+    return res;
+}
+
 /* radar_advance(S, rows, dt, kin, par, noise, pose) -> None. Tracker._advance_all for B objects, committed in
  * their rows: interaction, prediction (and the free estimate's), the probabilities only where dt > 0, what the
  * car's own movement is not sure about added to where each is (noise: (sa, sp) per object, pose (X, Y, psi) at
@@ -4460,7 +4682,7 @@ static PyObject *n_radar_frame(PyObject *self, PyObject *args)
     View vS, vpx, vpy;
     vS.held = vpx.held = vpy.held = 0;
     Py_ssize_t cap, B = 0, H, *rows = NULL;
-    double *buf = NULL, pose[3], ego[2], cfg[RFCFG], hz[8];
+    double *buf = NULL, pose[3], ego[2], cfg[RFCFG], hz[8];   /* hz: the horizons' values (speed x h) */
     RPar par;
     RPath path = {NULL, NULL, 0, 0.0, 0.0};
     if (rkeys_init() < 0 || store_get(oS, &vS, &cap) < 0 || (rows = idx_get(orows, cap, &B)) == NULL ||
@@ -4518,14 +4740,26 @@ static PyObject *n_radar_frame(PyObject *self, PyObject *args)
         double x[RN], P[RNN], mu[3], xp[8][RN], Pq[8][RNN];
         for (Py_ssize_t h = 0; h <= H; h++) {          /* now and ahead (Tracker.peek_many) */
             double dt = dts[b * (1 + H) + h], *xo = h ? xp[h - 1] : x, *Po = h ? Pq[h - 1] : P, mm[3];
+            if (h && fabs(dt) >= 1e-6) {                /* ahead: the place is all that is asked */
+                double o6[6];
+                r_peek_pos(row, dt, kin + 4 * b, &par, o6);
+                xo[R_PX] = o6[0];
+                xo[R_PY] = o6[1];
+                Po[0] = o6[2];
+                Po[RN + 1] = o6[5];
+                continue;
+            }
             if (fabs(dt) < 1e-6) {
                 memcpy(xo, row + RO_X, sizeof(double) * RN);
                 memcpy(Po, row + RO_P, sizeof(double) * RNN);
                 memcpy(mm, row + RO_MU, sizeof(mm));
-            } else {
-                double xs1[3 * RN], Ps1[3 * RNN];
-                r_evolve_row(row, dt, kin + 4 * b, &par, xs1, Ps1, mm, NULL, NULL);
-                r_combine(xs1, Ps1, mm, xo, Po);
+            } else {                                     /* now: place, velocity, acceleration, offset */
+                double x7[7], P4[16];
+                r_peek_part(row, dt, kin + 4 * b, &par, 4, x7, P4, mm);
+                memcpy(xo, x7, sizeof(x7));
+                for (int i = 0; i < 4; i++)
+                    for (int l = 0; l < 4; l++)
+                        Po[i * RN + l] = P4[i * 4 + l];
             }
             if (h == 0)
                 memcpy(mu, mm, sizeof(mm));
@@ -4998,6 +5232,7 @@ static PyMethodDef methods[] = {
     {"radar_p_still", n_radar_p_still, METH_VARARGS, "Tracker.p_still_many: a list of floats"},
     {"radar_advance", n_radar_advance, METH_VARARGS, "Tracker._advance_all on the objects' rows"},
     {"radar_peek", n_radar_peek, METH_VARARGS, "Tracker.peek_many on the objects' rows into given arrays"},
+    {"radar_peek_pos", n_radar_peek_pos, METH_VARARGS, "Tracker.peek_many, the place only (x, y and its covariance)"},
     {"radar_still", n_radar_still, METH_VARARGS, "Tracker.p_still_many on the objects' rows"},
     {"radar_h", n_radar_h, METH_VARARGS, "a sensor's measurement function (sensors.py h) into given arrays"},
     {"radar_marginals", n_radar_marginals, METH_VARARGS, "tracker.marginals into a given array"},

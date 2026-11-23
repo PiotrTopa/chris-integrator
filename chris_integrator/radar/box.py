@@ -99,7 +99,8 @@ class Radar:
         self.ego.reset()
         self.tracker.reset()
         self.queue = []                  # (t, src, sensor, dets)
-        self.path = None                 # (xs, ys left) in the car frame of path_t
+        self._plan = None                # the road model's plan (x, y right) in the car frame of path_t
+        self._path = None                # ... as arrays, y left (`path`)
         self.path_t = None
         self.seq = 0
         self.dropped = 0
@@ -245,12 +246,19 @@ class Radar:
         plan, ts = msg.get("plan"), msg.get("ts_mono_ns")
         if isinstance(plan, dict) and isinstance(plan.get("x"), list) and isinstance(plan.get("y"), list) \
                 and len(plan["x"]) >= 2 and len(plan["x"]) == len(plan["y"]) and isinstance(ts, int):
-            xs = np.asarray(plan["x"], float)
-            if np.all(np.diff(xs) >= 0.0) and xs[-1] > 5.0:
-                self.path, self.path_t = (xs, -np.asarray(plan["y"], float)), ts / NS       # the road model's y is right
+            xs = plan["x"]
+            if all(b - a >= 0.0 for a, b in zip(xs, xs[1:])) and xs[-1] > 5.0:
+                self._plan, self._path, self.path_t = (xs, plan["y"]), None, ts / NS
                 return
         if isinstance(ts, int) and self.path_t is not None and ts / NS - self.path_t > 1.0:
-            self.path = None
+            self._plan = self._path = None
+
+    @property
+    def path(self):
+        """The path: (xs, ys left) in the car frame of path_t, or None; made from the plan when first asked."""
+        if self._path is None and self._plan is not None:
+            self._path = (np.asarray(self._plan[0], float), -np.asarray(self._plan[1], float))   # the road model's y is right
+        return self._path
 
     def _push(self, scan):
         self.queue.append(scan)

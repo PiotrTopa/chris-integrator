@@ -506,16 +506,18 @@ class Tracker:
         cph, sph = math.cos(pose[2]), math.sin(pose[2])
         if getattr(sensor, "extraneous", None) is not None:
             sensor.extraneous = max(sensor.extraneous, self.new_rate.get(src, 0.0))
-        Rs = [np.diag(np.asarray(d["R"], float)) for d in dets]
         native = _NR is not None and hasattr(sensor, "native")
-        if native:
+        if native:                                       # R: its diagonal (a list), else the matrix
+            Rs = [np.asarray(d["R"], float).tolist() for d in dets]
             D = self._det_rows(dets)
             pairs, pds, cover = self._associate_native(src, t, sensor, pose, objs, D)
         else:
+            Rs = [np.diag(np.asarray(d["R"], float)) for d in dets]
             pairs, pds, cover = self._associate(src, t, sensor, pose, objs, dets)
         hit, used = set(), set()
         if self._common(sensor, src, pose, objs, dets, Rs, pairs) and native:
-            D = self._det_rows(dets, Rs)
+            for j, d in enumerate(dets):                 # what _common changed: the first row's angle and variance
+                D[j, 5], D[j, 9] = d["z"][0], Rs[j][0]
         if native and pairs:
             res = _NR.radar_update(self.store.a, [objs[i].slot for i, *_ in pairs], sensor.native(), pose,
                                    D[[j for _, j, *_ in pairs]], [(pds[i], lam, pr, objs[i].hits) for i, _, _, pr, lam in pairs],
@@ -534,9 +536,17 @@ class Tracker:
         if hit:                                          # written down now, checked when the time has come
             who = [objs[i] for i in sorted(hit)]
             hz = c["check_horizons"]
-            ahead = self.peek_many([o for o in who for _ in hz], [t + h for _ in who for h in hz])
-            for k, (xp, Pp, _) in enumerate(ahead):
-                who[k // len(hz)].checks.append((t + hz[k % len(hz)], float(xp[PX]), float(xp[PY]), Pp[:2, :2].copy()))
+            if _NR is not None:                          # the place is all that is asked: (x, y, P00, P01, P10, P11)
+                ahead = np.empty((len(who) * len(hz), 6))
+                _NR.radar_peek_pos(self.store.a, [o.slot for o in who for _ in hz], [t + h - o.t for o in who for h in hz],
+                                   [M._KIN4.get(o.label) or M._KIN4[None] for o in who for _ in hz],
+                                   M._native_par(self.mcfg), ahead)
+                for k, r in enumerate(ahead.tolist()):
+                    who[k // len(hz)].checks.append((t + hz[k % len(hz)], r[0], r[1], r[2:]))
+            else:
+                ahead = self.peek_many([o for o in who for _ in hz], [t + h for _ in who for h in hz])
+                for k, (xp, Pp, _) in enumerate(ahead):
+                    who[k // len(hz)].checks.append((t + hz[k % len(hz)], float(xp[PX]), float(xp[PY]), Pp[:2, :2].copy()))
         for i, o in enumerate(objs):
             pd = pds[i]
             if cover[i] > 0.0:
@@ -726,7 +736,7 @@ class Tracker:
         cover = [sensor.coverage(*car[i]) for i in range(nt)]
         return [(i, j, float(gain[i, j]), float(pair[i, j]), feat[(i, j)]) for i, j in assign(gain)], pds, cover
 
-    def _det_rows(self, dets, Rs=None):
+    def _det_rows(self, dets):
         """The scan's detections as the native core reads them (chris_native.c `RDET`): kind, scale-rate baseline,
         group (kind and baseline: what is predicted alike), vehicle (1) / person (-1) / not known (0), box width,
         z, the variances (R's diagonal)."""
@@ -736,8 +746,9 @@ class Tracker:
         for j, d in enumerate(dets):
             k = d.get("kind")
             lab = classvote.norm_label((d.get("attrs") or {}).get("class"))
-            z = list(d["z"])
-            R = list(d["R"]) if Rs is None else list(np.diag(Rs[j]))
+            z, R = d["z"], d["R"]
+            z = z.tolist() if isinstance(z, np.ndarray) else list(z)
+            R = R.tolist() if isinstance(R, np.ndarray) else list(R)
             rows.append([kind_code(k), float(d.get("sdt") or 0.0), kinds.setdefault((k, d.get("sdt")), len(kinds)),
                          0 if lab is None else (1 if lab in M.VEHICLES else -1), float(d.get("w") or 0.0)]
                         + z + list(pad[len(z):]) + R + list(pad[len(R):]))
@@ -783,7 +794,7 @@ class Tracker:
                     or pr < c["common_pair"]:
                 continue
             zp, H = sensor.h(o.x, pose, d)
-            s00 = float(H[0] @ o.P @ H[0]) + float(Rs[j][0, 0])
+            s00 = float(H[0] @ o.P @ H[0]) + float(Rs[j][0] if isinstance(Rs[j], list) else Rs[j][0, 0])
             v.append(float(d["z"][0]) - float(zp[0]))
             w.append(1.0 / s00)
         if len(v) < c["common_min"]:
@@ -805,7 +816,10 @@ class Tracker:
             if (d.get("kind") or "").rstrip("s") in ("rb", "rbh"):
                 d["z"] = np.array(d["z"], float)
                 d["z"][0] -= fast
-                Rs[j][0, 0] = max(Rs[j][0, 0] - jit + left, 0.25 * Rs[j][0, 0])
+                if isinstance(Rs[j], list):
+                    Rs[j][0] = max(Rs[j][0] - jit + left, 0.25 * Rs[j][0])
+                else:
+                    Rs[j][0, 0] = max(Rs[j][0, 0] - jit + left, 0.25 * Rs[j][0, 0])
         return True
 
     def _first_rate(self, o, d, sensor, pose):
@@ -1188,11 +1202,14 @@ class Tracker:
             for i, j in zip(*np.nonzero(near)):
                 nearj.setdefault(int(i), []).append((int(j), None))
                 nearset.add((int(i), int(j)))
+        index = {o.id: k for k, o in enumerate(obs)}
         for i in range(n):
-            if obs[i].merge_t:                           # a pair that is no longer near stops counting
-                for j in range(i + 1, n):
-                    if (i, j) not in nearset and obs[j].id not in dead and obs[i].id not in dead:
-                        obs[i].merge_t.pop(obs[j].id, None)
+            mt = obs[i].merge_t
+            if mt:                                       # a pair that is no longer near stops counting
+                for key in list(mt):
+                    j = index.get(key)
+                    if j is not None and j > i and (i, j) not in nearset and key not in dead and obs[i].id not in dead:
+                        mt.pop(key, None)
             for j, same in nearj.get(i, ()):
                 a, b = obs[i], obs[j]
                 if a.id in dead or b.id in dead:
