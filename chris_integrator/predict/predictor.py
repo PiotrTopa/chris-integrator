@@ -21,7 +21,7 @@ _NAT_KEYS = tuple(NATIVE_CFG)
 
 # object row (predict.c PO_*), state row, road row, band row, arm row
 (O_X, O_Y, O_VX, O_VY, O_AX, O_AY, O_SX, O_SY, O_SVX, O_SVY, O_KIND, O_PSTAT, O_LEN, O_WID, O_HDG, O_HDGSD, O_EXIST,
- O_SEEN, O_IND, O_BRAKE, O_PARKED, O_ID, O_VIS, O_SPARE) = range(24)
+ O_SEEN, O_IND, O_BRAKE, O_PARKED, O_ID, O_VIS, O_MOTION, O_WITH) = range(25)
 R_W, R_Q, R_KERBL, R_KERBR, R_VLIM = range(5)
 L_EGO, L_LEFT, L_RIGHT, L_ONC, L_CROSS, L_PARK, L_OFF = range(7)
 F_S, F_D, F_SD, F_DC, F_DIR, F_LANE, F_LEAD, F_GAP, F_E, F_R, F_A, F_PSI, F_STOP, F_JDIST, F_KERB, F_OM = range(16)
@@ -452,13 +452,15 @@ class Predictor:
             if hd.__class__ is list:                           # [value, std]
                 hd, hs = hd[0], hd[1] if len(hd) > 1 else None
             ind, br, vis = g("indicator"), g("brake_lights"), g("vis")
+            fl, mo = g("flags") or (), g("motion")              # the radar's own verdicts
             a[i] = (o["x_m"], o["y_m"], g("vx_mps") or 0.0, g("vy_mps") or 0.0, g("ax_mps2") or 0.0, g("ay_mps2") or 0.0,
                     std[0], std[1], std[2], std[3], kind.get(cls.get("label"), 8) if cls else 8,
                     _D(g("p_stationary"), 0.5), _D(g("len"), _NAN), _D(g("wid"), _NAN), _D(hd, _NAN), _D(hs, _NAN),
                     _D(g("exist"), 1.0), 0.0 if g("state") == "memory" else 1.0,
                     _NAN if ind is None else 1.0 if ind == "left" else -1.0 if ind == "right" else 0.0,
-                    _NAN if br is None else 1.0 if br else 0.0, 1.0 if "parked" in (g("flags") or ()) else 0.0, i,
-                    _NAN if vis is None else 0.0 if vis in ("occluded", "hidden", False) else 1.0, 0.0)
+                    _NAN if br is None else 1.0 if br else 0.0, 1.0 if "parked" in fl else 0.0, i,
+                    _NAN if vis is None else 0.0 if vis in ("occluded", "hidden", False) else 1.0,
+                    1.0 if mo == "stationary" else -1.0 if mo == "moving" else 0.0, 1.0 if "with_traffic" in fl or "oncoming" in fl else 0.0)
             ids.append(g("id"))
         if n:
             num = a[:, :12]

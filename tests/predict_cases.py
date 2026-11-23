@@ -7,6 +7,7 @@ NS = 1_000_000_000
 def obj(i, x, y, vx, vy, label="car", ps=0.02, std=(1.0, 0.3, 0.6, 0.3), **kw):
     return dict({"id": i, "state": "confirmed", "exist": 1.0, "x_m": round(x, 3), "y_m": round(y, 3), "vx_mps": vx,
                  "vy_mps": vy, "ax_mps2": 0.0, "ay_mps2": 0.0, "std": list(std), "p_stationary": ps,
+                 "motion": "moving" if ps < 0.3 else "stationary" if ps > 0.7 else "unknown",    # as the radar says it
                  "class": {"label": label} if label else None, "flags": []}, **kw)
 
 

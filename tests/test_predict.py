@@ -242,6 +242,37 @@ def test_without_context_it_still_predicts_and_trusts_the_road_less():
     assert k is None or k[-1, 3] > k2[-1, 3]
 
 
+def test_the_radars_motion_verdict_takes_hold_quickly_and_ignorance_stays_open():
+    ctx = dict(K.context(arm=False), n_right=0.3)                # a lane on the right is possible, not known
+    hist = []
+
+    def scene(t):
+        # tracked as driving with the traffic, then (from 1 s) the radar finds that it stands beside the path
+        if t < 1.0:
+            return [K.obj(1, 40.0, -3.0, 13.0, 0.0, ps=0.01, std=(8.0, 0.6, 4.0, 0.6), motion="moving", flags=["with_traffic"])]
+        return [K.obj(1, 40.0 - 14.0 * (t - 1.0), -3.0, 0.7, 0.0, ps=0.88, std=(3.5, 0.4, 2.1, 0.25), motion="stationary", flags=["parked"])]
+    drive(scene, 2.0, ctx, each=lambda t, m, p: hist.append((round(t, 2), futures(p, 1), lane(p, 1))))
+    at = {t: (f, ln) for t, f, ln in hist}
+    assert at[0.95][0]["keep"][0] > 0.9 and at[0.95][1] == "right"
+    f, ln = at[1.4]                                              # 0.4 s after the radar's verdict
+    assert sum(v[0] for k, v in f.items() if k in ("parked", "stopped", "move_off")) > 0.85 and f.get("keep", (0.0,))[0] < 0.1
+    f, ln = at[1.5]
+    assert ln == "park" and f["parked"][0] > 0.85
+
+    def newborn(t):
+        # a lead that has just appeared far ahead: speed known to 11 m/s, p_stationary the radar's prior; then it
+        # is found to drive
+        if t < 1.0:
+            return [K.obj(1, 62.0, -0.4, 5.5, 0.0, ps=0.6, std=(14.0, 0.3, 11.0, 0.5), motion="unknown")]
+        return [K.obj(1, 62.0, -0.4, 18.0, 0.0, ps=0.12, std=(13.0, 0.3, 9.0, 0.6), motion="unknown", flags=["with_traffic"])]
+    hist.clear()
+    drive(newborn, 1.5, ctx, each=lambda t, m, p: hist.append((round(t, 2), futures(p, 1), lane(p, 1))))
+    at = {t: f for t, f, ln in hist}
+    stand = lambda f: sum(v[0] for k, v in f.items() if k in ("parked", "stopped", "move_off"))
+    assert 0.4 < stand(at[0.9]) < 0.6                            # not known: neither hardens
+    assert stand(at[1.4]) < 0.12 and at[1.4]["keep"][0] > 0.85   # 0.4 s after the radar says it drives
+
+
 def test_knobs():
     m, pred = K.run(Predictor(dict(NOCHECK, native={"modes_max": 1.0})), T=1.5)
     assert set(pred.n_modes.tolist()) == {1} and np.allclose(pred.p[:, 0], 1.0)

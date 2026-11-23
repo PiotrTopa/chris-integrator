@@ -39,6 +39,9 @@
     X(evid_tau_s, 0.4)          /* a track's frames are one observation per this time (their errors are shared) */  \
     X(lane_switch_hz, 0.25)     /* lane filter: rate of an unseen change of lane */                                 \
     X(lane_floor, 0.01)         /* lane filter: what a lane kind keeps whatever the evidence */                     \
+    X(motion_tau_s, 0.15)       /* the radar's standing / moving verdict takes hold of the manoeuvres in this time */ \
+    X(motion_v_sd, 2.5)         /* a speed known no better than this says nothing about standing or moving ... */   \
+    X(motion_ps_band, 0.15)     /* ... while the radar's p_stationary is within this of one half */                 \
     X(cross_deg, 55.0)          /* heading against the road from which a road user crosses it */                    \
     X(keep_sd_m, 0.35)          /* lane keeping: 1 sigma of the offset from the lane's centre */                    \
     X(keep_rate_sd, 0.25)       /* lane keeping: 1 sigma of the lateral speed (m/s) */                              \
@@ -134,10 +137,10 @@ static const char *const PLANE[P_NLANE] = {"ego", "left", "right", "onc", "cross
 
 /* object row */
 enum { PO_X, PO_Y, PO_VX, PO_VY, PO_AX, PO_AY, PO_SX, PO_SY, PO_SVX, PO_SVY, PO_KIND, PO_PSTAT, PO_LEN, PO_WID, PO_HDG, PO_HDGSD,
-       PO_EXIST, PO_SEEN, PO_IND, PO_BRAKE, PO_PARKED, PO_ID, PO_VIS, PO_SPARE, P_NO };
+       PO_EXIST, PO_SEEN, PO_IND, PO_BRAKE, PO_PARKED, PO_ID, PO_VIS, PO_MOTION, PO_WITH, P_NO };
 /* an object's kept state */
 enum { PS_INIT, PS_T, PS_LANE, PS_INT = PS_LANE + P_NLANE, PS_D = PS_INT + P_NM, PS_DR, PS_PDD, PS_PDR, PS_PRR, PS_V, PS_A, PS_PVV,
-       PS_PVA, PS_PAA, PS_TSTAND, PS_TMOVE, PS_LMAP, PS_TKERB, PS_TOP, PS_DIR, PS_TLANE, P_NS = 48 };
+       PS_PVA, PS_PAA, PS_TSTAND, PS_TMOVE, PS_LMAP, PS_TKERB, PS_TOP, PS_DIR, PS_TLANE, PS_GSTAND, PS_PSL, P_NS = 48 };
 /* per object diagnostics (`feat`) */
 enum { PF_S, PF_D, PF_SD, PF_DC, PF_DIR, PF_LANE, PF_LEAD, PF_GAP, PF_E, PF_R, PF_A, PF_PSI, PF_STOP, PF_JDIST, PF_KERB, PF_OM, P_NF };
 /* the road */
@@ -716,7 +719,7 @@ typedef struct {
     const double *kin;
     int grp;                        /* 0 vehicle, 1 cyclist, 2 pedestrian */
     double s, d, sd_d, sd_s, th, kap, vt, vn, sp, psi, spsi;
-    double len, wid, pstat, exist;
+    double len, wid, pstat, minfo, exist;
     int lane, band, dir;
     double dc, bw;                  /* its lane's centre and width (base frame) */
     int nb[2];                      /* the band on ITS left / right (-1: none) */
@@ -755,6 +758,37 @@ typedef struct {
     double ebb[P_EMODES][4], egap, ed0;
     double stat[8];
 } PCtx;
+
+/* Does it stand: the radar's word. Its p_stationary; its verdicts, which it holds with a hysteresis of their own
+ * and which therefore say more than the number of one frame (`motion` stationary, the flag `parked`: half the
+ * doubt that it stands is taken away; `motion` moving, the flag `with_traffic`: half the doubt that it moves).
+ * Where the radar itself does not know (no verdict, p_stationary near one half: its prior, not evidence) and the
+ * speed is known no better than a few m/s, the answer is "not known": drawn towards one half by *info, the
+ * weight of the radar's word (0.1 to 1). */
+static double motion_state(const double *cfg, const double *o, double *info)
+{
+    double ps = p_clip(o[PO_PSTAT], 0.0, 1.0);
+    int verdict = 0;
+    if (o[PO_PARKED] > 0.5 || o[PO_MOTION] > 0.5) {
+        ps = 1.0 - 0.5 * (1.0 - ps);
+        verdict = 1;
+    }
+    if (o[PO_MOTION] < -0.5 || o[PO_WITH] > 0.5) {
+        ps = 0.5 * ps;
+        verdict = 1;
+    }
+    double u = 1.0;
+    if (!verdict) {
+        double band = cfg[PC_motion_ps_band], sv = o[PO_SVX] > o[PO_SVY] ? o[PO_SVX] : o[PO_SVY];
+        double u_ps = p_clip((fabs(ps - 0.5) - band) / band, 0.0, 1.0);
+        double u_v = p_clip(cfg[PC_motion_v_sd] - sv, 0.0, 1.0);
+        u = u_ps > u_v ? u_ps : u_v;
+        if (u < 0.1)
+            u = 0.1;
+    }
+    *info = u;
+    return 0.5 + u * (ps - 0.5);
+}
 
 /* ---- lanes -------------------------------------------------------------------------------------------- */
 static double band_occ(const double *b, double d, double sd)
@@ -923,6 +957,22 @@ static void lane_step(PCtx *c, PObj *q, double dt, double *lane_out)
     static const double PRIOR[P_NLANE] = {0.2, 0.12, 0.12, 0.15, 0.1, 0.16, 0.15};
     double *lp = q->st + PS_LANE, post[P_NLANE], sum = 0.0;
     int fresh = !(q->st[PS_INIT] > 0.5);
+    if (o[PO_PARKED] > 0.5 && q->grp != 2) {                   /* the radar: it stands beside the path */
+        em[PL_PARK] *= 1.0 + 3.0 * st;
+        em[PL_OFF] *= 1.0 + 3.0 * st;
+    }
+    if (!fresh) {
+        /* which lane it is in was concluded from how it moved; when the radar changes its mind about that (it
+         * stands after all, it drives after all), that much of the conclusion is void. Not where the change is
+         * one of motion itself (it came to a stop, it moves off: slow before and after): the lane holds */
+        double vk = q->st[PS_V] > q->sp ? q->st[PS_V] : q->sp;
+        double ch = fabs(st - q->st[PS_PSL]) * p_clip((vk - 2.0) / 3.0, 0.0, 1.0);
+        if (ch > 1.0)
+            ch = 1.0;
+        for (int l = 0; l < P_NLANE; l++)
+            lp[l] = (1.0 - ch) * lp[l] + ch * PRIOR[l];
+    }
+    q->st[PS_PSL] = st;
     double lam = fresh ? 1.0 : 1.0 - exp(-cfg[PC_lane_switch_hz] * dt);
     double wgt = fresh ? 1.0 : dt / cfg[PC_evid_tau_s];
     if (wgt > 1.0)
@@ -1256,7 +1306,11 @@ static void intent_step(PCtx *c, PObj *q, double dt, double *intent_out)
         Q[m] = 0.0;
         L[m] = 0.0;
     }
-    double st = q->pstat, lmove = log(1.0 - st > 0.02 ? 1.0 - st : 0.02), lstand = log(st > 0.02 ? st : 0.02);
+    /* standing or moving is not weighed here: the manoeuvres are of two groups (it stands: stand, and "it will
+     * start" where that begins from standstill; it moves: all others), the evidence below sorts the manoeuvres
+     * within each, and the groups' shares are the radar's word (below, after the filter's step) */
+    double st = q->pstat, lmove = 0.0, lstand = 0.0;
+    int pull_moving = 0;
     double quality = c->road[PR_Q], rh = c->rh;
     double ksd = cfg[PC_keep_sd_m], krs = cfg[PC_keep_rate_sd], asd = cfg[PC_acc_sd], ysd = cfg[PC_yaw_sd];
     double se = hypot(ksd, q->se), sr = hypot(krs, q->sr), sa = hypot(asd, q->sa), so = hypot(ysd, q->som);
@@ -1420,7 +1474,16 @@ static void intent_step(PCtx *c, PObj *q, double dt, double *intent_out)
             if (st > 0.5)
                 L[PM_PULL] = lstand;
             else
-                L[PM_PULL] = lmove + p_logn(toward, 0.5, hypot(0.5, q->sr), hypot(krs, q->sr)) + p_logn(q->sp, 1.5, 1.5, 1.5) + 2.0;
+            {
+                /* it moves, in the strip: pulling out shows as a speed towards the road. Where the tracker's
+                 * lateral speed says nothing (a new or poorly seen object), or it runs against the lane it would
+                 * join, this explains it no better than its own motion carried on (free) */
+                double known = p_clip((0.8 - q->sr) / 0.4, 0.0, 1.0);
+                int against = (int)c->bands[P_NB * tb + PB_DIR] * q->vt < -1.0;
+                pull_moving = 1;
+                L[PM_PULL] = lmove + p_logn(toward, 0.5, hypot(0.5, q->sr), hypot(krs, q->sr)) + p_logn(q->sp, 1.5, 1.5, 1.5)
+                             + known * 2.0 + (1.0 - known) * cfg[PC_free_loglik] - (against ? 3.0 : 0.0);
+            }
         }
         Q[PM_FREE] += 0.05;
     } else {
@@ -1482,6 +1545,24 @@ static void intent_step(PCtx *c, PObj *q, double dt, double *intent_out)
     }
     for (int m = 0; m < P_NM; m++)
         post[m] /= sum2;
+    {
+        /* the share of "it stands": the radar's (as far as it knows: motion_state), taking hold of the kept
+         * share within motion_tau_s */
+        double gs = 0.0, g = st;
+        int stand[P_NM];
+        for (int m = 0; m < P_NM; m++) {
+            stand[m] = m == PM_STAND || (m == PM_PULL && !pull_moving) || (m == PM_STARTX && st > 0.5);
+            if (stand[m])
+                gs += post[m];
+        }
+        if (!fresh && cfg[PC_motion_tau_s] > 1e-3)
+            g = q->st[PS_GSTAND] + (1.0 - exp(-dt / cfg[PC_motion_tau_s])) * (st - q->st[PS_GSTAND]);
+        q->st[PS_GSTAND] = g;
+        if (gs > 1e-9 && gs < 1.0 - 1e-9) {
+            for (int m = 0; m < P_NM; m++)
+                post[m] *= stand[m] ? g / gs : (1.0 - g) / (1.0 - gs);
+        }
+    }
     if (st > 0.5) {
         /* it stands: "it stays" and "it will start" (move off, pull out, step into the road) look the same now;
          * how the standing share splits among them is the situation's word alone */
@@ -2833,7 +2914,7 @@ static PyObject *n_predict_frame(PyObject *self, PyObject *args)
         q->grp = kind == 7 ? 2 : kind == 6 ? 1 : 0;
         q->len = q->o[PO_LEN] == q->o[PO_LEN] && q->o[PO_LEN] > 0.2 ? q->o[PO_LEN] : q->kin[PK_LEN];
         q->wid = q->o[PO_WID] == q->o[PO_WID] && q->o[PO_WID] > 0.2 ? q->o[PO_WID] : q->kin[PK_WID];
-        q->pstat = p_clip(q->o[PO_PSTAT], 0.0, 1.0);
+        q->pstat = motion_state(c->cfg, q->o, &q->minfo);
         q->exist = p_clip(q->o[PO_EXIST], 0.0, 1.0);
         q->traj = traj + (size_t)i * P_KMAX * nt * 6;
         double dt = T - q->st[PS_T];

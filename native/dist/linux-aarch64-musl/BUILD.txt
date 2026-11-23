@@ -4,7 +4,7 @@ compiler: cc (Alpine 15.2.0) 15.2.0
 python headers: Python 3.14.10
 numpy in the test run: 2.5.5
 source sha256: 158d3bf1548a13dd4f8d0b03dd0b4f9f9265edca81c0649971a2d335b9ae886d
-source sha256 (predict.c, included): 2589a124b352b1489b438c6ab0d16d23d0c71c820e3435eee2787748521958ce
-binary sha256: 962fb78deaa6b3a8abcd0f0bba91728a5bdd7b239746f88458f4dd2557a6e8e2
+source sha256 (predict.c, included): b4414dd3eef1fdf26718acf072dd0b225404f81d5970a4c756bb0174eb273f19
+binary sha256: 0b88fa84eee85737b0eb8dd0b887a7bb3d717326771ec87e67e27685a6fc0ae9
 .....................s..                                                 [100%]
-23 passed, 1 skipped in 413.42s (0:06:53)
+23 passed, 1 skipped in 371.14s (0:06:11)

@@ -602,12 +602,22 @@ road's curvilinear frame, so a parked car on the outside of a bend is `park`, no
 straight ahead of the car.
 
 What it reads of the `radar` object: `id`, `state`, `x_m`, `y_m`, `vx_mps`, `vy_mps`, `ax_mps2`, `ay_mps2`, `std`,
-`p_stationary`, `exist`, `class.label`, `flags` (`parked`); and, when a radar sends them (the estimation core's
+`p_stationary`, `motion`, `exist`, `class.label`, `flags` (`parked`, `with_traffic`, `oncoming`); and, when a radar sends them (the estimation core's
 additions), `len`, `wid` (m), `hdg` (rad, car frame; a number or `[value, std]`) with `hdg_std`, `vis`; also
 `indicator` (`"left"` / `"right"` / `"off"`) and `brake_lights` (bool) should a source ever give them. Without
 them: the class's usual size, the direction of the velocity, no light evidence. Of the message: `ts_mono_ns`,
 `ego.speed_mps`, `ego.yaw_rate_rps`, `ego.accel_mps2`, `ego.ground_frame` (a new ground frame starts the
 predictor empty).
+
+Standing or moving is the radar's word, not re-derived from the velocity: its `p_stationary`, sharpened by its
+verdicts (`motion` stationary / flag `parked`; `motion` moving / flag `with_traffic`), is the share of the standing
+manoeuvres (`parked`, `stopped`, `wait`, and "it will start": `move_off`, `pull_out`, `start_cross` from
+standstill), taking hold within `motion_tau_s` (0.15 s); the manoeuvre filter sorts within each group. Where the
+radar does not know (no verdict, `p_stationary` within 0.15 of one half, speed known no better than 2.5 m/s) the
+share is drawn to one half: neither hardens. When the verdict changes while the object was (or is) seen faster
+than a few m/s, that much of the lane assignment (which rested on how the object moved) is void and is decided
+anew; a car that comes to a stop or moves off keeps its lane. A `parked` flag weighs towards the lanes `park` and
+`off`. The flag `oncoming` (should a radar send it) counts as `with_traffic` does: it moves.
 
 The road context comes from `roadgeom` (centre line, lane width, junction arms with their control), `lanes`
 (neighbouring lanes seen, road edges, the map's lane counts), `egolane`, `road` (the plan, where no line is
