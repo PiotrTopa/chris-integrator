@@ -18,7 +18,9 @@ directory `<dir>/<YYYYmmdd-HHMMSS>/` with
                         (roadsense-signs `lights_replay`, `signd_replay`) needs to say what was there to see.
 
 The file is flushed and synced to the disk every 5 s (a host that loses power keeps all but the last
-seconds). A session opened while the wall clock was wrong (a boot without a clock source) is renamed to its
+seconds). Compressing and writing happen on a thread of the recorder's own, in the order the lines came: the
+compressor works through its buffer in pieces of about 128 kB (tens of milliseconds on a phone's little core),
+and the per-message path does not wait for that. A session opened while the wall clock was wrong (a boot without a clock source) is renamed to its
 true start time when the clock is stepped.
 
 Cost: about 30 kB/s of compressed messages and one 40-110 kB JPEG a second, a few milliseconds of one little
@@ -32,7 +34,9 @@ import gzip
 import json
 import logging
 import os
+import queue
 import shutil
+import threading
 import time
 
 from ..native import round                  # builtins.round, native where built
@@ -179,6 +183,8 @@ class Recorder:
         self._flush_t = 0.0
         self._frame_t = -1e9
         self._prune_t = 0.0
+        self._q = None              # lines (and flush marks) for the writer thread
+        self._thread = None
 
     # ---- session ---------------------------------------------------------
     def _open(self):
@@ -188,10 +194,42 @@ class Recorder:
         os.makedirs(os.path.join(self.dir, "frames"), exist_ok=True)
         self.fh = gzip.open(os.path.join(self.dir, "messages.jsonl.gz"), "at", compresslevel=3)
         self._opened = (self.clock(), self.wall())
+        self._q = queue.Queue(maxsize=4096)        # (a writer that falls far behind slows the caller, never loses lines)
+        self._thread = threading.Thread(target=self._writer, args=(self.fh, self._q), name="recorder", daemon=True)
+        self._thread.start()
         self.prune()
         log.info("recording to %s (cap %s MB)", self.dir, self.cfg["max_mb"])
 
+    _FLUSH = object()               # a mark in the writer's queue: flush the file and sync it to the disk
+    _STOP = object()
+
+    def _writer(self, fh, q):
+        """The writer thread: every line into the compressed file, in order; flush + fsync at each mark."""
+        while True:
+            item = q.get()
+            if item is self._STOP:
+                return
+            if self.failed:
+                continue
+            try:
+                if item is self._FLUSH:
+                    fh.flush()
+                    try:
+                        os.fsync(fh.fileno())
+                    except (OSError, ValueError, AttributeError):
+                        pass
+                else:
+                    fh.write(item)
+            except (OSError, ValueError) as e:
+                if not self.failed:
+                    log.warning("recorder stopped (write): %s", e)
+                self.failed = True
+
     def close(self):
+        if self._thread is not None:
+            self._q.put(self._STOP)
+            self._thread.join()
+            self._thread = self._q = None
         if self.fh is not None:
             try:
                 self.fh.close()
@@ -243,16 +281,12 @@ class Recorder:
         try:
             if self.fh is None:
                 self._open()
-            self.fh.write(line + "\n")
+            self._q.put(line + "\n")
             self.written["messages"] += 1
             self.written["bytes_in"] += len(line) + 1
             if now - self._flush_t > 5.0:
                 self._flush_t = now
-                self.fh.flush()
-                try:
-                    os.fsync(self.fh.fileno())
-                except (OSError, ValueError, AttributeError):
-                    pass
+                self._q.put(self._FLUSH)
                 self._redate(now)
             if mtype == "camera":
                 self._frame(now, line)
