@@ -171,10 +171,10 @@ def marginals(ratio, iters=30, tol=1e-4):
 # probabilities (mu), the free estimate (xf, Pf) and the combination (x, P). The object's attributes are views
 # of its row; the native calls read and write the rows of a scan's objects directly.
 _LAY = (("xs", (3, N)), ("Ps", (3, N, N)), ("mu", (3,)), ("xf", (N,)), ("Pf", (N, N)), ("x", (N,)), ("P", (N, N)))
-_OFF = {}
+_OFF = []
 _o = 0
 for _k, _sh in _LAY:
-    _OFF[_k] = (_o, _sh)
+    _OFF.append(("_" + _k, _o, _o + int(np.prod(_sh)), _sh))
     _o += int(np.prod(_sh))
 ROW = _o                         # numbers per object
 
@@ -259,8 +259,8 @@ class Obj:
     def bind(self, store):
         """Point the object's arrays at its row of the state array."""
         row = store.a[self.slot]
-        for k, (o, sh) in _OFF.items():
-            setattr(self, "_" + k, row[o:o + int(np.prod(sh))].reshape(sh))
+        for k, a, b, sh in _OFF:
+            setattr(self, k, row[a:b].reshape(sh))
 
     @property
     def exist(self):
@@ -294,6 +294,7 @@ class Tracker:
         self.scan_times = {}         # sensor id -> deque of scan times within the map's memory
         self.real_ids = set()        # objects that were confirmed: only their first detections make the map
         self.score_hist = {}         # sensor id -> [true counts, false counts] over the score bins
+        self.score_odds = {}         # sensor id -> the log odds of each bin, as far as asked since the last change
         self.bias_t = None
         self.t = None
 
@@ -455,18 +456,26 @@ class Tracker:
         return h
 
     def _score_odds(self, src, sc):
-        """Log odds a box of this score adds for "a real thing" (0 without a score)."""
+        """Log odds a box of this score adds for "a real thing" (0 without a score). Per bin, kept until the
+        sensor's histograms change (`_score_learn`)."""
         if sc is None:
             return 0.0
         c = self.cfg
-        ht, hf = self._hist(src)
         b = min(int(sc * c["score_bins"]), c["score_bins"] - 1)
-        r = math.log(((ht[b] + 0.5) / (ht.sum() + 0.5 * len(ht))) / ((hf[b] + 0.5) / (hf.sum() + 0.5 * len(hf))))
-        return c["score_gain"] * max(-c["score_max"], min(c["score_max"], r))
+        tab = self.score_odds.get(src)
+        if tab is None:
+            tab = self.score_odds[src] = [None] * c["score_bins"]
+        v = tab[b]
+        if v is None:
+            ht, hf = self._hist(src)
+            r = math.log(((ht[b] + 0.5) / (ht.sum() + 0.5 * len(ht))) / ((hf[b] + 0.5) / (hf.sum() + 0.5 * len(hf))))
+            v = tab[b] = c["score_gain"] * max(-c["score_max"], min(c["score_max"], r))
+        return v
 
     def _score_learn(self, scores, real):
         c = self.cfg
         for src, sc in scores:
+            self.score_odds.pop(src, None)
             h = self._hist(src)[0 if real else 1]
             h[min(int(sc * c["score_bins"]), c["score_bins"] - 1)] += 1.0
             if h.sum() > c["score_keep"]:
@@ -721,18 +730,18 @@ class Tracker:
         """The scan's detections as the native core reads them (chris_native.c `RDET`): kind, scale-rate baseline,
         group (kind and baseline: what is predicted alike), vehicle (1) / person (-1) / not known (0), box width,
         z, the variances (R's diagonal)."""
-        D = np.zeros((len(dets), 13))
+        rows = []
         kinds = {}
+        pad = (0.0, 0.0, 0.0, 0.0)
         for j, d in enumerate(dets):
             k = d.get("kind")
             lab = classvote.norm_label((d.get("attrs") or {}).get("class"))
-            z = d["z"]
-            m = len(z)
-            D[j, :5] = (kind_code(k), float(d.get("sdt") or 0.0), kinds.setdefault((k, d.get("sdt")), len(kinds)),
-                        0 if lab is None else (1 if lab in M.VEHICLES else -1), float(d.get("w") or 0.0))
-            D[j, 5:5 + m] = z
-            D[j, 9:9 + m] = d["R"] if Rs is None else np.diag(Rs[j])
-        return D
+            z = list(d["z"])
+            R = list(d["R"]) if Rs is None else list(np.diag(Rs[j]))
+            rows.append([kind_code(k), float(d.get("sdt") or 0.0), kinds.setdefault((k, d.get("sdt")), len(kinds)),
+                         0 if lab is None else (1 if lab in M.VEHICLES else -1), float(d.get("w") or 0.0)]
+                        + z + list(pad[len(z):]) + R + list(pad[len(R):]))
+        return np.array(rows, float).reshape(len(dets), 13)
 
     def _associate_native(self, src, t, sensor, pose, objs, D):
         """_associate in one native call (chris_native.c `radar_scan`)."""
@@ -970,13 +979,19 @@ class Tracker:
             if t - tf > c["check_window_s"]:
                 continue                                 # no update near that time: nothing to check it with
             back = t - tf                                # the present estimate, taken back to that time
-            ex, ey = o.x[PX] - o.x[VX] * back - px, o.x[PY] - o.x[VY] * back - py
-            S = Pp + o.P[:2, :2] + np.eye(2) * 0.05
-            try:
-                m2 = float(np.array([ex, ey]) @ np.linalg.solve(S, np.array([ex, ey]))) / 2.0
-            except np.linalg.LinAlgError:
-                continue
-            e = math.hypot(ex, ey)
+            if _NR is not None:
+                r = _NR.radar_check(self.store.a, o.slot, back, px, py, Pp)
+                if r is None:
+                    continue
+                m2, e = r
+            else:
+                ex, ey = o.x[PX] - o.x[VX] * back - px, o.x[PY] - o.x[VY] * back - py
+                S = Pp + o.P[:2, :2] + np.eye(2) * 0.05
+                try:
+                    m2 = float(np.array([ex, ey]) @ np.linalg.solve(S, np.array([ex, ey]))) / 2.0
+                except np.linalg.LinAlgError:
+                    continue
+                e = math.hypot(ex, ey)
             o.n_checks += 1
             o.consistency = m2 if o.consistency is None else o.consistency + 0.25 * (m2 - o.consistency)
             o.pred_err = e if o.pred_err is None else o.pred_err + 0.25 * (e - o.pred_err)
@@ -1091,6 +1106,13 @@ class Tracker:
                     and T - o.last_seen[src] <= c["bias_seen_s"] and o.P[M.DP, M.DP] < c["bias_ripe"] * o.dp0]
             if not ripe:
                 continue
+            a = 1.0 - math.exp(-dt / cc["bias_tau_s"])
+            if _NR is not None:
+                m, ws = _NR.radar_register(self.store.a, [o.slot for o in ripe], sen.dp_obj_var,
+                                           [o.slot for o in self.objects if src in o.sources], a)
+                b[0] += a * m
+                b[1] = max((1.0 - a) * b[1] + a / ws, math.radians(cc["bias_floor_deg"]) ** 2)
+                continue
             w = np.array([1.0 / (o.P[M.DP, M.DP] + sen.dp_obj_var) for o in ripe])
             v = np.array([o.x[M.DP] for o in ripe])
             if len(ripe) >= 3:                           # the middle one by weight: one wrong object does not steer it
@@ -1099,7 +1121,6 @@ class Tracker:
                 m = float(v[k][int(np.searchsorted(cw, 0.5 * cw[-1]))])
             else:
                 m = float((w * v).sum() / w.sum())
-            a = 1.0 - math.exp(-dt / cc["bias_tau_s"])
             shift = a * m
             b[0] += shift
             b[1] = max((1.0 - a) * b[1] + a / float(w.sum()), math.radians(cc["bias_floor_deg"]) ** 2)

@@ -4636,6 +4636,125 @@ done:
     return res;
 }
 
+/* radar_check(S, row, back, px, py, Pp) -> (m2, e) | None. Tracker._check for one expectation: the object's
+ * present estimate taken back by `back` seconds against where it said it would be then (px, py; Pp: the 2 x 2
+ * covariance it gave): half the squared distance in both uncertainties (+ 0.05 m2 each way), and the distance.
+ * None: the sum is singular. */
+static PyObject *n_radar_check(PyObject *self, PyObject *args)
+{
+    PyObject *oS, *oPp;
+    Py_ssize_t slot;
+    double back, px, py, Pp[4];
+    if (!PyArg_ParseTuple(args, "OndddO", &oS, &slot, &back, &px, &py, &oPp))
+        return NULL;
+    View vS;
+    Py_ssize_t cap;
+    if (store_get(oS, &vS, &cap) < 0)
+        return NULL;
+    PyObject *res = NULL;
+    if (slot < 0 || slot >= cap) {
+        PyErr_SetString(PyExc_IndexError, "radar: a row outside the state array");
+        goto done;
+    }
+    if (nums_get(oPp, 4, Pp, "Pp") < 0)
+        goto done;
+    {
+        const double *row = (const double *)vS.b.buf + slot * RROW, *x = row + RO_X, *P = row + RO_P;
+        double ex = x[R_PX] - x[R_VX] * back - px, ey = x[R_PY] - x[R_VY] * back - py;
+        double S[4] = {Pp[0] + P[0] + 0.05, Pp[1] + P[1] + 0.0, Pp[2] + P[RN] + 0.0, Pp[3] + P[RN + 1] + 0.05};
+        double nu[2] = {ex, ey}, d2;
+        if (r_mahal(S, 2, nu, &d2, NULL) < 0) {
+            res = Py_None;
+            Py_INCREF(res);
+        } else
+            res = Py_BuildValue("(dd)", d2 / 2.0, py_hypot(ex, ey));
+    }
+done:
+    view_drop(&vS);
+    return res;
+}
+
+/* radar_register(S, ripe, dp_var, rows, a) -> (m, sum of weights) | None. Tracker._register for one sensor:
+ * what the ripe objects agree on in their angle offsets (weights 1 / (P[dp, dp] + dp_var); from three on the
+ * middle one by weight, else the weighted mean), and that times `a` taken out of the offset of every object
+ * in `rows` (its hypotheses, combination and free estimate). None (nothing changed): no ripe object. */
+static PyObject *n_radar_register(PyObject *self, PyObject *args)
+{
+    PyObject *oS, *oripe, *orows;
+    double dpv, a;
+    if (!PyArg_ParseTuple(args, "OOdOd", &oS, &oripe, &dpv, &orows, &a))
+        return NULL;
+    View vS;
+    vS.held = 0;
+    PyObject *res = NULL;
+    Py_ssize_t cap, n = 0, nr = 0, *ripe = NULL, *rows = NULL;
+    double *w = NULL;
+    if (store_get(oS, &vS, &cap) < 0 || (ripe = idx_get(oripe, cap, &n)) == NULL || (rows = idx_get(orows, cap, &nr)) == NULL)
+        goto done;
+    if (n == 0) {
+        res = Py_None;
+        Py_INCREF(res);
+        goto done;
+    }
+    w = (double *)PyMem_Malloc((size_t)(4 * n) * sizeof(double));
+    if (w == NULL) {
+        PyErr_NoMemory();
+        goto done;
+    }
+    {
+        double *A = (double *)vS.b.buf, *v = w + n, *cw = v + n, *wv = cw + n, m;
+        for (Py_ssize_t i = 0; i < n; i++) {
+            const double *row = A + ripe[i] * RROW;
+            w[i] = 1.0 / (row[RO_P + R_DP * RN + R_DP] + dpv);
+            v[i] = row[RO_X + R_DP];
+        }
+        if (n >= 3) {                                    /* the middle one by weight */
+            Py_ssize_t *k = (Py_ssize_t *)PyMem_Malloc((size_t)n * sizeof(Py_ssize_t));
+            if (k == NULL) {
+                PyErr_NoMemory();
+                goto done;
+            }
+            for (Py_ssize_t i = 0; i < n; i++) {         /* argsort, stable (numpy's for small arrays) */
+                Py_ssize_t j = i;
+                while (j > 0 && v[k[j - 1]] > v[i]) {
+                    k[j] = k[j - 1];
+                    j--;
+                }
+                k[j] = i;
+            }
+            for (Py_ssize_t i = 0; i < n; i++)
+                cw[i] = i ? cw[i - 1] + w[k[i]] : w[k[i]];
+            double half = 0.5 * cw[n - 1];
+            Py_ssize_t idx = 0;
+            while (idx < n && cw[idx] < half)            /* np.searchsorted(cw, half): the first cw >= half */
+                idx++;
+            if (idx >= n)
+                idx = n - 1;
+            m = v[k[idx]];
+            PyMem_Free(k);
+        } else {
+            for (Py_ssize_t i = 0; i < n; i++)
+                wv[i] = w[i] * v[i];
+            m = np_sum(wv, n, 1) / np_sum(w, n, 1);
+        }
+        double shift = a * m;
+        for (Py_ssize_t i = 0; i < nr; i++) {
+            double *row = A + rows[i] * RROW;
+            for (int j = 0; j < 3; j++)
+                row[RO_XS + j * RN + R_DP] -= shift;
+            row[RO_X + R_DP] -= shift;
+            row[RO_XF + R_DP] -= shift;
+        }
+        res = Py_BuildValue("(dd)", m, np_sum(w, n, 1));
+    }
+done:
+    PyMem_Free(ripe);
+    PyMem_Free(rows);
+    PyMem_Free(w);
+    view_drop(&vS);
+    return res;
+}
+
 /* ==================================================================================================== */
 static PyMethodDef methods[] = {
     {"dumps", n_dumps, METH_O, "json.dumps(obj, separators=(',', ':')); raises Fallback where json must decide"},
@@ -4668,6 +4787,8 @@ static PyMethodDef methods[] = {
     {"radar_frame", n_radar_frame, METH_VARARGS, "the output's per-object numbers (box.py Radar.frame)"},
     {"radar_life", n_radar_life, METH_VARARGS, "Tracker.manage's numbers: stillness, finiteness, out-of-view place"},
     {"radar_merge", n_radar_merge, METH_VARARGS, "Tracker._merge's geometry: the near pairs and their test"},
+    {"radar_check", n_radar_check, METH_VARARGS, "Tracker._check for one expectation"},
+    {"radar_register", n_radar_register, METH_VARARGS, "Tracker._register for one sensor: the shared offset, taken out"},
     {NULL, NULL, 0, NULL}};
 
 static struct PyModuleDef moduledef = {PyModuleDef_HEAD_INIT, "_chris_native",
