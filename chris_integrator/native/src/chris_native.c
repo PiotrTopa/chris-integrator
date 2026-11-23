@@ -1931,8 +1931,8 @@ done:
 }
 
 /* ====================================================================================================
- * The estimator's filter pass and its innovation monitors (core/ekf.py `Filter._run`, core/monitors.py
- * `NisMonitor`, core/fdi.py `Trend`): the loop over the queued entries and their rows, with the first-pass
+ * The estimator's filter pass and its monitors (core/ekf.py `Filter._run`, core/monitors.py `NisMonitor`,
+ * `SelfCheck`, core/fdi.py `Trend`, `Stream`): the loop over the queued entries and their rows, with the first-pass
  * monitoring of every row, in one call. Python is called for what is not arithmetic: a row's model h(x), a
  * generic model's prediction, a row's own callback, and the integrator's hooks when a monitor's verdict
  * holds or changes.
@@ -2366,6 +2366,538 @@ static PyType_Slot trend_slots[] = {
     {0, NULL}};
 static PyType_Spec trend_spec = {"chris_integrator.native._chris_native.Trend", sizeof(Trend), 0, Py_TPFLAGS_DEFAULT,
                                  trend_slots};
+
+/* ---- a source's stated uncertainty over its characterised one (monitors.SelfCheck's arithmetic) -------------
+ * The window runs on evidence time (the clock advances by the time between samples, capped at max_step); it
+ * keeps recover_window_s of it. The verdict uses the median of the last fire_window_s and of the whole window.
+ * Both medians come from ordered copies kept as samples come and go (a new sample after its equals, the oldest
+ * equal removed: the order sorted() gives); while a NaN is in the window statistics.median decides. */
+typedef struct {
+    PyObject_HEAD
+    double fire_w, min_n, fire_ratio, rec_w, rec_min_n, rec_ratio, max_step;
+    double *ev, *it;                /* the window, a ring of capacity cap (oldest at head) */
+    Py_ssize_t head, len, cap, nfire; /* nfire: the newest nfire samples are within fire_window_s */
+    double *sa, *sf;                /* ordered copies: the whole window, the fire part */
+    Py_ssize_t nsa, nsf, nnan;
+    double evnow, last_t, median, changed_t, peak;
+    int has_last, fault, has_median, has_changed;
+    Py_ssize_t n;
+} SelfWin;
+
+static PyObject *SelfWinType;
+
+static PyObject *selfwin_new(PyTypeObject *tp, PyObject *args, PyObject *kw)
+{
+    allocfunc alloc = (allocfunc)PyType_GetSlot(tp, Py_tp_alloc);
+    return alloc(tp, 0);
+}
+
+static void selfwin_free(SelfWin *m)
+{
+    PyMem_Free(m->ev); PyMem_Free(m->it); PyMem_Free(m->sa); PyMem_Free(m->sf);
+    m->ev = m->it = m->sa = m->sf = NULL;
+    m->cap = 0;
+}
+
+/* SelfWindow(fire_window_s, min_n, fire_ratio, recover_window_s, recover_min_n, recover_ratio, max_step_s) */
+static int selfwin_init(PyObject *self, PyObject *args, PyObject *kw)
+{
+    SelfWin *m = (SelfWin *)self;
+    double a[7];
+    if (!PyArg_ParseTuple(args, "ddddddd", &a[0], &a[1], &a[2], &a[3], &a[4], &a[5], &a[6]) || np_ready() < 0)
+        return -1;
+    selfwin_free(m);
+    m->fire_w = a[0], m->min_n = a[1], m->fire_ratio = a[2], m->rec_w = a[3], m->rec_min_n = a[4];
+    m->rec_ratio = a[5], m->max_step = a[6];
+    m->head = m->len = m->nfire = m->nsa = m->nsf = m->nnan = m->n = 0;
+    m->evnow = m->last_t = m->median = m->changed_t = m->peak = 0.0;
+    m->has_last = m->fault = m->has_median = m->has_changed = 0;
+    return 0;
+}
+
+static void selfwin_dealloc(PyObject *self)
+{
+    PyTypeObject *tp = Py_TYPE(self);
+    selfwin_free((SelfWin *)self);
+    freefunc f = (freefunc)PyType_GetSlot(tp, Py_tp_free);
+    f(self);
+    Py_DECREF(tp);
+}
+
+static void sorted_insert(double *s, Py_ssize_t *ns, double d)
+{
+    Py_ssize_t lo = 0, hi = *ns;                    /* after the equal values */
+    while (lo < hi) {
+        Py_ssize_t mid = (lo + hi) / 2;
+        if (d < s[mid])
+            hi = mid;
+        else
+            lo = mid + 1;
+    }
+    memmove(s + lo + 1, s + lo, (size_t)(*ns - lo) * sizeof(double));
+    s[lo] = d;
+    (*ns)++;
+}
+
+static void sorted_remove(double *s, Py_ssize_t *ns, double d)
+{
+    Py_ssize_t lo = 0, hi = *ns;                    /* the leftmost equal value (the oldest of them) */
+    while (lo < hi) {
+        Py_ssize_t mid = (lo + hi) / 2;
+        if (s[mid] < d)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    if (lo < *ns && s[lo] == d) {
+        memmove(s + lo, s + lo + 1, (size_t)(*ns - lo - 1) * sizeof(double));
+        (*ns)--;
+    }
+}
+
+static double sorted_median(const double *s, Py_ssize_t n)
+{
+    return (n % 2) ? s[n / 2] : (s[n / 2 - 1] + s[n / 2]) / 2;
+}
+
+#define SW_AT(m, i) (((m)->head + (i)) % (m)->cap)
+
+/* statistics.median of the window's newest k samples (a NaN is among them) */
+static int selfwin_pymedian(SelfWin *m, Py_ssize_t k, double *out)
+{
+    PyObject *l = PyList_New(k);
+    if (l == NULL)
+        return -1;
+    for (Py_ssize_t i = 0; i < k; i++) {
+        PyObject *f = PyFloat_FromDouble(m->it[SW_AT(m, m->len - k + i)]);
+        if (f == NULL) {
+            Py_DECREF(l);
+            return -1;
+        }
+        PyList_SetItem(l, i, f);
+    }
+    PyObject *r = PyObject_CallFunctionObjArgs(stat_median, l, NULL);
+    Py_DECREF(l);
+    if (r == NULL)
+        return -1;
+    *out = PyFloat_AsDouble(r);
+    Py_DECREF(r);
+    return (*out == -1.0 && PyErr_Occurred()) ? -1 : 0;
+}
+
+static int selfwin_grow(SelfWin *m)
+{
+    Py_ssize_t cap = m->cap ? 2 * m->cap : 64;
+    double *ev = PyMem_Malloc((size_t)cap * sizeof(double)), *it = PyMem_Malloc((size_t)cap * sizeof(double));
+    double *sa = PyMem_Malloc((size_t)cap * sizeof(double)), *sf = PyMem_Malloc((size_t)cap * sizeof(double));
+    if (ev == NULL || it == NULL || sa == NULL || sf == NULL) {
+        PyMem_Free(ev); PyMem_Free(it); PyMem_Free(sa); PyMem_Free(sf);
+        PyErr_NoMemory();
+        return -1;
+    }
+    for (Py_ssize_t i = 0; i < m->len; i++) {
+        ev[i] = m->ev[SW_AT(m, i)];
+        it[i] = m->it[SW_AT(m, i)];
+    }
+    if (m->nsa)
+        memcpy(sa, m->sa, (size_t)m->nsa * sizeof(double));
+    if (m->nsf)
+        memcpy(sf, m->sf, (size_t)m->nsf * sizeof(double));
+    PyMem_Free(m->ev); PyMem_Free(m->it); PyMem_Free(m->sa); PyMem_Free(m->sf);
+    m->ev = ev, m->it = it, m->sa = sa, m->sf = sf;
+    m->head = 0;
+    m->cap = cap;
+    return 0;
+}
+
+/* one sample; returns 1 when the verdict changed, 0 when not, -1 on an error */
+static int selfwin_offer_c(SelfWin *m, double t, double r)
+{
+    if (m->has_last) {
+        double d = t - m->last_t;
+        if (0.0 > d)                                /* min(max(t - last_t, 0.0), max_step) */
+            d = 0.0;
+        if (m->max_step < d)
+            d = m->max_step;
+        m->evnow += d;
+    }
+    m->last_t = t;
+    m->has_last = 1;
+    if (m->len == m->cap && selfwin_grow(m) < 0)
+        return -1;
+    m->ev[SW_AT(m, m->len)] = m->evnow;
+    m->it[SW_AT(m, m->len)] = r;
+    m->len++;
+    m->nfire++;
+    if (r == r) {
+        sorted_insert(m->sa, &m->nsa, r);
+        sorted_insert(m->sf, &m->nsf, r);
+    } else
+        m->nnan++;
+    while (m->len && m->ev[m->head] < m->evnow - m->rec_w) {      /* the window keeps recover_window_s */
+        double v = m->it[m->head];
+        if (v == v) {
+            sorted_remove(m->sa, &m->nsa, v);
+            if (m->nfire == m->len)
+                sorted_remove(m->sf, &m->nsf, v);
+        } else
+            m->nnan--;
+        if (m->nfire == m->len)
+            m->nfire--;
+        m->head = (m->head + 1) % m->cap;
+        m->len--;
+    }
+    while (m->nfire && m->ev[SW_AT(m, m->len - m->nfire)] < m->evnow - m->fire_w) {
+        double v = m->it[SW_AT(m, m->len - m->nfire)];
+        if (v == v)
+            sorted_remove(m->sf, &m->nsf, v);
+        m->nfire--;
+    }
+    int nan_fire = 0;
+    if (m->nnan)
+        for (Py_ssize_t i = m->len - m->nfire; i < m->len; i++)
+            if (m->it[SW_AT(m, i)] != m->it[SW_AT(m, i)])
+                nan_fire = 1;
+    m->n = m->nfire;
+    if (m->n) {
+        if (nan_fire) {
+            if (selfwin_pymedian(m, m->n, &m->median) < 0)
+                return -1;
+        } else
+            m->median = sorted_median(m->sf, m->nsf);
+        m->has_median = 1;
+    } else
+        m->has_median = 0;
+    if ((double)m->n >= m->min_n) {
+        double q = m->median / m->fire_ratio;       /* max(self.peak, median / fire_ratio) */
+        if (q > m->peak)
+            m->peak = q;
+    }
+    int old = m->fault;
+    if (!old) {
+        if ((double)m->n >= m->min_n && m->median > m->fire_ratio)
+            m->fault = 1;
+    } else {
+        double span = m->len ? m->evnow - m->ev[m->head] : 0.0;
+        if ((double)m->len >= m->rec_min_n && span >= 0.9 * m->rec_w) {
+            double mr;
+            if (m->nnan) {
+                if (selfwin_pymedian(m, m->len, &mr) < 0)
+                    return -1;
+            } else
+                mr = sorted_median(m->sa, m->nsa);
+            if (mr < m->rec_ratio && m->median < m->rec_ratio)
+                m->fault = 0;
+        }
+    }
+    if (m->fault != old) {
+        m->changed_t = t;
+        m->has_changed = 1;
+        return 1;
+    }
+    return 0;
+}
+
+static PyObject *selfwin_offer(PyObject *self, PyObject *args)
+{
+    double t, r;
+    if (!PyArg_ParseTuple(args, "dd", &t, &r))
+        return NULL;
+    int ch = selfwin_offer_c((SelfWin *)self, t, r);
+    return ch < 0 ? NULL : PyBool_FromLong(ch);
+}
+
+static PyObject *selfwin_reset(PyObject *self, PyObject *unused)
+{
+    SelfWin *m = (SelfWin *)self;                   /* the window forgotten; evidence time and the verdict stay */
+    m->head = m->len = m->nfire = m->nsa = m->nsf = m->nnan = 0;
+    m->has_last = 0;
+    Py_RETURN_NONE;
+}
+
+static PyObject *selfwin_median(PyObject *self, void *c)
+{
+    SelfWin *m = (SelfWin *)self;
+    if (!m->has_median)
+        Py_RETURN_NONE;
+    return PyFloat_FromDouble(m->median);
+}
+static PyObject *selfwin_changed(PyObject *self, void *c)
+{
+    SelfWin *m = (SelfWin *)self;
+    if (!m->has_changed)
+        Py_RETURN_NONE;
+    return PyFloat_FromDouble(m->changed_t);
+}
+static PyObject *selfwin_fault(PyObject *self, void *c) { return PyBool_FromLong(((SelfWin *)self)->fault); }
+static PyObject *selfwin_n(PyObject *self, void *c) { return PyLong_FromSsize_t(((SelfWin *)self)->n); }
+static PyObject *selfwin_peak(PyObject *self, void *c) { return PyFloat_FromDouble(((SelfWin *)self)->peak); }
+static PyObject *selfwin_span(PyObject *self, void *c)
+{
+    SelfWin *m = (SelfWin *)self;
+    return PyFloat_FromDouble(m->len ? m->evnow - m->ev[m->head] : 0.0);
+}
+
+static PyMethodDef selfwin_methods[] = {
+    {"offer", selfwin_offer, METH_VARARGS, "offer(t, ratio) -> True when the verdict changed"},
+    {"reset_data", selfwin_reset, METH_NOARGS, "forget the window (evidence time and the verdict stay)"},
+    {NULL, NULL, 0, NULL}};
+static PyGetSetDef selfwin_getset[] = {
+    {"fault", selfwin_fault, NULL, "the verdict", NULL},
+    {"median", selfwin_median, NULL, "median ratio of the last fire_window_s (None before a sample)", NULL},
+    {"n", selfwin_n, NULL, "samples in the last fire_window_s", NULL},
+    {"peak", selfwin_peak, NULL, "the largest median over the firing level", NULL},
+    {"changed_t", selfwin_changed, NULL, "when the verdict last changed (None: never)", NULL},
+    {"span", selfwin_span, NULL, "evidence time the window covers", NULL},
+    {NULL, NULL, NULL, NULL, NULL}};
+static PyType_Slot selfwin_slots[] = {
+    {Py_tp_new, selfwin_new}, {Py_tp_init, selfwin_init}, {Py_tp_dealloc, selfwin_dealloc},
+    {Py_tp_methods, selfwin_methods}, {Py_tp_getset, selfwin_getset},
+    {Py_tp_doc, "A source's stated over characterised uncertainty, windowed (core/monitors.py SelfCheck subclasses it)"},
+    {0, NULL}};
+static PyType_Spec selfwin_spec = {"chris_integrator.native._chris_native.SelfWindow", sizeof(SelfWin), 0,
+                                   Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE, selfwin_slots};
+
+/* ---- signal integrity of one raw stream (fdi.Stream's arithmetic) -----------------------------------------
+ * offer(t, v, s) for a finite v: None (an old sample, or a stream not yet known to vary), 1 (the windowed
+ * statistics are not due: what was held last time holds), or (due, stuck, repeat, noise): stuck None or
+ * (fault, duration, samples); repeat None or (repeats, pairs) when their share reaches repeat_share; noise None
+ * or (ratio, wild, n) when it was computed. The texts and the held findings are the caller's (fdi.Stream). */
+typedef struct {
+    PyObject_HEAD
+    double stuck_s, stuck_n, stuck_fault_s, learn_n, learn_repeat, repeat_share, noise_lim, outlier_z;
+    Py_ssize_t repeat_w, noise_w, maxn;
+    double *qt, *qv, *qs, *work;
+    Py_ssize_t head, len;
+    double run_t, run_v, h_rep, noise_ratio;
+    int has_run;
+    long long run_n, k, h_n;
+} StreamSt;
+
+static PyObject *StreamType;
+
+static PyObject *stream_new(PyTypeObject *tp, PyObject *args, PyObject *kw)
+{
+    allocfunc alloc = (allocfunc)PyType_GetSlot(tp, Py_tp_alloc);
+    StreamSt *m = (StreamSt *)alloc(tp, 0);
+    if (m != NULL)
+        m->noise_ratio = 1.0;
+    return (PyObject *)m;
+}
+
+static void stream_free(StreamSt *m)
+{
+    PyMem_Free(m->qt); PyMem_Free(m->qv); PyMem_Free(m->qs); PyMem_Free(m->work);
+    m->qt = m->qv = m->qs = m->work = NULL;
+}
+
+/* StreamState(stuck_s, stuck_n, stuck_fault_s, learn_n, learn_repeat, repeat_window, repeat_share, noise_window,
+ *             noise_ratio, outlier_z) */
+static int stream_init(PyObject *self, PyObject *args, PyObject *kw)
+{
+    StreamSt *m = (StreamSt *)self;
+    double a[10];
+    if (!PyArg_ParseTuple(args, "dddddddddd", &a[0], &a[1], &a[2], &a[3], &a[4], &a[5], &a[6], &a[7], &a[8], &a[9]) ||
+        np_ready() < 0)
+        return -1;
+    if (!(a[5] >= 2 && a[7] >= 3 && a[5] < 1e6 && a[7] < 1e6) || a[5] != (double)(Py_ssize_t)a[5] ||
+        a[7] != (double)(Py_ssize_t)a[7]) {
+        PyErr_SetString(PyExc_ValueError, "StreamState: the windows must be whole numbers (repeat >= 2, noise >= 3)");
+        return -1;
+    }
+    stream_free(m);
+    m->stuck_s = a[0], m->stuck_n = a[1], m->stuck_fault_s = a[2], m->learn_n = a[3], m->learn_repeat = a[4];
+    m->repeat_w = (Py_ssize_t)a[5], m->repeat_share = a[6], m->noise_w = (Py_ssize_t)a[7], m->noise_lim = a[8];
+    m->outlier_z = a[9];
+    m->maxn = (m->noise_w > m->repeat_w ? m->noise_w : m->repeat_w) + 2;
+    m->qt = PyMem_Malloc((size_t)m->maxn * sizeof(double));
+    m->qv = PyMem_Malloc((size_t)m->maxn * sizeof(double));
+    m->qs = PyMem_Malloc((size_t)m->maxn * sizeof(double));
+    m->work = PyMem_Malloc((size_t)m->maxn * sizeof(double));
+    if (m->qt == NULL || m->qv == NULL || m->qs == NULL || m->work == NULL) {
+        stream_free(m);
+        PyErr_NoMemory();
+        return -1;
+    }
+    m->head = m->len = 0;
+    m->has_run = 0, m->run_n = 0, m->k = 0, m->h_n = 0;
+    m->h_rep = 0.0, m->noise_ratio = 1.0;
+    return 0;
+}
+
+static void stream_dealloc(PyObject *self)
+{
+    PyTypeObject *tp = Py_TYPE(self);
+    stream_free((StreamSt *)self);
+    freefunc f = (freefunc)PyType_GetSlot(tp, Py_tp_free);
+    f(self);
+    Py_DECREF(tp);
+}
+
+/* statistics.median of n values (sorted here when none is NaN; statistics.median itself otherwise) */
+static int median_of(double *a, Py_ssize_t n, double *out)
+{
+    int nan = 0;
+    for (Py_ssize_t i = 0; i < n; i++)
+        if (a[i] != a[i])
+            nan = 1;
+    if (nan || n == 0) {
+        PyObject *l = PyList_New(n);
+        if (l == NULL)
+            return -1;
+        for (Py_ssize_t i = 0; i < n; i++) {
+            PyObject *f = PyFloat_FromDouble(a[i]);
+            if (f == NULL) {
+                Py_DECREF(l);
+                return -1;
+            }
+            PyList_SetItem(l, i, f);
+        }
+        PyObject *r = PyObject_CallFunctionObjArgs(stat_median, l, NULL);
+        Py_DECREF(l);
+        if (r == NULL)
+            return -1;
+        *out = PyFloat_AsDouble(r);
+        Py_DECREF(r);
+        return (*out == -1.0 && PyErr_Occurred()) ? -1 : 0;
+    }
+    for (Py_ssize_t i = 1; i < n; i++) {            /* stable: the order sorted() gives */
+        double v = a[i];
+        Py_ssize_t j = i;
+        while (j > 0 && v < a[j - 1]) {
+            a[j] = a[j - 1];
+            j--;
+        }
+        a[j] = v;
+    }
+    *out = sorted_median(a, n);
+    return 0;
+}
+
+#define ST_AT(m, i) (((m)->head + (i)) % (m)->maxn)
+
+static PyObject *stream_offer(PyObject *self, PyObject *args)
+{
+    StreamSt *m = (StreamSt *)self;
+    double t, v, s;
+    if (!PyArg_ParseTuple(args, "ddd", &t, &v, &s))
+        return NULL;
+    if (m->qt == NULL) {
+        PyErr_SetString(PyExc_ValueError, "StreamState: not initialised");
+        return NULL;
+    }
+    if (m->len && t <= m->qt[ST_AT(m, m->len - 1)])
+        Py_RETURN_NONE;
+    if (m->has_run && v == m->run_v)
+        m->run_n++;
+    else
+        m->run_v = v, m->run_t = t, m->run_n = 1, m->has_run = 1;
+    if (m->len == m->maxn) {
+        m->head = (m->head + 1) % m->maxn;
+        m->len--;
+    }
+    m->qt[ST_AT(m, m->len)] = t, m->qv[ST_AT(m, m->len)] = v, m->qs[ST_AT(m, m->len)] = s;
+    m->len++;
+    /* what this stream normally does: the share of samples equal to their predecessor (while no run goes on) */
+    if (v != 0.0 && m->run_n <= 3) {
+        m->h_n++;
+        m->h_rep += ((m->run_n > 1 ? 1.0 : 0.0) - m->h_rep) / (double)(m->h_n < 500 ? m->h_n : 500);
+    }
+    if (!((double)m->h_n >= m->learn_n && m->h_rep < m->learn_repeat))
+        Py_RETURN_NONE;
+    PyObject *stuck = Py_None, *rep = Py_None, *noise = Py_None, *res = NULL;
+    Py_INCREF(Py_None); Py_INCREF(Py_None); Py_INCREF(Py_None);
+    if (fabs(v) > 4.0 * s && 4.0 * s > 0.0 && (double)m->run_n >= m->stuck_n && t - m->run_t >= m->stuck_s) {
+        Py_DECREF(stuck);
+        stuck = Py_BuildValue("(OdL)", t - m->run_t >= m->stuck_fault_s ? Py_True : Py_False, t - m->run_t, m->run_n);
+        if (stuck == NULL)
+            goto fail;
+    }
+    Py_ssize_t n = m->len;
+    m->k++;
+    if (m->k % 4) {                                 /* the windowed statistics: every fourth sample */
+        if (stuck == Py_None) {
+            Py_DECREF(stuck); Py_DECREF(rep); Py_DECREF(noise);
+            return PyLong_FromLong(1);
+        }
+        res = Py_BuildValue("(ONOO)", Py_False, stuck, rep, noise);
+        Py_DECREF(rep);
+        Py_DECREF(noise);
+        return res;
+    }
+    if (n >= m->repeat_w) {
+        Py_ssize_t kk = n - m->repeat_w, cnt = 0;
+        for (Py_ssize_t i = kk + 1; i < n; i++) {
+            double a = m->qv[ST_AT(m, i)], b = m->qv[ST_AT(m, i - 1)];
+            if (a == b && a != 0.0)
+                cnt++;
+        }
+        if ((double)cnt / (double)(n - kk - 1) >= m->repeat_share) {
+            Py_DECREF(rep);
+            if ((rep = Py_BuildValue("(nn)", cnt, n - kk - 1)) == NULL)
+                goto fail;
+        }
+    }
+    if (n >= m->noise_w) {
+        for (Py_ssize_t i = 0; i < n; i++)
+            m->work[i] = m->qs[ST_AT(m, i)];
+        double sig;
+        if (median_of(m->work, n, &sig) < 0)
+            goto fail;
+        if (sig > 0.0) {
+            Py_ssize_t nd = 0;
+            for (Py_ssize_t i = 2; i < n; i++) {
+                double a = m->qv[ST_AT(m, i)], b = m->qv[ST_AT(m, i - 1)], c = m->qv[ST_AT(m, i - 2)];
+                if (a != b)
+                    m->work[nd++] = fabs(a - 2.0 * b + c) / 2.449;
+            }
+            if (nd >= 10) {
+                Py_ssize_t wild = 0;
+                for (Py_ssize_t i = 0; i < nd; i++)
+                    if (m->work[i] > m->outlier_z * sig)
+                        wild++;
+                double med;
+                if (median_of(m->work, nd, &med) < 0)
+                    goto fail;
+                double ratio = 1.4826 * med / sig;
+                m->noise_ratio = ratio;
+                Py_DECREF(noise);
+                if ((noise = Py_BuildValue("(dnn)", ratio, wild, nd)) == NULL)
+                    goto fail;
+            }
+        }
+    }
+    res = Py_BuildValue("(ONNN)", Py_True, stuck, rep, noise);
+    return res;
+fail:
+    Py_XDECREF(stuck); Py_XDECREF(rep); Py_XDECREF(noise);
+    return NULL;
+}
+
+static PyObject *stream_clear(PyObject *self, PyObject *unused)
+{
+    StreamSt *m = (StreamSt *)self;                 /* the window and the run forgotten; what was learned stays */
+    m->head = m->len = 0;
+    m->has_run = 0;
+    m->run_n = 0;
+    Py_RETURN_NONE;
+}
+
+static PyObject *stream_noise(PyObject *self, void *c) { return PyFloat_FromDouble(((StreamSt *)self)->noise_ratio); }
+
+static PyMethodDef stream_methods[] = {
+    {"offer", stream_offer, METH_VARARGS, "offer(t, v, s) for a finite v: see the type's doc"},
+    {"clear", stream_clear, METH_NOARGS, "forget the window and the run (a new epoch)"},
+    {NULL, NULL, 0, NULL}};
+static PyGetSetDef stream_getset[] = {
+    {"noise_ratio", stream_noise, NULL, "the last measured noise over the characterised level", NULL},
+    {NULL, NULL, NULL, NULL, NULL}};
+static PyType_Slot stream_slots[] = {
+    {Py_tp_new, stream_new}, {Py_tp_init, stream_init}, {Py_tp_dealloc, stream_dealloc},
+    {Py_tp_methods, stream_methods}, {Py_tp_getset, stream_getset},
+    {Py_tp_doc, "Signal integrity of one raw stream (core/fdi.py Stream subclasses it)"}, {0, NULL}};
+static PyType_Spec stream_spec = {"chris_integrator.native._chris_native.StreamState", sizeof(StreamSt), 0,
+                                  Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE, stream_slots};
 
 /* ---- the filter pass ------------------------------------------------------------------------------------ */
 enum {
@@ -7109,6 +7641,12 @@ PyMODINIT_FUNC PyInit__chris_native(void)
     Py_INCREF(NisWinType);
     Py_INCREF(TrendType);
     if (PyModule_AddObject(m, "NisWindow", NisWinType) < 0 || PyModule_AddObject(m, "Trend", TrendType) < 0)
+        goto fail;
+    if ((SelfWinType = PyType_FromSpec(&selfwin_spec)) == NULL || (StreamType = PyType_FromSpec(&stream_spec)) == NULL)
+        goto fail;
+    Py_INCREF(SelfWinType);
+    Py_INCREF(StreamType);
+    if (PyModule_AddObject(m, "SelfWindow", SelfWinType) < 0 || PyModule_AddObject(m, "StreamState", StreamType) < 0)
         goto fail;
 #ifdef __FP_FAST_FMA
     /* informational: the target has a fused multiply-add; the build must not contract (see the Makefile) */

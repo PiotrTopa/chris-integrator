@@ -452,6 +452,15 @@ def test_golden_innovation_monitors():
         np.testing.assert_allclose(np.array(values, float), np.array(g["values"][i], float), rtol=1e-12, atol=1e-12)
 
 
+def test_golden_monitor_windows():
+    """The native SelfWindow (monitors.SelfCheck) and StreamState (fdi.Stream) against what the Python monitors
+    gave: every result exact (medians, comparisons, the stream's statistics and texts)."""
+    from chris_integrator.core import fdi as FD
+    from chris_integrator.core import monitors as MO
+    _held("selfcheck", K.cases_selfcheck(), lambda *c: K.selfcheck_run(MO.SelfCheck, *c))
+    _held("stream", K.cases_stream(), lambda *c: K.stream_run(FD.Stream, *c))
+
+
 def test_golden_filter_pass():
     """The native filter pass (ekf_run with the monitors) against the Python pass over scripts of late rows,
     re-runs, robust gating, disabled groups, quarantine from the hooks: over the arithmetic model every observed

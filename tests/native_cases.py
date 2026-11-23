@@ -628,3 +628,87 @@ def filter_pass_split(ego, res):
              quarantine, reruns)
     values = [[s[1].tolist(), s[2].tolist()] for s in states]
     return exact, values
+
+
+# ---- the monitors' windows: a source's own uncertainty, a raw stream's integrity ------------------------------
+SELF_CFG = dict(fire_window_s=5.0, min_n=15, fire_ratio=4.0, recover_window_s=10.0, recover_min_n=30, recover_ratio=3.0,
+                max_step_s=0.25)
+
+
+def cases_selfcheck():
+    """(cfg, [(t, ratio)], reset_at) for monitors.SelfCheck: faults and recoveries, NaN, zeros of both signs,
+    repeated values, time standing still and going back, gaps beyond the windows."""
+    rng = random.Random(53)
+    for i in range(300):
+        cfg = dict(SELF_CFG)
+        if i % 3:
+            cfg.update(fire_window_s=rng.choice([5.0, 1.0, 12.0]), min_n=rng.choice([15, 1, 4]),
+                       recover_window_s=rng.choice([10.0, 2.0]), recover_min_n=rng.choice([30, 3]),
+                       max_step_s=rng.choice([0.25, 3.0]))
+        t, offers, level, prev = 10.0, [], 1.0, 1.0
+        for _ in range(rng.randrange(1, 500)):
+            t += rng.choice([0.05, 0.05, 0.05, 0.0, 0.5, -0.2, 4.0])
+            if rng.random() < 0.02:
+                level = rng.choice([1.0, 6.0, 2.0, 10.0])
+            k = rng.random()
+            r = float("nan") if k < 0.01 else rng.choice([0.0, -0.0]) if k < 0.02 else prev if k < 0.1 else \
+                level * (0.5 + rng.random())
+            prev = r
+            offers.append((t, r))
+        yield cfg, offers, rng.randrange(len(offers) + 1)
+
+
+def selfcheck_run(SelfCheck, cfg, offers, reset_at):
+    m = SelfCheck("g", "q", cfg)
+    out = []
+    for i, (t, r) in enumerate(offers):
+        if i == reset_at:
+            m.reset_data()
+        ch = m.offer(t, r)
+        span = m.win.span() if hasattr(m, "win") else m.span
+        out.append((ch, m.fault, m.median, m.n, m.peak, m.changed_t, span))
+    return out
+
+
+def cases_stream():
+    """(cfg changes, [(t, v, s)]) for fdi's Stream: varying signals, frozen runs, repeats, noise bursts, wild
+    samples, ints, values that are not numbers, zero and odd sigmas, stamps going back."""
+    rng = random.Random(54)
+    for i in range(300):
+        c = {}
+        if i % 2:
+            c = dict(learn_n=rng.choice([60, 5]), stuck_n=rng.choice([10, 3]), stuck_s=rng.choice([1.5, 0.2]),
+                     stuck_fault_s=rng.choice([2.5, 0.4]),
+                     repeat_window=rng.choice([40, 6]), noise_window=rng.choice([40, 12]), noise_ratio=rng.choice([4.0, 1.5]))
+        t, offers, mode, v = 5.0, [], 0, 10.0
+        for _ in range(rng.randrange(1, 600)):
+            t += rng.choice([0.05, 0.05, 0.1, 0.0, -0.1])
+            if rng.random() < 0.03:
+                mode = rng.randrange(5)
+            s = rng.choice([0.1, 0.1, 0.1, 0.0, 1, 0.05]) if rng.random() < 0.95 else float("nan")
+            if mode == 0:                              # a varying signal
+                v = v + normal(rng, 0.2)
+            elif mode == 1:                            # frozen
+                pass
+            elif mode == 2:                            # sample and hold
+                v = v if rng.random() < 0.6 else v + normal(rng, 0.2)
+            elif mode == 3:                            # noise
+                v = 10.0 + normal(rng, 3.0)
+            else:                                      # wild samples now and then
+                v = v + normal(rng, 0.05) + (rng.choice([-20.0, 20.0]) if rng.random() < 0.1 else 0.0)
+            k = rng.random()
+            val = rng.choice([float("nan"), float("inf"), None, "x", True]) if k < 0.01 else \
+                rng.choice([0, 3, 0.0]) if k < 0.03 else v
+            offers.append((t, val, s))
+        yield c, offers
+
+
+def stream_run(Stream, c, offers):
+    from chris_integrator.core import fdi
+    st = Stream(dict(fdi.DEFAULT_CFG, **c))
+    out = []
+    for i, (t, v, s) in enumerate(offers):
+        if i == len(offers) // 2:
+            st.clear()
+        out.append((st.offer(t, v, s), st.noise_ratio))
+    return out

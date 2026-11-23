@@ -53,7 +53,7 @@ class Finding:
                 "since_s": round(max(0.0, now - self.since), 1), "text": self.text}
 
 
-class Stream:
+class _StreamPy:
     """Signal integrity of one raw stream (group, quantity)."""
 
     def __init__(self, cfg):
@@ -132,6 +132,49 @@ class Stream:
         self.run_n = 0
 
 
+class _StreamNative(_C.StreamState):
+    """Signal integrity of one raw stream (group, quantity): a value frozen while it should vary, samples that
+    repeat their predecessor, noise beyond the characterised level, wild samples, values that are not numbers. The
+    arithmetic is the native core's (chris_native.c `StreamState`); the findings' texts are made here."""
+
+    def __init__(self, cfg):
+        super().__init__(cfg["stuck_s"], cfg["stuck_n"], cfg["stuck_fault_s"], cfg["learn_n"], cfg["learn_repeat"],
+                         cfg["repeat_window"], cfg["repeat_share"], cfg["noise_window"], cfg["noise_ratio"],
+                         cfg["outlier_z"])
+        self.c = cfg
+        self.held = []
+
+    def offer(self, t, v, s):
+        """-> [(kind, level, text)] conditions that hold now."""
+        if not (isinstance(v, (int, float)) and math.isfinite(v)):
+            return [("invalid", "fault", "value is not a number")]
+        r = super().offer(t, v, s)
+        if r is None:
+            return []
+        if r == 1:
+            return list(self.held)
+        due, stuck, rep, noise = r
+        c, out = self.c, []
+        if stuck is not None:
+            out.append(("stuck", "fault" if stuck[0] else "warn",
+                        "value frozen at %.4g for %.1f s (%d samples)" % (v, stuck[1], stuck[2])))
+        if not due:
+            return out + self.held
+        self.held = []
+        out0 = len(out)
+        if rep is not None and not out:
+            out.append(("repeat", "warn", "%d %% of samples repeat their predecessor" % round(100.0 * rep[0] / rep[1])))
+        if noise is not None:
+            ratio, wild, nd = noise
+            if ratio >= c["noise_ratio"]:
+                out.append(("noise", "fault" if ratio >= c["noise_fault_ratio"] else "warn",
+                            "noise %.1fx the characterised level" % ratio))
+            elif wild / nd >= c["outlier_share"] and wild >= 3:
+                out.append(("outliers", "warn", "%d wild samples in the last %d" % (wild, nd)))
+        self.held = out[out0:]
+        return out
+
+
 class Clock:
     """Timing integrity of one message stream: how far its stamp is ahead of the newest stamp of any *other*
     stream when it arrives. Normally a constant of the stream (its latency); a step in it is a stamp offset or a
@@ -170,6 +213,11 @@ class Clock:
         self.base = self.t0 = None
         self.early = []
         self.shift = 0.0
+
+
+from .monitors import MON_PY  # noqa: E402
+
+Stream = _StreamPy if MON_PY else _StreamNative
 
 
 def Trend(cfg):
