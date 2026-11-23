@@ -618,12 +618,16 @@ def trend_run(Trend, cfg, offers):
 
 
 def filter_pass_split(ego, res):
-    """(exact part, values to rounding) of what filter_pass observed: over the arithmetic model everything is
-    exact; over the native model (sin, cos, exp of the C library) the states and the monitors' numbers are values,
-    the decisions (flags, hooks, rejections, quarantine) exact."""
-    if not ego:
-        return res, None
+    """(exact part, values to rounding) of what filter_pass observed. Over the arithmetic model everything is exact
+    but the trends' sums (exp of the C library); over the native model (sin, cos, exp) the states and the monitors'
+    numbers are values, the decisions (flags, hooks, rejections, quarantine) exact."""
     log, snaps, states, flags, rejected, quarantine, reruns = res
+    if not ego:
+        tv = [e[4] for e in log if e[0] == "trend"] + [v for snap in snaps for s in snap if len(s) == 5 for v in s[1:4]]
+        exact = ([e[:4] if e[0] == "trend" else e for e in log], [[s if len(s) == 4 else (s[0], s[4]) for s in snap]
+                                                                   for snap in snaps], states, flags, rejected,
+                 quarantine, reruns)
+        return exact, [tv]
     exact = ([(e[0], e[1], e[3] if e[0] in ("nis", "trend") else None) for e in log],
              [[s[0] for s in snap] for snap in snaps], [(s[0], s[4], s[5]) for s in states], flags, rejected,
              quarantine, reruns)

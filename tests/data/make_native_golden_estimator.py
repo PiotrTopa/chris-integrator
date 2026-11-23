@@ -7,7 +7,9 @@ of how the entries were made. It does not run on a later tree: the Python versio
 
 The `nis` entry was recorded again (from the same Python NisMonitor, at the commit that added this script) after
 its cases took e * e instead of e ** 2: `**` is libm's pow, whose last bit differs between C libraries (glibc
-and musl), so the inputs were not the same on the phone's platform.
+and musl), so the inputs were not the same on the phone's platform. The `filter_pass` entry was recorded again
+(from the Python pass at that commit) with the trends' sums over the arithmetic model as values to rounding
+(they take exp of the C library), no longer in the exact digest.
 """
 import gzip
 import json

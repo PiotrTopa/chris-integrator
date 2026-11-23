@@ -464,7 +464,8 @@ def test_golden_monitor_windows():
 def test_golden_filter_pass():
     """The native filter pass (ekf_run with the monitors) against the Python pass over scripts of late rows,
     re-runs, robust gating, disabled groups, quarantine from the hooks: over the arithmetic model every observed
-    bit; over the native model the decisions exactly and the states to rounding."""
+    bit but the trends' sums (exp: to rounding); over the native model the decisions exactly and the states to
+    rounding."""
     from chris_integrator.core import ekf as KF
     from chris_integrator.core import fdi as FD
     from chris_integrator.core import monitors as MO
@@ -475,7 +476,9 @@ def test_golden_filter_pass():
         res = K.filter_pass(ego, ops, KF.Filter, KF.Row, MO.NisMonitor, FD.Trend)
         exact, values = K.filter_pass_split(ego, res)
         assert K.digest(exact) == g["out"][i], i
-        if values is not None:
+        if not ego:                                    # the trends' sums
+            np.testing.assert_allclose(np.array(values[0]), np.array(g["values"][i][0]), rtol=1e-12, atol=1e-12)
+        else:
             for (x, P), (xr, Pr) in zip(values, g["values"][i]):
                 np.testing.assert_allclose(np.array(x), np.array(xr), rtol=1e-9, atol=1e-9)
                 np.testing.assert_allclose(np.array(P), np.array(Pr), rtol=1e-9, atol=1e-9)
