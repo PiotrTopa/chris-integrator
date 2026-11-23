@@ -306,6 +306,7 @@ def make_app(stack, readers=None, datadir=None, feed=None, recorder=None, roadse
             ("GET", "tracks", _topic("tracks", "no input yet")),
             ("GET", "lanes", _topic("lanes", "no road message yet")),
             ("GET", "view", _topic("view", "no road message yet")),
+            ("GET", "decide", _topic("decide", "no radar message yet")),
             ("GET", "calib", _topic("calib", "no calib message yet")),
             ("GET", "gnss", _topic("gnss", "no gnss message yet")),
             ("GET", "roadgeom", h_roadgeom),

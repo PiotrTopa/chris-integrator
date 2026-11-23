@@ -769,3 +769,27 @@ def scenario(name, seed=1, night=False):
     fn = SCENARIOS.get(name) or ALERT_SCENARIOS[name]
     spec = fn(seed, night)
     return ScenarioWorld(spec, seed=seed, name=name, night=night)
+
+
+# ---- lane DECIDE: the driver does not react (forward-collision-warning tests) -------------------------------------
+def sc_stopped_cruise(speed):
+    """A stationary car in the ego lane on a straight road, 200 m+ ahead; the ego keeps its speed and never reacts.
+    The run ends 0.3 s before the car's front would touch it (`collision_t`): an alert's lead time is measured to
+    that time (tools/decide_replay.py)."""
+    def build(seed, night):
+        rng = random.Random(seed * 101 + 9 + int(speed))
+        far = max(200.0, 12.0 * speed) + rng.uniform(0, 20)
+        L = DIMS["car"][0]
+        s_car = far + CAM_TO_AXLE + L / 2
+        t_col = (far - 2.1) / speed                  # the ego's front (2.1 m ahead of the camera) at the car's rear
+
+        def actors(w):
+            return [Actor(800, "car", "stopped_in_lane", s_car, lateral=[(0, rng.gauss(0, 0.15))],
+                          yaw_rel=rng.gauss(0, 0.02))]
+        return dict(T=t_col - 0.3, speed=[(0, speed)], curv=[(0, 0.0)], actors=actors,
+                    lead_range_m=70.0 if night else 100.0, approach=speed, mode="cruise", collision_t=t_col)
+    return build
+
+
+for _v in (14, 25):
+    ALERT_SCENARIOS["stopped_cruise_%d" % _v] = sc_stopped_cruise(float(_v))

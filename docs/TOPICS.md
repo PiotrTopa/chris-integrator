@@ -14,7 +14,14 @@ drawn from its objects (`attrs.source: "radar"`) and carry what it knows: `attrs
 vehicle standing beside the path: a screen draws it dimmed), `attrs.obstacle` (it stands on the path),
 `attrs.threat` (reached within seconds at the present speeds), `attrs.with_traffic`, `attrs.ttc_s`; and `view`
 has `alert`: `null` or `{"level": "threat" | "obstacle", "id", "x", "y", "ttc_s", "lead"}`, the one thing ahead
-to shout about (`lead: true` when it is the object the lead is drawn from). `{"view": {"radar_objects": false}}`
+to shout about (`lead: true` when it is the object the lead is drawn from). Since lane DECIDE (2026-11-23) these
+flags and the alert come from the decision layer's `decide` topic while it is fresh (below; `{"view": {"radar":
+{"flags_from": "radar"}}}` restores the radar's own flags): `attrs.threat` / `fl` `t` = the object's level as
+shown is warning or imminent; `attrs.obstacle` / `fl` `o` = caution, or information on an object the radar says
+stands on the path (`in_path`); `ttc_s` the decision layer's time to collision; `alert` = the `obstacle_ahead`
+alert while it would be said (stage caution or above, not suppressed, mode `shadow` or `on`): `level` `threat`
+from warning, `obstacle` at caution, with the added fields `stage`, `stage_name`, `mode`, `source: "decide"`,
+`tn`, `p_coll`, `tm_s`. A consumer keeps its own mode on top (the MFD's `obstacle_ahead` is `shadow` by default). `{"view": {"radar_objects": false}}`
 keeps the detector's boxes as the only source. While the radar speaks `view` also has `around`: every object
 all round the car for a plan display (a radar scope), remembered ones included and marked, the lead included
 (`view.around` below; `objects` is unchanged by it). Paths in the moved text are those of the chris-roadsense repository at the time
@@ -43,6 +50,7 @@ to the debug face (`--roadsense-http`). `POST /v2/vehicle` goes to the integrato
 | `GET /v2/fused` | map and camera combined per fact with provenance (topic `fused`, below) |
 | `GET /v2/lanes` | the tracked road geometry (topic `lanes`, below): four lane lines and two road edges with a presence that has hysteresis and a filtered geometry; 503 before the first `road` message |
 | `GET /v2/lead` | the tracked lead vehicle (topic `lead`, below): distance, relative speed, time gap, standing flag, `departed` cue, with the raw vision value alongside; 503 before the first `road` message |
+| `GET /v2/decide` | latest `decide` message (the decision layer: threat per object, the alerts; below) |
 | `GET /v2/view` | the display channel (topic `view`, below): smoothed objects and lines with ids, velocities and fades, and the road picture `view.road`, for a consumer that draws; 503 before the first `road` message |
 | `GET /v2/version` | `{"name":"roadsense-api","version":"2.0.0","api":2,"topics":[...]}`; `/v2/health` carries the same as `api: {"major": 2, "version": "2.0.0"}` |
 | `GET /v2/vehicle` | the car as the host describes it: mapd's `vehicle` message (every signal with age, quality and source, description, calibration estimates, feeders) plus the last scan of every range sensor (`objects`); 503 while mapd is not running. roadsense [`docs/VEHICLE_API.md`](https://github.com/PiotrTopa/roadsense/blob/main/docs/VEHICLE_API.md) 8 |
@@ -704,3 +712,87 @@ Without mapd, without a pack or without a position `road` still carries the came
 `<config dir>/view.json` (keys of `view.DEFAULT_CFG`; the key `road` holds overrides of
 `roadview.DEFAULT_CFG`). Replay: roadsense [`tools/view_replay.py`](https://github.com/PiotrTopa/roadsense/blob/main/tools/view_replay.py)` SESSION [--map MAP.jsonl]` prints how often each part is
 given on a recorded drive.
+
+
+### consolidated topic (chris-integrator): `{"type":"decide", ...}` (the decision layer, lane DECIDE)
+
+`chris_integrator/decide` with its plug-in `chris_integrator/plugins/decide.py`: one message per `radar` message
+(the radar's rate; `rate_hz` caps it), in the car frame of that message's time held fixed on the ground. For the
+car against every object the radar lists as confirmed or coast, over the object's predicted futures (the
+prediction layer's modes with a position covariance per time, contract in `chris_integrator/decide/futures.py`;
+without them, degraded, the radar's own two hypotheses as constant-velocity modes) and the car's own futures (the
+contract's `ego_fut`; without it, the road model's plan at the present acceleration and the present turn):
+
+```
+{"type": "decide", "api": 1, "seq": 812, "ts_mono_ns": ..., "ts_real_ns": ..., "radar_seq": 640, "frame": "car",
+ "ego": {"speed_mps": 13.9, "a_avail_mps2": [7.4, 6.1],      // braking, lateral: what a driver gets of mu g here
+         "road": "dry" | "wet" | "snow" | "ice",               // configured, or from `env` (rain: wet, snow: snow)
+         "t_react_s": 1.47,                                    // the driver's reaction time (quantile of a log-normal)
+         "driver": {"a_long": -0.3, "a_lat": 0.1, "brake": null}},
+ "futures": {"objects": "contract" | "cv" | "mixed", "cv": 3, "invalid": 0, "ego": "contract" | "own",
+             "ego_modes": [["path", 0.85], ["turn", 0.15]], "horizon_s": 6.0},
+ "objects": [ {                                                // listed: a level, p_coll >= 0.01, or a headway
+     "id": 17, "kind": "vehicle" | "vru" | "unknown", "size": [4.5, 1.8], "size_src": "class" | "radar",
+     "fut": "contract" | "cv",
+     "level": 3, "level_name": "warning",                      // 0 none, 1 information, 2 caution, 3 warning, 4 imminent
+     "level_exit": 3, "level_cond": 2,                         // with the exit thresholds; with conditioned probabilities
+     "shown": 3,                                               // with hysteresis between entry and exit (the view's flags)
+     "mass": [0.97, 0.97, 0.91, 0.12],                         // probability mass at level >= 1..4 (unconditioned)
+     "p_coll": 0.91, "p_coll_cond": 0.62,                      // collision probability over the horizon: sum over the
+                                                               //   pairs (object mode x car mode) of p0 x p_ego x pc
+     "ttc_s": 2.6, "thw_s": 1.1, "sep_m": 0.0,                 // on the mean futures; headway: a vehicle ahead going our way
+     "btn": 0.48, "stn": 0.21, "tn": 0.21,                     // threat numbers: required / available (brake, steer, best
+                                                               //   of every direction on the friction circle)
+     "a_req": {"brake": 3.6, "left": 1.3, "right": 1.6, "comb": 1.3, "comb_dir_deg": 90},
+     "ttb_s": 1.4, "tts_s": 1.9, "tm_s": 0.43,                 // last onset of full braking / steering that avoids it;
+                                                               //   tm = max(ttb, tts) - t_react: what the driver has left
+     "why": {"mode": "brake", "p0": 0.9, "p": 0.9, "ego_mode": "keep", "measure": "time_margin" | "threat_number" |
+             "collision_course", "pc": 0.99, "t_contact_s": 2.6},   // the pair and the measure that decided
+     "lane": {...},                                            // the prediction's lane probabilities, when given
+     "in_path": false,                                         // the radar's flag, passed on
+     "pairs": [...]} ],                                        // cfg pairs: every judged pair (explain view)
+ "alerts": [ {"id": "obstacle_ahead", "mode": "off" | "shadow" | "on", "stage": 3, "stage_name": "warning",
+              "active": false,                                 // mode on, stage >= show_from (caution), not suppressed
+              "object": 17, "since_s": 0.4, "latched": false,
+              "suppressed": null | "driver_braking" | "driver_steering_away" | "low_speed" | "sensor_degraded",
+              "reason": {"level", "level_exit", "kind", "measure", "mode", "ego_mode", "p0", "p_coll", "p_coll_cond",
+                         "tn", "btn", "stn", "tm_s", "ttb_s", "tts_s", "ttc_s", "thw_s", "fut"},
+              "text": "WARNING VEHICLE 2.6s"},
+            {"id": "headway", ...} ],
+ "primary": {...} | null,                                      // the obstacle_ahead entry while its stage > 0
+ "events": [ {"t", "alert", "mode", "event": "raise" | "escalate" | "lower" | "switch" | "suppress" | "unsuppress" |
+              "clear", "stage", "stage_name", "object", "suppressed", "would_show", "active", "reason", "text"} ],
+ "counts": {"judged": 12, "listed": 3, "steps": 121}}
+```
+
+How the numbers are made (docs/DESIGN.md section 17; the arithmetic is native, `decide.c`):
+
+| measure | method |
+|---|---|
+| `pc` per pair | quasi-Monte Carlo (`samples`, default 256, a fixed Halton sequence: deterministic): each draw is one whole future of the object's position error (the two covariances summed, coherent in time), its length, width and heading; the share of draws whose footprint overlaps the car's at any step of the horizon. `pc_method: "analytic"`: the exact Gaussian integral over the Minkowski sum of the two footprints per step (Owen's T per edge, adaptive quadrature), the horizon's figure its largest (a lower bound) |
+| collision course | the mean futures with the object's footprint inflated by `k_sigma` of its spread (capped) and the margins: they touch within the horizon |
+| `a_req` | the smallest constant demand from now that keeps the car clear of the inflated footprint (and, steering, of the other objects' most probable modes): braking with its build-up (`brake_buildup_s`), steering with its build-up, and `combo_dirs` braking-and-steering directions per side; followed `horizon_ext_s` beyond the horizon |
+| `btn`, `stn`, `tn` | `a_req.brake / a_avail[0]`, `min(left, right) / a_avail[1]`, the least share of the friction ellipse of any direction tried |
+| `ttb_s`, `tts_s` | the latest onset of full braking / full steering (to either side) that still avoids it |
+| levels | per pair: a collision course and `tn >= tn_min` or `tm <= tm_max` of the level (per class: vehicle, vru, unknown); per object: the highest level whose mass reaches its minimum |
+
+Alerts (`chris_integrator/decide/alerts.py`): `obstacle_ahead` (everything on a collision course ahead) and
+`headway` (time headway to a vehicle ahead: information below 1.5 s, caution below 0.9 s held 2 s, warning
+below 0.6 s; from 50 km/h). Each has a mode by configuration, `<config dir>/decide.json`:
+`{"alerts": {"obstacle_ahead": {"mode": "on"}}}`; default `shadow` for both (evaluated, logged exactly as it
+would have been said, `active: false`). Stage entry needs the level held `entry_hold_s` (0.3, 0.2, 0.1, 0 s for
+information .. imminent), a stage is shown at least `min_hold_s` (0.5, 1, 1.5, 2 s) and left when the exit level
+has been below it for `exit_hold_s` (0.5, 0.6, 0.8, 1 s); imminent latches until the exit level is information
+or the car stands. The primary changes to a challenger that ranks higher for `switch_hold_s` (0.3 s), at once to
+a higher level. Candidates: confirmed or coast, existence >= 0.6, seen within 2.5 s. On degraded futures: an
+object whose velocity is not observed yet raises at most information until the radar's p_stationary has moved to
+0.65; one the radar calls parked at most information; one that most probably stands rises above caution only when
+the radar's corridor test puts it surely in the path (`in_path`, `threat`). Suppressed (stage kept, nothing said,
+the reason given): the driver brakes at least 0.9 x the required deceleration (and 2 m/s^2), steers away (lateral
+acceleration >= 1.5 m/s^2 towards a side whose required demand it covers), speed below 3 m/s (2 m/s for
+pedestrians and cyclists), the sensors' newest sample older than 1 s. Every change is an event (`events`), kept
+in the plug-in's health (`shadow_log`, the last 20) and written to the log (`alert obstacle_ahead (shadow): raise
+stage warning object 17 [WARNING VEHICLE 2.6s]`).
+
+`tools/decide_replay.py CAPTURE | --scenario NAME`: what each alert would have done on a recorded drive or
+simulated scenarios: episodes, stages, lead time before the object's closest approach, false-alert candidates.

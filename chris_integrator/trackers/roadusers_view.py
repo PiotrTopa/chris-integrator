@@ -217,6 +217,10 @@ RADAR_CFG = dict(
     around_range_m=85.0,         # in every direction (the MFD radar view's largest range is 80 m)
     around_max=20,
     around_states=("confirmed", "coast", "memory"),
+    # the threat flags (`attrs.threat`, `attrs.obstacle`, `fl` t / o) and `alert` from the decision layer's `decide`
+    # while it is fresh (its per-object level as shown, with hysteresis, and its `obstacle_ahead` alert); "radar":
+    # the radar's own flags as before
+    flags_from="decide", decide_stale_s=0.5,
 )
 
 # a class label is passed in `around` only from this confidence on (the MFD's own rule for `objects`; a screen
@@ -253,6 +257,40 @@ class RadarDisplay:
         self.msg = None
         self.seen = {}               # radar id -> {"t0", "t", "o"}: first and last time listed, last object
         self.ar = {}                 # the same for `around` (remembered objects too)
+        self.dec = None              # the decision layer's newest `decide` (on_decide)
+        self._by_id = None
+
+    def on_decide(self, msg):
+        """The decision layer's `decide` message (or None): while it is fresh against the radar's, the threat flags
+        and the alert are its (`_flags`, `_alert`)."""
+        self.dec = msg if isinstance(msg, dict) else None
+
+    def _dec(self):
+        d, m = self.dec, self.msg
+        if self.cfg["flags_from"] != "decide" or d is None or m is None or not isinstance(d.get("ts_mono_ns"), int):
+            return None
+        if abs(d["ts_mono_ns"] - m["ts_mono_ns"]) / NS > self.cfg["decide_stale_s"]:
+            return None
+        return d
+
+    def _flags(self, o):
+        """(threat, obstacle, ttc_s) of a radar object. From `decide`: threat = its level as shown is warning or
+        above; obstacle = caution, or information on an object the radar says stands on the path (`in_path`);
+        ttc_s the decision layer's time to collision. Without a fresh `decide`: the radar's flags."""
+        fl = o.get("flags") or ()
+        d = self._dec()
+        if d is None:
+            return "threat" in fl, "in_path" in fl, o.get("ttc_s")
+        r = self._dec_by_id(d).get(o.get("id"))
+        if r is None:
+            return False, False, o.get("ttc_s")
+        sh = r.get("shown", r.get("level", 0)) or 0
+        return sh >= 3, sh == 2 or (sh == 1 and "in_path" in fl), r.get("ttc_s") if r.get("ttc_s") is not None else o.get("ttc_s")
+
+    def _dec_by_id(self, d):
+        if self._by_id is None or self._by_id[0] is not d:
+            self._by_id = (d, {r.get("id"): r for r in d.get("objects") or ()})
+        return self._by_id[1]
 
     def update(self, msg):
         ts = msg.get("ts_mono_ns")
@@ -308,6 +346,14 @@ class RadarDisplay:
         T = ts_ns / NS
         out, alert = [], None
         v_ego = float(((self.msg or {}).get("ego") or {}).get("speed_mps") or 0.0)
+        # with the decision layer: the one alert is its `obstacle_ahead` while that would be said (caution or above,
+        # not suppressed, mode shadow or on: a consumer applies its own mode on top)
+        dec = self._dec()
+        dec_al = None
+        if dec is not None:
+            dec_al = next((a for a in dec.get("alerts") or () if a.get("id") == "obstacle_ahead"), None)
+            if dec_al is None or dec_al.get("mode") == "off" or (dec_al.get("stage") or 0) < 2 or dec_al.get("suppressed"):
+                dec_al = None
         place = {}
         for oid in list(self.seen):
             s = self.seen[oid]
@@ -337,12 +383,20 @@ class RadarDisplay:
             o = s["o"]
             fl = o.get("flags") or ()
             is_lead = oid in lead_ids
-            if gone is None and o.get("state") in c["alert_states"] and ("threat" in fl or "in_path" in fl):
-                level = "threat" if "threat" in fl else "obstacle"
+            th, ob, ttc = self._flags(o)
+            if dec is None and gone is None and o.get("state") in c["alert_states"] and (th or ob):
+                level = "threat" if th else "obstacle"
                 if alert is None or (level == "threat") > (alert["level"] == "threat") or \
                         (level == alert["level"] and x < alert["x"]):
                     alert = {"level": level, "id": "ru:%d" % oid, "x": round(x, 2), "y": round(y, 2),
-                             "ttc_s": o.get("ttc_s"), "lead": is_lead}
+                             "ttc_s": ttc, "lead": is_lead}
+            if dec_al is not None and dec_al.get("object") == oid and gone is None:
+                st = dec_al["stage"]
+                rs = dec_al.get("reason") or {}
+                alert = {"level": "threat" if st >= 3 else "obstacle", "id": "ru:%d" % oid, "x": round(x, 2),
+                         "y": round(y, 2), "ttc_s": ttc, "lead": is_lead, "stage": st, "stage_name": dec_al.get("stage_name"),
+                         "mode": dec_al.get("mode"), "source": "decide", "tn": rs.get("tn"), "p_coll": rs.get("p_coll"),
+                         "tm_s": rs.get("tm_s")}
             if is_lead or not (0.5 < x <= c["max_range_m"] and abs(y) <= c["max_lateral_m"]):
                 s.pop("d0", None)                        # not drawn now: it fades in again when it is
                 continue
@@ -365,8 +419,8 @@ class RadarDisplay:
                         "meas_age_s": round(min((o.get("seen") or {"": 0.0}).values()) + max(T - s["t"], 0.0), 2),
                         "phase": phase, "alpha": round(alpha, 2),
                         "attrs": {"source": "radar", "approximate": True, "motion": o.get("motion"), "parked": parked,
-                                  "obstacle": "in_path" in fl, "threat": "threat" in fl,
-                                  "with_traffic": "with_traffic" in fl, "ttc_s": o.get("ttc_s")},
+                                  "obstacle": ob, "threat": th,
+                                  "with_traffic": "with_traffic" in fl, "ttc_s": ttc},
                         "cls": None if not isinstance(cls, dict) else {"label": cls.get("label"), "confidence": cls.get("confidence"),
                                                                        "source": cls.get("source")},
                         "box": None})
@@ -444,12 +498,13 @@ class RadarDisplay:
             if mv:
                 e["mv"] = mv
             # a remembered object is never an obstacle or a threat: nothing sees it
-            f = "".join(ch for ch, key in (("t", "threat"), ("o", "in_path"), ("p", "parked"), ("w", "with_traffic"))
-                        if key in fl and not (st == "memory" and ch in "to"))
+            th, ob, ttc = self._flags(o)
+            f = "".join(ch for ch, on in (("t", th), ("o", ob), ("p", "parked" in fl), ("w", "with_traffic" in fl))
+                        if on and not (st == "memory" and ch in "to"))
             if f:
                 e["fl"] = f
-            if ("t" in f or "o" in f) and isinstance(o.get("ttc_s"), (int, float)):
-                e["ttc"] = _r1(o["ttc_s"])
+            if ("t" in f or "o" in f) and isinstance(ttc, (int, float)):
+                e["ttc"] = _r1(ttc)
             if gone is not None:
                 a = max(0.0, 1.0 - max(gone, 0.0) / c["fade_s"])
             else:
@@ -473,6 +528,10 @@ class RadarDisplay:
             if label:
                 e["k"] = label
             lfl = (lead_obj or {}).get("flags") or ()
+            if lead_obj is not None:
+                lth, lob, _ = self._flags(lead_obj)
+                lfl = tuple(k for k in lfl if k not in ("threat", "in_path")) + (("threat",) if lth else ()) + \
+                    (("in_path",) if lob else ())
             mv = {"stationary": "s", "moving": "m"}.get((lead_obj or {}).get("motion"))
             if mv is None and isinstance(at.get("standing"), bool):
                 mv = "s" if at["standing"] else "m"
