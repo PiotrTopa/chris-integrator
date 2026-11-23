@@ -51,6 +51,12 @@ def _imports(retries=12, wait_s=20.0):
 
 # ---- one run through the stack ----------------------------------------------------------------------------------
 DET_EXTRA = None             # detector simulator parameters set from the command line
+# The detector's scale-rate measurement as measured on recorded rides (roadsense-signs lane scale-rate, 2026-11-23):
+# by day far boxes (12-20 px) come out at a median 0.009 /s over a 0.8 s baseline and 78 % of the boxes that have a
+# baseline get a value; at night about 0.05 /s and fewer. px: 1 sigma of the size per frame; max_std: the fit is
+# refused above this spread of the log scale.
+SCALE_DAY = {"px": 0.08, "rel": 0.002, "p": 0.78, "min_dt": 0.2, "max_dt": 1.0, "max_std": 0.06}
+SCALE_NIGHT = {"px": 0.45, "rel": 0.004, "p": 0.6, "min_dt": 0.2, "max_dt": 1.0, "max_std": 0.06}
 
 
 def run_stack(name, seed, night, road_users=True, det_params=None, track_source=True, camera_lead=True,
@@ -60,7 +66,8 @@ def run_stack(name, seed, night, road_users=True, det_params=None, track_source=
     view's display objects only, so tracks and lead are what they were before road users existed)."""
     MessageClock, default_sensors, rs, build = _imports()
     w = rs.scenario(name, seed=seed, night=night)
-    det = rs.DetectorSim(seed=1000 + seed, night=night, params=dict(det_params or {}, **(DET_EXTRA or {})) or None)
+    extra = {"scale_rate": SCALE_NIGHT if night else SCALE_DAY} if DET_EXTRA else {}
+    det = rs.DetectorSim(seed=1000 + seed, night=night, params=dict(det_params or {}, **extra) or None)
     sensors = default_sensors(vehicle={"seed": 11 + 97 * seed}, vision={"seed": 21 + 97 * seed, "leads": camera_lead},
                               gnss={"seed": 31 + 97 * seed}, map={"seed": 41 + 97 * seed})
     if road_users:
@@ -691,10 +698,12 @@ def main(argv=None):
                     help="the road model reports no lead (road.leads absent): what the road-user tracks do alone")
     ap.add_argument("--scale-rate", action="store_true",
                     help="the detector also measures how fast each object's image grows (assumed precision: 0.15 px "
-                         "on the size per frame, baseline up to 1.2 s, 80 %% of the whole boxes seen before)")
+                         "on the size per frame, baseline up to 1.2 s, 80 %% of the whole boxes seen before)".replace(
+                             "assumed precision: 0.15 px on the size per frame, baseline up to 1.2 s, 80 %% of the "
+                             "whole boxes seen before", "precision and coverage as measured on recorded rides: SCALE_DAY / SCALE_NIGHT"))
     a = ap.parse_args(argv)
     global DET_EXTRA
-    DET_EXTRA = {"scale_rate": {"px": 0.15, "rel": 0.003, "p": 0.8, "max_dt": 1.2}} if a.scale_rate else None
+    DET_EXTRA = "scale" if a.scale_rate else None
     if a.source == "view":
         a.baseline = True
     _, _, rs, _ = _imports()

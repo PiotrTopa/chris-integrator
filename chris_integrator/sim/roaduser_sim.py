@@ -305,7 +305,7 @@ class DetectorSim:
         self.pitch_err = math.radians(self.p["pitch_err_deg"]) * (pitch_sign if pitch_sign else rng.choice((-1, 1)))
         self.yaw_err = math.radians(self.p["yaw_err_deg"]) * (yaw_sign if yaw_sign else rng.choice((-1, 1)))
         self.log = []            # [(t, view, [(actor id | "fp:...", cls, box, clip)])]
-        self._seen = {}          # (actor, view) -> (time, true box height) of its last whole box there
+        self._seen = {}          # actor -> [(time, true box height)] of its whole boxes within the baseline window
 
     def calib_msg(self, ts_ns):
         return dict(self.calib, ts_mono_ns=ts_ns, ts_real_ns=ts_ns + 1_700_000_000 * NS)
@@ -443,14 +443,20 @@ class DetectorSim:
                 if sp:
                     # the detector's scale-rate measurement: this object's image against its image in an
                     # earlier pass of the same view (patch alignment: a fraction of a pixel on the size)
-                    prev = self._seen.get((aid, view))
-                    if prev is not None and not clip and 0.05 < t - prev[0] <= sp["max_dt"] and rng.random() < sp["p"]:
+                    # (the detector aligns patches of the full frame, so a box of either view continues the
+                    # chain; the oldest patch within its baseline window is the reference; a fit whose stated
+                    # spread is too large gives no value)
+                    hist = [q for q in self._seen.get(aid, ()) if t - q[0] <= sp["max_dt"]]
+                    old = [q for q in hist if t - q[0] >= sp["min_dt"]]
+                    if old and not clip and h >= 8.0 and rng.random() < sp["p"]:
+                        prev = old[0]
                         dts = t - prev[0]
-                        sd = math.hypot(sp["px"] / h, sp["px"] / prev[1], sp["rel"]) / dts
-                        dets[-1].update(scale_rate=round(math.log(h / prev[1]) / dts + rng.gauss(0.0, sd), 5),
-                                        scale_rate_std=round(sd, 5), scale_dt_s=round(dts, 3))
+                        sl = math.hypot(sp["px"] / h, sp["px"] / prev[1], sp["rel"])
+                        if sl <= sp["max_std"]:
+                            dets[-1].update(scale_rate=round(math.log(h / prev[1]) / dts + rng.gauss(0.0, sl / dts), 5),
+                                            scale_rate_std=round(sl / dts, 5), scale_dt_s=round(dts, 3))
                     if not clip:
-                        self._seen[(aid, view)] = (t, h)
+                        self._seen[aid] = hist + [(t, h)]
                 logd.append((aid, cls, box, clip))
             # false positives
             rate = 1.0 / 60.0 / (p["rate_hz"] * (1.0 - p["p_skip"]))      # per message, from per minute
