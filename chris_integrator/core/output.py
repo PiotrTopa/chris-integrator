@@ -2,7 +2,7 @@
 mode, age and contributing sources; calibration states; per-source health; the monitors' table."""
 import math
 
-from ..native import round                  # builtins.round, native where built
+from ..native import round                  # builtins.round (its results; the native core)
 from . import ego as E
 from .registry import NS
 

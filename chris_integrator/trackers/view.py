@@ -53,12 +53,11 @@ Display filtering, and what it costs (the measurement topics are untouched):
 
 No I/O and no wall clock in here; times come from the messages (CLOCK_MONOTONIC ns).
 """
+import bisect
 import math
 
-from ..native import round                  # builtins.round, native where built
-from .. import native as _native
+from ..native import core as _C, round, round_list
 from ..contract import LocalEgo, validity
-from ..fastround import round_flat, scales
 from .roadview import RoadView
 
 NS = 1e9
@@ -130,46 +129,26 @@ def _interp(xs, ys, x):
     return None
 
 
-def _interp_all_py(xs, ys, qs):
+def _interp_all(xs, ys, qs):
     """[_interp(xs, ys, q) for q in qs], walking the table once: for queries in rising order the segment search
     goes on where the last one ended (every earlier node was already below the smaller query); a query below
-    its predecessor starts over. The same comparisons and arithmetic as `_interp`, so the same numbers."""
-    if not xs or not ys:
-        return [None] * len(qs)
-    n = min(len(xs), len(ys))
-    x0, y0 = xs[0], ys[0]
-    out = []
-    i, prev = 1, None
-    for x in qs:
-        if x <= x0:
-            out.append(y0)
-            continue
-        if prev is not None and not x >= prev:
-            i = 1
-        prev = x
-        while i < n and not x <= xs[i]:
-            i += 1
-        if i >= n:
-            out.append(None)
-            continue
-        a, b = ys[i - 1], ys[i]
-        if a is None or b is None:
-            out.append(None)
-            continue
-        t = (x - xs[i - 1]) / ((xs[i] - xs[i - 1]) or 1.0)
-        out.append(a + (b - a) * t)
-    return out
+    its predecessor starts over. The same comparisons and arithmetic as `_interp`, so the same numbers (the
+    native core: chris_native.c `interp_all`; lists or tuples of numbers)."""
+    return _C.interp_all(xs, ys, qs)
 
 
-if _native.interp_all is None:
-    _interp_all = _interp_all_py
-else:
-    def _interp_all(xs, ys, qs, _n=_native.interp_all, _fb=_native.Fallback):
-        """`_interp_all_py` in the native core (lists of floats; anything else goes to the Python walk)."""
-        try:
-            return _n(xs, ys, qs)
-        except _fb:
-            return _interp_all_py(xs, ys, qs)
+def _prep(gx, y, y_std, xs, reach_std, b):
+    """A drawn line's points over `xs`: None when the first two have no value, else (ys, reach, jump). reach: the
+    distance up to which the line is drawn (it ends before the first point without a value or with a std above
+    `reach_std` beyond 10 m); ys: the points beyond it carry the last value (never drawn); jump: how far the
+    near part (5-20 m) moved against `b`, the drawn line (None without one). (chris_native.c `view_prep`)"""
+    return _C.view_prep(gx, y, y_std, xs, reach_std, b)
+
+
+def _blend(a, b, dy, ys, ks, dt, shifting):
+    """The drawn line's two smoothing stages towards ys (gains ks; while `shifting` the second stage follows the
+    first) and its lateral rate: (a, b, dy). (chris_native.c `view_blend`)"""
+    return _C.view_blend(a, b, dy, ys, ks, dt, shifting)
 
 
 class _Static:
@@ -667,27 +646,16 @@ class ViewBuilder:
             ok = isinstance(ln, dict) and ln.get("present") and isinstance(ln.get("y"), list)
             if ok:
                 gx = lanes["x"] if kind == "lane_line" else lanes.get("edges_x") or lanes["x"]
-                ys = _interp_all(gx, ln["y"], xs)
-                stds = _interp_all(gx, ln.get("y_std") or [], xs)
-                ok = ys[0] is not None and ys[1] is not None
+                fresh = st is None or not st.present and st.alpha == 0.0
+                r = _prep(gx, ln["y"], ln.get("y_std") or [], xs, c["line_reach_std_m"], None if fresh else st.b)
+                ok = r is not None
             if ok:
-                reach = xs[-1]
-                for i, (x, s) in enumerate(zip(xs, stds)):
-                    if ys[i] is None or (s is not None and s > c["line_reach_std_m"] and x > 10.0):
-                        reach = xs[i - 1]
-                        break
-                last = ys[0]
-                for i in range(len(ys)):                 # beyond the reach: carry the last value (never drawn)
-                    if ys[i] is None:
-                        ys[i] = last
-                    last = ys[i]
-                if st is None or not st.present and st.alpha == 0.0:
+                ys, reach, jump = r
+                if fresh:
                     st = self.lines[lid] = _Line(ys, ts)
                     self.seen.setdefault(lid, ts)
                 else:
                     # a restart on another marking moves the near part too; a turn sweeps only the far part
-                    near = [y - b for y, b, x in zip(ys, st.b, xs) if 5.0 <= x <= 20.0]
-                    jump = abs(sum(near) / len(near))
                     if jump > c["shift_m"] and st.shift_t is None:
                         st.shift_t = ts
                     k = None
@@ -707,10 +675,7 @@ class ViewBuilder:
                         st.a = list(st.b)
                         st.dy = rate
                     else:
-                        st.a = [p + (y - p) * k for p, y, k in zip(st.a, ys, ks)]
-                        st.b = [p + (y - p) * k for p, y, k in zip(st.b, st.a, ks)] if st.shift_t is None else list(st.a)
-                        if dt > 0:
-                            st.dy = [0.7 * d0 + 0.3 * (b - p) / dt for d0, b, p in zip(st.dy, st.b, prev)]
+                        st.a, st.b, st.dy = _blend(st.a, st.b, st.dy, ys, ks, dt, st.shift_t is not None)
                 st.present, st.reach, st.conf = True, reach, ln.get("conf")
                 st.alpha = min(1.0, st.alpha + fade)
             elif st is not None:
@@ -726,7 +691,7 @@ class ViewBuilder:
             phase = "leave" if not st.present else "appear" if st.alpha < 1.0 else \
                 "shift" if st.shift_t is not None else "coast" if (ln or {}).get("mode") == "coast" else "steady"
             # the points within reach, offsets then rates: rounded for all lines at once below
-            m = sum(1 for x in xs if x <= st.reach) if xs_rising else None
+            m = bisect.bisect_right(xs, st.reach) if xs_rising else None      # (xs in order: the count of x <= reach)
             o = {"id": lid, "kind": kind, "y": None, "dy": None,
                  "reach_m": st.reach, "conf": st.conf, "age_s": round((ts - self.seen.get(lid, st.t0)) / NS, 2),
                  "phase": phase, "alpha": round(st.alpha, 2)}
@@ -739,10 +704,7 @@ class ViewBuilder:
                 todo.append((o, m))
             out.append(o)
         if todo:
-            if _native.round_list is not None:          # the same numbers either way: round(v, 2) of each
-                rounded = _native.round_list(flat, 2)
-            else:
-                rounded = round_flat(flat, self._scale(len(flat)), self._two(len(flat)))
+            rounded = round_list(flat, 2)
             i = 0
             for o, m in todo:
                 pad = [None] * (nx - m)
@@ -752,20 +714,6 @@ class ViewBuilder:
         for lid in [k for k in self.lines if k not in seen]:
             del self.lines[lid]
         return out
-
-    _SCALES = {}
-
-    @classmethod
-    def _scale(cls, n):
-        """The scale array of `fastround.round_flat` for n numbers with two digits."""
-        sc = cls._SCALES.get(n)
-        if sc is None:
-            sc = cls._SCALES[n] = (scales([2] * n), [2] * n)
-        return sc[0]
-
-    @classmethod
-    def _two(cls, n):
-        return cls._SCALES[n][1]
 
     @staticmethod
     def _carry(ys, xs, v, r, dt):

@@ -199,7 +199,7 @@ class Api:
         rules, fused, lanes, view = P("rules"), P("fused"), P("lanes"), P("view")
         return {
             "api": {"major": API_MAJOR, "version": __version__, "server": "chris-integrator"},
-            # which implementation of the hot path runs: the native core or pure Python (and why)
+            # the native core in use (its version and module)
             "native": native_status(),
             "daemons": daemons,
             "fps": {t: self.mixer.fps(t) for t in TOPICS},

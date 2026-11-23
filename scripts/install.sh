@@ -21,12 +21,12 @@
 #                                        always runs /usr/bin/python3
 #   MAPPER_SRC                           the chris-mapper tree (default ../chris-mapper next to this tree)
 #   STOP_LEGACY=0                        do not stop / disable a legacy roadsense mapd (default: stop + disable)
-#   NATIVE                               the native core (docs/NATIVE.md): unset = use a compiled module when one
-#                                        for this machine is at hand (native/dist/linux-<machine>-<libc>/ of the
-#                                        tree, made by native/cross-build.sh, or one built in the tree by
-#                                        native/build.sh) and it passes its self-test here, else pure Python;
-#                                        NATIVE=0 = pure Python; NATIVE=/path/_chris_native.abi3.so = that file.
-#                                        Nothing is compiled by this script.
+#   NATIVE                               the native core (docs/NATIVE.md), which the package needs: unset = the
+#                                        compiled module for this machine in the tree (native/dist/linux-<machine>-
+#                                        <libc>/, made by native/cross-build.sh, or one built in the tree by
+#                                        native/build.sh); NATIVE=/path/_chris_native.abi3.so = that file. It must
+#                                        pass its self-test here, or nothing is installed (the installed package
+#                                        stays as it was). Nothing is compiled by this script.
 set -eu
 
 SRC=$(cd "$(dirname "$0")/.." && pwd)
@@ -55,21 +55,15 @@ die() { echo "install.sh: $*" >&2; exit 1; }
 [ -n "$D" ] || [ "$(id -u)" = 0 ] || die "run as root (or set DESTDIR=/some/dir for a scratch install)"
 [ -f "$SRC/chris_integrator/__init__.py" ] || die "no chris_integrator package in $SRC"
 [ -f "$SRC/systemd/chris-integrator.service" ] || die "no systemd/chris-integrator.service in $SRC"
-command -v "$PYTHON" >/dev/null 2>&1 || die "no $PYTHON (needs Python 3.10 or newer)"
-"$PYTHON" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)' \
-    || die "$("$PYTHON" -V 2>&1) is too old: Python 3.10 or newer is needed"
+command -v "$PYTHON" >/dev/null 2>&1 || die "no $PYTHON (needs Python 3.11 or newer: the native core uses its limited API)"
+"$PYTHON" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)' \
+    || die "$("$PYTHON" -V 2>&1) is too old: Python 3.11 or newer is needed"
 # third-party modules imported at run time (an import scan of both packages): numpy (the estimator core and
 # the map box: required), aiohttp (the consolidated HTTP / WebSocket API: required for a daemon that serves
 # consumers). Nothing else outside the standard library.
 for m in numpy aiohttp; do
     "$PYTHON" -c "import $m" 2>/dev/null || die "python module '$m' is missing for $PYTHON (Alpine: apk add py3-$m; Debian: apt install python3-$m); nothing was changed"
 done
-# the whole import chain of the daemon with this interpreter, from the source tree (no byte code written)
-PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$SRC${MAPPER_SRC:+:$MAPPER_SRC}" "$PYTHON" -c '
-import chris_integrator.daemon, chris_integrator.io.http, chris_integrator.stack
-import sys
-if len(sys.argv) > 1: import chris_mapper.box' ${MAPPER_SRC:+mapper} \
-    || die "the daemon does not import with $PYTHON (see the error above); nothing was changed"
 if [ "$SYSTEMCTL" = 1 ]; then
     command -v systemctl >/dev/null 2>&1 || die "no systemctl (use --no-systemctl, or DESTDIR=...)"
 fi
@@ -106,40 +100,44 @@ put_pkg() {   # $1 source package dir, $2 name: copied next to the old one, then
     mv "$LIB/$2.new" "$LIB/$2"
     note "code: $LIB/$2"
 }
-put_pkg "$SRC/chris_integrator" chris_integrator
-if [ -n "$MAPPER_SRC" ]; then put_pkg "$MAPPER_SRC/chris_mapper" chris_mapper; fi
-
-# ---- 2b. the native core: a compiled module for this machine is used when there is one and it gives the
-# pure-Python results here; otherwise the package runs pure Python (it is complete without it) --------------
-NAT_DIR=$LIB/chris_integrator/native
+# the package with its native core (docs/NATIVE.md): the compiled module for this machine goes into a staged copy,
+# which must pass the module's self-test with this interpreter before it replaces the installed package
 NAT_LIBC=glibc; (ldd --version 2>&1 || true) | grep -qi musl && NAT_LIBC=musl
 NAT_TAG=linux-$(uname -m)-$NAT_LIBC
-NAT_SRC=
 case "${NATIVE:-}" in
-    0|no|off|false) rm -f "$NAT_DIR"/_chris_native*.so ;;
-    "") if [ -f "$SRC/native/dist/$NAT_TAG/_chris_native.abi3.so" ]; then NAT_SRC=$SRC/native/dist/$NAT_TAG/_chris_native.abi3.so; fi ;;
+    "") NAT_SRC=$SRC/native/dist/$NAT_TAG/_chris_native.abi3.so
+        [ -f "$NAT_SRC" ] || NAT_SRC=$(ls "$SRC"/chris_integrator/native/_chris_native*.so 2>/dev/null | head -n 1)
+        [ -n "$NAT_SRC" ] && [ -f "$NAT_SRC" ] || die "native core: no compiled module for $NAT_TAG in $SRC (native/dist/$NAT_TAG/ or chris_integrator/native/). The package needs it: build it off the host with 'sh native/cross-build.sh' (or on a host with a compiler and the Python headers: 'sh native/build.sh'), then run this again. Nothing was installed." ;;
+    0|no|off|false) die "NATIVE=${NATIVE}: the package runs only with its native core (docs/NATIVE.md); nothing was installed" ;;
     *) [ -f "$NATIVE" ] || die "NATIVE=$NATIVE: no such file"; NAT_SRC=$NATIVE ;;
 esac
-if [ -n "$NAT_SRC" ]; then
-    rm -f "$NAT_DIR"/_chris_native*.so
-    install -m 644 "$NAT_SRC" "$NAT_DIR/_chris_native.abi3.so"
+STAGE=$LIB/.chris_integrator.stage
+rm -rf "$STAGE"
+mkdir -p "$STAGE"
+cp -r "$SRC/chris_integrator" "$STAGE/chris_integrator"
+find "$STAGE" -name __pycache__ -type d -prune -exec rm -rf {} \;
+rm -f "$STAGE"/chris_integrator/native/_chris_native*.so
+install -m 644 "$NAT_SRC" "$STAGE/chris_integrator/native/_chris_native.abi3.so"
+# (run from the staged directory: `-m` looks in the working directory first, which may be the source tree)
+if ! NAT_OUT=$(cd "$STAGE" && PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$STAGE" "$PYTHON" -m chris_integrator.native 2>&1); then
+    rm -rf "$STAGE"
+    die "native core: the module $NAT_SRC does not work here ($(echo "$NAT_OUT" | tail -n 1)). Nothing was installed: the installed package is as it was."
 fi
-if ls "$NAT_DIR"/_chris_native*.so >/dev/null 2>&1; then
-    # the self-test: the module must load with this interpreter and give the reference's results on this machine
-    # (run from the installed directory: `-m` looks in the working directory first, which may be the source tree)
-    if NAT_OUT=$(cd "$LIB" && PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$LIB${PYTHONPATH:+:$PYTHONPATH}" CHRIS_NATIVE=1 "$PYTHON" -m chris_integrator.native 2>&1); then
-        NAT_SUM=$(sha256sum "$NAT_DIR"/_chris_native*.so | cut -c1-16)
-        note "native core: IN USE ($NAT_TAG, sha256 $NAT_SUM..., from ${NAT_SRC:-the source tree}; self-test ok)"
-    else
-        rm -f "$NAT_DIR"/_chris_native*.so
-        note "native core: NOT used, the compiled module ${NAT_SRC:-of the source tree} failed here and was removed: pure Python ($(echo "$NAT_OUT" | tail -n 1))"
-    fi
-else
-    case "${NATIVE:-}" in
-        0|no|off|false) note "native core: not installed (NATIVE=${NATIVE}): pure Python" ;;
-        *) note "native core: no compiled module for $NAT_TAG at hand (native/cross-build.sh or native/build.sh make one): pure Python" ;;
-    esac
+# the whole import chain of the daemon with this interpreter, from the staged copy (no byte code written)
+if ! (cd "$STAGE" && PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$STAGE${MAPPER_SRC:+:$MAPPER_SRC}" "$PYTHON" -c '
+import chris_integrator.daemon, chris_integrator.io.http, chris_integrator.stack
+import sys
+if len(sys.argv) > 1: import chris_mapper.box' ${MAPPER_SRC:+mapper}); then
+    rm -rf "$STAGE"
+    die "the daemon does not import with $PYTHON (see the error above); nothing was installed: the installed package is as it was"
 fi
+NAT_SUM=$(sha256sum "$STAGE"/chris_integrator/native/_chris_native.abi3.so | cut -c1-16)
+rm -rf "$LIB/chris_integrator"
+mv "$STAGE/chris_integrator" "$LIB/chris_integrator"
+rm -rf "$STAGE"
+note "code: $LIB/chris_integrator"
+note "native core: $NAT_TAG, sha256 $NAT_SUM..., from $NAT_SRC; self-test ok"
+if [ -n "$MAPPER_SRC" ]; then put_pkg "$MAPPER_SRC/chris_mapper" chris_mapper; fi
 
 # ---- 3. integrator.env: the car defaults, an existing file kept --------------------------------------
 ENVF=$ETC/integrator.env

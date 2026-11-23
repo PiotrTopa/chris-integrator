@@ -21,7 +21,7 @@ import collections
 import math
 import statistics
 
-from ..native import round                  # builtins.round, native where built
+from ..native import round                  # builtins.round (its results; the native core)
 
 DEFAULT_CFG = dict(
     stuck_s=1.5, stuck_n=10,          # identical non-zero values for this long and this many samples: stuck

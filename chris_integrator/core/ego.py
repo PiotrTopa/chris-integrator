@@ -16,7 +16,7 @@ import math
 
 import numpy as np
 
-from ..native import ekf as _N
+from ..native import core as _C
 
 _empty = np.empty
 
@@ -70,19 +70,7 @@ class EgoModel:
         self._gm = []                      # (index, tau_s, sigma)
         self._clamp = []
         self.heading_free = True           # False: the heading does not move the position yet (not initialised)
-        self._rho_cache = {}
-        self._diag = None
         self._par = None                   # the native core's parameter block (made on first use)
-
-    @staticmethod
-    def apply_F(F, M):
-        """F @ M for the transition `predict` returned (kinematic block and a diagonal)."""
-        Fc, rho = F
-        out = M.copy()
-        out[:NCORE, :] = Fc @ M[:NCORE, :]
-        if rho is not None:
-            out *= rho[:, None]
-        return out
 
     def add_aux(self, owner, aux):
         name = "%s.%s" % (owner, aux.name)
@@ -93,7 +81,6 @@ class EgoModel:
         self.aux.append((name, aux))
         self.n += 1
         self._psd = np.append(self._psd, 0.0 if aux.tau_s else aux.psd)
-        self._rho_cache.clear()            # (the cached vectors have the old length)
         self._par = None
         if aux.tau_s:
             self._gm.append((i, aux.tau_s, aux.sigma0))
@@ -122,21 +109,6 @@ class EgoModel:
         vg = x[V] / (1.0 + x[SV])
         return (vg * c, vg * s, x[W], x[A], 0.0, x[AL], 0.0, vg * math.sin(x[TH]), 0.0, 0.0)
 
-    def _rho(self, dt):
-        """(decay, added variance) of the Gauss-Markov states over dt, kept per dt."""
-        rho = self._rho_cache.get(dt)
-        if rho is None:
-            if len(self._rho_cache) > 256:
-                self._rho_cache.clear()
-            n = self.n
-            r = np.ones(n)
-            q = np.zeros(n)
-            for i, tau, sig in self._gm:
-                r[i] = math.exp(-dt / tau)
-                q[i] = sig * sig * (1.0 - math.exp(-2.0 * dt / tau))
-            rho = self._rho_cache[dt] = (r, q)
-        return rho
-
     def _native_par(self):
         """The model's constants as the native core reads them (chris_native.c `ekf_predict`)."""
         c = self.c
@@ -153,113 +125,38 @@ class EgoModel:
         return self._par
 
     def predict(self, x, P, dt):
-        """(x, P, F) after dt. With the native core: the same steps in C (`_predict_py` is the reference; the
-        two differ only in the order the covariance's sums of products are taken, i.e. at rounding level)."""
-        if _N is None or x.shape[0] != self.n:
-            return self._predict_py(x, P, dt)
+        """(x, P, F) after dt (the native core: chris_native.c `ekf_predict`): the kinematic states moved over dt
+        (speed by the acceleration, heading by the yaw rate and its rate, position along the mean heading and
+        altitude by the grade, both with the speed scaled to the ground), a random walk or a Gauss-Markov decay
+        for each calibration state, the process noise (white jerk and yaw jerk integrated over dt, position noise
+        along the heading), after a gap of more than 0.5 s the caps of the bounded quantities' variance, and the
+        clamps of the calibration states. F = (Fc, rho): the kinematic block of the transition and the
+        Gauss-Markov states' decay over dt (None without such states)."""
         n = self.n
-        rho = _empty(n) if self._gm else None             # the Gauss-Markov states' decay over dt (part of F)
+        if x.shape[0] != n:
+            raise ValueError("predict: a state of %d, the model has %d" % (x.shape[0], n))
+        rho = _empty(n) if self._gm else None
         x1, P1, Fc = _empty(n), _empty((n, n)), _empty((NCORE, NCORE))
+        par = self._par if self._par is not None else self._native_par()
         try:
-            _N.ekf_predict(x, P, dt, self._par if self._par is not None else self._native_par(), rho, x1, P1, Fc)
-        except (TypeError, ValueError, BufferError):      # arrays the native core does not take (not contiguous)
-            return self._predict_py(x, P, dt)
+            _C.ekf_predict(x, P, dt, par, rho, x1, P1, Fc)
+        except (TypeError, ValueError, BufferError):      # (a view, or another dtype: made a contiguous array)
+            _C.ekf_predict(np.ascontiguousarray(x, dtype=float), np.ascontiguousarray(P, dtype=float), dt, par,
+                           rho, x1, P1, Fc)
         return x1, P1, (Fc, rho)
 
     def rts(self, Pp, F, Pa, xa, xp, xs, Ps, wrap_idx):
-        """One smoother step back over a prediction, native: (xs, Ps), False when Pp is singular, or None when
-        the native core is not in use (the filter then does the step with numpy: core/ekf.py `at`)."""
-        if _N is None:
-            return None
+        """One Rauch-Tung-Striebel step back over a prediction (the native core: chris_native.c `ekf_rts`):
+        C = solve(Pp, F Pa)^T, (xa + C (xs - xp), Pa + C (Ps - Pp) C^T), the differences of the angle states in
+        `wrap_idx` wrapped; False when Pp is singular."""
         n = xa.shape[0]
         xo, Po = np.empty(n), np.empty((n, n))
+        args = (Pp, F[0], F[1], Pa, xa, xp, xs, Ps)
         try:
-            ok = _N.ekf_rts(Pp, F[0], F[1], Pa, xa, xp, xs, Ps, wrap_idx, xo, Po)
+            ok = _C.ekf_rts(*args, wrap_idx, xo, Po)
         except (TypeError, ValueError, BufferError):
-            return None
+            ok = _C.ekf_rts(*(None if a is None else np.ascontiguousarray(a, dtype=float) for a in args), wrap_idx, xo, Po)
         return (xo, Po) if ok else False
-
-    def _predict_py(self, x, P, dt):
-        c = self.c
-        n = self.n
-        x = x.copy()
-        v, a, w, al, psi, th = x[V], x[A], x[W], x[AL], x[PSI], x[TH]
-        dt2 = dt * dt
-        g = 1.0 / (1.0 + x[SV])            # odometric -> ground
-        ds = (v * dt + 0.5 * a * dt2) * g
-        pm = psi + 0.5 * w * dt + al * dt2 / 6.0
-        cm, sm = math.cos(pm), math.sin(pm)
-        sth, cth = math.sin(th), math.cos(th)
-        x[PE] += ds * cm
-        x[PN] += ds * sm
-        x[PSI] = psi + w * dt + 0.5 * al * dt2
-        x[V] = v + a * dt
-        x[W] = w + al * dt
-        x[Z] += ds * sth
-        # the transition matrix is the identity but for the kinematic block (the calibration states are random
-        # walks or Gauss-Markov: a diagonal). Built as a list, the covariance propagated block-wise: this is
-        # the filter's inner loop.
-        dsm, dcm, h = -ds * sm, ds * cm, 0.5 * dt
-        Fc = np.array((
-            (1.0, 0.0, dsm, dt * cm * g, 0.5 * dt2 * cm * g, dsm * h, dsm * dt2 / 6.0, 0.0, 0.0, -ds * g * cm),
-            (0.0, 1.0, dcm, dt * sm * g, 0.5 * dt2 * sm * g, dcm * h, dcm * dt2 / 6.0, 0.0, 0.0, -ds * g * sm),
-            (0.0, 0.0, 1.0, 0.0, 0.0, dt, 0.5 * dt2, 0.0, 0.0, 0.0),
-            (0.0, 0.0, 0.0, 1.0, dt, 0.0, 0.0, 0.0, 0.0, 0.0),
-            (0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0),
-            (0.0, 0.0, 0.0, 0.0, 0.0, 1.0, dt, 0.0, 0.0, 0.0),
-            (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0),
-            (0.0, 0.0, 0.0, dt * sth * g, 0.5 * dt2 * sth * g, 0.0, 0.0, 1.0, ds * cth, -ds * g * sth),
-            (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0),
-            (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0)))
-        rho = None
-        if self._gm:
-            rho = self._rho(dt)
-            x *= rho[0]
-        P = P.copy()
-        P[:NCORE, :] = Fc @ P[:NCORE, :]
-        P[:, :NCORE] = P[:, :NCORE] @ Fc.T
-        if rho is not None:
-            P *= rho[0][:, None]
-            P *= rho[0][None, :]
-        F = (Fc, None if rho is None else rho[0])
-        # process noise (white jerk and yaw jerk integrated over dt; position noise along the heading)
-        dt3, dt4, dt5 = dt2 * dt, dt2 * dt2, dt2 * dt2 * dt
-        qj, qy = c["jerk_psd"], c["yaw_jerk_psd"]
-        q55, q44, q33 = qj * dt5 / 20.0, qj * dt4 / 8.0, qj * dt3 / 6.0
-        pp = c["pos_psd"] * dt
-        Qk = np.array((
-            (q55 * cm * cm + pp, q55 * cm * sm, 0.0, q44 * cm, q33 * cm, 0.0, 0.0),
-            (q55 * cm * sm, q55 * sm * sm + pp, 0.0, q44 * sm, q33 * sm, 0.0, 0.0),
-            (0.0, 0.0, qy * dt5 / 20.0, 0.0, 0.0, qy * dt4 / 8.0, qy * dt3 / 6.0),
-            (q44 * cm, q44 * sm, 0.0, qj * dt3 / 3.0, qj * dt2 / 2.0, 0.0, 0.0),
-            (q33 * cm, q33 * sm, 0.0, qj * dt2 / 2.0, qj * dt, 0.0, 0.0),
-            (0.0, 0.0, qy * dt4 / 8.0, 0.0, 0.0, qy * dt3 / 3.0, qy * dt2 / 2.0),
-            (0.0, 0.0, qy * dt3 / 6.0, 0.0, 0.0, qy * dt2 / 2.0, qy * dt)))
-        P[:7, :7] += Qk
-        P[Z, Z] += c["alt_psd"] * dt
-        P[TH, TH] += c["grade_psd"] * dt
-        P[SV, SV] += c["scale_psd"] * dt
-        if n > NCORE:
-            d = self._diag
-            if d is None or len(d) != n - NCORE:
-                d = self._diag = np.arange(NCORE, n)
-            P[d, d] += self._psd * dt
-            if rho is not None:
-                P[d, d] += rho[1][NCORE:]
-        if dt > 0.5:
-            # a gap without data: the white-noise model would let the uncertainty of bounded quantities grow
-            # without limit; a car's speed, acceleration and yaw rate are bounded, a heading is at most unknown
-            for i, lim in _CAPS:
-                if P[i, i] > lim:
-                    k = math.sqrt(lim / P[i, i])
-                    P[i, :] *= k
-                    P[:, i] *= k
-        for i, lo, hi in self._clamp:
-            if lo is not None and x[i] < lo:
-                x[i] = lo
-            elif hi is not None and x[i] > hi:
-                x[i] = hi
-        return x, P, F
 
 
 # ---- geodesy (local tangent plane; fine over a drive) -------------------------------------------------

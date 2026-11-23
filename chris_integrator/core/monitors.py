@@ -7,7 +7,7 @@ import collections
 import math
 import statistics
 
-from ..native import round                  # builtins.round, native where built
+from ..native import round                  # builtins.round (its results; the native core)
 
 
 class Series:

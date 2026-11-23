@@ -1,28 +1,51 @@
 # The native core
 
-chris-integrator is pure Python + numpy, and stays complete that way. On a slow core (the reference
-deployment runs it on a phone's little core) the price of Python is the budget, so the arithmetic and the
-text work of the per-message hot path also exist in C: one file, `chris_integrator/native/src/chris_native.c`,
-compiled to one module, `chris_integrator/native/_chris_native.abi3.so`. Where that module is present and loads,
-it is used; where it is not, the same functions run in Python. Nothing else in the package knows which.
+On a slow core (the reference deployment runs chris-integrator on a phone's little core) the price of Python
+is the budget, so the arithmetic and the text work of the per-message hot path are written in C: one file,
+`chris_integrator/native/src/chris_native.c`, compiled to one module, `chris_integrator/native/_chris_native.abi3.so`.
+The module is part of the package: it is required, and every function in it exists once. There is no second,
+pure-Python implementation of what is native, and no switch between two.
 
-    python -m chris_integrator.native      which implementation runs here + a self-test against the reference
-    GET /v2/health  ->  "native": {"active": true, "implementation": "native", "parts": [...], "version": 4}
-    the daemon's first log lines: "hot path NATIVE (json, round, interp, ekf, lanes, radar)"  |  "hot path pure Python: <why>"
+    python -m chris_integrator.native      the module in use, and its self-test on this machine
+    GET /v2/health  ->  "native": {"active": true, "implementation": "native", "parts": [...], "version": 6, "module": "..."}
+    the daemon's first log lines: "native core version 6 (_chris_native.abi3.so; json, round, interp, ekf, lanes, radar)"
 
-## What is native, and what "the same" means for each part
+A package without the module (or with one of another version) does not import: the error says that the native
+core is not built, does not load, or is of the wrong version, and how to build it (below).
 
-| part | native function | reference (pure Python) | results |
+## The rules
+
+* **One implementation.** What is native is written in C only; the Python around it prepares the arrays and
+  takes the results. A part that is moved into C loses its Python code in the same change.
+* **What is not ours stays CPython's.** Where the C code cannot be certain to give CPython's result for an input
+  (a type the JSON writer does not know, a number beyond the reader's exact path, a float next to a decimal tie
+  in `round`), it hands that input to CPython's own function: `json.dumps`, `json.loads`, `builtins.round`. That
+  is the standard library deciding, not a second implementation of ours.
+* **Exact where it can be.** Elementwise steps are written in the order numpy (or Python) computes them, with
+  plain IEEE arithmetic (`-ffp-contract=off`: no fused multiply-add), so they give the same bits. Sums of
+  products are added in index order: correct to the last bit or two, not the bits a BLAS gives ("to rounding").
+* **Held to known results.** `tests/test_native.py` holds every function: JSON and rounding against CPython's
+  json and round; the rest against what the pure-Python references gave before they were removed, frozen as
+  golden data (`tests/native_cases.py` makes the inputs, `tests/data/native_golden.json.gz` holds the results:
+  the digest of every exact result, the values where a result agrees to rounding). A change to a native function
+  that changes a result fails those tests; a deliberate change records new golden data and says why.
+
+## What each part does, and what "the same" means
+
+| part | native function | what it gives | held to |
 |---|---|---|---|
-| `json` | `dumps(obj)` | `json.dumps(obj, separators=(",", ":"))` | the same text, byte for byte |
-| `json` | `loads(bytes or str)` | `json.loads` | the same objects (types, values, sign of zero, key order) |
-| `json` | `dumps` of `Rounded((list, n))` | `json.dumps([round(v, n) for v in list])` | the same text (the recorder's reduced `road`) |
-| `round` | `round(x, n)`, `round_list(list, n)` | `builtins.round` | the same value and type |
-| `interp` | `interp_all(xs, ys, qs)` | `trackers.view._interp_all_py` | the same values |
-| `lanes` | `lanes_measure`, `lanes_predict`, `lanes_fit`, `lanes_apply`, `round_lists` (the lane tracker's arrays) | numpy expressions in `trackers/lanes.py` | the same bits |
-| `ekf` | `ekf_project`, `ekf_update`, `ekf_sym` (one scalar row of the filter) | numpy expressions in `core/ekf.py` | the same bits for rows of one state index (most rows); to rounding for rows over several states |
-| `ekf` | `ekf_predict` (the process model) | `EgoModel._predict_py` | state and transition: the same bits; covariance: to rounding |
-| `ekf` | `ekf_rts` (one smoother step) | `np.linalg.solve` + products in `core/ekf.py` | to rounding |
+| `json` | `dumps(obj)` | `json.dumps(obj, separators=(",", ":"))`, byte for byte; `json.dumps` itself for what the writer leaves to it | `json.dumps` |
+| `json` | `loads(bytes or str)` | `json.loads`: the same objects (types, values, sign of zero, key order); `json.loads` itself for what the reader leaves to it, so errors are CPython's | `json.loads` |
+| `json` | `trim_road(line, ...)` (fastjson) | the `road` line without the members the default stack does not read, cut from the bytes | golden: the bytes |
+| `json` | `slim_road_line(road)` (io/recorder) | the recorder's reduced `road`, written in one pass: lists rounded (`round(v, n)`, None stays null), keys as json converts them | golden: the text |
+| `round` | `round(x, n)`, `round_list(list, n)` | `builtins.round`: the same value and type | `builtins.round` |
+| `interp` | `interp_all(xs, ys, qs)` (trackers/view) | the view's table walk | golden: values and types |
+| `interp` | `view_prep`, `view_blend` (trackers/view) | a drawn line's points, reach and jump (CPython's compensated `sum`); its two smoothing stages | golden |
+| `lanes` | `lanes_measure`, `lanes_predict`, `lanes_fit`, `lanes_apply`, `round_lists` (trackers/lanes) | the lane tracker's array steps | golden: the bits |
+| `lanes` | `geom_centre`, `geom_reach` (trackers/roadgeom) | the road geometry's centre line from the camera and its reach (a configured number stays its own object) | golden: the bits |
+| `ekf` | `ekf_project`, `ekf_update`, `ekf_sym` (core/ekf) | one scalar row of the filter | golden: the bits for rows of one state index (most rows); the projection to rounding for rows over several states |
+| `ekf` | `ekf_predict` (core/ego) | the process model | golden: state and transition to the last bit (sin, cos, exp of the C library), covariance to rounding |
+| `ekf` | `ekf_rts` (core/ego) | one smoother step | golden: to rounding |
 | `radar` | `radar_evolve` (stillness, switching, interaction with the free estimate's hand-over, prediction with the speed bound; optionally the combination and the free estimate's prediction: `Tracker._evolve` + `combine_b` in one call for B objects) | `radar/models.py`: `_evolve_py` = `still_b`, `transition_b`, `mix_b`, `predict_b`, `combine_b` | to rounding (tests: 1e-12 of each block's largest magnitude); on the development machine the same bits |
 | `radar` | `radar_combine`, `radar_p_still` | `combine_b`, `Tracker.p_still_many`'s numpy | to rounding |
 | `radar` | `radar_h` (the sensors' measurement functions: camera kinds b, rb, rbh, bt with and without the scale-rate row, microwave radar) | `CameraBoxes.h_py`, `MicrowaveRadar.h_py` | the same bits (`math.hypot` as CPython computes it) |
@@ -31,19 +54,15 @@ it is used; where it is not, the same functions run in Python. Nothing else in t
 | `radar` | `radar_advance`, `radar_peek`, `radar_peek_pos`, `radar_still`, `radar_life`, `radar_merge` (on the objects' rows of the tracker's state array) | `Tracker._advance_all`, `peek_many`, `p_still_many`, `_life`, `_merge` | to rounding; `radar_peek_pos` the same bits as `radar_peek` for what it computes |
 | `radar` | `radar_frame` (every listed object's numbers of a message, and with the objects' attributes the message's objects themselves, flags and their hysteresis included) | `Radar._numbers` + the dict assembly in `Radar.frame` | to rounding (printed digits: the same except a last digit now and then) |
 
-The `lanes` part is exact because the tracker's arithmetic is elementwise (numpy computes those with plain
-IEEE operations, one element at a time), and its two means over the gate points are added in the order numpy
-adds them there (in sequence: the masked selection comes out in column order). That order is numpy's
-implementation, not its contract: `tests/test_native.py` holds it against the installed numpy.
+The lane tracker's steps are exact because its arithmetic is elementwise, and its two means over the gate points
+are added in sequence, as numpy adds a masked selection. The road geometry's arc length is a sequential sum of
+`hypot`, as `np.cumsum` takes it.
 
-"To rounding": numpy hands sums of products (`@`, `solve`) to its BLAS, which adds them in an order of its own
-(and with fused multiply-adds on ARM); the native code adds them in index order with plain IEEE arithmetic.
-Both are correct to the last bit or two of a double; they are not the same bits. The filter's results
-therefore differ between the two implementations at the 1e-13 level (and between two machines' numpy the same
-way: BLAS kernels differ per CPU). After the monitors and trackers, on recorded drives, that shows as a handful
-of messages per drive in which a number that rounds to zero carries the other sign (`-0.0` / `0.0`) and, rarely,
-a last printed digit; lane report L50 has the counts. Everything else in the table is exact, by construction
-and by test.
+"To rounding": the C code adds sums of products in index order with plain IEEE arithmetic; numpy's BLAS (which
+gave the frozen results) adds them in an order of its own, with fused multiply-adds on ARM. Both are correct to
+the last bit or two of a double. After the monitors and trackers, on recorded drives, that shows as a handful of
+messages per drive in which a number that rounds to zero carries the other sign (`-0.0` / `0.0`) and, rarely, a
+last printed digit; lane report L50 has the counts.
 
 The `radar` part propagates only the entries of the motion model's transition that are not zero (at most three
 per row of the 8x8 `F`; the reference multiplies dense matrices), takes the elementwise steps in numpy's order
@@ -55,18 +74,31 @@ a dense product makes NaN of 0 * inf where skipping the zero does not. The switc
 `models.combine_many`, `models.combine` and `models.p_still_many`; arrays the native call does not take (not
 float64, not contiguous) also go to the reference.
 
-A native function never guesses. Where it is not certain to give the reference's result for an input (a type
-it does not know, a number outside its exact path, damaged text) it raises `native.Fallback` (or calls the
-reference itself) and the reference runs for that one call. So errors, corner cases and exotic inputs are
-CPython's own: `loads` of bad JSON raises `json.JSONDecodeError` from `json.loads`.
+### Inputs the C code takes, and what it does with others
 
-### Why the exact parts are exact
+* Arrays: float64 (index arrays: the platform's 64-bit integer), C-contiguous. The Python around a call makes
+  lists and views into such arrays first (`np.ascontiguousarray`).
+* Numbers in lists (the view, the road geometry's settings): floats (and float subclasses, read as their value)
+  and ints up to 2^53, bools as ints. Anything else, and an int beyond 2^53, is a `TypeError`. (The removed
+  Python computed with big ints exactly and returned numpy scalars as numpy scalars; neither reaches these
+  functions in the stack.)
+* A lane line's `y` / `y_std` (`lanes_measure`): a list or a tuple of n items that `float()` converts (ints,
+  bools, numeric text), all finite; else the line is not taken (no `y`) or its deviations default (no
+  `y_std`); an int beyond the float range raises `OverflowError`, as numpy does. Another sequence type (a numpy
+  array) is not read as one: the line is not taken.
+* `trim_road` takes `bytes` (anything else is made `bytes` first) and returns the line itself when there is
+  nothing to cut.
+
+### Why the exact parts of the JSON work are exact
 
 * **Writing a float.** `repr(x)` is the shortest decimal string that reads back as `x`. If `x` equals
   `k / 10^n` for an integer `k` below 10^15 (tested by one exact division), the string of `k` with `n` decimals
   is that shortest string: decimals of 15 significant digits or fewer and doubles correspond one to one. Every
   number the stack rounds before it writes is of this kind. Everything else (17 digits, exponent forms) goes
   through CPython's own `PyOS_double_to_string`.
+* **Writing a rounded float** (`slim_road_line`): `rint(x * 10^n)` is the integer `k` of that string, so the text
+  is `k` with `n` decimals and the trailing zeros dropped, written without a second test; next to a decimal tie,
+  or below 1e-4 (where `repr` writes an exponent), `round` and the float writer decide.
 * **Reading a float.** A decimal with a mantissa up to 2^53 and at most 22 decimals is one exact division of
   two exact doubles, correctly rounded: what `strtod` returns. Everything else goes through
   `PyOS_string_to_double`.
@@ -79,26 +111,13 @@ CPython's own: `loads` of bad JSON raises `json.JSONDecodeError` from `json.load
 `loads` reads external input (the daemons' lines, the vehicle feed). It is a recursive-descent reader over a
 (pointer, end) pair: every read is checked against `end`, nesting is limited to 64 levels (deeper input goes
 to `json.loads`), strings are validated as UTF-8 by CPython's decoder, numbers longer than 63 characters or
-19 digits go to the reference. `tests/test_native.py::test_loads_survives_damaged_input` feeds it 40000 cut
-and corrupted lines and requires the reference's result or an error; build with `SANITIZE=1` to run the suite
+19 digits go to `json.loads`. `tests/test_native.py::test_loads_survives_damaged_input` feeds it 40000 cut
+and corrupted lines and requires `json.loads`' result or an error; build with `SANITIZE=1` to run the suite
 under the address and undefined-behaviour sanitizers:
 
     SANITIZE=1 OUT=/tmp/asan sh native/build.sh
     cp /tmp/asan/_chris_native.abi3.so chris_integrator/native/
     LD_PRELOAD=$(cc -print-file-name=libasan.so) ASAN_OPTIONS=detect_leaks=0 python -m pytest tests/test_native.py
-
-## Selection
-
-`chris_integrator/native/__init__.py` decides at import:
-
-* the module loads and has the expected version -> native, every part;
-* `CHRIS_NATIVE=0` in the environment -> pure Python (the reference; the comparison baseline);
-* `CHRIS_NATIVE=json,round,interp,lanes` -> only those parts native (the exact ones: a run with them must give
-  the reference's output line for line; adding `ekf` or `radar` adds their rounding-level differences);
-* the module is absent or does not load -> pure Python, and `status()["reason"]` says why.
-
-The unit's environment can carry the switch (`/etc/chris/integrator.env`: `CHRIS_NATIVE=0`) for a rollback
-without touching files.
 
 ## Building
 
@@ -107,56 +126,46 @@ machine type and C library it was built for. It needs a C compiler and the Pytho
 to run but libm. No numpy headers: arrays pass through the buffer protocol.
 
     sh native/build.sh                        this machine -> chris_integrator/native/_chris_native.abi3.so
-    pip install .                             builds it when a compiler is there; installs pure Python when not
-    CHRIS_NATIVE_BUILD=0 pip install .        pure Python on purpose
+    pip install .                             builds it (a compiler and the Python headers are needed)
     sh native/cross-build.sh                  another platform, in a container (default: linux/arm64, Alpine: musl)
 
 Flags that matter: `-ffp-contract=off` (no fused multiply-add: it would change bits that are otherwise
-numpy's), no `-ffast-math`, no `-march`. The code is plain C99.
+numpy's), no `-ffast-math`, no `-march`. The code is plain C99. `VERSION` in the module and in
+`chris_integrator/native/__init__.py` must agree: a change of a function's contract raises both.
 
 ### A target that must not be touched (the reference phone)
 
-The phone's operating system is pinned and has no Python headers. Nothing is installed on it:
+The phone's operating system is pinned and has no Python headers. Nothing is compiled on it:
 
     sh native/cross-build.sh
     # -> native/dist/linux-aarch64-musl/_chris_native.abi3.so  and BUILD.txt (compiler, image, checksums, test result)
 
 builds in an `alpine:edge` arm64 container on the development machine (docker with qemu-user binfmt), runs
 the self-test and `tests/test_native.py` there against the container's numpy, and leaves the artefact in
-`native/dist/`. The directory is not tracked by git; it travels with the source tree that is copied to the
-target. `scripts/install.sh` then:
+`native/dist/`, which travels with the source tree that is copied to the target. `scripts/install.sh` then:
 
-1. copies the package;
-2. if `native/dist/linux-<machine>-<libc>/_chris_native.abi3.so` exists for the target (or `NATIVE=/path` names
-   a file, or the tree holds a module built in place), puts it into the installed package;
-3. runs `python3 -m chris_integrator.native` with the target's interpreter: the module must load and give the
-   reference's results on that machine (JSON text, rounding, parsing, the filter steps against numpy);
-4. keeps the module if that passes; removes it and says so if not. The log line is one of
-   `native core: IN USE (linux-aarch64-musl, sha256 ..., self-test ok)`,
-   `native core: NOT used, the compiled module ... failed here and was removed: pure Python`,
-   `native core: no compiled module for linux-aarch64-musl at hand ...: pure Python`,
-   `native core: not installed (NATIVE=0): pure Python`.
+1. takes `native/dist/linux-<machine>-<libc>/_chris_native.abi3.so` for the target (or `NATIVE=/path` names a
+   file, or the tree holds a module built in place); without one it stops before it changes anything;
+2. puts a copy of the package with that module into a staging directory and runs `python3 -m
+   chris_integrator.native` and the daemon's imports there with the target's interpreter;
+3. replaces the installed package with the staged one only when that passes; otherwise it stops, and the
+   installed package stays as it was. The log line is
+   `native core: linux-aarch64-musl, sha256 ..., from ...; self-test ok`.
 
-The script never compiles. Undo on a running system: `CHRIS_NATIVE=0` in `integrator.env`, or delete the
-`.so`, and restart the unit.
+The script never compiles.
 
 ### Wheels
 
-`pip wheel .` gives `chris_integrator-<v>-cp311-abi3-<platform>.whl` with the module, or a pure wheel with
-`CHRIS_NATIVE_BUILD=0`. For a release: cibuildwheel with `CIBW_BUILD=cp311-*` (abi3 covers later versions),
-manylinux and musllinux, x86_64 and aarch64; plus the sdist, from which `pip install` builds or falls back.
+`pip wheel .` gives `chris_integrator-<v>-cp311-abi3-<platform>.whl` with the module. For a release:
+cibuildwheel with `CIBW_BUILD=cp311-*` (abi3 covers later versions), manylinux and musllinux, x86_64 and
+aarch64; plus the sdist, from which `pip install` builds.
 
 ## Tests
 
-    python -m pytest tests                          the whole suite on what is installed (native if built)
-    CHRIS_NATIVE=0 python -m pytest tests           the whole suite on the reference
-    python -m pytest tests/test_native.py           native against reference, function by function, and a
-                                                    simulated drive through both (two processes)
-    tools/cost_bench.py run REC --dump A.gz         (CHRIS_NATIVE=0 ... --dump B.gz;  cost_bench.py diff A.gz B.gz)
-                                                    every message of every stream of a recorded drive, both ways
-
-Without the compiled module the native comparisons are skipped and everything else runs: the package passes
-its tests with no compiler.
+    python -m pytest tests                          the whole suite (builds first: sh native/build.sh)
+    python -m pytest tests/test_native.py           every native function against its golden results
+    tools/cost_bench.py run REC --dump A.gz         every message of every stream of a recorded drive;
+    tools/cost_bench.py diff A.gz B.gz              two trees (before / after a change) compared
 
 ## A native plug-in
 
@@ -165,9 +174,8 @@ a box declares `name`, `inputs`, `outputs`, `DEFAULT_CFG` and answers `on_input(
 ways to put compiled code behind it, in order of cost:
 
 1. **A Python box with a native kernel** (what the estimator and the display box do): the box stays the
-   declared, replaceable unit in Python; its arithmetic calls functions that exist twice, reference and
-   native, selected in `chris_integrator.native`. The contract and the wiring do not change; a replay is
-   deterministic; the reference stays testable.
+   declared, replaceable unit in Python; its arithmetic calls the native core. The contract and the wiring
+   do not change; a replay is deterministic.
 2. **A box written as an extension type** (C, C++, Rust with PyO3, Cython): any importable class with the
    attributes above and `on_input` is a plug-in; `mixer.json` names it (`{"plugins": [{"class":
    "package.module:Class"}]}`, see `stack.py`). Messages are the bus' dicts, so such a box pays the
@@ -177,8 +185,7 @@ ways to put compiled code behind it, in order of cost:
    a serialisation each way (`tools/hop_cost.py`); for boxes that are not tied to a camera frame
    (`sync=False`).
 
-A box that keeps its own reference implementation follows the rule of this package: the reference decides
-what is right, the compiled code is an accelerated copy with the same tests.
+A part moved into C follows the rules above: its Python goes, its results are frozen as golden data first.
 
 ## Licences
 

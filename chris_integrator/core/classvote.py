@@ -26,7 +26,7 @@ often on a bicycle). Nothing here is read by gating, association, existence or t
 """
 import math
 
-from ..native import round                  # builtins.round, native where built
+from ..native import round                  # builtins.round (its results; the native core)
 
 ALIASES = {"person": "human", "pedestrian": "human", "bicycle": "bike", "cyclist": "bike", "rider": "bike",
            "motorcycle": "motorbike", "motor": "motorbike", "lorry": "truck", "coach": "bus", "train": "tram"}

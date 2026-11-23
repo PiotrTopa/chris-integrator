@@ -43,8 +43,8 @@ import math
 
 import numpy as np
 
-from ..native import round                  # builtins.round, native where built
-from ..native import Fallback as _Fallback, lanes as _NL
+from ..native import round                  # builtins.round (its results; the native core)
+from ..native import core as _C
 from ..contract import LocalEgo, validity
 
 NS = 1e9
@@ -117,30 +117,15 @@ def _median(a):
     return float(s[h]) if n % 2 else float((s[h - 1] + s[h]) / 2.0)
 
 
-# ---- the array steps of a frame ----------------------------------------------------------------------------
-# Each exists twice: the numpy expressions (the reference) and the native core's function with the same
-# arithmetic (`chris_integrator.native`, part "lanes"); the tracker below calls whichever is in use.
-def _fit_py(c, x, zs, zy, prob, y, p):
-    """(r, gate, nu, jumps, nsigs): measurement noise, the gate points, the innovation of every line and how
-    well the frame fits each track (mean absolute innovation; the same in sigmas)."""
-    r_lane = np.maximum(c["r_floor"], c["r_scale"] * zs[:N_LANE])
-    r_edge = np.maximum(c["edge_r_floor"], c["edge_r_scale"] * zs[N_LANE:])
-    r = np.vstack((r_lane, r_edge))
-    gate = (x >= c["gate_x"][0]) & (x <= c["gate_x"][1])
-    if not gate.any():
-        gate[:] = True
-    r = r * np.where(prob < c["on_conf"], c["low_prob_inflate"], 1.0)[:, None]   # a weak frame weighs less
-    nu_all = zy - y
-    an = np.abs(nu_all[:, gate])
-    jumps = an.mean(axis=1)
-    nsigs = (an / np.sqrt(p[:, gate] + r[:, gate] ** 2)).mean(axis=1)
-    return r, gate, nu_all, jumps, nsigs
-
-
+# ---- the array steps of a frame (the native core: chris_native.c `lanes_*`) ---------------------------------
 _FIT_PAR = {}                   # the constants of `_fit` as the native function takes them, per configuration
 
 
-def _fit_native(c, x, zs, zy, prob, y, p):
+def _fit(c, x, zs, zy, prob, y, p):
+    """(r, gate, nu, jumps, nsigs): measurement noise (the deviations scaled and floored, lines and edges with
+    their own constants, inflated for a weak frame), the gate points (all of them when none lies in gate_x), the
+    innovation of every line, and how well the frame fits each track over the gate (mean absolute innovation;
+    the same in sigmas)."""
     n = x.shape[0]
     r, nu = np.empty((N_LINES, n)), np.empty((N_LINES, n))
     gate, jumps, nsigs = np.empty(n, bool), np.empty(N_LINES), np.empty(N_LINES)
@@ -151,47 +136,19 @@ def _fit_native(c, x, zs, zy, prob, y, p):
         if len(_FIT_PAR) > 16:
             _FIT_PAR.clear()
         par = _FIT_PAR[key] = np.array(key, float)
-    try:
-        _NL.lanes_fit(x, zy, zs, prob, y, p, par, r, nu, gate, jumps, nsigs)
-    except (TypeError, ValueError, BufferError):
-        return _fit_py(c, x, zs, zy, prob, y, p)
+    _C.lanes_fit(x, zy, zs, prob, y, p, par, r, nu, gate, jumps, nsigs)
     return r, gate, nu, jumps, nsigs
 
 
-def _update_py(y, p, r, nu_all, upd):
-    """The scalar-gain update of the lines `upd` (a list of line numbers), in place."""
-    pu, ru = p[upd], r[upd]
-    k = pu / (pu + ru * ru)
-    y[upd] += k * nu_all[upd]
-    p[upd] = pu * (1.0 - k)
+def _update(y, p, r, nu_all, upd):
+    """The scalar-gain update of the lines `upd` (a list of line numbers), in place: k = p / (p + r^2),
+    y += k nu, p *= 1 - k."""
+    _C.lanes_apply(y, p, r, nu_all, upd)
 
 
-def _update_native(y, p, r, nu_all, upd):
-    try:
-        _NL.lanes_apply(y, p, r, nu_all, upd)
-    except (TypeError, ValueError, BufferError):
-        _update_py(y, p, r, nu_all, upd)
-
-
-def _round2_py(a, root=False):
-    """np.round(a, 2).tolist() (root: of np.sqrt(a))."""
-    if root:
-        with np.errstate(invalid="ignore"):
-            return np.round(np.sqrt(a), 2).tolist()
-    return np.round(a, 2).tolist()
-
-
-def _round2_native(a, root=False):
-    try:
-        return _NL.round_lists(a, 2, root)
-    except (TypeError, ValueError, BufferError):
-        return _round2_py(a, root)
-
-
-if _NL is None:
-    _fit, _update, _round2 = _fit_py, _update_py, _round2_py
-else:
-    _fit, _update, _round2 = _fit_native, _update_native, _round2_native
+def _round2(a, root=False):
+    """np.round(a, 2).tolist() (root: of np.sqrt(a); a negative variance gives NaN)."""
+    return _C.round_lists(a, 2, root)
 
 
 def map_prior(map_msg, now_ns, cfg=DEFAULT_CFG):
@@ -245,13 +202,14 @@ class RoadGeometryTracker:
         self.x = None               # the model's 33 distances
         self.y = None               # [6, n] filtered lateral offsets
         self.p = None               # [6, n] variances
-        self.have = np.zeros(N_LINES, bool)       # a geometry track exists
-        self.present = np.zeros(N_LINES, bool)    # reported as present (hysteresis)
-        self.conf = np.zeros(N_LINES)
-        self.since = np.zeros(N_LINES)            # ts (s) of the last presence change
-        self.unsupported = np.zeros(N_LINES)      # seconds without a usable frame
+        # (per line: plain lists, read and written one element at a time in the frame's loop)
+        self.have = [False] * N_LINES             # a geometry track exists
+        self.present = [False] * N_LINES          # reported as present (hysteresis)
+        self.conf = [0.0] * N_LINES
+        self.since = [0.0] * N_LINES              # ts (s) of the last presence change
+        self.unsupported = [0.0] * N_LINES        # seconds without a usable frame
         self.cand_t = [None] * N_LINES            # ts (s) of the first misfitting frame
-        self.cand_n = np.zeros(N_LINES, int)
+        self.cand_n = [0] * N_LINES
         self.cand_y = [None] * N_LINES
         self.snaps = 0
         self.ts = None
@@ -291,55 +249,9 @@ class RoadGeometryTracker:
         n = len(x)
         srcs = [ll[i] if i < N_LANE and i < len(ll) else re[i - N_LANE] if i >= N_LANE and i - N_LANE < len(re) else None
                 for i in range(N_LINES)]
-        if _NL is not None:
-            # the usual frame in the native core: the same arrays as the code below makes (anything unusual
-            # about the message: `Fallback`, and the code below decides)
-            y, s, prob, ok = np.empty((N_LINES, n)), np.empty((N_LINES, n)), np.empty(N_LINES), np.empty(N_LINES, bool)
-            try:
-                _NL.lanes_measure(srcs, x, c["edge_std_x"][0], c["edge_std_x"][1], c["edge_std_bad"],
-                                  c["edge_std_good"], y, s, prob, ok)
-                return x, y, s, prob, ok
-            except (_Fallback, TypeError, ValueError, BufferError):
-                pass
-        y = np.zeros((N_LINES, n))
-        s = np.ones((N_LINES, n))
-        prob = np.zeros(N_LINES)
-        ok = np.zeros(N_LINES, bool)
-        near = (x >= c["edge_std_x"][0]) & (x <= c["edge_std_x"][1])
-        # the usual frame: six lines with n offsets and n deviations each. All twelve lists become one array (one
-        # conversion and one finiteness test instead of twelve of each); anything else goes line by line
-        rows = fin = None
-        if all(isinstance(d, dict) and isinstance(d.get("y"), list) and isinstance(d.get("y_std"), list)
-               and len(d["y"]) == n and len(d["y_std"]) == n for d in srcs):
-            try:
-                rows = np.array([d["y"] for d in srcs] + [d["y_std"] for d in srcs], float)
-            except (TypeError, ValueError):
-                rows = None
-            if rows is not None and rows.shape == (2 * N_LINES, n):
-                fin = np.isfinite(rows).all(axis=1)
-            else:
-                rows = None
-        for i in range(N_LINES):
-            src = srcs[i]
-            if not isinstance(src, dict):
-                continue
-            if rows is not None:
-                yi = rows[i] if fin[i] else None
-                si = rows[N_LINES + i] if fin[N_LINES + i] else None
-            else:
-                yi, si = _arr(src.get("y"), n), _arr(src.get("y_std"), n)
-            if yi is None:
-                continue
-            if si is None:
-                si = np.full(n, 0.3 if i < N_LANE else 1.0)
-            y[i], s[i] = yi, np.maximum(si, 1e-3)
-            if i < N_LANE:
-                p = src.get("prob")
-                prob[i] = min(1.0, max(0.0, float(p))) if _fin(p) else 0.0
-            else:
-                sd = _median(si[near]) if near.any() else _median(si)
-                prob[i] = min(1.0, max(0.0, (c["edge_std_bad"] - sd) / (c["edge_std_bad"] - c["edge_std_good"])))
-            ok[i] = True
+        y, s, prob, ok = np.empty((N_LINES, n)), np.empty((N_LINES, n)), np.empty(N_LINES), np.empty(N_LINES, bool)
+        _C.lanes_measure(srcs, x, c["edge_std_x"][0], c["edge_std_x"][1], c["edge_std_bad"], c["edge_std_good"],
+                         y, s, prob, ok)
         return x, y, s, prob, ok
 
     # ---- one frame -------------------------------------------------------
@@ -364,7 +276,7 @@ class RoadGeometryTracker:
             self.y = np.zeros((N_LINES, len(x)))
             self.p = np.ones((N_LINES, len(x)))
             self.ts, self.seq = ts / NS, seq
-            self.since[:] = self.ts
+            self.since = [self.ts] * N_LINES
             v, vsrc, yaw = self._motion(es)
             return self._message(road, np.zeros(N_LINES), np.zeros(N_LINES, bool), v, vsrc, yaw, None)
         t = ts / NS
@@ -375,7 +287,7 @@ class RoadGeometryTracker:
             self.x = x
             self.y = np.zeros((N_LINES, len(x)))
             self.p = np.ones((N_LINES, len(x)))
-            self.since[:] = t
+            self.since = [t] * N_LINES
             dt = 0.0
         self.ts, self.seq = t, seq
         v, vsrc, yaw = self._motion(es)
@@ -390,10 +302,11 @@ class RoadGeometryTracker:
         # measurement noise, and how well this frame fits every track, for all lines at once
         r, gate, nu_all, jumps, nsigs = _fit(c, x, zs, zy, prob, self.y, self.p)
         upd = []
+        probs, oks, jumps, nsigs = prob.tolist(), ok.tolist(), jumps.tolist(), nsigs.tolist()   # (the same values)
 
         for i in range(N_LINES):
             # presence (hysteresis on the filtered probability, thresholds moved by the map prior)
-            p_i = prob[i] if ok[i] else 0.0
+            p_i = probs[i] if oks[i] else 0.0
             self.conf[i] += (p_i - self.conf[i]) * a
             on, off = c["on_conf"], c["off_conf"]
             if prior is not None and i in (0, 3):
@@ -402,16 +315,16 @@ class RoadGeometryTracker:
                     on, off = on + c["prior_shift"], off + c["prior_off_shift"]
                 elif tag == "expected":
                     on, off = on - 0.5 * c["prior_shift"], off - c["prior_off_shift"]
-            was = bool(self.present[i])
+            was = self.present[i]
             if not was and self.conf[i] >= on:
                 self.present[i] = True
             elif was and self.conf[i] < off:
                 self.present[i] = False
-            if bool(self.present[i]) != was:
+            if self.present[i] != was:
                 self.since[i] = t
 
             # geometry
-            usable = ok[i] and p_i >= c["update_prob"]
+            usable = oks[i] and p_i >= c["update_prob"]
             if not usable:
                 self.unsupported[i] += dt
                 if self.cand_t[i] is not None and t - self.cand_t[i] > c["cand_keep_s"] + c["snap_s"]:
@@ -457,16 +370,10 @@ class RoadGeometryTracker:
         shift = c["slide_gain"] * max(0.0, v) * dt
         cap = c["max_std"] ** 2
         default = shift == 0.0 and c["yaw_gain"] == 0.0 and c["vy_gain"] == 0.0
-        if default and _NL is not None:                 # the default (a random walk) in the native core
-            try:
-                _NL.lanes_predict(self.p, x, c["q0"], c["q1"], dt, cap)
-                return
-            except (TypeError, ValueError, BufferError):
-                pass
-        q = (c["q0"] + c["q1"] * x) ** 2 * dt
-        if default:                                     # the default: a random walk
-            np.minimum(self.p + q, cap, out=self.p)
+        if default:                                     # the default, a random walk: p = min(p + q dt, cap)
+            _C.lanes_predict(self.p, x, c["q0"], c["q1"], dt, cap)
             return
+        q = (c["q0"] + c["q1"] * x) ** 2 * dt
         dy = c["yaw_gain"] * yaw * dt * x + c["vy_gain"] * vy * dt
         for i in range(N_LINES):
             if not self.have[i]:
@@ -502,9 +409,10 @@ class RoadGeometryTracker:
         c = self.cfg
         valid, reason, inputs = getattr(self, "_validity", (True, None, {}))
         ys = sds = None
-        if np.count_nonzero(self.present & self.have) > 1:      # element-wise, so the same numbers as line by line
+        if sum(1 for p, h in zip(self.present, self.have) if p and h) > 1:   # element-wise: the same numbers as line by line
             ys = _round2(self.y)
             sds = _round2(self.p, True)
+        prob, ok = prob.tolist(), ok.tolist()
         lines = [self._line(i, prob, ok, ys, sds) for i in range(N_LINES)]
         width = None
         if lines[1]["present"] and lines[2]["present"]:

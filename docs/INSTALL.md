@@ -10,7 +10,8 @@ run changes nothing the first one set up. On a host that already runs a chris-ro
 
 | what | why | Alpine / postmarketOS | Debian / Ubuntu |
 |---|---|---|---|
-| Python 3.10 or newer | the daemon | `python3` | `python3` |
+| Python 3.11 or newer | the daemon (the native core uses the CPython limited API of 3.11) | `python3` | `python3` |
+| the native core, compiled for the host | the hot path (`docs/NATIVE.md`): required; built off the host (`native/cross-build.sh`) or on it (`native/build.sh`: a C compiler and the Python headers) | | |
 | numpy | the estimator core (`chris_integrator/core`), the map box (`chris_mapper/rsmap.py`, `context.py`): required | `py3-numpy` | `python3-numpy` |
 | aiohttp | the consolidated HTTP / WebSocket API (`chris_integrator/io/http.py`): required for a daemon that serves consumers | `py3-aiohttp` | `python3-aiohttp` |
 | systemd | the unit; not needed for a scratch install | | |
@@ -25,22 +26,19 @@ aiohttp bring along.
 `install.sh` checks all of this, and that the daemon's whole import chain loads with the host's interpreter,
 **before** it changes anything; a missing module stops it with the package to install.
 
-### The native core (optional)
+### The native core
 
-The package is pure Python and complete as such. A compiled module with the hot path's arithmetic and text
-work (`docs/NATIVE.md`) makes the daemon about twice as cheap; `install.sh` uses one when it is at hand for the
-host's machine type and C library and passes its self-test on the host, and says which it did:
+The package needs its compiled module (`docs/NATIVE.md`). `install.sh` never compiles: it takes the module made
+for the host's machine type and C library and checks it on the host before it replaces anything:
 
-| situation | what the script does | its line in the summary |
+| situation | what the script does | its line |
 |---|---|---|
-| `native/dist/linux-<machine>-<libc>/_chris_native.abi3.so` in the source tree (made off the host by `native/cross-build.sh`), or a module built in the tree (`native/build.sh`), or `NATIVE=/path/to/_chris_native.abi3.so` | copies it into the installed package, runs `python3 -m chris_integrator.native` (loads? gives the pure-Python results on this machine?) | `native core: IN USE (linux-aarch64-musl, sha256 ..., self-test ok)` |
-| the self-test fails or the module does not load (another machine type, another C library) | removes the module again | `native core: NOT used, the compiled module ... failed here and was removed: pure Python (...)` |
-| no module at hand | nothing | `native core: no compiled module for linux-... at hand (...): pure Python` |
-| `NATIVE=0` | removes a module left by an earlier run | `native core: not installed (NATIVE=0): pure Python` |
+| `native/dist/linux-<machine>-<libc>/_chris_native.abi3.so` in the source tree (made off the host by `native/cross-build.sh`), or a module built in the tree (`native/build.sh`), or `NATIVE=/path/to/_chris_native.abi3.so` | stages the package with it, runs `python3 -m chris_integrator.native` and the daemon's imports there, then replaces the installed package | `native core: linux-aarch64-musl, sha256 ..., from ...; self-test ok` |
+| the module does not load or fails its self-test (another machine type, another C library, another version) | stops; the installed package stays as it was | `install.sh: native core: the module ... does not work here (...). Nothing was installed ...` |
+| no module at hand | stops before it changes anything | `install.sh: native core: no compiled module for linux-... (...). The package needs it: build it ...` |
 
-The script never compiles and installs no package. On a running system the choice is visible in `GET
-/v2/health` (`native`) and in the daemon's log at start (`hot path NATIVE (...)` / `hot path pure Python: ...`);
-`CHRIS_NATIVE=0` in `/etc/chris/integrator.env` switches the native core off without touching files.
+On a running system `GET /v2/health` (`native`) and the daemon's first log lines name the module and its
+version.
 
 ## Install
 
