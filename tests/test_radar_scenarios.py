@@ -32,29 +32,29 @@ def _key(name, light, radar):
 # Stronger properties: {run key: {metric path: (op, threshold)}}; path into score()'s dict, dot separated
 # ("roles.<role>...." / "all...." / "groups.<gid>...." / top-level). None = not enforced yet.
 _COMMON = {
-    "all.id_switches_per_actor": ("<=", None),
-    "all.held_share": (">=", None),
-    "all.moving_called_stationary": ("<=", None),
+    "all.id_switches_per_actor": ("<=", 3.6),         # measured at 1e85e8f (seed 1, day): camera 0.14-1.8, extended 2.5-3.0
+    "all.held_share": (">=", 0.25),                   # camera 0.30-0.61, extended 0.90-0.94
+    "all.moving_called_stationary": ("<=", 0.22),     # camera 0-0.08, extended 0.12-0.18
     "all.occlusion.object.held_share": (">=", None),
     "all.occlusion.object.reacq_same_id": (">=", None),
     "all.occlusion.fov.reacq_same_id": (">=", None),
     "all.extent.len_err_p50": ("<=", None),
-    "all.extent.wid_err_p50": ("<=", None),
-    "all.extent.hdg_err_pi_p50": ("<=", None),
+    "all.extent.wid_err_p50": ("<=", 0.35),           # 0.01-0.21 m
+    "all.extent.hdg_err_pi_p50": ("<=", 0.22),        # 0.02-0.15 rad
     "all.extent.hdg_err_2pi_p50": ("<=", None),
     "false_tracks_per_min": ("<=", None),
 }
 EXPECT = {
     "crossing_pair/day/camera": dict(_COMMON, **{
-        "roles.pair_a.id_switches": ("<=", None),
-        "roles.pair_b.id_switches": ("<=", None),
+        "roles.pair_a.id_switches": ("<=", 1),
+        "roles.pair_b.id_switches": ("<=", 1),
         "roles.ped_a.id_switches": ("<=", None),
         "roles.ped_b.id_switches": ("<=", None),
         "roles.pair_a.occlusion.object.reacq_same_id": (">=", None),
     }),
     "occlusion/day/camera": dict(_COMMON, **{
-        "roles.occ_lead.occlusion.object.held_share": (">=", None),
-        "roles.occ_lead.occlusion.object.reacq_same_id": (">=", None),
+        "roles.occ_lead.occlusion.object.held_share": (">=", 0.9),      # the lead behind the truck: kept
+        "roles.occ_lead.occlusion.object.reacq_same_id": (">=", 1.0),   # ... and found again as itself
         "roles.occ_ped.occlusion.object.held_share": (">=", None),
         "roles.occ_ped.occlusion.object.reacq_same_id": (">=", None),
         "roles.edge_car.occlusion.fov.reacq_same_id": (">=", None),
