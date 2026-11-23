@@ -42,6 +42,7 @@ Scans are processed in time order once the car's own motion is known up to their
 late is applied to the objects taken back to its time (tracker.py).
 """
 import math
+import operator
 
 import numpy as np
 
@@ -247,7 +248,7 @@ class Radar:
         if isinstance(plan, dict) and isinstance(plan.get("x"), list) and isinstance(plan.get("y"), list) \
                 and len(plan["x"]) >= 2 and len(plan["x"]) == len(plan["y"]) and isinstance(ts, int):
             xs = plan["x"]
-            if all(b - a >= 0.0 for a, b in zip(xs, xs[1:])) and xs[-1] > 5.0:
+            if all(map((0.0).__le__, map(operator.sub, xs[1:], xs))) and xs[-1] > 5.0:
                 self._plan, self._path, self.path_t = (xs, plan["y"]), None, ts / NS
                 return
         if isinstance(ts, int) and self.path_t is not None and ts / NS - self.path_t > 1.0:

@@ -26,6 +26,7 @@ class EgoMotion:
         self.reset()
 
     def reset(self):
+        self._at = {}            # state_at of the times asked since the last sample (one message asks a few)
         self.t = []              # sample times
         self.s = []              # (xr, yr, psi, v, w, a, sig_v, sig_w, stands) at each time: rear axle pose
         self.frame = 0           # counts resets: objects of an older frame are meaningless
@@ -41,6 +42,8 @@ class EgoMotion:
         """One sample of the car's motion. Returns False for a sample that is not newer than the newest."""
         v = 0.0 if stands else float(v)
         w = 0.0 if stands else float(w)
+        if self._at:
+            self._at = {}
         if not self.t:
             self.t.append(t)
             self.s.append((-self.axle, 0.0, 0.0, v, w, float(a), sig_v, sig_w, bool(stands)))
@@ -69,6 +72,14 @@ class EgoMotion:
 
     def state_at(self, t):
         """(xr, yr, psi, v, w, a) of the rear axle at time t, or None before any sample."""
+        s = self._at.get(t)
+        if s is None:
+            s = self._at[t] = self._state_at(t)
+            if len(self._at) > 64:
+                self._at = {t: s}
+        return s
+
+    def _state_at(self, t):
         if not self.t:
             return None
         i = bisect.bisect_right(self.t, t)
