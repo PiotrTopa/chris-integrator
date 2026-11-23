@@ -245,6 +245,7 @@ class RadarDisplay:
         if self.msg is not None and t < self.msg["ts_mono_ns"] / NS - 2.0:
             self.reset()             # a new time axis
         self.msg = msg
+        listed = set()
         for o in msg.get("objects") or ():
             if o.get("state") not in ("confirmed", "coast"):
                 continue
@@ -252,16 +253,23 @@ class RadarDisplay:
             if s is None:
                 s = self.seen[o["id"]] = {"t0": t}
             s["t"], s["o"] = t, o
+            s.pop("lost", None)
+            listed.add(o["id"])
+        for oid, s in self.seen.items():                 # not in this message any more: it starts to leave
+            if oid not in listed:
+                s.setdefault("lost", t)
 
     def fresh(self, ts_ns):
         return self.msg is not None and abs(ts_ns - self.msg["ts_mono_ns"]) / NS <= self.cfg["stale_s"]
 
-    def _same_as_lead(self, x, y, lead):
+    def _same_as_lead(self, x, y, lead, sx=0.0):
+        """The radar's place of an object against the lead's: within the lead's width, and within what the
+        radar itself says it knows of the distance (a camera-only object: a quarter of it, more when new)."""
         if lead is None:
             return False
         c = self.cfg
         lx, ly = float(lead["x"]), float(lead["y"])
-        return abs(y - ly) <= c["lead_halfwidth_m"] and abs(x - lx) <= max(c["lead_range_m"], c["lead_range_rel"] * lx)
+        return abs(y - ly) <= c["lead_halfwidth_m"] and abs(x - lx) <= max(c["lead_range_m"], c["lead_range_rel"] * lx, 2.0 * sx)
 
     def objects(self, ts_ns, lead=None):
         """(display objects, alert or None) at a frame time (ns). lead: the view's lead object (x, y right)."""
@@ -273,22 +281,32 @@ class RadarDisplay:
         for oid in list(self.seen):
             s = self.seen[oid]
             o = s["o"]
-            gone = T - s["t"]
-            if gone > c["fade_s"] + 0.15:
+            gone = T - s["lost"] if "lost" in s else None        # since the radar dropped it
+            if (gone is not None and gone > c["fade_s"]) or T - s["t"] > c["stale_s"]:
                 del self.seen[oid]
                 continue
-            dt = max(0.0, min(gone, 1.0))
+            dt = max(0.0, min(T - s["t"], 1.0))
             place[oid] = (float(o["x_m"]) + (float(o["vx_mps"]) - v_ego) * dt,      # the car frame of now: relative motion
                           -(float(o["y_m"]) + float(o["vy_mps"]) * dt), gone)        # view frame: y right
         # the one radar object the lead is drawn from: the nearest to it in range among those in its place
-        near = [(abs(x - float(lead["x"])), oid) for oid, (x, y, _) in place.items() if self._same_as_lead(x, y, lead)]
-        lead_id = min(near)[1] if near else None
+        near = [(abs(x - float(lead["x"])), oid) for oid, (x, y, _) in place.items()
+                if self._same_as_lead(x, y, lead, float((self.seen[oid]["o"].get("std") or [0.0])[0]))]
+        lead_ids = set()
+        if near:
+            # ... and what the radar holds twice at that place (a second object on the same vehicle, until the
+            # radar has merged them): not a second vehicle to draw
+            first = min(near)[1]
+            lead_ids.add(first)
+            for _, oid in near:
+                sx = float((self.seen[oid]["o"].get("std") or [0.0])[0])
+                if abs(place[oid][0] - place[first][0]) <= max(3.0, 2.0 * sx):
+                    lead_ids.add(oid)
         for oid, (x, y, gone) in place.items():
             s = self.seen[oid]
             o = s["o"]
             fl = o.get("flags") or ()
-            is_lead = oid == lead_id
-            if gone <= 0.15 and o.get("state") in c["alert_states"] and ("threat" in fl or "in_path" in fl):
+            is_lead = oid in lead_ids
+            if gone is None and o.get("state") in c["alert_states"] and ("threat" in fl or "in_path" in fl):
                 level = "threat" if "threat" in fl else "obstacle"
                 if alert is None or (level == "threat") > (alert["level"] == "threat") or \
                         (level == alert["level"] and x < alert["x"]):
@@ -302,8 +320,8 @@ class RadarDisplay:
             parked = "parked" in fl
             if label in ("bike", "motorbike") and o.get("motion") != "moving" and "on_path" not in fl:
                 continue
-            if gone > 0.15:
-                phase, alpha = "leave", max(0.0, 1.0 - (gone - 0.15) / c["fade_s"])
+            if gone is not None:
+                phase, alpha = "leave", max(0.0, 1.0 - max(gone, 0.0) / c["fade_s"])
             else:
                 fin = (T - s.setdefault("d0", T)) / c["fade_s"]      # from the frame it is first DRAWN in
                 phase = "appear" if fin < 1.0 else ("coast" if o.get("state") == "coast" else "steady")
@@ -313,7 +331,7 @@ class RadarDisplay:
                         "x": round(x, 2), "y": round(y, 2),
                         "vx": round(float(o.get("v_rel_mps") or 0.0), 2), "vy": round(-float(o["vy_mps"]), 2),
                         "sx": sd[0], "sy": sd[1], "age_s": o.get("age_s"),
-                        "meas_age_s": round(min((o.get("seen") or {"": 0.0}).values()) + gone, 2),
+                        "meas_age_s": round(min((o.get("seen") or {"": 0.0}).values()) + max(T - s["t"], 0.0), 2),
                         "phase": phase, "alpha": round(alpha, 2),
                         "attrs": {"source": "radar", "approximate": True, "motion": o.get("motion"), "parked": parked,
                                   "obstacle": "in_path" in fl, "threat": "threat" in fl,

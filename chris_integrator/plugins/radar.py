@@ -20,7 +20,12 @@ class Radar(Plugin):
 
     def __init__(self, cfg=None, name=None):
         super().__init__(None, name)
-        self.box = _Radar(cfg)
+        cfg = dict(cfg or {})
+        # messages per second at most: the objects are carried between messages by their own velocity (the
+        # view does), and on a phone's small cores every message costs milliseconds
+        self.rate_hz = float(cfg.pop("rate_hz", 10.0))
+        self._ts = None
+        self.box = _Radar(cfg or None)
 
     def on_input(self, stream, msg, ctx):
         b = self.box
@@ -36,12 +41,16 @@ class Radar(Plugin):
             b.on_ego_state(msg)
             ts = msg.get("ts_mono_ns")
             if isinstance(ts, int):
+                if self._ts is not None and 0 <= ts - self._ts < (1.0 / self.rate_hz - 0.01) * 1e9:
+                    return
+                self._ts = ts
                 out = b.frame(ts)
                 if out is not None:
                     out["ts_real_ns"] = msg.get("ts_real_ns")
                     ctx.emit("radar", out)
 
     def reset(self, reason=None):
+        self._ts = None
         self.box.reset(reason)
 
     def health(self):
