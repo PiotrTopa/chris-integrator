@@ -172,6 +172,9 @@ class CameraBoxes(Sensor):
 
     def p_detect(self, xc, yc, x=None):
         p = self.coverage(xc, yc)
+        if p > 0.0 and self.cover is not None and math.hypot(xc, yc) < self.cover["ground_min_m"]:
+            p *= self.cfg["p_cut"]                        # nearer than the view's first ground point: its box
+                                                          # is cut there, and a cut box is often not reported
         if p <= 0.0 or x is None or self.h_min is None:
             return p
         # a detector does not report boxes below a size, and is unsure just above it
@@ -257,9 +260,48 @@ class CameraBoxes(Sensor):
         # a bearing alone fits everything on its ray: it holds only an object near enough to be cut at the bottom
         return math.hypot(xc, yc) <= self.cfg["near_margin"] * self.cover["ground_min_m"]
 
+    def _start_top(self, det, pose, label):
+        """An object first seen in a box cut at the bottom: its feet are out of the picture, its top is not.
+        For a kind whose height is known well and differs enough from the camera's own (a person, a lorry) the
+        top edge says how far it is; for a car, about as tall as the camera sits, it says nothing and the box
+        starts no object."""
+        k = kin(label)
+        c = self.cfg
+        ho = k["h"]
+        dh = self.hc - ho
+        if label is None or abs(dh) < c["top_start_rel"] * k["h_rel"] * ho:
+            return None
+        a = float(det["z"][1]) - self.bias
+        if a * dh <= 0.0 or abs(math.tan(a)) < 1e-4:
+            return None
+        r = dh / math.tan(a)
+        if not 1.0 < r <= c["max_range_m"]:
+            return None
+        b = float(det["z"][0])
+        dr_dh = -ho / math.tan(a)                         # range per (log) height
+        dr_da = -dh / (math.sin(a) ** 2)                  # range per angle
+        var_r = dr_dh ** 2 * k["h_rel"] ** 2 + dr_da ** 2 * (det["R"][1] + self.bias_var)
+        if var_r > (c["top_start_rel_range"] * r) ** 2:
+            return None
+        x0 = np.zeros(N)
+        x0[LH] = math.log(ho)
+        P0 = _prior(label, c)
+        P0[DP, DP] = self.bias_var + self.dp_obj_var
+        ang = b + pose[2]
+        ca, sa = math.cos(ang), math.sin(ang)
+        x0[PX], x0[PY] = pose[0] + r * ca, pose[1] + r * sa
+        U = np.array([[ca, -sa], [sa, ca]])
+        P0[:2, :2] = U @ np.diag([var_r, det["R"][0] * r * r + 0.05]) @ U.T
+        c_lh = dr_dh * k["h_rel"] ** 2
+        P0[PX, LH] = P0[LH, PX] = ca * c_lh
+        P0[PY, LH] = P0[LH, PY] = sa * c_lh
+        return x0, P0
+
     def start(self, det, pose, label):
         kd = base(det["kind"])
-        if kd in ("b", "bt", ""):
+        if kd == "bt":
+            return self._start_top(det, pose, label)
+        if kd in ("b", ""):
             return None
         k = kin(label)
         hc = self.hc
@@ -305,6 +347,9 @@ CAMERA_CFG = dict(
     born_small=0.7, born_small_scale=0.5,     # share of new objects that appear at the smallest box size (log scale)
     h_full_rel=2.0,              # a box this many times the smallest is detected as well as any
     p_small=0.1,                 # ... and one at the limit this much of that
+    top_start_rel=2.5, top_start_rel_range=0.45,   # a cut box starts an object when its kind's height differs from
+                                 # the camera's by this many of its own spreads, and the range comes out this well
+    p_cut=0.4,
     use_scale_rate=True, scale_rate_floor=0.01,   # (1/s) the detector's stated spread is not believed below this
     scale_rate_span=1.5,         # (1/s) scale rates of things not known yet lie within about this much
     max_range_m=80.0,
