@@ -56,8 +56,9 @@ ZeroDivisionError; a row's prediction, value and variance are read as floats (`f
 becomes a float of the same value: the monitors hold floats where the Python held numpy scalars (the same bits;
 only `round()` of a value next to a decimal tie could differ, numpy rounding by its own rule); a state that is
 not float64 is made a float64 copy; a stream's value beyond 2^53 is read as the nearest double.
-| `radar` | `Hyp` (radar/tracker: the objects' trees of hypotheses, the clusters and their global hypotheses; `scan`: one scan's step of every leaf, gate and likelihood ratios, the scan's common angle, clusters, ranked assignments (Murty), births, updates in Joseph form, N-scan pruning; `drop`, `rows`, `chain`, `leaves`, `start`, `info`, `clusters`, `dump`, `load`) | which detection is whose, over several scans (docs/RADAR.md) | golden: calls of `scan` and `drop` on simulated drives, the hypotheses and rows after them (discrete results the same, numbers to rounding) |
+| `radar` | `Hyp` (radar/tracker: the objects' trees of hypotheses, the clusters and their global hypotheses; `scan`: one scan's step of every leaf, gate and likelihood ratios, the scan's common angle, clusters, ranked assignments (Murty), births, updates in Joseph form, N-scan pruning; `smooth`: a story's past smoothed backwards; `drop`, `rows`, `chain`, `leaves`, `start`, `info`, `clusters`, `dump`, `load`) | which detection is whose, over several scans (docs/RADAR.md) | golden: calls of `scan` and `drop` on simulated drives, the hypotheses and rows after them (discrete results the same, numbers to rounding) |
 | `radar` | `radar_peek`, `radar_peek_pos`, `radar_peek_models`, `radar_life`, `radar_merge`, `radar_check`, `radar_register`, `radar_combine_rows` (radar/tracker, on rows of the state array) | the motion model without committing, and the objects' upkeep | golden: to rounding |
+| `radar` | `radar_cells` (an extended sensor's returns grouped into cells), `radar_groups`, `radar_group_support` (rows, queues, platoons and what a row says about a member) (radar/tracker) | docs/RADAR.md 4 and 7 | golden: to rounding |
 | `radar` | `radar_frame` (radar/box) | the message's objects: their numbers, flags with their hysteresis, the dicts | golden: to rounding; digests of three drives' messages (x86-64) |
 | `radar` | `radar_h` (radar/sensors: camera kinds b, rb, rbh, bt with and without the scale-rate row, microwave radar, position), `radar_marginals`, `radar_assign`, `radar_kbest`, `radar_predict1`, `radar_still1`, `radar_transition1` (one hypothesis; tests and tools) | measurement functions, pairings' probabilities, assignment, ranked assignments, one hypothesis' step | golden |
 
@@ -77,7 +78,7 @@ The radar (`chris_integrator/radar`) has no Python implementation of its arithme
 measurement functions, a scan (step, association over several scans, update, the start of an object), the objects'
 upkeep and the message's objects are C only. Python keeps the objects' life (states, votes, records, merging),
 the message's assembly around the objects, and the glue. The objects' numbers live in one float64 array of the
-tracker (`tracker.State`): a row of 406 numbers per node of an object's tree of hypotheses (`tracker._LAY`: motion
+tracker (`tracker.State`): a row of 408 numbers per node of an object's tree of hypotheses (`tracker._LAY`: motion
 hypotheses, free estimate, combination, extent, the step that led into the node, the node's record). Which rows
 are in use, the trees' links, the clusters and their global hypotheses are held by the native object `Hyp`
 (docs/RADAR.md), which reads and writes the rows in place; `Hyp.dump()` / `Hyp.load()` give and take all of it as

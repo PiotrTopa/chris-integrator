@@ -75,8 +75,9 @@ CFG = dict(
     hyp_keep_steps=40, hyp_keep_s=2.0,   # each story's history kept this far back (the smoother's reach)
     rows=1024,                   # of the state array at the start (it grows as needed)
     # the past, smoothed (docs/RADAR.md, section 6): a backward pass over each story after every sighting, as far
-    # back as smooth_s; the velocity that is put out as `vs` and judged is the one smooth_lag_s ago
-    smooth=True, smooth_s=2.0, smooth_lag_s=0.5,
+    # back as smooth_s (the whole trajectory once per smooth_hist_s; 0: at every sighting); the velocity that is
+    # put out as `vs` and judged is the one smooth_lag_s ago
+    smooth=True, smooth_s=2.0, smooth_lag_s=0.5, smooth_hist_s=0.5,
     # structure (docs/RADAR.md, section 7): rows of standing things, queues, platoons. The free room between two
     # members (standing / driving), how alike two drivers' velocities are, how straight the line is (m + share
     # of its length), how near the car's own line a queue's passes, members needed (a queue: two)
@@ -224,7 +225,7 @@ class Obj:
     __slots__ = ("id", "h", "slot", "_xs", "_Ps", "_mu", "_xf", "_Pf", "_x", "_P", "_e", "_Pe", "_st", "_m", "t0", "state",
                  "sources", "last_seen", "vote", "history", "checks", "consistency", "pred_err", "n_checks", "nis",
                  "verdict", "coast_s", "velocity_seen", "merge_t", "flags", "last_cover", "dp0", "scores", "cls", "kin",
-                 "store", "pe", "pp", "nleaf", "in_map", "label_code", "hidden_t", "vs", "fs", "ps_lag", "grp", "grp_kind")
+                 "store", "pe", "pp", "nleaf", "in_map", "label_code", "hidden_t", "vs", "fs", "ps_lag", "grp", "grp_kind", "hist_t")
     xs, Ps, mu, xf, Pf, x, P, e, Pe, st, m = (_view(k) for k, _ in _LAY)
     t = _meta(M_T)                   # the time its numbers are of
     logodds = _meta(M_L)             # that it exists, in the primary's story (`exist`: over all stories)
@@ -265,6 +266,7 @@ class Obj:
         self.vs = None               # its velocity a lag ago, smoothed: (vx, vy, 1 sigma x, y, how long ago), ground frame
         self.fs = None               # the free estimate's smoothed velocity and its covariance (vx, vy, 00, 01, 11)
         self.ps_lag = None           # the smoothed probability of "it stands" at the lag
+        self.hist_t = -1e18          # when its trajectory was last smoothed as a whole
         self.grp = None              # the group it is of (id), and the group's kind: row | queue | platoon
         self.grp_kind = None
 
@@ -550,10 +552,17 @@ class Tracker:
         nodes): its trajectory (`history`) and its velocity a lag ago (`vs`), from the detections that came after
         as well. The filtered state stays what is put out for now."""
         c = self.cfg
-        r = self.hyp.smooth(self.store.a, o.h, M._native_par(self.mcfg), c["hyp_keep_steps"], c["smooth_s"], c["smooth_lag_s"])
+        # back to the lag after every sighting (the velocity that is judged and put out); the whole trajectory, as
+        # far as smooth_s, once per smooth_hist_s (it costs four times the short pass with a 17 Hz sensor)
+        whole = o.t - o.hist_t >= c["smooth_hist_s"]
+        r = self.hyp.smooth(self.store.a, o.h, M._native_par(self.mcfg), c["hyp_keep_steps"],
+                            c["smooth_s"] if whole else 1.5 * c["smooth_lag_s"], c["smooth_lag_s"])
         if r is None:
             return
         hist, o.vs, o.fs, o.ps_lag = r
+        if not whole:
+            return
+        o.hist_t = o.t
         t_old = hist[-1][0]
         keep = [h for h in o.history if h[0] < t_old - 1e-6]     # older than the smoother reaches: as it was
         o.history.clear()

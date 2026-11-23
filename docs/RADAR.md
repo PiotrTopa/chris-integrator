@@ -297,8 +297,8 @@ measures range rate (a microwave radar's first return settles it).
 The filtered state is the estimate from the detections up to now; it is what the message carries as the present.
 The past can be known better: the chain of nodes from an object's primary back is one story's history, each node
 holding the motion hypotheses after its scan and the step that led into it (switching matrix, dt, what the car's
-own movement added). `Hyp.smooth` runs a backward pass over it after every sighting, as far back as `smooth_s`
-(2 s): per motion hypothesis a Rauch-Tung-Striebel step (the gain from a Cholesky factor of the predicted
+own movement added). `Hyp.smooth` runs a backward pass over it after every sighting back to the lag, and once per `smooth_hist_s`
+(0.5 s; 0: every sighting) as far back as `smooth_s` (2 s) for the trajectory: per motion hypothesis a Rauch-Tung-Striebel step (the gain from a Cholesky factor of the predicted
 covariance), with the hypotheses mixed backwards (the smoother of the interacting multiple model filter: each
 hypothesis of a node receives the child's smoothed hypotheses in proportion to what it handed them), and a plain
 RTS pass for the free estimate. Nothing is written back into the nodes: the filter's rows stay the filter's.
