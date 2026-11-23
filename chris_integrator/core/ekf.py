@@ -15,7 +15,7 @@ import math
 
 import numpy as np
 
-from ..native import ekf as _N
+from ..native import core as _C
 
 T_NU = 4.0                      # degrees of freedom of the robust rows' Student-t
 
@@ -48,64 +48,40 @@ def wrap_pi(a):
     return (a + math.pi) % (2.0 * math.pi) - math.pi
 
 
-# ---- the arithmetic of one scalar row -------------------------------------------------------------------
-# Two implementations of the same three steps: numpy (the reference) and the native core (when it is in use:
-# `chris_integrator.native`). `_run` below is the same code for both. The native steps work in place on arrays
-# the loop owns (`own`: this pass made the array, nothing else holds it); the numpy steps make new arrays.
-def _project_py(P, idx, coef, buf=None):
-    """(ph, s0): P h^T and h P h^T of a sparse row h. (`buf`: a work array of the pass, used by the native step.)"""
-    ph = P[:, idx] @ coef
-    return ph, float(coef @ ph[idx])
+# ---- the arithmetic of one scalar row (the native core: chris_native.c `ekf_project`, `ekf_update`, `ekf_sym`) --
+# The steps work in place on arrays the filter pass owns (`own`: this pass made the array, nothing else holds it).
+# A row model may return lists, and an array may be a view: those are made contiguous arrays first.
+def _f64(a):
+    return np.ascontiguousarray(a, dtype=float)
 
 
-def _apply_py(x, P, ph, s, nu, freeze, own):
-    """The row's correction: x in place (the caller's own copy), the new P returned."""
-    k = ph / s
-    if freeze is None:
-        x += k * nu
-        return P - k[:, None] * ph[None, :]
-    # Schmidt-Kalman: the frozen states' uncertainty is in S, but they are not corrected by this
-    # row (the gain is no longer optimal: the Joseph form of the covariance update)
-    k[freeze] = 0.0
-    x += k * nu
-    kp = k[:, None] * ph[None, :]
-    P = P - kp - kp.T + s * (k[:, None] * k[None, :])
-    return 0.5 * (P + P.T)
-
-
-def _sym_py(P, own):
-    return 0.5 * (P + P.T)
-
-
-def _project_native(P, idx, coef, buf=None):
+def _project(P, idx, coef, buf=None):
+    """(ph, s0): P h^T and h P h^T of a sparse row h (`buf`: a work array of the pass for ph)."""
     ph = np.empty(P.shape[0]) if buf is None else buf
     try:
-        return ph, _N.ekf_project(P, idx, coef, ph)
-    except (TypeError, ValueError, BufferError):       # a row model that returns lists, or a view
-        return _project_py(P, np.asarray(idx, dtype=np.intp), np.asarray(coef, dtype=float))
+        return ph, _C.ekf_project(P, idx, coef, ph)
+    except (TypeError, ValueError, BufferError):     # lists, a view: made contiguous arrays (a wrong shape fails again)
+        return ph, _C.ekf_project(_f64(P), np.ascontiguousarray(idx, dtype=np.intp), _f64(coef), ph)
 
 
-def _apply_native(x, P, ph, s, nu, freeze, own):
+def _apply(x, P, ph, s, nu, freeze, own):
+    """The row's correction: x in place (the caller's own copy), P in place when `own`; returns P. Without
+    `freeze`: k = ph / s, x += k nu, P -= k ph^T; with it (Schmidt-Kalman: those states are not corrected by this
+    row, the gain is no longer optimal) the Joseph form, symmetrised."""
     if not own:
-        P = P.copy()
-    try:
-        _N.ekf_update(x, P, ph, s, nu, freeze)
-    except (TypeError, ValueError, BufferError):
-        return _apply_py(x, P, ph, s, nu, freeze, own)
+        P = np.array(P, dtype=float, order="C")
+    if freeze is not None:
+        freeze = np.ascontiguousarray(freeze, dtype=np.intp)
+    _C.ekf_update(x, P, ph, s, nu, freeze)
     return P
 
 
-def _sym_native(P, own):
+def _sym(P, own):
+    """0.5 (P + P^T), in place when `own`."""
     if not own:
-        return _sym_py(P, own)
-    _N.ekf_sym(P)
+        P = np.array(P, dtype=float, order="C")
+    _C.ekf_sym(P)
     return P
-
-
-if _N is None:
-    _project, _apply, _sym = _project_py, _apply_py, _sym_py
-else:
-    _project, _apply, _sym = _project_native, _apply_native, _sym_native
 
 
 class Filter:
@@ -323,9 +299,9 @@ class Filter:
         while j1 + 1 < len(self.entries) and self.entries[j1 + 1].t - T <= self.lookahead:
             j1 += 1
         xs, Ps = self.entries[j1].x, self.entries[j1].P
-        # a model may return its transition in a structured form and multiply by it itself (`apply_F`)
-        fmul = getattr(self.model, "apply_F", None) or (lambda F, M: F @ M)
-        rts = getattr(self.model, "rts", None)         # a model may do the whole step itself (the native core)
+        # a model may do the whole step itself (`rts`: the estimator's model, in the native core); for a model
+        # without one, the step with numpy and the transition as a matrix
+        rts = getattr(self.model, "rts", None)
 
         def back(Pp, F, Pa, xa, xp, xs, Ps):
             """One step back over a prediction: the smoothed (x, P) at its start from the smoothed at its end."""
@@ -333,9 +309,8 @@ class Filter:
                 r = rts(Pp, F, Pa, xa, xp, xs, Ps, self.wrap_idx)
                 if r is False:
                     raise np.linalg.LinAlgError("singular")
-                if r is not None:
-                    return r
-            C = np.linalg.solve(Pp, fmul(F, Pa)).T
+                return r
+            C = np.linalg.solve(Pp, F @ Pa).T
             return xa + C @ self._diff(xs, xp), Pa + C @ (Ps - Pp) @ C.T
         try:
             for j in range(j1, j0, -1):                # smooth back to entry j0
