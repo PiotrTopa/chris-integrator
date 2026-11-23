@@ -8,7 +8,14 @@ topic (the map box) is described in chris-mapper's `docs/MAP.md`, the map pack f
 The raw per-camera topics this API passes through (`road`, `signs`, `lights` with its `road_users`, `env`,
 `camera`, `calib`, `display_lanes`, `governor`) are chris-roadsense's (its [`docs/ARCHITECTURE.md`](https://github.com/PiotrTopa/roadsense/blob/main/docs/ARCHITECTURE.md)). The object
 class fields of lane L42 (`tracks[].class`, `lead.class`, `view.objects[].cls`) and the `road_user` objects of
-`view` are in the tables below (design: `chris_integrator/trackers/roadusers_view.py`, `docs/DESIGN.md` section 16). Paths in the moved text are those of the chris-roadsense repository at the time
+`view` are in the tables below (design: `chris_integrator/trackers/roadusers_view.py`, `docs/DESIGN.md` section 16).
+While the radar component (`chris_integrator/radar`, topic `radar`) speaks, the `road_user` objects of `view` are
+drawn from its objects (`attrs.source: "radar"`) and carry what it knows: `attrs.motion`, `attrs.parked` (a
+vehicle standing beside the path: a screen draws it dimmed), `attrs.obstacle` (it stands on the path),
+`attrs.threat` (reached within seconds at the present speeds), `attrs.with_traffic`, `attrs.ttc_s`; and `view`
+has `alert`: `null` or `{"level": "threat" | "obstacle", "id", "x", "y", "ttc_s", "lead"}`, the one thing ahead
+to shout about (`lead: true` when it is the object the lead is drawn from). `{"view": {"radar_objects": false}}`
+keeps the detector's boxes as the only source. Paths in the moved text are those of the chris-roadsense repository at the time
 ([`docs/VEHICLE_API.md`](https://github.com/PiotrTopa/roadsense/blob/main/docs/VEHICLE_API.md), `chris_integrator/...`, "section Calibration" of its ARCHITECTURE.md).
 
 Ports in a deployment: the consolidated API on 8090, the camera instance's debug face on 8091 (`docs/INSTALL.md`).

@@ -74,7 +74,7 @@ class ClassSlot(unittest.TestCase):
     def test_class_with_confidence_and_source_on_track_lead_and_view(self):
         ld = [m for m in self.cls["lead"] if m["present"]]
         with_cls = [m for m in ld if m["class"]]
-        self.assertGreater(len(with_cls) / len(ld), 0.9)
+        self.assertGreater(len(with_cls) / len(ld), 0.8)             # unknown where the detector lost it for EXPIRE_S
         c = with_cls[-1]["class"]
         self.assertEqual((c["label"], c["source"]), ("truck", "roadusers"))    # one "car" in seven does not flip it
         self.assertGreater(c["confidence"], 0.6)

@@ -8,7 +8,7 @@ from ..trackers.egolane import EgoLaneEstimator
 from ..trackers.fusion import Fusion
 from ..trackers.lanes import RoadGeometryTracker
 from ..trackers.roadgeom import RoadGeometryFusion
-from ..trackers.roadusers_view import RoadUserDisplay
+from ..trackers.roadusers_view import RadarDisplay, RoadUserDisplay
 from ..trackers.rules import RulesInEffect
 from ..trackers.speedlimit import load_rules
 from ..trackers.view import ViewBuilder
@@ -273,13 +273,17 @@ class View(Plugin):
               In("tracks", optional=True),
               In("map", trigger=True, optional=True), In("lights", trigger=True, optional=True),
               In("signs", trigger=True, optional=True), In("display_lanes", trigger=True, optional=True),
-              In("calib", optional=True), In("governor", optional=True), In("road_users", trigger=True, optional=True))
+              In("calib", optional=True), In("governor", optional=True), In("road_users", trigger=True, optional=True),
+              In("radar", trigger=True, optional=True))
     outputs = (Out("view", "display", "frame", doc="the display channel: road picture, objects, lines"),)
 
     def __init__(self, cfg=None, name=None):
         super().__init__(None, name)
         cfg = dict(cfg or {})
         self.users = RoadUserDisplay(cfg.pop("road_users", None))   # road users the object layer cannot place
+        # ... drawn from the radar's objects while the radar speaks (parked ones marked, what stands in the way
+        # raised as the view's `alert`); `radar_objects: false` keeps the detector's boxes as the only source
+        self.radar = RadarDisplay(cfg.pop("radar", None)) if cfg.pop("radar_objects", True) else None
         self.builder = ViewBuilder(cfg or None)
         self._ts = None                    # frame time of the last `view` built (the governor's view_hz cap)
         self._lead = None                  # the lead object of the last `view` (its detection is not drawn twice)
@@ -296,6 +300,9 @@ class View(Plugin):
             b.on_display_lanes(msg)
         elif stream == "road_users":       # non-critical: drawn where the camera can place them, never measured
             self.users.update(msg, self._lead)
+        elif stream == "radar":
+            if self.radar is not None:
+                self.radar.update(msg)
         else:
             cap, ts = ((ctx.get("governor") or {}).get("caps") or {}).get("view_hz", -1), msg.get("ts_mono_ns")
             if not (cap < 0 or self._ts is None or not isinstance(ts, int) or ts < self._ts
@@ -307,13 +314,19 @@ class View(Plugin):
                              el and el.get("est"), ego=ctx.get("ego_state", frame=True))
             if out is not None:
                 self._lead = next((o for o in out["objects"] if o.get("role") == "lead"), None)
-                if self.users.objs:
+                if self.radar is not None and self.radar.fresh(out["ts_mono_ns"]):
+                    objs, alert = self.radar.objects(out["ts_mono_ns"], self._lead)
+                    out["objects"] = out["objects"] + objs
+                    out["alert"] = alert
+                elif self.users.objs:
                     out["objects"] = out["objects"] + self.users.objects(out["ts_mono_ns"])
                 ctx.emit("view", out)
 
     def reset(self, reason=None):
         self.builder.reset()
         self.users.reset()
+        if self.radar is not None:
+            self.radar.reset()
         self._ts = None
         self._lead = None
 

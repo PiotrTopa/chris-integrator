@@ -29,6 +29,7 @@ import os
 from .mixer import Mixer, Plugin, StreamSpec
 from .plugins.common import Rates
 from .plugins.estimator import Estimator
+from .plugins.radar import Radar
 from .plugins.roadusers import RoadUsers
 from .plugins.trackers import EgoLane, EgoLight, Fused, Lanes, RideWatch, RoadGeom, Rules, SignContext, View
 
@@ -173,6 +174,7 @@ def build(cfg=None, config_dir=None, datadir=None, clock=None, mapper="auto", ex
         est_cfg["lead"] = dict(lead, **(est_cfg.get("lead") or {}))
     view_cfg = conf("view")
     boxes = [RideWatch(), RoadUsers(conf("road_users") or None), Estimator(est_cfg)]
+    boxes.append(Radar(conf("radar") or None))        # the objects around the car (chris_integrator/radar)
     if external_map:
         st.add_channel("map_in", EXTERNAL_MAP, info="an external map matcher")
     elif mapper not in (None, False):

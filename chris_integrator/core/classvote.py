@@ -14,6 +14,9 @@ not flicker with it. So the label of an object is a vote over its whole life:
   times how much evidence there is (1 - exp(-observations / `EVIDENCE_SCALE`)): a label the detector only ever
   gives with a low score (on the car's camera: vans called `truck` at 0.3-0.6) stays a low-confidence label
   however often it is repeated, and two observations do not make a confident class;
+* a vote nobody has added to for `EXPIRE_S` is over: the class is unknown again and the next observation
+  starts a new vote. A track outlives what it was labelled from: the car's wall-facing "lead" of 2026-11-22
+  took `human` from one passer-by and showed it for 47 s after the person had gone;
 * below `MIN_VOTES` observations or `MIN_CONFIDENCE` the class is unknown (None): "unknown" beats a confident
   wrong answer, and a consumer draws its generic shape then.
 
@@ -34,6 +37,7 @@ FIRST_RATIO = 1.5
 MIN_VOTES = 2
 MIN_CONFIDENCE = 0.35
 EVIDENCE_SCALE = 1.0
+EXPIRE_S = 4.0               # without an observation for this long the label lapses and the vote restarts
 
 
 def norm_label(label):
@@ -58,7 +62,10 @@ def vote(mem, label, conf, src, t, weight=1.0):
     if not mem:
         mem.update({"w": {}, "c": {}, "src": {}, "t": t, "n": 0, "shown": None})
     dt = t - mem["t"] if t is not None and mem["t"] is not None else 0.0
-    if dt > 0.0:
+    if dt > EXPIRE_S:                     # the old vote is over: what is seen now is judged on its own
+        mem.clear()
+        mem.update({"w": {}, "c": {}, "src": {}, "t": t, "n": 0, "shown": None})
+    elif dt > 0.0:
         k = 0.5 ** (dt / HALF_LIFE_S)
         for key in mem["w"]:
             mem["w"][key] *= k
@@ -99,5 +106,7 @@ def result(mem, T=None):
     if conf < MIN_CONFIDENCE:
         return None
     age = 0.0 if T is None or mem.get("t") is None else max(0.0, T - mem["t"])
+    if age > EXPIRE_S:
+        return None
     return {"label": label, "confidence": round(min(1.0, conf), 2), "source": mem["src"].get(label),
             "age_s": round(age, 2), "votes": mem["n"]}

@@ -204,3 +204,122 @@ class RoadUserDisplay:
         self.objs = keep
         out.sort(key=lambda o: o["x"])
         return out[:c["max_objects"]]
+
+
+RADAR_CFG = dict(
+    fade_s=0.3,                  # appear / leave
+    max_range_m=70.0, max_lateral_m=12.0, max_objects=12,
+    stale_s=1.0,                 # a radar message older than this draws nothing (the old builder takes over)
+    lead_halfwidth_m=1.2, lead_range_rel=0.25, lead_range_m=4.0,
+    alert_states=("confirmed", "coast"),
+)
+
+
+class RadarDisplay:
+    """Display objects from the radar's objects (chris_integrator/radar): the same output as `RoadUserDisplay`,
+    with what the radar knows on top: `attrs.motion`, `attrs.parked` (a vehicle that stands beside the path: a
+    screen draws it dimmed), `attrs.obstacle` (it stands ON the path), `attrs.threat` (the car reaches it within
+    seconds at the present speeds), `attrs.ttc_s`, `attrs.with_traffic`.
+
+    `alert(...)`: the one thing a screen must shout about, if any: {"level": "threat" | "obstacle", "id", "x",
+    "y" (right), "ttc_s", "lead": bool (it is the object the lead is drawn from)}. It is taken from all radar
+    objects, also the one not drawn again because the lead shows it.
+
+    Nothing pops: an object fades in when the radar first lists it and fades out where it was last (carried on by
+    its velocity) when the radar drops it. A riderless two-wheeler that stands beside the path is not drawn
+    (parked ones line every street)."""
+
+    def __init__(self, cfg=None):
+        self.cfg = dict(RADAR_CFG, **(cfg or {}))
+        self.reset()
+
+    def reset(self):
+        self.msg = None
+        self.seen = {}               # radar id -> {"t0", "t", "o"}: first and last time listed, last object
+
+    def update(self, msg):
+        ts = msg.get("ts_mono_ns")
+        if not isinstance(ts, int):
+            return
+        t = ts / NS
+        if self.msg is not None and t < self.msg["ts_mono_ns"] / NS - 2.0:
+            self.reset()             # a new time axis
+        self.msg = msg
+        for o in msg.get("objects") or ():
+            if o.get("state") not in ("confirmed", "coast"):
+                continue
+            s = self.seen.get(o["id"])
+            if s is None:
+                s = self.seen[o["id"]] = {"t0": t}
+            s["t"], s["o"] = t, o
+
+    def fresh(self, ts_ns):
+        return self.msg is not None and abs(ts_ns - self.msg["ts_mono_ns"]) / NS <= self.cfg["stale_s"]
+
+    def _same_as_lead(self, x, y, lead):
+        if lead is None:
+            return False
+        c = self.cfg
+        lx, ly = float(lead["x"]), float(lead["y"])
+        return abs(y - ly) <= c["lead_halfwidth_m"] and abs(x - lx) <= max(c["lead_range_m"], c["lead_range_rel"] * lx)
+
+    def objects(self, ts_ns, lead=None):
+        """(display objects, alert or None) at a frame time (ns). lead: the view's lead object (x, y right)."""
+        c = self.cfg
+        T = ts_ns / NS
+        out, alert = [], None
+        v_ego = float(((self.msg or {}).get("ego") or {}).get("speed_mps") or 0.0)
+        place = {}
+        for oid in list(self.seen):
+            s = self.seen[oid]
+            o = s["o"]
+            gone = T - s["t"]
+            if gone > c["fade_s"] + 0.15:
+                del self.seen[oid]
+                continue
+            dt = max(0.0, min(gone, 1.0))
+            place[oid] = (float(o["x_m"]) + (float(o["vx_mps"]) - v_ego) * dt,      # the car frame of now: relative motion
+                          -(float(o["y_m"]) + float(o["vy_mps"]) * dt), gone)        # view frame: y right
+        # the one radar object the lead is drawn from: the nearest to it in range among those in its place
+        near = [(abs(x - float(lead["x"])), oid) for oid, (x, y, _) in place.items() if self._same_as_lead(x, y, lead)]
+        lead_id = min(near)[1] if near else None
+        for oid, (x, y, gone) in place.items():
+            s = self.seen[oid]
+            o = s["o"]
+            fl = o.get("flags") or ()
+            is_lead = oid == lead_id
+            if gone <= 0.15 and o.get("state") in c["alert_states"] and ("threat" in fl or "in_path" in fl):
+                level = "threat" if "threat" in fl else "obstacle"
+                if alert is None or (level == "threat") > (alert["level"] == "threat") or \
+                        (level == alert["level"] and x < alert["x"]):
+                    alert = {"level": level, "id": "ru:%d" % oid, "x": round(x, 2), "y": round(y, 2),
+                             "ttc_s": o.get("ttc_s"), "lead": is_lead}
+            if is_lead or not (0.5 < x <= c["max_range_m"] and abs(y) <= c["max_lateral_m"]):
+                s.pop("d0", None)                        # not drawn now: it fades in again when it is
+                continue
+            cls = o.get("class") or None
+            label = cls.get("label") if isinstance(cls, dict) else None
+            parked = "parked" in fl
+            if label in ("bike", "motorbike") and o.get("motion") != "moving" and "on_path" not in fl:
+                continue
+            if gone > 0.15:
+                phase, alpha = "leave", max(0.0, 1.0 - (gone - 0.15) / c["fade_s"])
+            else:
+                fin = (T - s.setdefault("d0", T)) / c["fade_s"]      # from the frame it is first DRAWN in
+                phase = "appear" if fin < 1.0 else ("coast" if o.get("state") == "coast" else "steady")
+                alpha = min(1.0, max(0.0, fin))
+            sd = o.get("std") or [0.0, 0.0, 0.0, 0.0]
+            out.append({"id": "ru:%d" % oid, "kind": "road_user", "role": "other",
+                        "x": round(x, 2), "y": round(y, 2),
+                        "vx": round(float(o.get("v_rel_mps") or 0.0), 2), "vy": round(-float(o["vy_mps"]), 2),
+                        "sx": sd[0], "sy": sd[1], "age_s": o.get("age_s"),
+                        "meas_age_s": round(min((o.get("seen") or {"": 0.0}).values()) + gone, 2),
+                        "phase": phase, "alpha": round(alpha, 2),
+                        "attrs": {"source": "radar", "approximate": True, "motion": o.get("motion"), "parked": parked,
+                                  "obstacle": "in_path" in fl, "threat": "threat" in fl,
+                                  "with_traffic": "with_traffic" in fl, "ttc_s": o.get("ttc_s")},
+                        "cls": None if not isinstance(cls, dict) else {"label": cls.get("label"), "confidence": cls.get("confidence"),
+                                                                       "source": cls.get("source")},
+                        "box": None})
+        out.sort(key=lambda q: q["x"])
+        return out[:c["max_objects"]], alert

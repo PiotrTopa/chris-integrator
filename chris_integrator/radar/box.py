@@ -1,0 +1,401 @@
+"""The radar component's face: messages in, the `radar` message out.
+
+In:
+    on_ego_state(msg)     the integrator's `ego_state` (speed, yaw rate, acceleration with uncertainty)
+    on_ego(msg)           or a plain vehicle feed (`ego`: speed_mps, yaw_rate_rps, accel_long_mps2)
+    on_road_users(msg)    a camera's class detector (`road_users`, core/roadusers.py): bearing, ground range
+    on_objects(msg)       a range sensor's detections (`objects` of kind radar / lidar, vehicle input API)
+    on_road(msg)          the road model's frame: its plan is the path the objects are judged against
+
+Out, `frame(ts_mono_ns)` -> {"type": "radar", ...}: every object in the car frame of that time (x forward,
+y LEFT, origin the reference camera):
+
+    id, state (tentative | confirmed | coast | memory: out of every sensor's field, carried on by its motion
+        model and the car's movement), exist, age_s, hits, sources, seen {sensor: s since},
+    x_m, y_m, vx_mps, vy_mps, ax_mps2, ay_mps2     position, velocity and acceleration OVER THE GROUND, car axes
+    speed_mps, heading_rad                          over the ground; heading (car frame, left positive) null below 1 m/s
+    v_rel_mps                                       along the car's axis, relative to the car
+    std [x, y, vx, vy]                              1 sigma
+    motion ("stationary" | "moving" | "unknown"), p_stationary, models {stand, cv, ca}
+    class {"label", "confidence", "source", "votes"} | null
+    flags: on_path (inside the path's corridor), in_path (stands on the path: an obstacle), parked (a vehicle
+           that stands beside the path), with_traffic (drives with the car: see predict_path), unpredictable
+           (keeps being elsewhere than predicted)
+    path_offset_m, ttc_s (time to reach it at the present closing speed, on the path only)
+    p_threat                                        probability that the car reaches it within `threat_ttc_s` at the
+                                                    present speeds, over everything the object may be doing (it
+                                                    stands, it crawls, it drives with the traffic), for an object
+                                                    surely inside the path's corridor; flag `threat` when that is
+                                                    nearly certain and has held. It does not wait for the verdict
+                                                    "stationary": a thing in the way that the car closes on fast
+                                                    is a threat whether it stands or creeps
+    consistency, pred_err_m                         how its earlier predictions held (tracker.py)
+    angle_offset_deg                                this object's own offset of the camera's ground angle (sensors.py)
+    predict [{"t_s", "x_m", "y_m", "std_m"}]        where it will be, in the car frame of NOW (the car's own
+                                                    further movement not applied): by its own motion, straight on
+    predict_path [{"t_s", "x_m", "y_m"}] | null     for an object that drives with the car (same heading, similar
+                                                    speed; flag `with_traffic`): where it will be if it keeps
+                                                    following the road as the car does: along the car's own
+                                                    path, at its present offset beside it, at its present speed
+
+Scans are processed in time order once the car's own motion is known up to their time; a scan that arrives
+late is applied to the objects taken back to its time (tracker.py).
+"""
+import math
+
+import numpy as np
+
+from ..core import classvote
+from ..core.roadusers import Camera
+from ..native import round                  # builtins.round, native where built
+from . import models as M
+from .ego import EgoMotion
+from .models import AX, AY, DP, PX, PY, STAND, VX, VY
+from .sensors import CAMERA_CFG, CameraBoxes, MicrowaveRadar
+from .tracker import Tracker
+
+NS = 1e9
+
+CFG = dict(
+    corridor_m=1.3, corridor_rel=0.012,      # on the path: |offset| <= corridor_m + corridor_rel x distance
+    parked_offset_m=1.9,                     # a standing vehicle this far beside the path is parked
+    path_max_m=150.0,
+    ttc_min_closing=0.5,
+    in_path_sigma=1.0, in_path_slack_m=0.4, in_path_hold_s=0.4,
+    threat_ttc_s=2.7, threat_p=0.85, threat_hold_s=0.2, threat_min_mps=3.0,
+    predict_s=(0.5, 1.0, 2.0),
+    # "drives with the car": heading within this of the path's direction where it is, speed within this ratio
+    # of the car's own, and both really driving
+    with_heading_deg=20.0, with_speed=(0.5, 1.5), with_min_mps=3.0,
+    queue_max=200,
+    tentative=False,                         # list tentative objects too
+)
+
+
+def _fin(v):
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+
+
+class Radar:
+    def __init__(self, cfg=None):
+        cfg = dict(cfg or {})
+        self.cfg = dict(CFG, **{k: v for k, v in cfg.items() if k in CFG})
+        self.camera_cfg = dict(CAMERA_CFG, **(cfg.get("camera") or {}))
+        self.ego = EgoMotion()
+        self.tracker = Tracker(self.ego, cfg.get("tracker"), cfg.get("models"))
+        self.radars = {}                 # microwave radar sensor id -> MicrowaveRadar
+        self.focal_px = float(cfg.get("focal_px", 975.0))    # of the frame the boxes are given in (on_calib sets it)
+        self.cam_height = float(self.camera_cfg["cam_height_m"])
+        self.h_min = {}                  # view (its nearest ground point) -> the smallest box height seen (px)
+        self.cam = None
+        self.frame_scale = 1.0
+        self.reset()
+
+    def reset(self, reason=None):
+        self.ego.reset()
+        self.tracker.reset()
+        self.queue = []                  # (t, src, sensor, dets)
+        self.path = None                 # (xs, ys left) in the car frame of path_t
+        self.path_t = None
+        self.seq = 0
+        self.dropped = 0
+        self._in_since = {}              # object id -> since when it has surely stood on the path
+        self._threat_since = {}
+
+    # ---- inputs -------------------------------------------------------------------------------------------
+    def on_ego_state(self, msg):
+        ts = msg.get("ts_mono_ns")
+        sp = msg.get("speed") or {}
+        if not isinstance(ts, int) or not sp.get("valid") or not _fin(sp.get("value")):
+            return
+        yr, ac, st = msg.get("yaw_rate") or {}, msg.get("accel") or {}, msg.get("standstill") or {}
+        stands = bool(st.get("value"))
+        self.ego.add(ts / NS, sp["value"], yr.get("value") if yr.get("valid") and _fin(yr.get("value")) else 0.0,
+                     ac.get("value") if ac.get("valid") and _fin(ac.get("value")) else 0.0,
+                     sp.get("std") if _fin(sp.get("std")) else 0.1, yr.get("std") if _fin(yr.get("std")) else 0.003, stands)
+
+    def on_ego(self, msg):
+        ts = msg.get("ts_mono_ns")
+        if not isinstance(ts, int) or not _fin(msg.get("speed_mps")):
+            return
+        stands = bool(msg.get("standstill"))
+        v = abs(msg["speed_mps"]) if not msg.get("reverse") else -abs(msg["speed_mps"])
+        self.ego.add(ts / NS, v, msg.get("yaw_rate_rps") if _fin(msg.get("yaw_rate_rps")) else 0.0,
+                     msg.get("accel_long_mps2") if _fin(msg.get("accel_long_mps2")) else 0.0, 0.15, 0.004, stands)
+
+    def on_road_users(self, msg):
+        ts, objs = msg.get("ts_mono_ns"), msg.get("objects")
+        if not isinstance(ts, int) or not isinstance(objs, list) or msg.get("shed"):
+            return                       # shed by the load governor: not "nothing there"
+        c = self.camera_cfg
+        cov, cover = msg.get("coverage"), None
+        if isinstance(cov, dict) and all(_fin(cov.get(k)) for k in ("bearing_min_deg", "bearing_max_deg", "ground_min_m")):
+            cover = {"bearing_min": math.radians(cov["bearing_min_deg"]) - 0.02,
+                     "bearing_max": math.radians(cov["bearing_max_deg"]) + 0.02, "ground_min_m": float(cov["ground_min_m"])}
+        dets = []
+        f, hc = self.focal_px, self.cam_height
+        jit = math.radians(c["pitch_jitter_deg"])
+        for o in objs:
+            if not isinstance(o, dict) or not isinstance(o.get("class"), str) or not _fin(o.get("bearing_deg")):
+                continue
+            b = math.radians(o["bearing_deg"])
+            at = {"class": o["class"], "class_conf": o.get("class_conf"), "weight": o.get("weight", 1.0), "box": o.get("box")}
+            clip = o.get("clip") or ""
+            box = o.get("box")
+            box = [float(v) for v in box] if isinstance(box, (list, tuple)) and len(box) == 4 and all(_fin(v) for v in box) else None
+            hpx = box[3] - box[1] if box else None
+            wa = (box[2] - box[0]) / f if box and box[2] > box[0] else None      # the box's width as an angle
+            if box and not clip and hpx and hpx >= 6.0 and wa:
+                at["aspect"] = (box[2] - box[0]) / hpx   # of a whole box: which way a vehicle points
+            # the box's centre: as good as its edges, unless a side is cut (then the centre is not the object's)
+            if box and "l" not in clip and "r" not in clip:
+                sb = math.hypot(c["bearing_rel"] * (box[2] - box[0]) / f, math.radians(c["bearing_floor_deg"]))
+            else:
+                sb = math.radians(o["bearing_std_deg"]) if _fin(o.get("bearing_std_deg")) else math.radians(1.0)
+            if _fin(o.get("range_m")) and o["range_m"] > 0.5:
+                # the ground point as the camera saw it: the angle below the horizon of the bottom edge
+                r = float(o["range_m"])
+                ang = math.atan2(hc, r)
+                if hpx is not None and hpx > 0.0:
+                    sa = math.hypot((c["bottom_px"] + c["bottom_rel"] * hpx) / f, jit)
+                else:                                    # no box given: what the stated range error is as an angle
+                    sr = float(o["range_std_m"]) if _fin(o.get("range_std_m")) else 0.2 * r
+                    sa = max(sr * hc / (r * r + hc * hc), jit)
+                if hpx is not None and hpx >= 6.0 and "t" not in clip and "b" not in clip:
+                    sh = (c["height_std_px"] + c["height_std_rel"] * hpx) / hpx          # of the logarithm
+                    dets.append({"kind": "rbh", "z": np.array([ang, b, math.log(hpx * self.frame_scale)]),
+                                 "R": np.array([sa * sa, sb * sb, sh * sh]), "attrs": at, "w": wa})
+                else:
+                    dets.append({"kind": "rb", "z": np.array([ang, b]), "R": np.array([sa * sa, sb * sb]), "attrs": at, "w": wa})
+            elif "b" in clip:
+                top = None
+                if box and "t" not in clip and self.cam is not None and hpx:
+                    ry = self.cam.ray(0.5 * (box[0] + box[2]), box[1])
+                    top = math.atan2(ry[2], math.hypot(ry[0], ry[1]))          # below the horizon: positive
+                if top is not None:
+                    st = math.hypot((c["bottom_px"] + c["bottom_rel"] * hpx) / f, jit)
+                    dets.append({"kind": "bt", "z": np.array([b, top]), "R": np.array([sb * sb, st * st]), "attrs": at, "w": wa})
+                else:
+                    dets.append({"kind": "b", "z": np.array([b]), "R": np.array([sb * sb]), "attrs": at, "w": wa})
+        # the detector's size limit in this view, as its boxes show it: the smallest seen, forgotten slowly
+        key = round(cover["ground_min_m"]) if cover else None
+        hs = [math.exp(d["z"][2]) for d in dets if d["kind"] == "rbh"]
+        hm = self.h_min.get(key)
+        if hs:
+            hm = min(hs) if hm is None else min(min(hs), hm * 1.002)
+            self.h_min[key] = hm
+        elif hm is None and self.h_min:
+            hm = float("inf")                            # a box feed, but this view has not shown a box yet
+        self._push((ts / NS, msg.get("sensor") or "cam", CameraBoxes(cover, c, f, hc, hm), dets))
+
+    def on_calib(self, msg):
+        """The camera's calibration message: the focal length that turns a box height into a size at a distance."""
+        if _fin(msg.get("focal_px")) and msg["focal_px"] > 100.0:
+            self.focal_px = float(msg["focal_px"])
+        if _fin(msg.get("height_m")) and 0.3 < msg["height_m"] < 4.0:
+            self.cam_height = float(msg["height_m"])
+        try:
+            self.cam = Camera(msg)                        # rows of the picture as angles (a box's top edge)
+        except (TypeError, ValueError):
+            self.cam = None
+
+    def on_objects(self, msg):
+        """A range sensor's scan (vehicle input API `objects`, kind radar / lidar): range_m, azimuth_deg,
+        range_rate_mps per detection, in the sensor's frame; `mount` {x_m, y_m, yaw_deg} in the car frame."""
+        ts, objs = msg.get("ts_mono_ns"), msg.get("objects")
+        if not isinstance(ts, int) or not isinstance(objs, list) or msg.get("kind") not in ("radar", "lidar", None):
+            return
+        sid = msg.get("sensor") or "radar"
+        mt = msg.get("mount") or {}
+        mount = (float(mt.get("x_m", 0.0)), float(mt.get("y_m", 0.0)), math.radians(float(mt.get("yaw_deg", 0.0))))
+        sen = self.radars.get(sid)
+        if sen is None or (sen.mx, sen.my, sen.yaw) != mount:
+            sen = self.radars[sid] = MicrowaveRadar(mount)
+        dets = []
+        sr, sa, sv = sen.sigma
+        for o in objs:
+            if not isinstance(o, dict) or not (_fin(o.get("range_m")) and _fin(o.get("azimuth_deg")) and _fin(o.get("range_rate_mps"))):
+                continue
+            r, az = float(o["range_m"]), math.radians(o["azimuth_deg"])
+            if r < 0.5 or r > sen.max_range or abs(az) > sen.fov:
+                continue
+            dets.append({"z": np.array([r, az, float(o["range_rate_mps"])]), "R": np.array([sr * sr, sa * sa, sv * sv]),
+                         "attrs": {k: o[k] for k in ("class", "prob") if k in o}})
+        self._push((ts / NS, sid, sen, dets))
+
+    def on_road(self, msg):
+        plan, ts = msg.get("plan"), msg.get("ts_mono_ns")
+        if isinstance(plan, dict) and isinstance(plan.get("x"), list) and isinstance(plan.get("y"), list) \
+                and len(plan["x"]) >= 2 and len(plan["x"]) == len(plan["y"]) and isinstance(ts, int):
+            xs = np.asarray(plan["x"], float)
+            if np.all(np.diff(xs) >= 0.0) and xs[-1] > 5.0:
+                self.path, self.path_t = (xs, -np.asarray(plan["y"], float)), ts / NS       # the road model's y is right
+                return
+        if isinstance(ts, int) and self.path_t is not None and ts / NS - self.path_t > 1.0:
+            self.path = None
+
+    def _push(self, scan):
+        self.queue.append(scan)
+        if len(self.queue) > self.cfg["queue_max"]:
+            self.queue.sort(key=lambda s: s[0])
+            del self.queue[0]
+            self.dropped += 1
+
+    # ---- one output ---------------------------------------------------------------------------------------
+    def _drain(self, T):
+        self.queue.sort(key=lambda s: s[0])
+        k = 0
+        while k < len(self.queue) and self.queue[k][0] <= T + 1e-6:
+            t, src, sensor, dets = self.queue[k]
+            k += 1
+            self.tracker.process(src, t, sensor, dets)
+        del self.queue[:k]
+
+    def _offset(self, x, y, v, w):
+        """Lateral offset of a car-frame point from the path (positive left) and what the path was."""
+        if self.path is not None and x <= self.path[0][-1] + 5.0:
+            return y - float(np.interp(x, self.path[0], self.path[1])), "plan"
+        k = w / v if v > 2.0 else 0.0
+        return y - 0.5 * k * x * x, "arc"
+
+    def _path_point(self, s, v, w):
+        """The path at distance s ahead (car frame): (x, y, direction). The road model's plan as far as it
+        reaches, beyond it (and without one) the arc the car is driving."""
+        if self.path is not None and s <= self.path[0][-1]:
+            xs, ys = self.path
+            y = float(np.interp(s, xs, ys))
+            d = 1.0
+            return s, y, math.atan2(float(np.interp(s + d, xs, ys)) - float(np.interp(s - d, xs, ys)), 2.0 * d)
+        k = w / v if v > 2.0 else 0.0
+        if abs(k) < 1e-6:
+            return s, 0.0, 0.0
+        return math.sin(k * s) / k, (1.0 - math.cos(k * s)) / k, k * s
+
+    def frame(self, ts):
+        """The `radar` message for time ts (ns), or None while the car's own motion is unknown."""
+        T = ts / NS
+        if self.ego.newest is None or T - self.ego.newest > 1.0:
+            return None
+        c = self.cfg
+        self._drain(T)
+        tr = self.tracker
+        tr.manage(T)
+        X, Y, psi = self.ego.pose_at(T)
+        es = self.ego.state_at(T)
+        v_ego, w_ego = es[3], es[4]
+        ch, sh = math.cos(psi), math.sin(psi)
+        Rm = np.array([[ch, sh], [-sh, ch]])              # ground -> car axes
+        out = []
+        shown = [o for o in tr.objects if o.state != "tentative" or c["tentative"]]
+        hz = (0.0,) + tuple(c["predict_s"])
+        at = tr.peek_many([o for o in shown for _ in hz], [T + h for _ in shown for h in hz])     # now and ahead, in one go
+        still = tr.p_still_many(shown)
+        for n, o in enumerate(shown):
+            x, P, mu = at[n * len(hz)]
+            pc = Rm @ np.array([x[PX] - X, x[PY] - Y])
+            vc = Rm @ np.array([x[VX], x[VY]])
+            ac = Rm @ np.array([x[AX], x[AY]])
+            Pp, Pv = Rm @ P[:2, :2] @ Rm.T, Rm @ P[2:4, 2:4] @ Rm.T
+            speed = math.hypot(vc[0], vc[1])
+            label = o.label
+            off, by = self._offset(pc[0], pc[1], v_ego, w_ego)
+            flags = set(o.flags)
+            on = 0.3 < pc[0] <= c["path_max_m"] and abs(off) <= c["corridor_m"] + c["corridor_rel"] * pc[0]
+            if on:
+                flags.add("on_path")
+            # "it stands in the way" is the strongest thing the radar says: it needs the place to be inside the
+            # corridor beyond what the place's own uncertainty could explain, and to have stayed there
+            sy = math.sqrt(max(float(Pp[1, 1]), 0.0))
+            sure_in = on and abs(off) + c["in_path_sigma"] * sy <= c["corridor_m"] + c["corridor_rel"] * pc[0] + c["in_path_slack_m"]
+            hold = self._in_since.get(o.id)
+            if o.verdict == "stationary" and sure_in:
+                if hold is None:
+                    hold = self._in_since[o.id] = T
+                if T - hold >= c["in_path_hold_s"]:
+                    flags.add("in_path")
+            else:
+                self._in_since.pop(o.id, None)
+            # reached within threat_ttc_s? Each hypothesis says how likely its speed along the car's axis is
+            # below the one that would just make it
+            p_thr = 0.0
+            if sure_in and v_ego >= c["threat_min_mps"] and o.state != "tentative":
+                need = v_ego - float(pc[0]) / c["threat_ttc_s"]
+                for m_ in range(len(M.MODELS)):
+                    vm = ch * o.xs[m_][VX] + sh * o.xs[m_][VY]
+                    Pm = o.Ps[m_]
+                    sm = math.sqrt(max(ch * ch * Pm[VX, VX] + 2.0 * ch * sh * Pm[VX, VY] + sh * sh * Pm[VY, VY], 0.0) + 0.09)
+                    p_thr += float(o.mu[m_]) * 0.5 * (1.0 + math.erf((need - vm) / (sm * 1.4142)))
+            th0 = self._threat_since.get(o.id)
+            if p_thr >= c["threat_p"]:
+                if th0 is None:
+                    th0 = self._threat_since[o.id] = T
+                if T - th0 >= c["threat_hold_s"]:
+                    flags.add("threat")
+            else:
+                self._threat_since.pop(o.id, None)
+            if o.verdict == "stationary" and not on and abs(off) > c["parked_offset_m"] \
+                    and label not in ("human", "bike", "motorbike"):
+                flags.add("parked")
+            v_rel = vc[0] - v_ego
+            ttc = pc[0] / -v_rel if on and v_rel < -c["ttc_min_closing"] else None
+            pred = []
+            for m, h in enumerate(c["predict_s"]):
+                xp, Pq, _ = at[n * len(hz) + 1 + m]
+                q = Rm @ np.array([xp[PX] - X, xp[PY] - Y])
+                pred.append({"t_s": h, "x_m": round(float(q[0]), 2), "y_m": round(float(q[1]), 2),
+                             "std_m": round(math.sqrt(max(float(np.trace(Pq[:2, :2])), 0.0)), 2)})
+            # the same object if it keeps following the road as the car does
+            along = None
+            if speed >= c["with_min_mps"] and v_ego >= c["with_min_mps"] and pc[0] > 0.0 \
+                    and c["with_speed"][0] <= speed / v_ego <= c["with_speed"][1]:
+                _, _, th = self._path_point(float(pc[0]), v_ego, w_ego)
+                dh = (math.atan2(vc[1], vc[0]) - th + math.pi) % (2.0 * math.pi) - math.pi
+                if abs(dh) <= math.radians(c["with_heading_deg"]):
+                    flags.add("with_traffic")
+                    along = []
+                    for h in c["predict_s"]:
+                        px_, py_, th = self._path_point(float(pc[0]) + speed * h, v_ego, w_ego)
+                        along.append({"t_s": h, "x_m": round(px_ - off * math.sin(th), 2), "y_m": round(py_ + off * math.cos(th), 2)})
+            cls = classvote.result(o.vote, T)
+            out.append({
+                "id": o.id, "state": o.state, "exist": round(o.exist, 3), "age_s": round(T - o.t0, 2), "hits": o.hits,
+                "sources": sorted(o.sources), "seen": {s: round(max(0.0, T - t), 3) for s, t in o.last_seen.items()},
+                "x_m": round(float(pc[0]), 2), "y_m": round(float(pc[1]), 2),
+                "vx_mps": round(float(vc[0]), 2), "vy_mps": round(float(vc[1]), 2),
+                "ax_mps2": round(float(ac[0]), 2), "ay_mps2": round(float(ac[1]), 2),
+                "speed_mps": round(speed, 2), "heading_rad": round(math.atan2(vc[1], vc[0]), 3) if speed >= 1.0 else None,
+                "v_rel_mps": round(float(v_rel), 2),
+                "std": [round(math.sqrt(max(float(Pp[0, 0]), 0.0)), 2), round(math.sqrt(max(float(Pp[1, 1]), 0.0)), 2),
+                        round(math.sqrt(max(float(Pv[0, 0]), 0.0)), 2), round(math.sqrt(max(float(Pv[1, 1]), 0.0)), 2)],
+                "motion": o.verdict, "p_stationary": round(still[n], 3),
+                "models": {n: round(float(m), 3) for n, m in zip(M.MODELS, mu)},
+                "class": None if cls is None else {"label": cls["label"], "confidence": cls["confidence"],
+                                                   "source": cls["source"], "votes": cls["votes"]},
+                "flags": sorted(flags), "path_offset_m": round(off, 2), "ttc_s": None if ttc is None else round(float(ttc), 2),
+                "p_threat": round(p_thr, 3),
+                "consistency": None if o.consistency is None else round(o.consistency, 2),
+                "pred_err_m": None if o.pred_err is None else round(o.pred_err, 2),
+                "angle_offset_deg": round(math.degrees(float(x[DP])), 3), "predict": pred,
+                "predict_path": along})
+        live = {o.id for o in tr.objects}
+        for k in [k for k in self._in_since if k not in live]:
+            del self._in_since[k]
+        for k in [k for k in self._threat_since if k not in live]:
+            del self._threat_since[k]
+        out.sort(key=lambda r: r["x_m"])
+        self.seq += 1
+        sensors = {}
+        for src, (sen, t) in tr.sensors.items():
+            sensors[src] = dict(tr.stats.get(src, {}), kind=sen.name, age_s=round(max(0.0, T - t), 3))
+            if src in tr.bias:                           # the camera's pitch error as the objects have shown it
+                sensors[src].update(pitch_bias_deg=round(math.degrees(tr.bias[src][0]), 3),
+                                    pitch_bias_std_deg=round(math.degrees(math.sqrt(tr.bias[src][1])), 3))
+        return {"type": "radar", "api": 1, "seq": self.seq, "ts_mono_ns": ts, "frame": "car", "objects": out,
+                "ego": {"speed_mps": round(v_ego, 2), "yaw_rate_rps": round(w_ego, 4), "accel_mps2": round(es[5], 2),
+                        "stands": self.ego.stands_at(T), "ground_frame": self.ego.frame},
+                "path": None if self.path is None else "plan", "sensors": sensors,
+                "counts": {"objects": len(tr.objects), "listed": len(out), "queued": len(self.queue), "dropped": self.dropped}}
+
+    def health(self):
+        return {"objects": len(self.tracker.objects), "queued": len(self.queue), "dropped": self.dropped,
+                "ego_samples": len(self.ego)}

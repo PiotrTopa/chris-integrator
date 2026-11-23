@@ -82,6 +82,7 @@ def strip(msgs):
         m = copy.deepcopy(m)
         m.pop("class", None)
         m.pop("sensors", None)
+        m.pop("alert", None)                 # the view's alert comes from the road users (the radar)
         for tr in m.get("tracks") or []:
             tr.pop("class", None)
         if "objects" in m:
@@ -163,6 +164,20 @@ class Vote(unittest.TestCase):
             classvote.vote(mem, "truck", 0.8, "s", 10.0 + 0.2 * i)
         self.assertEqual(classvote.result(mem)["label"], "truck")
 
+    def test_a_label_lapses_when_nothing_supports_it_any_more(self):
+        # the car, 2026-11-22: a wall tracked as the lead took "human" from one passer-by and kept it for 47 s
+        mem = {}
+        for i in range(4):
+            classvote.vote(mem, "person", 0.6, "s", 0.2 * i)
+        self.assertEqual(classvote.result(mem, 0.8)["label"], "human")
+        self.assertEqual(classvote.result(mem, 0.6 + classvote.EXPIRE_S - 0.1)["label"], "human")
+        self.assertIsNone(classvote.result(mem, 0.6 + classvote.EXPIRE_S + 0.1))
+        # what is seen after the gap is judged on its own: one observation is not a class, the old label is gone
+        classvote.vote(mem, "car", 0.8, "s", 60.0)
+        self.assertIsNone(classvote.result(mem, 60.0))
+        classvote.vote(mem, "car", 0.8, "s", 60.2)
+        self.assertEqual(classvote.result(mem, 60.2)["label"], "car")
+
     def test_aliases(self):
         self.assertEqual([classvote.norm_label(x) for x in ("person", "motor", "rider", "Bicycle", "van", "train")],
                          ["human", "motorbike", "bike", "bike", "van", "tram"])
@@ -188,7 +203,8 @@ class RoadUsersInTheStack(unittest.TestCase):
     def test_lead_class_is_voted_and_stable(self):
         ld = [m for m in self.cls["lead"] if m["present"]]
         labels = [(m["class"] or {}).get("label") for m in ld]
-        self.assertGreater(labels.count("truck") / len(ld), 0.9)      # one "car" in four does not flip it
+        self.assertGreater(labels.count("truck") / len(ld), 0.8)      # one "car" in four does not flip it
+        self.assertEqual(set(labels), {"truck", None})                # unknown where the detector lost it (EXPIRE_S)
         changes = sum(1 for a, b in zip(labels, labels[1:]) if a != b and a is not None and b is not None)
         self.assertEqual(changes, 0)
         self.assertEqual(ld[-1]["class"]["source"], "roadusers")

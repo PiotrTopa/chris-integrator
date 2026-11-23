@@ -223,6 +223,9 @@ def from_lights(msg, calib, sensor="cam", cfg=PROJ_CFG):
     out = {"type": "road_users", "sensor": sensor, "seq": msg.get("seq"), "ts_mono_ns": msg.get("ts_mono_ns"),
            "ts_real_ns": msg.get("ts_real_ns"), "view": msg.get("view"), "roi": msg.get("roi"),
            "shed": ru is None, "calib": "message" if calib else "nominal", "objects": []}
+    cov = field_of(msg.get("roi"), cam)
+    if cov is not None:
+        out["coverage"] = cov
     for o in ru or ():
         if not isinstance(o, dict) or not isinstance(o.get("cls"), str) or not isinstance(o.get("box"), list) or len(o["box"]) != 4:
             continue
@@ -235,6 +238,24 @@ def from_lights(msg, calib, sensor="cam", cfg=PROJ_CFG):
                                          "rider": bool(o.get("rider")), "clip": clip, "box": o["box"],
                                          "weight": cfg["clipped_weight"] if clip else 1.0}))
     return out
+
+
+def field_of(roi, cam):
+    """What a view of the detector can see: {"bearing_min_deg", "bearing_max_deg" (left positive),
+    "ground_min_m": the nearest ground point (the road at the bottom of the region; a box standing nearer is cut
+    there and has a bearing only)}, or None without a usable region. Read by the radar (chris_integrator/radar):
+    a miss outside a view's field says nothing about an object."""
+    if not isinstance(roi, (list, tuple)) or len(roi) != 4 or not all(fin(v) for v in roi):
+        return None
+    x0, y0, x1, y1 = (float(v) for v in roi)
+    if not (x1 > x0 and y1 > y0):
+        return None
+    g = cam.ground(0.5 * (x0 + x1), y1 - 2.0)
+    if g is None:
+        return None
+    b0, b1 = cam.bearing(x0), cam.bearing(x1)
+    return {"bearing_min_deg": round(math.degrees(min(b0, b1)), 2), "bearing_max_deg": round(math.degrees(max(b0, b1)), 2),
+            "ground_min_m": round(math.hypot(g[0], g[1]), 2)}
 
 
 def _factory(spec):
