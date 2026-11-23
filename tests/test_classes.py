@@ -54,6 +54,8 @@ def strip(msgs):
             tr.pop("class", None)
         for o in m.get("objects") or []:
             o.pop("cls", None)
+        for o in m.get("around") or []:         # view.around: the class label is the class attribute too
+            o.pop("k", None)
         out.append(m)
     return out
 

@@ -282,7 +282,8 @@ class View(Plugin):
         cfg = dict(cfg or {})
         self.users = RoadUserDisplay(cfg.pop("road_users", None))   # road users the object layer cannot place
         # ... drawn from the radar's objects while the radar speaks (parked ones marked, what stands in the way
-        # raised as the view's `alert`); `radar_objects: false` keeps the detector's boxes as the only source
+        # raised as the view's `alert`); `radar_objects: false` keeps the detector's boxes as the only source;
+        # `{"radar": {"around": false}}` leaves out `view.around` (every object all round, for a radar scope)
         self.radar = RadarDisplay(cfg.pop("radar", None)) if cfg.pop("radar_objects", True) else None
         self.builder = ViewBuilder(cfg or None)
         self._ts = None                    # frame time of the last `view` built (the governor's view_hz cap)
@@ -318,6 +319,9 @@ class View(Plugin):
                     objs, alert = self.radar.objects(out["ts_mono_ns"], self._lead)
                     out["objects"] = out["objects"] + objs
                     out["alert"] = alert
+                    if self.radar.cfg["around"]:
+                        # all round the car, for a plan display (radar scope); `objects` above is unchanged
+                        out["around"] = self.radar.around(out["ts_mono_ns"], self._lead)
                 elif self.users.objs:
                     out["objects"] = out["objects"] + self.users.objects(out["ts_mono_ns"])
                 ctx.emit("view", out)
