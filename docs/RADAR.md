@@ -312,6 +312,19 @@ solved here. What would: the density of new objects following the structure (sec
 known row and at the horizon of the detector), an appearance feature that tells two cars apart, or a sensor that
 measures range rate (a microwave radar's first return settles it).
 
+**What the place's error across the road is made of (2026-11-24).** Against the centre of the actor whose box an
+object last took (tools/radar_trace.py, "is the stated uncertainty of the centre right?"), the error ACROSS the line
+of sight is as stated (within 1 / 2 sigma 0.68-0.79 / 0.94-0.98 in the parked scenarios): the bearing is good and
+the model knows it. What reads as a lateral error of 1-2.6 m at 25-60 m is the error ALONG the line of sight seen
+through the bearing (a car-frame y error of the range error times the sine of the bearing; on a bend the lane's
+place also moves with the range). The large ones came from vans and trucks read with a car's height (section 4,
+"Height": the false obstacle_ahead objects of curve_parked 299 and parked_street 248 were single-actor tracks of
+parked vans), not from rows; the cars that remained (curve_parked 233, 343) are single-actor tracks with the range
+1.5-3 m long (the car prior's 1.6 m against the simulator's 1.5 m cars, within the stated 20 %) passing 1.4-1.8 m
+beside the car. Hops between the cars of a row are real (7 % of the updates in curve_parked, 14 % beyond 50 m) but
+were not behind those alerts. The simulator's detector boxes every car on its own (a box covered by nearer ones for
+0.6 or more is dropped, never merged), so a box covering two cars does not occur there.
+
 ## 6. The past, smoothed
 
 The filtered state is the estimate from the detections up to now; it is what the message carries as the present.
@@ -352,8 +365,13 @@ members in their order along the line).
 What a group does for its members:
 * **A row or a queue holds its members standing and in line** (`radar_group_support`, every `group_s`): each
   member's standing hypothesis takes "I stand on the line the OTHERS make" as a measurement across the line
-  (`group_sigma_m` and the line's own scatter), and standing is `group_gain` times likelier for it than for a thing
-  by itself. A member whose own sightings show a speed is not of the group (the test of section 6), and its own
+  (`group_sigma_m`, the line's own scatter and how well the others' mean place across it is known), and standing is
+  `group_gain` times likelier for it than for a thing by itself. The row says that to its sigma and no better
+  however often it is asked: the member's variance across the line is brought down to sigma^2 at most, and one
+  that knows its place better by its own detections takes nothing from it. (Until 2026-11-24 it was an independent
+  measurement at every `group_s`: after five seconds a row member's place was held to a third of `group_sigma_m`
+  from the same few neighbours, and the stated place was overconfident: curve_parked, seed 1, standing objects at
+  25-60 m, y error within 2 sigma 0.94 with the support, 0.99 without.) A member whose own sightings show a speed is not of the group (the test of section 6), and its own
   detections weigh far more than the gain: a car that pulls out of the row is `moving` and out of the group
   (`PastAndStructure`).
 * **A hidden member of a queue persists**: hidden by the queue's own vehicles (section 3) it is kept as long as a

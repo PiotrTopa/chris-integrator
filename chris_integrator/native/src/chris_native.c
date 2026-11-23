@@ -11091,8 +11091,17 @@ static PyObject *n_radar_group_support(PyObject *self, PyObject *args)
         H[R_PX] = -ln[3];
         H[R_PY] = ln[2];
         double nu = -(H[R_PX] * (x[R_PX] - ln[0]) + H[R_PY] * (x[R_PY] - ln[1]));
-        double S = H[R_PX] * (H[R_PX] * P[0] + H[R_PY] * P[RN]) + H[R_PY] * (H[R_PX] * P[1] + H[R_PY] * P[RN + 1]) + R;
-        if (S > 0.0 && isfinite(S) && nu * nu <= 9.0 * S) {
+        /* the row says where the member is across the line to `sigma`, and no better however often it is asked
+         * (every group_s, from the same few neighbours): the member's own variance across the line is brought down
+         * to sigma^2 at most (the measurement's variance p R / (p - R)); one that knows its place better by its own
+         * detections takes nothing from the row. (Taken as an independent measurement at every call, the row made
+         * its members' places overconfident: docs/RADAR.md, section 7.) */
+        double p = H[R_PX] * (H[R_PX] * P[0] + H[R_PY] * P[RN]) + H[R_PY] * (H[R_PX] * P[1] + H[R_PY] * P[RN + 1]);
+        int take = p > 1.0001 * R;
+        if (take)
+            R = p * R / (p - R);
+        double S = p + R;
+        if (take && S > 0.0 && isfinite(S) && nu * nu <= 9.0 * S) {
             double K[RN], Si = 1.0 / S, Hm[4 * RN] = {0}, nv[4] = {nu, 0.0, 0.0, 0.0};
             memcpy(Hm, H, sizeof(H));
             r_gain(P, Hm, 1, &Si, K);

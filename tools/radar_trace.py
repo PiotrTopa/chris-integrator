@@ -224,6 +224,8 @@ def run(name, seed, night, radar_cfg=None, det_params=None):
             rr = max(math.hypot(dx, dy), 0.5)
             ul = np.array([dx / rr, dy / rr])
             ua = np.array([-dy / rr, dx / rr])
+            Pc = Rg @ P[:2, :2] @ Rg.T
+            row["Pc"] = [float(Pc[0, 0]), float(Pc[0, 1]), float(Pc[1, 1])]     # the centre's covariance, car axes
             row["sd_al"], row["sd_ac"] = float(math.sqrt(max(ul @ P[:2, :2] @ ul, 0.0))), float(math.sqrt(max(ua @ P[:2, :2] @ ua, 0.0)))
             for q in out["objects"]:
                 if q["id"] == o.id:
@@ -232,9 +234,15 @@ def run(name, seed, night, radar_cfg=None, det_params=None):
                 r = max(a["range"], 0.5)
                 ux, uy = a["ref_x"] / r, a["ref_y"] / r
                 ex, ey = xc - a["ref_x"], yc - a["ref_y"]
+                # the state is the object's centre (native version 8): its errors against the truth's centre,
+                # along and across the line of sight to it
+                rc = max(math.hypot(a["x"], a["y"]), 0.5)
+                cx, cy = a["x"] / rc, a["y"] / rc
+                fx, fy = xc - a["x"], yc - a["y"]
                 row.update(moving=a["moving"], role=a["role"], tx=a["ref_x"], ty=a["ref_y"], tvx=a["vx"], tvy=a["vy"],
                            along=ex * ux + ey * uy, across=-ex * uy + ey * ux, range=r, tlab=a["stationary_label"],
-                           tH=a["H"], lane_off=a["lane_offset"])
+                           tH=a["H"], lane_off=a["lane_offset"], tcx=a["x"], tcy=a["y"],
+                           along_c=fx * cx + fy * cy, across_c=-fx * cy + fy * cx)
             R["frames"].append(row)
         return out
     box.frame = frame
@@ -453,15 +461,23 @@ def report_state(R):
               % (lo, hi, nn, np.mean([f["vx"] for f in rows]), np.median(ve), np.percentile(ve, 90), np.mean([f["mu"][0] for f in rows]),
                  100.0 * vd["stationary"] / nn, 100.0 * vd["moving"] / nn, 100.0 * vd["unknown"] / nn,
                  np.mean([f["sc"] for f in rows]), np.median([f["along"] for f in rows])))
-    print("  is the stated uncertainty of the place right? pure objects, hits >= 4: |error| / stated sd (rms; 1 = right)")
-    for lo, hi in ((0, 15), (15, 30), (30, 50), (50, 100)):
-        rows = [f for f in F if f["pure"] and lo <= f["range"] < hi and f["hits"] >= 4 and f["state"] == "confirmed"]
-        if len(rows) < 10:
-            continue
-        print("    %2d-%-3d m: n %4d, along: stated sd med %.2f m, ratio %.2f; across: stated sd med %.2f m (%.2f deg), ratio %.2f"
-              % (lo, hi, len(rows), np.median([f["sd_al"] for f in rows]), math.sqrt(np.mean([(f["along"] / max(f["sd_al"], 1e-6)) ** 2 for f in rows])),
-                 np.median([f["sd_ac"] for f in rows]), np.median([math.degrees(f["sd_ac"] / f["range"]) for f in rows]),
-                 math.sqrt(np.mean([(f["across"] / max(f["sd_ac"], 1e-6)) ** 2 for f in rows]))))
+    print("  is the stated uncertainty of the centre right? hits >= 4, against the truth's centre: |error| / stated sd (rms; 1 = right),"
+          " share within 1 / 2 sd across")
+    for pure in (True, False):
+        for lo, hi in ((0, 15), (15, 30), (30, 50), (50, 100)):
+            rows = [f for f in F if f["pure"] == pure and lo <= f["range"] < hi and f["hits"] >= 4 and f["state"] == "confirmed"
+                    and "across_c" in f]
+            if len(rows) < 10:
+                continue
+            print("    %s %2d-%-3d m: n %4d, along: stated sd med %.2f m, ratio %.2f; across: |err| med %.2f m, stated sd med %.2f m (%.2f deg), "
+                  "ratio %.2f, within 1/2 sd %.2f/%.2f"
+                  % ("pure " if pure else "mixed", lo, hi, len(rows), np.median([f["sd_al"] for f in rows]),
+                     math.sqrt(np.mean([(f["along_c"] / max(f["sd_al"], 1e-6)) ** 2 for f in rows])),
+                     np.median([abs(f["across_c"]) for f in rows]),
+                     np.median([f["sd_ac"] for f in rows]), np.median([math.degrees(f["sd_ac"] / f["range"]) for f in rows]),
+                     math.sqrt(np.mean([(f["across_c"] / max(f["sd_ac"], 1e-6)) ** 2 for f in rows])),
+                     np.mean([abs(f["across_c"]) <= f["sd_ac"] for f in rows]),
+                     np.mean([abs(f["across_c"]) <= 2.0 * f["sd_ac"] for f in rows])))
     # false "stands on the path"
     bad = [f for f in F if not f["moving"] and f.get("tlab") == "parked" and "on_path" in f.get("flags", ()) and f["verdict"] == "stationary"]
     if bad:

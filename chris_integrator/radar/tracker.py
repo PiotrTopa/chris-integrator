@@ -781,11 +781,14 @@ class Tracker:
                     o = objs[k]
                     if o.verdict == "moving" or self.shown_moving(o) >= c["group_still_m2"]:
                         continue
-                    # the line the others make (a member does not support itself)
-                    xs = [(float(objs[q].x[PX]), float(objs[q].x[PY])) for q in mem if q != k]
-                    mx, my = sum(p[0] for p in xs) / len(xs), sum(p[1] for p in xs) / len(xs)
+                    # the line the others make (a member does not support itself), and how well their mean place
+                    # across it is known (their own uncertainties across the line, as independent)
+                    oth = [objs[q] for q in mem if q != k]
+                    mx, my = sum(float(q.x[PX]) for q in oth) / len(oth), sum(float(q.x[PY]) for q in oth) / len(oth)
+                    nx, ny = -line[3], line[2]
+                    vl = sum(nx * nx * q.P[PX, PX] + 2.0 * nx * ny * q.P[PX, PY] + ny * ny * q.P[PY, PY] for q in oth) / len(oth) ** 2
                     _NR.radar_group_support(a, self.hyp.rows(o.h), (mx, my, line[2], line[3]),
-                                            math.hypot(c["group_sigma_m"], rms), c["group_gain"], c["mu_floor"])
+                                            math.sqrt(c["group_sigma_m"] ** 2 + rms * rms + float(vl)), c["group_gain"], c["mu_floor"])
         if support:
             self.group_t = T
         self.groups = groups
