@@ -72,8 +72,6 @@ class Sensor:
             d[i] = wrap(d[i])
         return d
 
-    def start(self, det, pose, label):
-        return None
 
 
 def kind_code(kind):
@@ -89,17 +87,6 @@ def kind_code(kind):
 def base(kind):
     """A detection kind without the mark of an extra scale-rate row ("rbhs" -> "rbh")."""
     return kind[:-1] if kind and kind.endswith("s") else kind
-
-
-def _prior(label, cfg):
-    """Velocity / acceleration / scale part of a new object's covariance: what its kind may be doing."""
-    k = kin(label)
-    P = np.zeros((N, N))
-    P[VX, VX] = P[VY, VY] = k["v0_std"] ** 2
-    P[4, 4] = P[5, 5] = (0.6 * k["a_lon"]) ** 2
-    P[DP, DP] = math.radians(cfg.get("bias_std0_deg", 0.6)) ** 2 + math.radians(cfg.get("dp_obj_std_deg", 0.2)) ** 2
-    P[LH, LH] = k["h_rel"] ** 2
-    return P
 
 
 class CameraBoxes(Sensor):
@@ -167,88 +154,12 @@ class CameraBoxes(Sensor):
                 cv["bearing_max"] if cv else 0.0, cv["ground_min_m"] if cv else 0.0, c["max_range_m"], self.p_d,
                 c["p_cut"], math.nan if self.h_min is None else self.h_min, c["h_full_rel"], c["p_small"],
                 c["near_margin"], self.extraneous, v["b"], v["rb"], v["rbh"], v["bt"], c["scale_rate_span"],
-                c["logh_span"], c["born_small"], c["born_small_scale"])
+                c["logh_span"], c["born_small"], c["born_small_scale"], self.bias_var, self.dp_obj_var,
+                math.radians(c["pitch_jitter_deg"]) ** 2, math.radians(c["bias_floor_deg"]) ** 2, c["top_start_rel"],
+                c["top_start_rel_range"])
 
     def h(self, x, pose, det=None):
         return Sensor.h(self, x, pose, det or {"kind": "rb"})
-
-    def _start_top(self, det, pose, label):
-        """An object first seen in a box cut at the bottom: its feet are out of the picture, its top is not.
-        For a kind whose height is known well and differs enough from the camera's own (a person, a lorry) the
-        top edge says how far it is; for a car, about as tall as the camera sits, it says nothing and the box
-        starts no object."""
-        k = kin(label)
-        c = self.cfg
-        ho = k["h"]
-        dh = self.hc - ho
-        if label is None or abs(dh) < c["top_start_rel"] * k["h_rel"] * ho:
-            return None
-        a = float(det["z"][1]) - self.bias
-        if a * dh <= 0.0 or abs(math.tan(a)) < 1e-4:
-            return None
-        r = dh / math.tan(a)
-        if not 1.0 < r <= c["max_range_m"]:
-            return None
-        b = float(det["z"][0])
-        dr_dh = -ho / math.tan(a)                         # range per (log) height
-        dr_da = -dh / (math.sin(a) ** 2)                  # range per angle
-        var_r = dr_dh ** 2 * k["h_rel"] ** 2 + dr_da ** 2 * (det["R"][1] + self.bias_var)
-        if var_r > (c["top_start_rel_range"] * r) ** 2:
-            return None
-        x0 = np.zeros(N)
-        x0[LH] = math.log(ho)
-        P0 = _prior(label, c)
-        P0[DP, DP] = self.bias_var + self.dp_obj_var
-        ang = b + pose[2]
-        ca, sa = math.cos(ang), math.sin(ang)
-        x0[PX], x0[PY] = pose[0] + r * ca, pose[1] + r * sa
-        U = np.array([[ca, -sa], [sa, ca]])
-        P0[:2, :2] = U @ np.diag([var_r, det["R"][0] * r * r + 0.05]) @ U.T
-        c_lh = dr_dh * k["h_rel"] ** 2
-        P0[PX, LH] = P0[LH, PX] = ca * c_lh
-        P0[PY, LH] = P0[LH, PY] = sa * c_lh
-        return x0, P0
-
-    def start(self, det, pose, label):
-        kd = base(det["kind"])
-        if kd == "bt":
-            return self._start_top(det, pose, label)
-        if kd in ("b", ""):
-            return None
-        k = kin(label)
-        hc = self.hc
-        b = float(det["z"][1])
-        x0 = np.zeros(N)
-        x0[LH] = math.log(k["h"])
-        P0 = _prior(label, self.cfg)
-        p_dp = self.bias_var + self.dp_obj_var            # what is not known of this object's angle offset
-        P0[DP, DP] = p_dp
-        # the road's range: the angle, the known part of its error taken out; never beyond the sensor's reach
-        ang = max(float(det["z"][0]) - self.bias, math.atan2(hc, self.cfg["max_range_m"]))
-        rg = hc / math.tan(ang)
-        J = (rg * rg + hc * hc) / hc                      # distance per angle
-        var_g = J * J * (det["R"][0] + p_dp)
-        r, var_r, wg, rh = rg, var_g, 1.0, 0.0
-        if kd == "rbh":
-            # a second range, independent of the first: the object's own size
-            rh = math.exp(self.logf + x0[LH] - float(det["z"][2])) / max(math.cos(b), 0.3)
-            var_h = rh * rh * (k["h_rel"] ** 2 + det["R"][2])
-            wg = var_h / (var_g + var_h)
-            r, var_r = wg * rg + (1.0 - wg) * rh, var_g * var_h / (var_g + var_h)
-        a = b + pose[2]
-        ca, sa = math.cos(a), math.sin(a)
-        x0[PX], x0[PY] = pose[0] + r * ca, pose[1] + r * sa
-        U = np.array([[ca, -sa], [sa, ca]])
-        P0[:2, :2] = U @ np.diag([var_r, det["R"][1] * r * r + 0.05]) @ U.T
-        # the place came from the angle and from the size: its error along the line of sight is tied to what is
-        # not known of either (without these terms the object would not know that learning one fixes the other)
-        c_dp = wg * J * p_dp
-        c_lh = (1.0 - wg) * rh * k["h_rel"] ** 2
-        P0[PX, DP] = P0[DP, PX] = ca * c_dp
-        P0[PY, DP] = P0[DP, PY] = sa * c_dp
-        P0[PX, LH] = P0[LH, PX] = ca * c_lh
-        P0[PY, LH] = P0[LH, PY] = sa * c_lh
-        return x0, P0
 
 
 CAMERA_CFG = dict(
@@ -297,32 +208,7 @@ class MicrowaveRadar(Sensor):
         self.clutter = false_per_scan / (max_range * 2.0 * fov * 60.0)
 
     def native(self):
-        return (1.0, self.mx, self.my, self.yaw, self.fov, self.max_range, self.p_d, self.clutter) + (0.0,) * 16
-
-    def _sensor(self, pose):
-        X, Y, psi, vx, vy, w = pose
-        c, s = math.cos(psi), math.sin(psi)
-        ox, oy = c * self.mx - s * self.my, s * self.mx + c * self.my          # the mount's lever on the ground
-        return X + ox, Y + oy, vx - w * oy, vy + w * ox
-
-
-    def start(self, det, pose, label):
-        r, az, rr = (float(v) for v in det["z"])
-        sx, sy, svx, svy = self._sensor(pose)
-        a = az + self.yaw + pose[2]
-        ca, sa = math.cos(a), math.sin(a)
-        x0 = np.zeros(N)
-        x0[PX], x0[PY] = sx + r * ca, sy + r * sa
-        vr = rr + ca * svx + sa * svy                    # the object's own speed along the line of sight
-        x0[VX], x0[VY] = vr * ca, vr * sa
-        P0 = _prior(label, {})
-        U = np.array([[ca, -sa], [sa, ca]])
-        P0[:2, :2] = U @ np.diag([det["R"][0] + 0.1, det["R"][1] * r * r + 0.1]) @ U.T
-        # along the line of sight the speed is measured; across it nothing is known
-        k = kin(label)
-        P0[2:4, 2:4] = U @ np.diag([4.0 * det["R"][2] + 0.5, k["v0_std"] ** 2]) @ U.T
-        x0[LH] = math.log(k["h"])
-        return x0, P0
+        return (1.0, self.mx, self.my, self.yaw, self.fov, self.max_range, self.p_d, self.clutter) + (0.0,) * 22
 
 
 class Position(Sensor):
@@ -336,16 +222,4 @@ class Position(Sensor):
         self.clutter = false_per_scan / (max_range * max_range)
 
     def native(self):
-        return (2.0, self.fov, self.max_range, self.p_d, self.clutter) + (0.0,) * 19
-
-    def start(self, det, pose, label):
-        c, s = math.cos(pose[2]), math.sin(pose[2])
-        zx, zy = float(det["z"][0]), float(det["z"][1])
-        x0 = np.zeros(N)
-        x0[PX], x0[PY] = pose[0] + c * zx - s * zy, pose[1] + s * zx + c * zy
-        P0 = _prior(label, {})
-        x0[LH] = math.log(kin(label)["h"])
-        Rm = np.array([[c, -s], [s, c]])
-        R = np.diag(det["R"]) if np.ndim(det["R"]) == 1 else np.asarray(det["R"], float)
-        P0[:2, :2] = Rm @ R @ Rm.T
-        return x0, P0
+        return (2.0, self.fov, self.max_range, self.p_d, self.clutter) + (0.0,) * 25

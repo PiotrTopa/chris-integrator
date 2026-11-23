@@ -33,7 +33,7 @@ NS = 1_000_000_000
 def run(name, seed, night, radar_cfg=None, det_params=None):
     from chris_integrator.mixer import MessageClock
     from chris_integrator.radar import models as M
-    from chris_integrator.radar.sensors import CameraBoxes
+    from chris_integrator.radar import tracker as TK
     from chris_integrator.sim import default_sensors
     from chris_integrator.sim import roaduser_sim as rs
     from chris_integrator.stack import build
@@ -68,18 +68,7 @@ def run(name, seed, night, radar_cfg=None, det_params=None):
             ctx["n"] = ctx.get("n", 0) + 1
         return index.get(int(round(t * NS)), {})
 
-    started = []
-    orig_start = CameraBoxes.start
-
-    def start(self, d, pose, label):
-        out = orig_start(self, d, pose, label)
-        if out is not None:
-            started.append(d)
-        return out
-    CameraBoxes.start = start
-
-    orig_process, orig_assoc, orig_after = tr.process, tr._associate, tr._after_update
-    pending = {}
+    orig_process, orig_after = tr.process, tr._after_update
 
     def process(src, t, sensor, dets):
         ctx["dets"] = dets
@@ -107,13 +96,13 @@ def run(name, seed, night, radar_cfg=None, det_params=None):
             row.update(b_ref=bt_ref, b_ctr=bt_c)
             R["meas"].append(row)
         before = {o.id for o in tr.objects}
-        del started[:]
         ctx.update(t=t, truth=T, pose=pose, sensor=sensor, present={d.get("actor") for d in dets},
                    has_obj={owner.get(o.id) for o in tr.objects})
         n_obj = len(tr.objects)
         orig_process(src, t, sensor, dets)
         new = [o for o in tr.objects if o.id not in before]
-        for o, d in zip(new, started):
+        for o in new:
+            d = dets[int(o.m[TK.M_DET])]                 # the detection that started it
             owner[o.id] = d.get("actor")
             actors_of[o.id].append(d.get("actor"))
             # is there already an object on this actor?
@@ -123,25 +112,36 @@ def run(name, seed, night, radar_cfg=None, det_params=None):
         R["scans"].append({"t": t, "dets": len(dets), "objs": n_obj, "view": getattr(sensor, "cover", None) and
                            round(sensor.cover["ground_min_m"], 1)})
 
-    def upd_row(o, d, Rm, sensor, pose, src, t, gain):
-        """The row of an update, from the object as it is before it (the scan's pairs are updated in one call)."""
+    def upd_row(o, d, Rm, sensor, pose, src, t):
+        """The row of an update: the object as its story had it before the detection (the node before the primary,
+        stepped to the scan's time: every motion hypothesis by itself, and their combination)."""
         T = ctx["truth"]
         prev = owner.get(o.id)
         act = d.get("actor")
+        chain = tr.hyp.chain(o.h)
+        S0, m0 = tr.store.a, TK.OFF["m"][0]
+        par = M._native_par(tr.mcfg)
+        xs, Ps, mu0 = np.empty((3, M.N)), np.empty((3, M.N, M.N)), np.empty(3)
+        x0, P0, _mu = np.empty((1, M.N)), np.empty((1, M.N, M.N)), np.empty((1, 3))
+        dt0 = t - float(S0[chain[1], m0 + TK.M_T])
+        M.NR.radar_peek_models(S0, chain[1], dt0, o.kin, par, xs, Ps, mu0)
+        M.NR.radar_peek(S0, [chain[1]], [dt0], [o.kin], par, x0, P0, _mu)
+        hits0 = int(S0[chain[1], m0 + TK.M_HITS])
         # the object's own prediction of this detection, before it is used
-        zp, H = sensor.h(o.x, pose, d)
+        zp, H = sensor.h(x0[0], pose, d)
         nu = sensor.residual(np.asarray(d["z"], float), zp, d)
-        S = H @ o.P @ H.T + Rm
+        S = H @ P0[0] @ H.T + Rm
         d2 = float(nu @ np.linalg.solve(S, nu))
         a = T.get(prev) if prev is not None else None
         row = {"t": t, "obj": o.id, "actor": act, "prev": prev, "hop": prev is not None and act != prev, "kind": d["kind"],
-               "hits": o.hits, "gain": gain, "nis": d2 / len(nu), "dim": len(nu), "mu0": [float(m) for m in o.mu],
+               "hits": hits0, "gain": float(o.m[TK.M_DL]), "leaves": o.nleaf, "p_story": o.pp, "nis": d2 / len(nu),
+               "dim": len(nu), "mu0": [float(m) for m in mu0],
                "nu": [float(v) for v in nu], "sd": [float(math.sqrt(max(S[i, i], 0.0))) for i in range(len(nu))]}
         like = []
         for j in range(3):
-            zj, Hj = sensor.h(o.xs[j], pose, d)
+            zj, Hj = sensor.h(xs[j], pose, d)
             nj = sensor.residual(np.asarray(d["z"], float), zj, d)
-            Sj = Hj @ o.Ps[j] @ Hj.T + Rm
+            Sj = Hj @ Ps[j] @ Hj.T + Rm
             like.append(float(nj @ np.linalg.solve(Sj, nj)) / len(nj))
             row.setdefault("sd_m", []).append([float(math.sqrt(max(Sj[i, i], 0.0))) for i in range(len(nj))])
             row.setdefault("ldet_m", []).append(float(0.5 * math.log(max(np.linalg.det(Sj), 1e-300))))
@@ -165,27 +165,21 @@ def run(name, seed, night, radar_cfg=None, det_params=None):
             row.update(prev_present=prev in ctx["present"], new_had_obj=act in ctx["has_obj"], state=o.state,
                        sep=math.hypot(an["x"] - ap["x"], an["y"] - ap["y"]) if an is not None and ap is not None else None,
                        sep_b=abs(math.degrees(math.atan2(an["y"], an["x"]) - math.atan2(ap["y"], ap["x"]))) if an is not None and ap is not None else None,
-                       seen_ago=t - max(o.last_seen.values()), sd_pos=float(math.sqrt(max(np.linalg.eigvalsh(o.P[:2, :2])[-1], 0.0))))
+                       seen_ago=t - float(S0[chain[1], m0 + TK.M_THIT]),
+                       sd_pos=float(math.sqrt(max(np.linalg.eigvalsh(P0[0][:2, :2])[-1], 0.0))))
         return row
 
-    def assoc(src, t, sensor, pose, objs, D):
-        out = orig_assoc(src, t, sensor, pose, objs, D)
-        for i, j, g, _, _ in out[0]:
-            d = ctx["dets"][j]
-            pending[objs[i].id] = upd_row(objs[i], d, np.diag(np.asarray(d["R"], float)), sensor, pose, src, t, g)
-        return out
-
-    def after(o, d, sensor, src, t, n, dl):
-        orig_after(o, d, sensor, src, t, n, dl)
-        row = pending.pop(o.id, None)
-        if row is None:
-            return
+    def after(o, d, sensor, src, t):
+        if len(tr.hyp.chain(o.h)) < 2:
+            return orig_after(o, d, sensor, src, t)
+        row = upd_row(o, d, np.diag(np.asarray(d["R"], float)), sensor, ctx["pose"], src, t)
+        orig_after(o, d, sensor, src, t)
         row["mu1"] = [float(m) for m in o.mu]
         owner[o.id] = d.get("actor")
         actors_of[o.id].append(d.get("actor"))
         R["upd"].append(row)
 
-    tr.process, tr._associate, tr._after_update = process, assoc, after
+    tr.process, tr._after_update = process, after
 
     orig_frame = box.frame
 
@@ -251,7 +245,6 @@ def run(name, seed, night, radar_cfg=None, det_params=None):
             st.deliver(det.calib_msg(m["ts_mono_ns"]))
             calib_sent = True
         st.deliver(m)
-    CameraBoxes.start = orig_start
     R["pitch_err"] = math.degrees(det.pitch_err)
     return w, det, box, R
 

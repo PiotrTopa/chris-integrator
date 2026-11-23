@@ -101,6 +101,22 @@ def _native_par(cfg):
     return e[1]
 
 
+_KINB = {}
+
+
+def kinb(label):
+    """What a kind can do, for an object started by a detection of it, as the native core reads it (chris_native.c
+    `RKB`): a_lon, a_lat, v_max, v_still, p_stand, v0_std, v0_lat, h, h_rel, width, length (0: no direction of its
+    own), 1 if the kind is known."""
+    r = _KINB.get(label)
+    if r is None:
+        k = KIN.get(label, KIN[None])
+        wl = k.get("wl", (0.0, 0.0))
+        r = _KINB[label] = (k["a_lon"], k["a_lat"], k["v_max"], k["v_still"], k["p_stand"], k["v0_std"], k["v0_lat"],
+                            k["h"], k["h_rel"], wl[0], wl[1], 0.0 if label is None or label not in KIN else 1.0)
+    return r
+
+
 # ---- one hypothesis, for tests and tools (the tracker works on its objects' rows: tracker.py) -----------------
 def still(x, P, v0):
     """How much a hypothesis says "it does not move": the weight of its velocity (mean and uncertainty) inside

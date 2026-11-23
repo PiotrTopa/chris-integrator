@@ -421,6 +421,108 @@ class Tracking(unittest.TestCase):
             for o in tr.objects:
                 self.assertLessEqual(set(o.merge_t), live)                 # no count kept for an object that is gone
 
+    def test_a_doubtful_pairing_is_decided_by_the_scans_that_follow(self):
+        """Two standing things 1.4 m apart, a sensor that places them to 0.4 m across. One scan brings a single
+        detection between them, a hair nearer A. It was B's (B has moved towards A; the next scans show B there and A
+        where it was). With hypotheses kept over scans the first reading (A's) is revised: A's history says it was not
+        reported in that scan, and A is not dragged. Decided scan by scan (hyp_n_scan 0) the first reading stands."""
+        from chris_integrator.radar.sensors import Position
+        from chris_integrator.radar.tracker import M_DET, M_T, OFF, Tracker
+
+        def run(cfg):
+            ego = EgoMotion()
+            tr = Tracker(ego, cfg)
+            sen = Position()
+            R = np.array([0.01, 0.16])
+
+            def scan(k, pts):
+                t = 10 + 0.1 * k
+                ego.add(t, 0.0, 0.0, stands=True)
+                tr.process("pos", t, sen, [{"z": np.array(p, float), "R": R, "attrs": {"class": "car", "class_conf": 0.8}} for p in pts])
+                tr.manage(t)
+                return t
+            for k in range(12):
+                scan(k, [(20, 0.7), (20, -0.7)])
+            A = min(tr.objects, key=lambda o: abs(o.x[1] - 0.7))
+            B = min(tr.objects, key=lambda o: abs(o.x[1] + 0.7))
+            t_amb = scan(12, [(20, 0.05)])
+            first = (int(A.m[M_DET]), int(B.m[M_DET]), A.nleaf, round(A.pp, 2))
+            for k in range(13, 17):
+                scan(k, [(20, 0.7), (20, 0.0)])
+
+            def took(o):                                 # what the object's story now says about that scan
+                S, m0 = tr.store.a, OFF["m"][0]
+                return [int(S[r, m0 + M_DET]) for r in tr.hyp.chain(o.h) if abs(S[r, m0 + M_T] - t_amb) < 1e-6][0]
+            return first, took(A), took(B), float(A.x[1]), sorted(o.id for o in tr.objects), (A.id, B.id), tr
+
+        first, a, b, ya, ids, ab, tr = run({})
+        self.assertEqual(first[:2], (0, -1))                              # at the scan itself: A's, and in doubt
+        self.assertGreaterEqual(first[2], 2)
+        self.assertLess(first[3], 0.9)
+        self.assertEqual((a, b), (-1, 0))                                 # four scans on: it was B's
+        self.assertAlmostEqual(ya, 0.7, delta=0.03)                       # A was not dragged
+        self.assertEqual(ids, sorted(ab))                                 # the same two objects, the same ids
+        info = tr.hyp.info()
+        self.assertEqual((info["objects"], info["n_scan"]), (2, 5))
+        self.assertGreater(info["assignments"], info["scans"])           # more than one reading was weighed
+        first, a, b, ya, ids, ab, tr = run({"hyp_n_scan": 0, "hyp_k_best": 1})
+        self.assertEqual((first[:3], a, b), ((0, -1, 1), 0, -1))           # decided at once, for good
+        self.assertLess(ya, 0.68)
+
+    def test_two_cars_swapping_sides_keep_their_ids_more_often_with_hypotheses_over_scans(self):
+        """Two cars 45 m ahead swap sides (2.4 m apart, passing through each other's bearing) in a microwave radar
+        whose azimuth noise is 0.8 m there, with misses and clutter. Counted: how often each still has, two seconds
+        after the swap, the id it had before it."""
+        def run(seed, cfg):
+            rng = random.Random(seed)
+            rd = Radar({"tracker": cfg})
+            v, first, last = 12.0, {}, {}
+            for i in range(181):
+                t = 50 + i * 0.05
+                s = t - 50
+                rd.on_ego({"ts_mono_ns": int(t * NS), "speed_mps": v, "yaw_rate_rps": 0.0})
+                u = min(1.0, max(0.0, (s - 3.0) / 3.0))                    # they swap sides between 3 s and 6 s
+                yy = 1.2 * math.cos(math.pi * u)
+                tr = {"a": (45.0, yy), "b": (46.0, -yy)}
+                if i % 2 == 0:
+                    dets = [{"range_m": math.hypot(x - 2.0, y) + rng.gauss(0, 0.25), "range_rate_mps": rng.gauss(0, 0.15),
+                             "azimuth_deg": math.degrees(math.atan2(y, x - 2.0)) + rng.gauss(0, 1.0)}
+                            for x, y in tr.values() if rng.random() >= 0.15]
+                    dets += [{"range_m": rng.uniform(38, 52), "azimuth_deg": rng.uniform(-6, 6), "range_rate_mps": rng.gauss(0, 3)}
+                             for _ in range(rng.choice([0, 1, 1, 2]))]     # and clutter
+                    rd.on_objects({"type": "objects", "kind": "radar", "sensor": "front", "ts_mono_ns": int(t * NS),
+                                   "mount": {"x_m": 2.0, "y_m": 0.0, "yaw_deg": 0.0}, "objects": dets})
+                m = rd.frame(int(t * NS))
+                if 2.0 <= s <= 2.9 or s >= 8.0:
+                    for n, (x, y) in tr.items():
+                        near = [(math.hypot(o["x_m"] - x, o["y_m"] - y), o["id"]) for o in m["objects"] if o["state"] != "memory"]
+                        near = [q for q in near if q[0] < 1.0]
+                        if near:
+                            (first if s < 3.0 else last)[n] = min(near)[1]
+            return sum(1 for n in "ab" if n in first and last.get(n) == first[n])
+        seeds = range(60)
+        multi = sum(run(seed, {}) for seed in seeds)
+        single = sum(run(seed, {"hyp_n_scan": 0, "hyp_k_best": 1}) for seed in seeds)
+        self.assertGreater(multi, single + 3, (multi, single))            # (100 seeds: 182 against 163 of 200)
+        self.assertGreater(multi, 0.85 * 2 * len(seeds))
+
+    def test_the_hypotheses_can_be_written_down_and_restored(self):
+        rd, _ = world(10.0, {"p": (50.0, -3.0, 0.0, 0.0), "q": (52.0, -3.3, 0.0, 0.0), "lead": (30.0, 0.2, 9.0, 0.0)}, 3.0, seed=3)
+        H = rd.tracker.hyp
+        d = H.dump()
+        H2 = M.NR.Hyp(1, 1, 1, 1, 1.0, 1, 1.0, 1)
+        H2.load(d)
+        self.assertEqual(H2.dump(), d)
+        for o in rd.tracker.objects:
+            self.assertEqual(H2.chain(o.h), H.chain(o.h))
+            self.assertEqual(H.chain(o.h)[0], o.slot)                     # the object's numbers are its primary's
+            self.assertEqual(H.rows(o.h)[0], o.slot)
+            self.assertLessEqual(sum(p for _, p in H.leaves(o.h)), 1.0 + 1e-9)
+            self.assertEqual(len(H.leaves(o.h)), o.nleaf)
+        info = H.info()
+        self.assertEqual(info["objects"], len(rd.tracker.objects))
+        self.assertEqual(info["rows"] - info["rows_free"], sum(len(H.rows(o.h)) for o in rd.tracker.objects))
+
     def test_one_box_is_not_an_object(self):
         rd = Radar()
         for i in range(40):

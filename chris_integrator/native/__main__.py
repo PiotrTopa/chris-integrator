@@ -70,7 +70,8 @@ def selftest(n=20000, seed=1):
         a, b = np.asarray(a, float), np.asarray(b, float)
         return a.shape == b.shape and bool(np.all(np.abs(a - b) <= tol * np.maximum(np.abs(b), 1.0)))
     for row, dt, label, ref in RADAR_EVOLVE:
-        S = np.array([row])
+        S = np.zeros((1, 406))                           # a row of the state array: the motion part recorded
+        S[0, :len(row)] = row
         out = np.empty((1, 6))
         _n.radar_peek_pos(S, [0], [dt], [R._KIN4.get(label) or R._KIN4[None]], R._native_par(R.CFG), out)
         if not close(out[0], ref):
@@ -78,7 +79,7 @@ def selftest(n=20000, seed=1):
             break
     for sen, kind, sdt, x, pose, zr, Hr in RADAR_H:
         z, H = np.empty(4), np.empty((4, 8))
-        m = _n.radar_h(sen, kind, sdt, x, pose, z, H)
+        m = _n.radar_h(list(sen) + [0.0] * (30 - len(sen)), kind, sdt, x, pose, z, H)
         if not (close(z[:m], zr) and close(H[:m], Hr)):
             bad.append("radar_h differs from the reference's measurement function")
             break

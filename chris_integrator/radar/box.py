@@ -321,7 +321,7 @@ class Radar:
                               M._native_par(tr.mcfg), (X, Y, psi), (v_ego, w_ego), self._ncfg(), tuple(c["predict_s"]),
                               path[0] if path is not None else None, path[1] if path is not None else None,
                               [0.0 if o.state == "tentative" else 1.0 for o in shown], [k[3] for k in kin],
-                              [(o.id, o.state, o.logodds, o.t0, o.hits, o.sources, o.last_seen, o.verdict, o.flags,
+                              [(o.id, o.state, math.log(max(o.pe, 1e-6) / max(1.0 - o.pe, 1e-6)), o.t0, o.hits, o.sources, o.last_seen, o.verdict, o.flags,
                                 o.label, o.range_t, o.consistency, o.pred_err, self._class(o, T)) for o in shown],
                               self._in_since, self._threat_since, T,
                               (c["in_path_hold_s"], c["threat_p"], c["threat_range_s"], c["threat_hold_s"],

@@ -32,7 +32,7 @@
 #include <stdint.h>
 #include <string.h>
 
-#define NATIVE_VERSION 7
+#define NATIVE_VERSION 8
 
 static PyObject *Fallback;          /* raised where CPython's json must decide */
 static PyObject *builtin_round;
@@ -4857,7 +4857,8 @@ static int out_get(PyObject *o, View *v, Py_ssize_t n, int optional, double **ou
  * elimination with partial pivoting (the reference: LAPACK): results agree with it to rounding. ---- */
 
 /* an object's row in the tracker's state array (tracker.py `_LAY`) */
-enum { RO_XS = 0, RO_PS = 24, RO_MU = 216, RO_XF = 219, RO_PF = 227, RO_X = 291, RO_P = 299, RROW = 363 };
+enum { RO_XS = 0, RO_PS = 24, RO_MU = 216, RO_XF = 219, RO_PF = 227, RO_X = 291, RO_P = 299, RO_E = 363, RO_PE = 366,
+       RO_ST = 375, RO_M = 388, RROW = 406 };
 
 /* the state array (capacity, RROW), writable */
 static int store_get(PyObject *o, View *v, Py_ssize_t *cap)
@@ -4918,7 +4919,7 @@ static int rnums_get(PyObject *o, Py_ssize_t n, double *out, const char *what)
 /* ---- the sensors (sensors.py): what a scan measures of a state ---- */
 enum { SEN_CAMERA = 0, SEN_MICROWAVE = 1, SEN_POSITION = 2 };
 enum { K_B = 0, K_RB = 1, K_RBH = 2, K_BT = 3, K_NONE = 4, K_SCALE = 8 };
-#define RSENS 24
+#define RSENS 30
 
 typedef struct {
     int type;
@@ -4927,11 +4928,12 @@ typedef struct {
     int cover;
     double bmin, bmax, gmin, max_range, p_d, p_cut, h_min, h_full, p_small, near, extra, vol[4], srspan, lhspan,
         born, born_s;
+    double bias_var, dp_var, jit2, bias_floor2, top_rel, top_range;
     /* microwave */
     double mx, my, yaw, fov, clutter;
 } RSens;
 
-/* sensors.py `Sensor.native()`: 24 numbers */
+/* sensors.py `Sensor.native()`: RSENS numbers */
 static int sens_get(PyObject *o, RSens *s)
 {
     double v[RSENS];
@@ -4946,6 +4948,7 @@ static int sens_get(PyObject *o, RSens *s)
         for (int k = 0; k < 4; k++)
             s->vol[k] = v[16 + k];
         s->srspan = v[20]; s->lhspan = v[21]; s->born = v[22]; s->born_s = v[23];
+        s->bias_var = v[24]; s->dp_var = v[25]; s->jit2 = v[26]; s->bias_floor2 = v[27]; s->top_rel = v[28]; s->top_range = v[29];
     } else if (s->type == SEN_MICROWAVE) {
         s->mx = v[1]; s->my = v[2]; s->yaw = v[3]; s->fov = v[4]; s->max_range = v[5]; s->p_d = v[6]; s->clutter = v[7];
     } else if (s->type == SEN_POSITION) {
@@ -5664,263 +5667,6 @@ out:
     return cnt;
 }
 
-/* ---- one scan's association (Tracker.process) ---- */
-#define RDET 13                  /* a detection: kind, sdt, group, vehicle (-1, 0, 1), box width, z[4], R[4] */
-#define RSCFG 10                 /* gate for 1..4 rows, feat_sigma, feat_same, feat_span, map_bw[3] */
-
-/* radar_scan(S, rows, sensor, pose, objs, dets, mem, nscan, cfg, pd_out, cov_out, ratio_out|None,
- *            gain_out|None, feat_out|None) -> [(i, j, gain, pair, lam)]
- *   objs: (nt, 3) [kind of the object's label (-1 a person or bike, 0 unknown, 1 a vehicle), width of its last
- *         box if the box feature applies (NaN if not), id];  dets: (nd, RDET);  mem: (nm, 5) the map's entries that
- *         count [rows, z0, z1, z2, object id] or None;  nscan: scans in the map's memory.
- * Every object's probability of being reported (pd_out) and the sensor's coverage at its place (cov_out); the
- * pairs of the scan's assignment with their gain, their probability in the scan as a whole (marginals) and the
- * other story's density over the box feature (tracker `feat`). */
-static PyObject *n_radar_scan(PyObject *self, PyObject *args)
-{
-    PyObject *oS, *orows, *osen, *opose, *oobj, *odet, *omem, *ocfg, *opd, *ocov, *orat, *ogain, *ofeat;
-    double nscan;
-    if (!PyArg_ParseTuple(args, "OOOOOOOdOOOOOO", &oS, &orows, &osen, &opose, &oobj, &odet, &omem, &nscan, &ocfg,
-                          &opd, &ocov, &orat, &ogain, &ofeat))
-        return NULL;
-    PyObject *res = NULL;
-    View vS, vpd, vcov, vrat, vgain, vfeat;
-    vS.held = vpd.held = vcov.held = vrat.held = vgain.held = vfeat.held = 0;
-    Py_ssize_t cap, nt = 0, nd, nm = 0, *rows = NULL, *pi = NULL, *pj = NULL;
-    double *ob = NULL, *dt = NULL, *mem = NULL, *wk = NULL;
-    double pose[6], cfg[RSCFG], *pd, *cov, *rat, *gain, *feat;
-    RSens sen;
-    if (store_get(oS, &vS, &cap) < 0 || (rows = idx_get(orows, cap, &nt)) == NULL || sens_get(osen, &sen) < 0 ||
-        rnums_get(opose, 6, pose, "pose") < 0 || rnums_get(ocfg, RSCFG, cfg, "cfg") < 0)
-        goto done;
-    nd = batch_len(odet);
-    if (nd < 0)
-        goto done;
-    if (omem != Py_None) {
-        nm = batch_len(omem);
-        if (nm < 0)
-            goto done;
-    }
-    ob = (double *)PyMem_Malloc((size_t)(3 * nt + RDET * nd + 5 * nm + 1) * sizeof(double));
-    /* work: ratio, gain, feat, own (nt x nd each) if not given; lam0, loc (nd); car (2 nt) */
-    wk = (double *)PyMem_Malloc((size_t)(4 * nt * nd + 2 * nd + 2 * nt + 1) * sizeof(double));
-    pi = (Py_ssize_t *)PyMem_Malloc((size_t)(2 * (nt + nd) + 2) * sizeof(Py_ssize_t));
-    if (ob == NULL || wk == NULL || pi == NULL) {
-        PyErr_NoMemory();
-        goto done;
-    }
-    pj = pi + nt + nd + 1;
-    dt = ob + 3 * nt;
-    mem = dt + RDET * nd;
-    if ((nt && rows_get(oobj, nt, 3, ob, "objs") < 0) || (nd && rows_get(odet, nd, RDET, dt, "dets") < 0) ||
-        (nm && rows_get(omem, nm, 5, mem, "mem") < 0) ||
-        out_get(opd, &vpd, nt, 0, &pd, "pd_out") < 0 || out_get(ocov, &vcov, nt, 0, &cov, "cov_out") < 0 ||
-        out_get(orat, &vrat, nt * nd, 1, &rat, "ratio_out") < 0 || out_get(ogain, &vgain, nt * nd, 1, &gain, "gain_out") < 0 ||
-        out_get(ofeat, &vfeat, nt * nd, 1, &feat, "feat_out") < 0)
-        goto done;
-    {
-    double *own = wk + 3 * nt * nd, *lam0 = wk + 4 * nt * nd, *loc = lam0 + nd, *car = loc + nd;
-    if (rat == NULL)
-        rat = wk;
-    if (gain == NULL)
-        gain = wk + nt * nd;
-    if (feat == NULL)
-        feat = wk + 2 * nt * nd;
-    double *A = (double *)vS.b.buf;
-    double cph = cos(pose[2]), sph = sin(pose[2]);
-    for (Py_ssize_t i = 0; i < nt; i++) {
-        const double *x = A + rows[i] * RROW + RO_X;
-        double dx = x[R_PX] - pose[0], dy = x[R_PY] - pose[1];
-        car[2 * i] = cph * dx + sph * dy;
-        car[2 * i + 1] = -sph * dx + cph * dy;
-        pd[i] = r_p_detect(&sen, car[2 * i], car[2 * i + 1], x);
-        cov[i] = r_coverage(&sen, car[2 * i], car[2 * i + 1]);
-    }
-    for (Py_ssize_t k = 0; k < nt * nd; k++) {
-        rat[k] = 0.0;
-        gain[k] = -INFINITY;
-        feat[k] = 0.0;
-        own[k] = 0.0;
-    }
-    if (nd && nt) {
-        int ng = 0;
-        for (Py_ssize_t j = 0; j < nd; j++) {
-            const double *d = dt + j * RDET;
-            lam0[j] = r_density(&sen, (int)d[0], d + 5);
-            if ((int)d[2] + 1 > ng)
-                ng = (int)d[2] + 1;
-            /* the map: unexplained detections that became objects, near this one (tracker `_local_density`) */
-            loc[j] = 0.0;
-            int base = (int)d[0] & 7;
-            if (sen.type != SEN_CAMERA || !(base == K_RB || base == K_RBH) || nm == 0)
-                continue;
-            int n = base == K_RB ? 2 : 3;
-            double norm = pymax(nscan, 1.0);
-            for (int a = 0; a < n; a++)
-                norm *= cfg[7 + a] * 2.5066;
-            for (Py_ssize_t e = 0; e < nm; e++) {
-                const double *me = mem + 5 * e;
-                if (me[0] < n)
-                    continue;
-                double q = 0.0;
-                for (int a = 0; a < n; a++)
-                    q += pow((d[5 + a] - me[1 + a]) / cfg[7 + a], 2.0);
-                if (q < 25.0) {
-                    double v = exp(-0.5 * q) / norm;
-                    loc[j] += v;
-                    for (Py_ssize_t i = 0; i < nt; i++)
-                        if (ob[3 * i + 2] == me[4])
-                            own[i * nd + j] += v;
-                }
-            }
-        }
-        Py_ssize_t *J = pi;                              /* a group's detections (pi is free until the end) */
-        int *ok = (int *)PyMem_Malloc((size_t)nd * sizeof(int));
-        double *qs = (double *)PyMem_Malloc((size_t)(3 * nd) * sizeof(double));
-        if (ok == NULL || qs == NULL) {
-            PyMem_Free(ok);
-            PyMem_Free(qs);
-            PyErr_NoMemory();
-            goto done;
-        }
-        double *dets = qs + nd, *lk = dets + nd;
-        double zp[4], H[4 * RN], HP[4 * RN], S[16], zm[4], Hm[4 * RN], HPm[4 * RN], Sm[16];
-        for (Py_ssize_t i = 0; i < nt; i++) {
-            if (pd[i] <= 0.0)
-                continue;
-            const double *row = A + rows[i] * RROW;
-            const double *x = row + RO_X, *P = row + RO_P, *mu = row + RO_MU;
-            double ov = ob[3 * i], lbw = ob[3 * i + 1];
-            for (int g = 0; g < ng; g++) {
-                Py_ssize_t nJ = 0;
-                for (Py_ssize_t j = 0; j < nd; j++)
-                    if ((int)dt[j * RDET + 2] == g)
-                        J[nJ++] = j;
-                if (nJ == 0)
-                    continue;
-                const double *d0 = dt + J[0] * RDET;
-                int kind = (int)d0[0];
-                double sdt = d0[1];
-                if (sen.type == SEN_CAMERA && sen.cover && ((kind & 7) == K_B || (kind & 7) == K_BT) &&
-                    !(py_hypot(car[2 * i], car[2 * i + 1]) <= sen.near * sen.gmin))
-                    continue;                            /* CameraBoxes.takes */
-                int anyok = 0;
-                for (Py_ssize_t a = 0; a < nJ; a++) {
-                    ok[a] = dt[J[a] * RDET + 3] * ov >= 0.0;    /* a pedestrian's box does not continue a vehicle */
-                    anyok |= ok[a];
-                }
-                if (!anyok)
-                    continue;
-                /* the gate: the object as a whole */
-                int m = r_h(&sen, kind, sdt, x, pose, zp, H);
-                int ar = r_angle_row(&sen, kind);
-                double gate = (m >= 1 && m <= 4) ? cfg[m - 1] : 16.0;
-                r_hph(H, m, P, HP, S);
-                int sing = 0;
-                anyok = 0;
-                for (Py_ssize_t a = 0; a < nJ; a++) {
-                    const double *d = dt + J[a] * RDET;
-                    double nuj[4], Sj[16], q;
-                    for (int r = 0; r < m; r++)
-                        nuj[r] = r == ar ? wrap_pi(d[5 + r] - zp[r]) : d[5 + r] - zp[r];
-                    memcpy(Sj, S, sizeof(double) * (size_t)(m * m));
-                    for (int r = 0; r < m; r++)
-                        Sj[r * m + r] = S[r * m + r] + d[9 + r];
-                    if (r_mahal(Sj, m, nuj, &q, NULL) < 0) {
-                        sing = 1;                        /* numpy: LinAlgError for the whole group */
-                        break;
-                    }
-                    ok[a] = ok[a] && q <= gate;
-                    anyok |= ok[a];
-                }
-                if (sing || !anyok)
-                    continue;
-                /* what each hypothesis, with its own prediction and weight, gives the detection */
-                for (Py_ssize_t a = 0; a < nJ; a++)
-                    lk[a] = 0.0;
-                double c2 = pow(2.0 * PI, (double)m);
-                for (int mm = 0; mm < 3; mm++) {
-                    if (mu[mm] < 1e-4)
-                        continue;
-                    r_h(&sen, kind, sdt, row + RO_XS + mm * RN, pose, zm, Hm);
-                    r_hph(Hm, m, row + RO_PS + mm * RNN, HPm, Sm);
-                    int bad = 0;
-                    for (Py_ssize_t a = 0; a < nJ; a++) {
-                        if (!ok[a])
-                            continue;
-                        const double *d = dt + J[a] * RDET;
-                        double nuj[4], Sj[16];
-                        for (int r = 0; r < m; r++)
-                            nuj[r] = r == ar ? wrap_pi(d[5 + r] - zm[r]) : d[5 + r] - zm[r];
-                        memcpy(Sj, Sm, sizeof(double) * (size_t)(m * m));
-                        for (int r = 0; r < m; r++)
-                            Sj[r * m + r] = Sm[r * m + r] + d[9 + r];
-                        if (r_mahal(Sj, m, nuj, &qs[a], &dets[a]) < 0) {
-                            bad = 1;
-                            break;
-                        }
-                    }
-                    if (bad)
-                        continue;
-                    for (Py_ssize_t a = 0; a < nJ; a++)
-                        if (ok[a] && qs[a] < 60.0 && dets[a] > 0.0)
-                            lk[a] += mu[mm] * exp(-0.5 * pymin(qs[a], 60.0)) / sqrt(c2 * dets[a]);
-                }
-                for (Py_ssize_t a = 0; a < nJ; a++) {
-                    if (!ok[a] || lk[a] <= 0.0)
-                        continue;
-                    const double *d = dt + J[a] * RDET;
-                    Py_ssize_t j = J[a];
-                    double F = 1.0;
-                    if (!isnan(lbw) && d[4] > 0.0 && ar >= 0) {      /* the box as a feature */
-                        double e = fabs(wrap_pi(d[5 + ar] - zp[ar])) / np_maximum(0.5 * (d[4] + lbw), 1e-4);
-                        double sg = cfg[4], t = np_minimum(e / sg, 12.0);
-                        F = cfg[6] * (cfg[5] * 0.7979 / sg * exp(-0.5 * (t * t)) + (1.0 - cfg[5]) / cfg[6]);
-                    }
-                    /* the other story's density here: not counting this object's own first detection */
-                    double lam = pymax(lam0[j], loc[j] - own[i * nd + j]);
-                    double r = pd[i] * lk[a] * F / ((1.0 - pd[i]) * lam);
-                    rat[i * nd + j] = r;
-                    double gg = log(r);
-                    if (gg > 0.0) {
-                        gain[i * nd + j] = gg;
-                        feat[i * nd + j] = lam / F;
-                    }
-                }
-            }
-        }
-        PyMem_Free(ok);
-        PyMem_Free(qs);
-    }
-    /* the pairing's probabilities in the scan as a whole, and the assignment */
-    double *pair = own;                                  /* free now */
-    if (r_marginals(rat, nt, nd, pair) < 0)
-        goto done;
-    Py_ssize_t np_ = r_assign(gain, nt, nd, pi, pj);
-    if (np_ < 0)
-        goto done;
-    res = PyList_New(np_);
-    if (res == NULL)
-        goto done;
-    for (Py_ssize_t q = 0; q < np_; q++) {
-        Py_ssize_t k = pi[q] * nd + pj[q];
-        PyObject *t = Py_BuildValue("(nnddd)", pi[q], pj[q], gain[k], pair[k], feat[k]);
-        if (t == NULL) {
-            Py_CLEAR(res);
-            goto done;
-        }
-        PyList_SetItem(res, q, t);
-    }
-    }
-done:
-    PyMem_Free(rows);
-    PyMem_Free(ob);
-    PyMem_Free(wk);
-    PyMem_Free(pi);
-    view_drop(&vS); view_drop(&vpd); view_drop(&vcov); view_drop(&vrat); view_drop(&vgain); view_drop(&vfeat);
-    return res;
-}
-
 /* ---- the update of a scan's pairs (Tracker._update, its arithmetic) ---- */
 /* K = P H^T Si (N x m), from HP = H P (P symmetric is NOT assumed: P H^T computed as such) */
 static void r_gain(const double *P, const double *H, int m, const double *Si, double *K)
@@ -5991,11 +5737,6 @@ static void r_take(double *x, double *P, const double *K, const double *H, const
     memcpy(P, Pn, sizeof(Pn));
 }
 
-static inline double clamp_dp(double v)          /* min(0.05, max(-0.05, v)) as Python takes it */
-{
-    return pymin(0.05, pymax(-0.05, v));
-}
-
 /* nu = z - h(x) wrapped, S = H P H^T + diag(R); returns m */
 static int r_innov(const RSens *s, int kind, double sdt, const double *x, const double *P, const double *pose,
                    const double *z, const double *R, double *nu, double *H, double *S)
@@ -6011,231 +5752,13 @@ static int r_innov(const RSens *s, int kind, double sdt, const double *x, const 
     return m;
 }
 
-#define RPAIR 4                  /* a pair: p_detect, lam (feat), pair probability (NaN: none), the object's hits */
-
-/* radar_update(S, rows, sensor, pose, dets, pairs, cfg) -> [(nis, dlogodds)]
- *   rows: the objects' rows (one per pair);  dets: (np, RDET) each pair's detection (as `_common` left it);
- *   pairs: (np, RPAIR);  cfg: (mu_hold_hits, mu_floor).
- * Every pair's detection into its object: the hypotheses, the free estimate, the probabilities of the hypotheses
- * and the combination are written into the object's row; returned per pair: the normalized innovation of the
- * object as a whole (before the update) and what the detection adds to the object's log odds of existing. */
-static PyObject *n_radar_update(PyObject *self, PyObject *args)
-{
-    PyObject *oS, *orows, *osen, *opose, *odet, *opair, *ocfg;
-    if (!PyArg_ParseTuple(args, "OOOOOOO", &oS, &orows, &osen, &opose, &odet, &opair, &ocfg))
-        return NULL;
-    PyObject *res = NULL;
-    View vS;
-    vS.held = 0;
-    Py_ssize_t cap, np_ = 0, *rows = NULL;
-    double *buf = NULL, pose[6], cfg[2];
-    RSens sen;
-    if (store_get(oS, &vS, &cap) < 0 || (rows = idx_get(orows, cap, &np_)) == NULL || sens_get(osen, &sen) < 0 ||
-        rnums_get(opose, 6, pose, "pose") < 0 || rnums_get(ocfg, 2, cfg, "cfg") < 0)
-        goto done;
-    buf = (double *)PyMem_Malloc((size_t)((RDET + RPAIR) * np_ + 1) * sizeof(double));
-    if (buf == NULL) {
-        PyErr_NoMemory();
-        goto done;
-    }
-    if (np_ && (rows_get(odet, np_, RDET, buf, "dets") < 0 || rows_get(opair, np_, RPAIR, buf + RDET * np_, "pairs") < 0))
-        goto done;
-    for (Py_ssize_t q = 0; q < np_; q++)
-        for (Py_ssize_t q2 = q + 1; q2 < np_; q2++)
-            if (rows[q] == rows[q2]) {
-                PyErr_SetString(PyExc_ValueError, "radar_update: one object in two pairs");
-                goto done;
-            }
-    res = PyList_New(np_);
-    if (res == NULL)
-        goto done;
-    double *A = (double *)vS.b.buf;
-    for (Py_ssize_t q = 0; q < np_; q++) {
-        const double *d = buf + q * RDET, *pp = buf + RDET * np_ + q * RPAIR;
-        double *row = A + rows[q] * RROW;
-        double *mu = row + RO_MU;
-        int kind = (int)d[0];
-        double sdt = d[1], pd = pp[0], lam = pp[1], pair = pp[2], hits = pp[3];
-        double other = pymax((1.0 - pd) * lam, 1e-300);
-        double like[3], Hs[3][4 * RN], nus[3][4], Ss[3][16], Sis[3][16];
-        int m = 0;
-        for (int j = 0; j < 3; j++) {
-            double det;
-            m = r_innov(&sen, kind, sdt, row + RO_XS + j * RN, row + RO_PS + j * RNN, pose, d + 5, d + 9, nus[j], Hs[j], Ss[j]);
-            if (r_inv(Ss[j], m, Sis[j], &det) < 0) {
-                PyErr_SetString(PyExc_ValueError, "radar_update: a singular innovation covariance");   /* numpy: LinAlgError */
-                Py_CLEAR(res);
-                goto done;
-            }
-            double t[4], d2 = 0.0;
-            for (int c = 0; c < m; c++) {
-                double acc = 0.0;
-                for (int r = 0; r < m; r++)
-                    acc = r ? acc + nus[j][r] * Sis[j][r * m + c] : nus[j][r] * Sis[j][r * m + c];
-                t[c] = acc;
-            }
-            for (int c = 0; c < m; c++)
-                d2 = c ? d2 + t[c] * nus[j][c] : t[c] * nus[j][c];
-            like[j] = exp(-0.5 * pymin(d2, 400.0)) / sqrt(pymax(pow(2.0 * PI, (double)m) * det, 1e-30));
-        }
-        /* whose the detection is: one question for the whole object, shrunk by the pairing's probability */
-        double lo = (mu[0] * like[0] + mu[1] * like[1]) + mu[2] * like[2];
-        double beta_o = pd * lo / (pd * lo + other);
-        double comp = (isnan(pair) || beta_o <= 0.0) ? 1.0 : pymin(1.0, pair / beta_o);
-        beta_o *= comp;
-        /* the object as a whole, before the update (its NIS) */
-        double nu0[4], H0[4 * RN], S0[16], d20;
-        int m0 = r_innov(&sen, kind, sdt, row + RO_X, row + RO_P, pose, d + 5, d + 9, nu0, H0, S0);
-        if (r_mahal(S0, m0, nu0, &d20, NULL) < 0) {
-            PyErr_SetString(PyExc_ValueError, "radar_update: a singular innovation covariance");
-            Py_CLEAR(res);
-            goto done;
-        }
-        for (int j = 0; j < 3; j++) {
-            double K[RN * 4];
-            double *x = row + RO_XS + j * RN, *P = row + RO_PS + j * RNN;
-            double beta = pymax(comp * pd * like[j] / (pd * like[j] + other), beta_o);
-            r_gain(P, Hs[j], m, Sis[j], K);
-            r_take(x, P, K, Hs[j], d + 9, nus[j], m, beta);
-            if (j == R_STAND)
-                for (int k = R_VX; k <= R_AY; k++)
-                    x[k] = 0.0;
-            x[R_DP] = clamp_dp(x[R_DP]);
-        }
-        /* the free estimate takes it the same way */
-        {
-            double nu[4], H[4 * RN], Sf[16], Si[16], det, K[RN * 4];
-            double *x = row + RO_XF, *P = row + RO_PF;
-            int mf = r_innov(&sen, kind, sdt, x, P, pose, d + 5, d + 9, nu, H, Sf);
-            if (r_inv(Sf, mf, Si, &det) < 0) {
-                PyErr_SetString(PyExc_ValueError, "radar_update: a singular innovation covariance");
-                Py_CLEAR(res);
-                goto done;
-            }
-            double t[4], d2 = 0.0;
-            for (int c = 0; c < mf; c++) {
-                double acc = 0.0;
-                for (int r = 0; r < mf; r++)
-                    acc = r ? acc + nu[r] * Si[r * mf + c] : nu[r] * Si[r * mf + c];
-                t[c] = acc;
-            }
-            for (int c = 0; c < mf; c++)
-                d2 = c ? d2 + t[c] * nu[c] : t[c] * nu[c];
-            double lf = exp(-0.5 * pymin(d2, 400.0)) / sqrt(pymax(pow(2.0 * PI, (double)mf) * det, 1e-30));
-            double beta = pymax(comp * pd * lf / (pd * lf + other), beta_o);
-            r_gain(P, H, mf, Si, K);
-            r_take(x, P, K, H, d + 9, nu, mf, beta);
-            x[R_DP] = clamp_dp(x[R_DP]);
-        }
-        /* the hypotheses weighed by how well each predicted the detection */
-        double tot = (mu[0] * like[0] + mu[1] * like[1]) + mu[2] * like[2];
-        double w[3];
-        for (int j = 0; j < 3; j++)
-            w[j] = mu[j] * (pd * like[j] + other);
-        if (tot > 0.0 && (sen.type == SEN_MICROWAVE || hits >= cfg[0] || (kind & K_SCALE))) {
-            double ws = (w[0] + w[1]) + w[2], nm[3];
-            for (int j = 0; j < 3; j++) {
-                double v = w[j] / ws;
-                nm[j] = (isnan(v) || v >= cfg[1]) ? v : cfg[1];
-            }
-            double s2 = (nm[0] + nm[1]) + nm[2];
-            for (int j = 0; j < 3; j++)
-                mu[j] = nm[j] / s2;
-        } else if (tot > 0.0 && w[1] + w[2] > 0.0) {
-            double mv = mu[1] + mu[2], ws = w[1] + w[2];
-            for (int j = 1; j < 3; j++) {
-                double v = mv * w[j] / ws;
-                mu[j] = (isnan(v) || v >= cfg[1]) ? v : cfg[1];
-            }
-            double s2 = (mu[0] + mu[1]) + mu[2];
-            for (int j = 0; j < 3; j++)
-                mu[j] = mu[j] / s2;
-        }
-        double like_all = pymax(tot, 1e-30);
-        double dl = pymin(pymax(log(pymax(sen.p_d * like_all / r_density(&sen, kind, d + 5), 1e-9)), log(1.5)), log(20.0));
-        r_combine(row + RO_XS, row + RO_PS, mu, row + RO_X, row + RO_P);
-        PyObject *t = Py_BuildValue("(dd)", d20 / m0, dl);
-        if (t == NULL) {
-            Py_CLEAR(res);
-            goto done;
-        }
-        PyList_SetItem(res, q, t);
-    }
-done:
-    PyMem_Free(rows);
-    PyMem_Free(buf);
-    view_drop(&vS);
-    return res;
-}
-
-/* radar_first_rate(S, row, sensor, pose, sdt, z, R, mu_floor) -> None. A new object's first box came with a scale
- * rate (Tracker._first_rate): every hypothesis and the free estimate take that one row in full (Joseph form), the
- * hypotheses are weighed by how well each had expected it (never below mu_floor), the combination is written. */
-static PyObject *n_radar_first_rate(PyObject *self, PyObject *args)
-{
-    PyObject *oS, *osen, *opose;
-    Py_ssize_t slot;
-    double sdt, z, R, floor_;
-    if (!PyArg_ParseTuple(args, "OnOOdddd", &oS, &slot, &osen, &opose, &sdt, &z, &R, &floor_))
-        return NULL;
-    View vS;
-    Py_ssize_t cap;
-    if (store_get(oS, &vS, &cap) < 0)
-        return NULL;
-    PyObject *res = NULL;
-    double pose[6];
-    RSens sen;
-    if (slot < 0 || slot >= cap) {
-        PyErr_SetString(PyExc_IndexError, "radar: a row outside the state array");
-        goto done;
-    }
-    if (sens_get(osen, &sen) < 0 || rnums_get(opose, 6, pose, "pose") < 0)
-        goto done;
-    {
-        double *row = (double *)vS.b.buf + slot * RROW, *mu = row + RO_MU, like[3] = {0.0, 0.0, 0.0};
-        for (int j = 0; j < 4; j++) {
-            double *x = j == 3 ? row + RO_XF : row + RO_XS + j * RN, *P = j == 3 ? row + RO_PF : row + RO_PS + j * RNN;
-            double nu[4], H[4 * RN], S[16], K[RN * 4];
-            r_innov(&sen, K_NONE | K_SCALE, sdt, x, P, pose, &z, &R, nu, H, S);
-            if (!(S[0] > 0.0) || !isfinite(S[0]))
-                continue;                                /* nothing to learn from a row with no spread */
-            double Si = 1.0 / S[0];
-            r_gain(P, H, 1, &Si, K);
-            r_take(x, P, K, H, &R, nu, 1, 1.0);
-            if (j == 3)
-                break;
-            like[j] = exp(-0.5 * pymin(nu[0] * nu[0] / S[0], 400.0)) / sqrt(2.0 * PI * S[0]);
-            if (j == R_STAND)
-                for (int k = R_VX; k <= R_AY; k++)
-                    x[k] = 0.0;
-        }
-        double w[3] = {mu[0] * like[0], mu[1] * like[1], mu[2] * like[2]};
-        double ws = (w[0] + w[1]) + w[2];
-        if (ws > 0.0) {
-            double s2 = 0.0;
-            for (int j = 0; j < 3; j++) {
-                w[j] = pymax(w[j] / ws, floor_);
-                s2 += w[j];
-            }
-            for (int j = 0; j < 3; j++)
-                mu[j] = w[j] / s2;
-        }
-        r_combine(row + RO_XS, row + RO_PS, mu, row + RO_X, row + RO_P);
-    }
-    res = Py_None;
-    Py_INCREF(res);
-done:
-    view_drop(&vS);
-    return res;
-}
-
 /* ---- the motion model on the objects' rows ---- */
 /* one object's hypotheses and free estimate after dt (Tracker._evolve): into xs1 (3N), Ps1 (3NN), c (3), and
  * the free estimate into xf1, Pf1 when given */
 static void r_evolve_row(const double *row, double dt, const double *K, const RPar *par, double *xs1, double *Ps1,
-                         double *c, double *xf1, double *Pf1)
+                         double *c, double *xf1, double *Pf1, double *Tout)
 {
-    double T[9], xm[3 * RN], Pm[3 * RNN];
+    double Tl[9], *T = Tout ? Tout : Tl, xm[3 * RN], Pm[3 * RNN];
     const double *X = row + RO_XS, *P = row + RO_PS;
     double q0 = r_still(X + RN, P + RNN, K[3]), q1 = r_still(X + 2 * RN, P + 2 * RNN, K[3]);
     r_transition(dt, q0, q1, par, T);
@@ -6468,70 +5991,6 @@ done:
     return res;
 }
 
-/* radar_advance(S, rows, dt, kin, par, noise, pose) -> None. Tracker._advance_all for B objects, committed in
- * their rows: interaction, prediction (and the free estimate's), the probabilities only where dt > 0, what the
- * car's own movement is not sure about added to where each is (noise: (sa, sp) per object, pose (X, Y, psi) at
- * the target time; the object's place before the step), the combination. */
-static PyObject *n_radar_advance(PyObject *self, PyObject *args)
-{
-    PyObject *oS, *orows, *odt, *okin, *opar, *onoise, *opose;
-    if (!PyArg_ParseTuple(args, "OOOOOOO", &oS, &orows, &odt, &okin, &opar, &onoise, &opose))
-        return NULL;
-    PyObject *res = NULL;
-    View vS;
-    vS.held = 0;
-    Py_ssize_t cap, B = 0, *rows = NULL;
-    double *dk = NULL, pose[3];
-    RPar par;
-    if (store_get(oS, &vS, &cap) < 0 || (rows = idx_get(orows, cap, &B)) == NULL || rpar_get(opar, &par) < 0 ||
-        rnums_get(opose, 3, pose, "pose") < 0)
-        goto done;
-    dk = (double *)PyMem_Malloc((size_t)(B ? B : 1) * 7 * sizeof(double));
-    if (dk == NULL) {
-        PyErr_NoMemory();
-        goto done;
-    }
-    if (rows_get(odt, B, 1, dk, "dt") < 0 || rows_get(okin, B, 4, dk + B, "kin") < 0 ||
-        rows_get(onoise, B, 2, dk + 5 * B, "noise") < 0)
-        goto done;
-    double *A = (double *)vS.b.buf;
-    double ch = cos(pose[2]), sh = sin(pose[2]);
-    for (Py_ssize_t b = 0; b < B; b++) {
-        double *row = A + rows[b] * RROW;
-        double dt = dk[b], sa = dk[5 * B + 2 * b], sp = dk[5 * B + 2 * b + 1];
-        double xs1[3 * RN], Ps1[3 * RNN], c[3], xf1[RN], Pf1[RNN];
-        r_evolve_row(row, dt, dk + B + 4 * b, &par, xs1, Ps1, c, xf1, Pf1);
-        if (dt > 0.0)
-            memcpy(row + RO_MU, c, sizeof(c));
-        if (sa > 0.0 || sp > 0.0) {
-            /* the car's travel error lies along its heading; its heading error swings the object about the car */
-            double dx = row[RO_X + R_PX] - pose[0], dy = row[RO_X + R_PY] - pose[1];
-            double a2 = sa * sa, p2 = sp * sp;
-            double e00 = a2 * (ch * ch) + p2 * (dy * dy), e01 = a2 * (ch * sh) + p2 * (-dx * dy),
-                   e11 = a2 * (sh * sh) + p2 * (dx * dx);
-            for (int j = 0; j < 4; j++) {
-                double *P = j < 3 ? Ps1 + j * RNN : Pf1;
-                P[0] += e00;
-                P[1] += e01;
-                P[RN] += e01;
-                P[RN + 1] += e11;
-            }
-        }
-        memcpy(row + RO_XS, xs1, sizeof(xs1));
-        memcpy(row + RO_PS, Ps1, sizeof(Ps1));
-        memcpy(row + RO_XF, xf1, sizeof(xf1));
-        memcpy(row + RO_PF, Pf1, sizeof(Pf1));
-        r_combine(row + RO_XS, row + RO_PS, row + RO_MU, row + RO_X, row + RO_P);
-    }
-    res = Py_None;
-    Py_INCREF(res);
-done:
-    PyMem_Free(rows);
-    PyMem_Free(dk);
-    view_drop(&vS);
-    return res;
-}
-
 /* radar_peek(S, rows, dt, kin, par, x_out, P_out, mu_out) -> None. Tracker.peek_many: where each object is
  * believed to be after its dt (an object whose |dt| < 1e-6: its row as it is), nothing committed */
 static PyObject *n_radar_peek(PyObject *self, PyObject *args)
@@ -6567,7 +6026,7 @@ static PyObject *n_radar_peek(PyObject *self, PyObject *args)
             continue;
         }
         double xs1[3 * RN], Ps1[3 * RNN];
-        r_evolve_row(row, dt, dk + B + 4 * b, &par, xs1, Ps1, muo + 3 * b, NULL, NULL);
+        r_evolve_row(row, dt, dk + B + 4 * b, &par, xs1, Ps1, muo + 3 * b, NULL, NULL, NULL);
         r_combine(xs1, Ps1, muo + 3 * b, xo + b * RN, Po + b * RNN);
     }
     res = Py_None;
@@ -6575,6 +6034,49 @@ static PyObject *n_radar_peek(PyObject *self, PyObject *args)
 done:
     PyMem_Free(rows);
     PyMem_Free(dk);
+    view_drop(&vS); view_drop(&v1); view_drop(&v2); view_drop(&v3);
+    return res;
+}
+
+/* radar_peek_models(S, row, dt, kin, par, xs_out (3, N), Ps_out (3, N, N), mu_out (3)) -> None: one row's motion
+ * hypotheses after dt, each by itself (the interaction and the prediction of a scan's step), nothing committed
+ * (for tools: what each hypothesis expects of a detection) */
+static PyObject *n_radar_peek_models(PyObject *self, PyObject *args)
+{
+    PyObject *oS, *okin, *opar, *o1, *o2, *o3;
+    Py_ssize_t slot;
+    double dt;
+    if (!PyArg_ParseTuple(args, "OndOOOOO", &oS, &slot, &dt, &okin, &opar, &o1, &o2, &o3))
+        return NULL;
+    PyObject *res = NULL;
+    View vS, v1, v2, v3;
+    vS.held = v1.held = v2.held = v3.held = 0;
+    Py_ssize_t cap;
+    double kin[4], *xo, *Po, *muo;
+    RPar par;
+    if (store_get(oS, &vS, &cap) < 0 || rpar_get(opar, &par) < 0 || rnums_get(okin, 4, kin, "kin") < 0 ||
+        out_get(o1, &v1, 3 * RN, 0, &xo, "xs_out") < 0 || out_get(o2, &v2, 3 * RNN, 0, &Po, "Ps_out") < 0 ||
+        out_get(o3, &v3, 3, 0, &muo, "mu_out") < 0)
+        goto done;
+    if (slot < 0 || slot >= cap) {
+        PyErr_SetString(PyExc_IndexError, "radar: a row outside the state array");
+        goto done;
+    }
+    {
+        const double *row = (const double *)vS.b.buf + slot * RROW;
+        if (fabs(dt) < 1e-6) {
+            memcpy(xo, row + RO_XS, 3 * RN * sizeof(double));
+            memcpy(Po, row + RO_PS, 3 * RNN * sizeof(double));
+            memcpy(muo, row + RO_MU, 3 * sizeof(double));
+        } else {
+            double c[3];
+            r_evolve_row(row, dt, kin, &par, xo, Po, c, NULL, NULL, NULL);
+            memcpy(muo, dt > 0.0 ? c : row + RO_MU, 3 * sizeof(double));
+        }
+    }
+    res = Py_None;
+    Py_INCREF(res);
+done:
     view_drop(&vS); view_drop(&v1); view_drop(&v2); view_drop(&v3);
     return res;
 }
@@ -7364,7 +6866,7 @@ static PyObject *n_radar_life(PyObject *self, PyObject *args)
                 memcpy(mm, row + RO_MU, sizeof(mm));
             } else {
                 double xs1[3 * RN], Ps1[3 * RNN];
-                r_evolve_row(row, dt, kin + 4 * b, &par, xs1, Ps1, mm, NULL, NULL);
+                r_evolve_row(row, dt, kin + 4 * b, &par, xs1, Ps1, mm, NULL, NULL, NULL);
                 r_combine(xs1, Ps1, mm, x, P);
             }
             double lam;
@@ -7393,7 +6895,7 @@ done:
     return res;
 }
 
-#define RMCFG 3                  /* merge_m, merge_rel, merge_dv */
+#define RMCFG 4                  /* merge_m, merge_rel, merge_dv, merge_d2 */
 
 /* radar_merge(S, rows, times, kin, par, here, ego, cfg) -> [(i, j, same_place)]
  * Tracker._merge's geometry: the pairs (i < j) worth a look (nearer than the limit can be at any range in reach,
@@ -7445,7 +6947,7 @@ static PyObject *n_radar_merge(PyObject *self, PyObject *args)
                 memcpy(xb, xb0, sizeof(xb));
             else {
                 double xs1[3 * RN], Ps1[3 * RNN], mm[3], Pp[RNN];
-                r_evolve_row(rb, tm[i] - tm[j], kin + 4 * j, &par, xs1, Ps1, mm, NULL, NULL);
+                r_evolve_row(rb, tm[i] - tm[j], kin + 4 * j, &par, xs1, Ps1, mm, NULL, NULL, NULL);
                 r_combine(xs1, Ps1, mm, xb, Pp);
             }
             double r = py_hypot(xa[R_PX] - here[2 * i], xa[R_PY] - here[2 * i + 1]);
@@ -7453,6 +6955,14 @@ static PyObject *n_radar_merge(PyObject *self, PyObject *args)
             double dv = hypot(xb[R_VX] - xa[R_VX], xb[R_VY] - xa[R_VY]);
             double sv = sqrt(pymax((Pa[R_VX * RN + R_VX] + Pa[R_VY * RN + R_VY]) + (Pb[R_VX * RN + R_VX] + Pb[R_VY * RN + R_VY]), 0.0));
             int same = !(py_hypot(xb[R_PX] - xa[R_PX], xb[R_PY] - xa[R_PY]) > lim) && !(dv > cfg[2] + 2.0 * sv);
+            if (same) {
+                /* ... and within what the two know of their places: two things whose places are known and differ
+                 * are two things, however near (cars side by side in a microwave radar's view) */
+                double S[4] = {Pa[0] + Pb[0] + 0.05, Pa[1] + Pb[1], Pa[RN] + Pb[RN], Pa[RN + 1] + Pb[RN + 1] + 0.05};
+                double nu[2] = {xb[R_PX] - xa[R_PX], xb[R_PY] - xa[R_PY]}, d2;
+                if (r_mahal(S, 2, nu, &d2, NULL) == 0 && d2 > cfg[3])
+                    same = 0;
+            }
             PyObject *t = Py_BuildValue("(nnO)", i, j, same ? Py_True : Py_False);
             if (t == NULL || PyList_Append(res, t) < 0) {
                 Py_XDECREF(t);
@@ -7593,59 +7103,2760 @@ done:
     return res;
 }
 
-/* radar_common(S, rows, sensor, pose, items) -> (m, sum of weights). Tracker._common's numbers: for each settled
- * pair (its object's row; item: kind, sdt, the detection's first row z0 and its variance R00) the angle
- * innovation of the object as a whole and its weight 1 / (H0 P H0 + R00); the middle one by weight. */
-static PyObject *n_radar_common(PyObject *self, PyObject *args)
+/* ====================================================================================================
+ * The radar's hypotheses (radar/tracker.py `Tracker.process`): which detection is whose, decided over several
+ * scans. Track-oriented multiple-hypothesis tracking in its Bernoulli form (docs/RADAR.md has the choice and
+ * the derivation):
+ *
+ *   node      one row of the state array: an object's numbers after one scan under one story of what the scan's
+ *             detections were (the object took detection j, or it was not reported). A node's parent is the same
+ *             object one scan earlier; the nodes of an object form a tree, its leaves are the object's present
+ *             hypotheses. The chain from a leaf to the root is that story's history, kept for the smoother.
+ *   cluster   objects that compete for detections now or did within the last scans. A cluster holds its global
+ *             hypotheses: each picks one leaf of every object of the cluster (or none: in that story the object
+ *             does not exist, its first detection was another object's) such that no detection is used twice,
+ *             with its probability (log weight, normalised in the cluster).
+ *   scan      every leaf is stepped to the scan's time into a child (the "not reported" story); the leaves are
+ *             compared with the detections (gate, likelihood ratio against "something else": the sensor's
+ *             clutter and new objects); objects that share a gated detection are put into one cluster; for each
+ *             global hypothesis of a cluster the K best assignments of its detections are enumerated (Murty's
+ *             ranked assignment over the ratio matrix) and the best of all of them kept; a detection left
+ *             over in a hypothesis starts an object there. Then the trees are cut N scans back to the branch
+ *             the best hypothesis descends from (N-scan pruning): a doubtful pairing is decided by what the
+ *             following scans show, not by a blend made on the spot.
+ *
+ * The object that is put out is the leaf of the cluster's best hypothesis (`primary`); the probability that it
+ * exists is summed over all the cluster's hypotheses. An object's identity is its tree: it does not change
+ * when the best hypothesis changes its mind about which branch is true.
+ * ==================================================================================================== */
+
+/* ---- scratch memory of one call: blocks freed together ---- */
+typedef struct ArBlk { struct ArBlk *next; double align_; } ArBlk;
+typedef struct { ArBlk *head; int failed; } Arena;
+
+static void *ar_get(Arena *a, size_t n)
 {
-    PyObject *oS, *orows, *osen, *opose, *oit;
-    if (!PyArg_ParseTuple(args, "OOOOO", &oS, &orows, &osen, &opose, &oit))
+    ArBlk *b = (ArBlk *)PyMem_Malloc(sizeof(ArBlk) + (n ? n : 1));
+    if (b == NULL) {
+        a->failed = 1;
         return NULL;
+    }
+    b->next = a->head;
+    a->head = b;
+    return (void *)(b + 1);
+}
+
+static void ar_free(Arena *a)
+{
+    while (a->head) {
+        ArBlk *n = a->head->next;
+        PyMem_Free(a->head);
+        a->head = n;
+    }
+}
+
+typedef struct {
+    int alive, in_map;
+    int nleaf, leafcap;
+    int32_t *leaf;                   /* its present hypotheses (rows) */
+    int32_t primary;                 /* its leaf in the best hypothesis of its cluster (else its likeliest leaf) */
+    int32_t cl;                      /* its cluster */
+    long long born;                  /* the level of its first node */
+    long long freed;                 /* the level at which its handle became free (not taken again in that scan) */
+    double kin[4], veh, idnum;       /* what its kind can do; vehicle (1) / person (-1) / not known (0); its id */
+    double pe, pp;                   /* probability that it exists; that the primary's story is the true one */
+} HTrack;
+
+typedef struct {
+    int alive, nt, ng;
+    int32_t *tr;                     /* nt objects (handles) */
+    int32_t *lf;                     /* ng x nt: each hypothesis' leaf of each object, -1: not in this story */
+    double *lw;                      /* ng log weights, normalised, the best first */
+} HCl;
+
+typedef struct {
+    PyObject_HEAD
+    Py_ssize_t cap;                  /* rows of the state array */
+    int32_t *parent, *nchild, *owner;    /* per row: its parent row (-1: a root), its children, its object (-1: free) */
+    int32_t *freel;
+    Py_ssize_t nfree;
+    HTrack *tr;
+    int ntr;                         /* handles in use (alive or not) */
+    int trcap;
+    HCl *cl;
+    int ncl, clcap;
+    long long level;                 /* scans processed */
+    /* the knobs (tracker.py CFG `hyp_*`) */
+    int n_scan, k_best, max_leaves, keep_steps, max_cluster;
+    double prune_ln, keep_s;
+    /* counters since the start */
+    long long c_scans, c_leaves, c_children, c_hyps, c_murty, c_births, c_pruned;
+} Hyp;
+
+static PyObject *HypType;
+
+/* the row of an object's numbers (tracker.py `_LAY`): hypotheses, free estimate, combination; then the extent
+ * (length, width, heading and their covariance), the step that led into this node (for the smoother: the
+ * switching matrix, dt, what the car's own movement added), and the node's own record (RMETA numbers) */
+enum { M_T, M_L, M_HITS, M_THIT, M_RANGE_T, M_BOXW, M_BOXT, M_BOXS, M_NIS, M_DL, M_DET, M_LEVEL, M_VIS, M_PD, M_SRC,
+       M_OCC, M_COV, M_OCCBY, RMETA };
+enum { ST_T = 0, ST_DT = 9, ST_E = 10 };
+
+static inline double sigm(double l) { return 1.0 / (1.0 + exp(-l)); }
+
+static void hyp_release(Hyp *H)
+{
+    for (int i = 0; i < H->ntr; i++)
+        PyMem_Free(H->tr[i].leaf);
+    for (int i = 0; i < H->ncl; i++) {
+        PyMem_Free(H->cl[i].tr);
+        PyMem_Free(H->cl[i].lf);
+        PyMem_Free(H->cl[i].lw);
+    }
+    PyMem_Free(H->tr);
+    PyMem_Free(H->cl);
+    PyMem_Free(H->parent);
+    PyMem_Free(H->nchild);
+    PyMem_Free(H->owner);
+    PyMem_Free(H->freel);
+    H->tr = NULL;
+    H->cl = NULL;
+    H->parent = H->nchild = H->owner = H->freel = NULL;
+    H->ntr = H->trcap = H->ncl = H->clcap = 0;
+    H->cap = 0;
+    H->nfree = 0;
+}
+
+static int hyp_rows(Hyp *H, Py_ssize_t cap)
+{
+    if (cap <= H->cap)
+        return 0;
+    int32_t *p = (int32_t *)PyMem_Realloc(H->parent, (size_t)cap * sizeof(int32_t));
+    if (p)
+        H->parent = p;
+    int32_t *n = (int32_t *)PyMem_Realloc(H->nchild, (size_t)cap * sizeof(int32_t));
+    if (n)
+        H->nchild = n;
+    int32_t *o = (int32_t *)PyMem_Realloc(H->owner, (size_t)cap * sizeof(int32_t));
+    if (o)
+        H->owner = o;
+    int32_t *f = (int32_t *)PyMem_Realloc(H->freel, (size_t)cap * sizeof(int32_t));
+    if (f)
+        H->freel = f;
+    if (!p || !n || !o || !f) {
+        PyErr_NoMemory();
+        return -1;
+    }
+    for (Py_ssize_t r = cap - 1; r >= H->cap; r--) {    /* the lowest free row is taken first */
+        H->parent[r] = -1;
+        H->nchild[r] = 0;
+        H->owner[r] = -1;
+        H->freel[H->nfree++] = (int32_t)r;
+    }
+    /* keep the free rows in falling order below the new ones: the lowest first */
+    if (H->cap > 0 && H->nfree > cap - H->cap) {
+        Py_ssize_t old = H->nfree - (cap - H->cap);
+        /* the list is [old free rows..., new rows falling]: the new ones go below the old ones */
+        int32_t *tmp = (int32_t *)PyMem_Malloc((size_t)H->nfree * sizeof(int32_t));
+        if (tmp == NULL) {
+            PyErr_NoMemory();
+            return -1;
+        }
+        memcpy(tmp, H->freel + old, (size_t)(cap - H->cap) * sizeof(int32_t));
+        memcpy(tmp + (cap - H->cap), H->freel, (size_t)old * sizeof(int32_t));
+        memcpy(H->freel, tmp, (size_t)H->nfree * sizeof(int32_t));
+        PyMem_Free(tmp);
+    }
+    H->cap = cap;
+    return 0;
+}
+
+static PyObject *hyp_new(PyTypeObject *tp, PyObject *args, PyObject *kw)
+{
+    allocfunc alloc = (allocfunc)PyType_GetSlot(tp, Py_tp_alloc);
+    return alloc(tp, 0);
+}
+
+/* Hyp(rows, n_scan, k_best, max_leaves, prune_ln, keep_steps, keep_s, max_cluster) */
+static int hyp_init(PyObject *self, PyObject *args, PyObject *kw)
+{
+    Hyp *H = (Hyp *)self;
+    Py_ssize_t cap;
+    int n_scan, k_best, max_leaves, keep_steps, max_cluster;
+    double prune_ln, keep_s;
+    if (!PyArg_ParseTuple(args, "niiididi", &cap, &n_scan, &k_best, &max_leaves, &prune_ln, &keep_steps, &keep_s,
+                          &max_cluster))
+        return -1;
+    if (cap < 1 || n_scan < 0 || k_best < 1 || max_leaves < 1 || keep_steps < 1 || max_cluster < 1) {
+        PyErr_SetString(PyExc_ValueError, "Hyp: rows, k_best, max_leaves, keep_steps, max_cluster >= 1, n_scan >= 0");
+        return -1;
+    }
+    hyp_release(H);
+    H->level = 0;
+    H->n_scan = n_scan;
+    H->k_best = k_best;
+    H->max_leaves = max_leaves;
+    H->prune_ln = prune_ln;
+    H->keep_steps = keep_steps > n_scan + 1 ? keep_steps : n_scan + 1;
+    H->keep_s = keep_s;
+    H->max_cluster = max_cluster;
+    H->c_scans = H->c_leaves = H->c_children = H->c_hyps = H->c_murty = H->c_births = H->c_pruned = 0;
+    return hyp_rows(H, cap);
+}
+
+static void hyp_dealloc(PyObject *self)
+{
+    PyTypeObject *tp = Py_TYPE(self);
+    hyp_release((Hyp *)self);
+    freefunc f = (freefunc)PyType_GetSlot(tp, Py_tp_free);
+    f(self);
+    Py_DECREF(tp);
+}
+
+/* a free row for object h (parent p, -1: a root), or -1 when the state array is full */
+static int32_t h_take(Hyp *H, int h, int32_t p)
+{
+    if (H->nfree == 0)
+        return -1;
+    int32_t r = H->freel[--H->nfree];
+    H->owner[r] = h;
+    H->parent[r] = p;
+    H->nchild[r] = 0;
+    if (p >= 0)
+        H->nchild[p]++;
+    return r;
+}
+
+static void h_give(Hyp *H, int32_t r)
+{
+    H->owner[r] = -1;
+    H->parent[r] = -1;
+    H->nchild[r] = 0;
+    H->freel[H->nfree++] = r;
+}
+
+/* a leaf is dropped: its row is free, and every ancestor that is left without a child with it */
+static void h_drop_up(Hyp *H, int32_t r)
+{
+    while (r >= 0 && H->nchild[r] == 0) {
+        int32_t p = H->parent[r];
+        h_give(H, r);
+        if (p < 0)
+            break;
+        H->nchild[p]--;
+        r = p;
+    }
+}
+
+static int h_track_new(Hyp *H)
+{
+    int h = -1;
+    for (int i = 0; i < H->ntr; i++)
+        if (!H->tr[i].alive && H->tr[i].leaf == NULL && H->tr[i].freed != H->level) {
+            h = i;
+            break;
+        }
+    if (h < 0) {
+        if (H->ntr == H->trcap) {
+            int nc = H->trcap ? 2 * H->trcap : 32;
+            HTrack *t = (HTrack *)PyMem_Realloc(H->tr, (size_t)nc * sizeof(HTrack));
+            if (t == NULL)
+                return -1;
+            H->tr = t;
+            H->trcap = nc;
+        }
+        h = H->ntr++;
+    }
+    HTrack *t = &H->tr[h];
+    memset(t, 0, sizeof(*t));
+    t->alive = 1;
+    t->freed = -1;
+    t->primary = -1;
+    t->cl = -1;
+    t->leafcap = 4;
+    t->leaf = (int32_t *)PyMem_Malloc((size_t)t->leafcap * sizeof(int32_t));
+    if (t->leaf == NULL) {
+        t->alive = 0;
+        return -1;
+    }
+    return h;
+}
+
+static int h_leaf_add(HTrack *t, int32_t r)
+{
+    if (t->nleaf == t->leafcap) {
+        int nc = 2 * t->leafcap;
+        int32_t *l = (int32_t *)PyMem_Realloc(t->leaf, (size_t)nc * sizeof(int32_t));
+        if (l == NULL)
+            return -1;
+        t->leaf = l;
+        t->leafcap = nc;
+    }
+    t->leaf[t->nleaf++] = r;
+    return 0;
+}
+
+static int h_cluster_new(Hyp *H, int nt, int ng)
+{
+    int c = -1;
+    for (int i = 0; i < H->ncl; i++)
+        if (!H->cl[i].alive) {
+            c = i;
+            break;
+        }
+    if (c < 0) {
+        if (H->ncl == H->clcap) {
+            int nc = H->clcap ? 2 * H->clcap : 32;
+            HCl *q = (HCl *)PyMem_Realloc(H->cl, (size_t)nc * sizeof(HCl));
+            if (q == NULL)
+                return -1;
+            H->cl = q;
+            H->clcap = nc;
+        }
+        c = H->ncl++;
+        memset(&H->cl[c], 0, sizeof(HCl));
+    }
+    HCl *q = &H->cl[c];
+    q->tr = (int32_t *)PyMem_Malloc((size_t)(nt ? nt : 1) * sizeof(int32_t));
+    q->lf = (int32_t *)PyMem_Malloc((size_t)(nt * ng > 0 ? nt * ng : 1) * sizeof(int32_t));
+    q->lw = (double *)PyMem_Malloc((size_t)(ng ? ng : 1) * sizeof(double));
+    if (!q->tr || !q->lf || !q->lw) {
+        PyMem_Free(q->tr);
+        PyMem_Free(q->lf);
+        PyMem_Free(q->lw);
+        q->tr = q->lf = NULL;
+        q->lw = NULL;
+        return -1;
+    }
+    q->alive = 1;
+    q->nt = nt;
+    q->ng = ng;
+    return c;
+}
+
+static void h_cluster_free(Hyp *H, int c)
+{
+    HCl *q = &H->cl[c];
+    PyMem_Free(q->tr);
+    PyMem_Free(q->lf);
+    PyMem_Free(q->lw);
+    q->tr = q->lf = NULL;
+    q->lw = NULL;
+    q->alive = 0;
+    q->nt = q->ng = 0;
+}
+
+/* an object is gone: its rows are free, its handle too */
+static void h_track_free(Hyp *H, int h)
+{
+    HTrack *t = &H->tr[h];
+    for (Py_ssize_t r = 0; r < H->cap; r++)
+        if (H->owner[r] == h)
+            h_give(H, (int32_t)r);
+    PyMem_Free(t->leaf);
+    t->leaf = NULL;
+    t->nleaf = t->leafcap = 0;
+    t->alive = 0;
+    t->cl = -1;
+    t->primary = -1;
+    t->freed = H->level;
+}
+
+/* ---- the best assignments in order (Murty) ---- */
+#define LAP_BIG 1e17
+
+/* The cheapest assignment of n rows to m >= n columns, every row to one column of its own (the Hungarian method
+ * with potentials, O(n^2 m)); c: n x m, LAP_BIG for a pair that may not be. Returns the cost; col[i]. Work: u (n + 1),
+ * v, minv (m + 1) doubles; p, way (m + 1) ints; used (m + 1) chars. */
+static double lap_solve(const double *c, int n, int m, int *col, double *u, double *v, double *minv, int *p, int *way,
+                        char *used)
+{
+    for (int i = 0; i <= n; i++)
+        u[i] = 0.0;
+    for (int j = 0; j <= m; j++) {
+        v[j] = 0.0;
+        p[j] = 0;
+    }
+    for (int i = 1; i <= n; i++) {
+        p[0] = i;
+        int j0 = 0;
+        for (int j = 0; j <= m; j++) {
+            minv[j] = INFINITY;
+            used[j] = 0;
+        }
+        do {
+            used[j0] = 1;
+            int i0 = p[j0], j1 = 0;
+            double delta = INFINITY;
+            for (int j = 1; j <= m; j++)
+                if (!used[j]) {
+                    double cur = c[(i0 - 1) * m + (j - 1)] - u[i0] - v[j];
+                    if (cur < minv[j]) {
+                        minv[j] = cur;
+                        way[j] = j0;
+                    }
+                    if (minv[j] < delta) {
+                        delta = minv[j];
+                        j1 = j;
+                    }
+                }
+            for (int j = 0; j <= m; j++)
+                if (used[j]) {
+                    u[p[j]] += delta;
+                    v[j] -= delta;
+                } else
+                    minv[j] -= delta;
+            j0 = j1;
+        } while (p[j0] != 0);
+        do {
+            int j1 = way[j0];
+            p[j0] = p[j1];
+            j0 = j1;
+        } while (j0);
+    }
+    double cost = 0.0;
+    for (int j = 1; j <= m; j++)
+        if (p[j] > 0) {
+            col[p[j] - 1] = j - 1;
+            cost += c[(p[j] - 1) * m + (j - 1)];
+        }
+    return cost;
+}
+
+typedef struct MNode {
+    double cost;
+    double *c;                       /* its matrix: the constraints written in */
+    int *col;
+    int fixed;                       /* rows 0..fixed-1 are held to col[] */
+} MNode;
+
+/* The k cheapest assignments of n rows to m columns in order of cost (Murty 1968, the partition of Miller, Stone
+ * and Cox: a solution's problem is split by its rows in order, each part holding the rows before and forbidding
+ * the row's own pairing). out_col: k x n, out_cost: k. Returns how many there are (<= k), -1: no memory. */
+static int murty(Arena *ar, const double *c, int n, int m, int k, int *out_col, double *out_cost)
+{
+    if (n == 0) {
+        out_cost[0] = 0.0;
+        return 1;
+    }
+    size_t wk = (size_t)(n + 1 + 2 * (m + 1)) * sizeof(double) + (size_t)(2 * (m + 1)) * sizeof(int) + (size_t)(m + 1);
+    double *u = (double *)ar_get(ar, wk + 16);
+    int maxq = k * n + 1, nq = 0;
+    MNode *Q = (MNode *)ar_get(ar, (size_t)maxq * sizeof(MNode));
+    if (u == NULL || Q == NULL)
+        return -1;
+    double *v = u + n + 1, *minv = v + m + 1;
+    int *p = (int *)(minv + m + 1), *way = p + m + 1;
+    char *used = (char *)(way + m + 1);
+    MNode first;
+    first.c = (double *)ar_get(ar, (size_t)(n * m) * sizeof(double));
+    first.col = (int *)ar_get(ar, (size_t)n * sizeof(int));
+    if (first.c == NULL || first.col == NULL)
+        return -1;
+    memcpy(first.c, c, (size_t)(n * m) * sizeof(double));
+    first.cost = lap_solve(first.c, n, m, first.col, u, v, minv, p, way, used);
+    first.fixed = 0;
+    if (first.cost >= LAP_BIG * 0.5)
+        return 0;
+    Q[nq++] = first;
+    int found = 0;
+    while (found < k && nq > 0) {
+        int b = 0;
+        for (int i = 1; i < nq; i++)
+            if (Q[i].cost < Q[b].cost)
+                b = i;
+        MNode nd = Q[b];
+        Q[b] = Q[--nq];
+        memcpy(out_col + found * n, nd.col, (size_t)n * sizeof(int));
+        out_cost[found++] = nd.cost;
+        if (found == k)
+            break;
+        /* its problem split: part i holds rows < i to this solution and forbids row i's pairing */
+        for (int i = nd.fixed; i < n; i++) {
+            MNode ch;
+            ch.c = (double *)ar_get(ar, (size_t)(n * m) * sizeof(double));
+            ch.col = (int *)ar_get(ar, (size_t)n * sizeof(int));
+            if (ch.c == NULL || ch.col == NULL)
+                return -1;
+            memcpy(ch.c, nd.c, (size_t)(n * m) * sizeof(double));
+            for (int r = nd.fixed; r < i; r++) {        /* held: the row's other columns and the column's other rows */
+                int cc = nd.col[r];
+                for (int j = 0; j < m; j++)
+                    if (j != cc)
+                        ch.c[r * m + j] = LAP_BIG;
+                for (int r2 = 0; r2 < n; r2++)
+                    if (r2 != r)
+                        ch.c[r2 * m + cc] = LAP_BIG;
+            }
+            ch.c[i * m + nd.col[i]] = LAP_BIG;
+            ch.fixed = i;
+            ch.cost = lap_solve(ch.c, n, m, ch.col, u, v, minv, p, way, used);
+            if (ch.cost < LAP_BIG * 0.5 && nq < maxq)
+                Q[nq++] = ch;
+        }
+    }
+    return found;
+}
+
+/* ---- a scan's detections against a leaf ---- */
+#define RDET 20                  /* a detection: kind, sdt, group, vehicle (-1, 0, 1), box width, z[4], R[4], what its
+                                    score adds to the log odds of "a real thing", the whole box's aspect (0: not
+                                    known), then for a cell of several returns of an extended sensor: their number
+                                    and the scatter of their places about the mean (sxx, sxy, syy; sensor axes) */
+enum { D_KIND, D_SDT, D_GROUP, D_VEH, D_W, D_Z, D_R = 9, D_SCORE = 13, D_ASPECT, D_NRET, D_SXX, D_SXY, D_SYY, D_SPARE };
+#define RSCFG 13                 /* gate for 1..4 rows, feat_sigma, feat_same, feat_span, map_bw[3], feat_max_s,
+                                    common_min, common_pair */
+
+typedef struct {
+    const RSens *sen;
+    const double *pose, *cfg;
+    double *D;
+    Py_ssize_t nd, nm;
+    int ng;
+    const double *mem;
+    double *lam0, *loc, *kmat;       /* per detection: the sensor's density, the map's, the map's kernels (nd x nm) */
+    double cph, sph;
+    Py_ssize_t *J;                   /* work: nd */
+    int *ok;
+    double *qs, *dets, *lk;
+} RAs;
+
+/* what does not depend on the object: each detection's density of "something else" (sensors.py density; the
+ * map of where unexplained detections that became objects have been turning up: tracker `_local_density`) */
+static void ras_dets(RAs *q, double nscan)
+{
+    const RSens *sen = q->sen;
+    q->ng = 0;
+    for (Py_ssize_t j = 0; j < q->nd; j++) {
+        const double *d = q->D + j * RDET;
+        q->lam0[j] = r_density(sen, (int)d[D_KIND], d + D_Z);
+        if ((int)d[D_GROUP] + 1 > q->ng)
+            q->ng = (int)d[D_GROUP] + 1;
+        q->loc[j] = 0.0;
+        for (Py_ssize_t e = 0; e < q->nm; e++)
+            q->kmat[j * q->nm + e] = 0.0;
+        int base = (int)d[D_KIND] & 7;
+        if (sen->type != SEN_CAMERA || !(base == K_RB || base == K_RBH) || q->nm == 0)
+            continue;
+        int n = base == K_RB ? 2 : 3;
+        double norm = pymax(nscan, 1.0);
+        for (int a = 0; a < n; a++)
+            norm *= q->cfg[7 + a] * 2.5066;
+        for (Py_ssize_t e = 0; e < q->nm; e++) {
+            const double *me = q->mem + 5 * e;
+            if (me[0] < n)
+                continue;
+            double s = 0.0;
+            for (int a = 0; a < n; a++)
+                s += pow((d[D_Z + a] - me[1 + a]) / q->cfg[7 + a], 2.0);
+            if (s < 25.0) {
+                double v = exp(-0.5 * s) / norm;
+                q->loc[j] += v;
+                q->kmat[j * q->nm + e] = v;
+            }
+        }
+    }
+}
+
+/* One leaf against every detection of the scan. lr[j]: the logarithm of (pd x the likelihood the leaf's hypotheses
+ * give detection j x the box feature) over the density of "something else" there, -inf where the pair may not be
+ * (outside the gate, a pedestrian's box on a vehicle, a kind of box this place cannot give). pd: the leaf's
+ * probability of being reported; (cx, cy): its place in the car frame; ov: vehicle / person / not known; lbw: the
+ * width of its last box where the box feature applies (NaN: not); idnum: its object's id (the map's own entries
+ * do not count against it). */
+static void ras_row(const RAs *q, const double *row, double pd, double cx, double cy, double ov, double lbw,
+                    double idnum, double *lr)
+{
+    const RSens *sen = q->sen;
+    const double *pose = q->pose, *cfg = q->cfg, *dt = q->D;
+    Py_ssize_t nd = q->nd, *J = q->J;
+    int *ok = q->ok;
+    double *qs = q->qs, *dets = q->dets, *lk = q->lk;
+    for (Py_ssize_t j = 0; j < nd; j++)
+        lr[j] = -INFINITY;
+    if (!(pd > 0.0))
+        return;
+    const double *x = row + RO_X, *P = row + RO_P, *mu = row + RO_MU;
+    double zp[4], H[4 * RN], HP[4 * RN], S[16], zm[4], Hm[4 * RN], HPm[4 * RN], Sm[16];
+    for (int g = 0; g < q->ng; g++) {
+        Py_ssize_t nJ = 0;
+        for (Py_ssize_t j = 0; j < nd; j++)
+            if ((int)dt[j * RDET + D_GROUP] == g)
+                J[nJ++] = j;
+        if (nJ == 0)
+            continue;
+        const double *d0 = dt + J[0] * RDET;
+        int kind = (int)d0[D_KIND];
+        double sdt = d0[D_SDT];
+        if (sen->type == SEN_CAMERA && sen->cover && ((kind & 7) == K_B || (kind & 7) == K_BT) &&
+            !(py_hypot(cx, cy) <= sen->near * sen->gmin))
+            continue;                                    /* CameraBoxes.takes */
+        int anyok = 0;
+        for (Py_ssize_t a = 0; a < nJ; a++) {
+            ok[a] = dt[J[a] * RDET + D_VEH] * ov >= 0.0;    /* a pedestrian's box does not continue a vehicle */
+            anyok |= ok[a];
+        }
+        if (!anyok)
+            continue;
+        /* the gate: the object as a whole */
+        int m = r_h(sen, kind, sdt, x, pose, zp, H);
+        int ar = r_angle_row(sen, kind);
+        double gate = (m >= 1 && m <= 4) ? cfg[m - 1] : 16.0;
+        r_hph(H, m, P, HP, S);
+        int sing = 0;
+        anyok = 0;
+        for (Py_ssize_t a = 0; a < nJ; a++) {
+            const double *d = dt + J[a] * RDET;
+            double nuj[4], Sj[16], s;
+            for (int r = 0; r < m; r++)
+                nuj[r] = r == ar ? wrap_pi(d[D_Z + r] - zp[r]) : d[D_Z + r] - zp[r];
+            memcpy(Sj, S, sizeof(double) * (size_t)(m * m));
+            for (int r = 0; r < m; r++)
+                Sj[r * m + r] = S[r * m + r] + d[D_R + r];
+            if (r_mahal(Sj, m, nuj, &s, NULL) < 0) {
+                sing = 1;
+                break;
+            }
+            ok[a] = ok[a] && s <= gate;
+            anyok |= ok[a];
+        }
+        if (sing || !anyok)
+            continue;
+        /* what each hypothesis, with its own prediction and weight, gives the detection */
+        for (Py_ssize_t a = 0; a < nJ; a++)
+            lk[a] = 0.0;
+        double c2 = pow(2.0 * PI, (double)m);
+        for (int mm = 0; mm < 3; mm++) {
+            if (mu[mm] < 1e-4)
+                continue;
+            r_h(sen, kind, sdt, row + RO_XS + mm * RN, pose, zm, Hm);
+            r_hph(Hm, m, row + RO_PS + mm * RNN, HPm, Sm);
+            int bad = 0;
+            for (Py_ssize_t a = 0; a < nJ; a++) {
+                if (!ok[a])
+                    continue;
+                const double *d = dt + J[a] * RDET;
+                double nuj[4], Sj[16];
+                for (int r = 0; r < m; r++)
+                    nuj[r] = r == ar ? wrap_pi(d[D_Z + r] - zm[r]) : d[D_Z + r] - zm[r];
+                memcpy(Sj, Sm, sizeof(double) * (size_t)(m * m));
+                for (int r = 0; r < m; r++)
+                    Sj[r * m + r] = Sm[r * m + r] + d[D_R + r];
+                if (r_mahal(Sj, m, nuj, &qs[a], &dets[a]) < 0) {
+                    bad = 1;
+                    break;
+                }
+            }
+            if (bad)
+                continue;
+            for (Py_ssize_t a = 0; a < nJ; a++)
+                if (ok[a] && qs[a] < 60.0 && dets[a] > 0.0)
+                    lk[a] += mu[mm] * exp(-0.5 * pymin(qs[a], 60.0)) / sqrt(c2 * dets[a]);
+        }
+        for (Py_ssize_t a = 0; a < nJ; a++) {
+            if (!ok[a] || lk[a] <= 0.0)
+                continue;
+            const double *d = dt + J[a] * RDET;
+            Py_ssize_t j = J[a];
+            double F = 1.0;
+            if (!isnan(lbw) && d[D_W] > 0.0 && ar >= 0) {     /* the box as a feature */
+                double e = fabs(wrap_pi(d[D_Z + ar] - zp[ar])) / np_maximum(0.5 * (d[D_W] + lbw), 1e-4);
+                double sg = cfg[4], t = np_minimum(e / sg, 12.0);
+                F = cfg[6] * (cfg[5] * 0.7979 / sg * exp(-0.5 * (t * t)) + (1.0 - cfg[5]) / cfg[6]);
+            }
+            /* the other story's density here: not counting this object's own first detection */
+            double own = 0.0;
+            for (Py_ssize_t e = 0; e < q->nm; e++)
+                if (q->mem[5 * e + 4] == idnum)
+                    own += q->kmat[j * q->nm + e];
+            double lam = pymax(q->lam0[j], q->loc[j] - own);
+            double v = log(pd * lk[a] * F / lam);
+            if (isfinite(v))
+                lr[j] = v;
+        }
+    }
+}
+
+/* ---- a detection into a leaf: all of it (within a hypothesis the pairing is not in doubt) ---- */
+static inline double clamp_dp(double v)          /* min(0.05, max(-0.05, v)) as Python takes it */
+{
+    return pymin(0.05, pymax(-0.05, v));
+}
+
+/* The row takes detection d of the sensor at `pose`: every motion hypothesis and the free estimate in full (Joseph
+ * form), the hypotheses weighed by how well each had predicted it (from `hold` sightings on, unless the sensor
+ * measures speed or the detection a scale rate; between the moving ones always; never below `floor`), the
+ * combination. *nis: the object's normalised innovation before the update; *dl: what the fit adds to the log
+ * odds that the object exists. -1: an innovation covariance is singular (nothing changed). */
+static int r_update_full(double *row, const RSens *sen, const double *pose, const double *d, double hold, double floor_,
+                         double *nis, double *dl)
+{
+    double *mu = row + RO_MU;
+    int kind = (int)d[D_KIND];
+    double sdt = d[D_SDT], hits = row[RO_M + M_HITS];
+    double like[3], Hs[3][4 * RN], nus[3][4], Ss[3][16], Sis[3][16];
+    int m = 0;
+    for (int j = 0; j < 3; j++) {
+        double det;
+        m = r_innov(sen, kind, sdt, row + RO_XS + j * RN, row + RO_PS + j * RNN, pose, d + D_Z, d + D_R, nus[j], Hs[j], Ss[j]);
+        if (r_inv(Ss[j], m, Sis[j], &det) < 0)
+            return -1;
+        double t[4], d2 = 0.0;
+        for (int c = 0; c < m; c++) {
+            double acc = 0.0;
+            for (int r = 0; r < m; r++)
+                acc += nus[j][r] * Sis[j][r * m + c];
+            t[c] = acc;
+        }
+        for (int c = 0; c < m; c++)
+            d2 += t[c] * nus[j][c];
+        like[j] = exp(-0.5 * pymin(d2, 400.0)) / sqrt(pymax(pow(2.0 * PI, (double)m) * det, 1e-30));
+    }
+    double nu0[4], H0[4 * RN], S0[16], d20, nuf[4], Hf[4 * RN], Sf[16], Sif[16], detf;
+    int m0 = r_innov(sen, kind, sdt, row + RO_X, row + RO_P, pose, d + D_Z, d + D_R, nu0, H0, S0);
+    if (r_mahal(S0, m0, nu0, &d20, NULL) < 0)
+        return -1;
+    int mf = r_innov(sen, kind, sdt, row + RO_XF, row + RO_PF, pose, d + D_Z, d + D_R, nuf, Hf, Sf);
+    if (r_inv(Sf, mf, Sif, &detf) < 0)
+        return -1;
+    for (int j = 0; j < 3; j++) {
+        double K[RN * 4];
+        double *x = row + RO_XS + j * RN, *P = row + RO_PS + j * RNN;
+        r_gain(P, Hs[j], m, Sis[j], K);
+        r_take(x, P, K, Hs[j], d + D_R, nus[j], m, 1.0);
+        if (j == R_STAND)
+            for (int k = R_VX; k <= R_AY; k++)
+                x[k] = 0.0;
+        x[R_DP] = clamp_dp(x[R_DP]);
+    }
+    {
+        double K[RN * 4];
+        double *x = row + RO_XF, *P = row + RO_PF;
+        r_gain(P, Hf, mf, Sif, K);
+        r_take(x, P, K, Hf, d + D_R, nuf, mf, 1.0);
+        x[R_DP] = clamp_dp(x[R_DP]);
+    }
+    double tot = (mu[0] * like[0] + mu[1] * like[1]) + mu[2] * like[2];
+    double w[3] = {mu[0] * like[0], mu[1] * like[1], mu[2] * like[2]};
+    if (tot > 0.0 && (sen->type == SEN_MICROWAVE || hits >= hold || (kind & K_SCALE))) {
+        double nm[3], s2 = 0.0;
+        for (int j = 0; j < 3; j++) {
+            double v = w[j] / tot;
+            nm[j] = (isnan(v) || v >= floor_) ? v : floor_;
+            s2 += nm[j];
+        }
+        for (int j = 0; j < 3; j++)
+            mu[j] = nm[j] / s2;
+    } else if (tot > 0.0 && w[1] + w[2] > 0.0) {
+        double mv = mu[1] + mu[2], ws = w[1] + w[2];
+        for (int j = 1; j < 3; j++) {
+            double v = mv * w[j] / ws;
+            mu[j] = (isnan(v) || v >= floor_) ? v : floor_;
+        }
+        double s2 = (mu[0] + mu[1]) + mu[2];
+        for (int j = 0; j < 3; j++)
+            mu[j] = mu[j] / s2;
+    }
+    double like_all = pymax(tot, 1e-30);
+    *dl = pymin(pymax(log(pymax(sen->p_d * like_all / r_density(sen, kind, d + D_Z), 1e-9)), log(1.5)), log(20.0));
+    *nis = d20 / m0;
+    r_combine(row + RO_XS, row + RO_PS, mu, row + RO_X, row + RO_P);
+    return 0;
+}
+
+/* ---- an object first seen (sensors.py `start`, tracker.py: what a new object may be doing) ---- */
+#define RKB 12                   /* what the detection's kind can do, for an object started by it: a_lon, a_lat, v_max,
+                                    v_still, p_stand, v0_std, v0_lat, h, h_rel, width, length (0: no direction of its
+                                    own), 1 if the kind is known */
+enum { KB_ALON, KB_ALAT, KB_VMAX, KB_VSTILL, KB_PSTAND, KB_V0, KB_V0LAT, KB_H, KB_HREL, KB_WID, KB_LEN, KB_KNOWN };
+#define RBCFG 8                  /* new_exist, p_any_side, side_m, with_rel, with_std, p_ca0, mu_floor, births allowed */
+
+/* models.side_on: the probability that a vehicle whose whole box is `aspect` times as wide as tall, seen at
+ * `bearing`, points across the car's direction; NaN: the kind or the box does not say */
+static double r_side_on(const double *kb, double aspect, double bearing)
+{
+    if (!(kb[KB_LEN] > 0.0) || !(aspect > 0.0))
+        return NAN;
+    double w = kb[KB_WID], l = kb[KB_LEN], cb = fabs(cos(bearing)), sb = fabs(sin(bearing));
+    double along = (w * cb + l * sb) / kb[KB_H], across = (w * sb + l * cb) / kb[KB_H];
+    double la = pow(log(aspect / along) / 0.25, 2.0), lc = pow(log(aspect / across) / 0.25, 2.0);
+    double mn = pymin(la, lc);
+    double pa = exp(-0.5 * (la - mn)), pc = exp(-0.5 * (lc - mn));
+    return pc / (pa + pc);
+}
+
+/* U diag(a, b) U^T into the 2 x 2 block (r, r) of P (N x N), U the rotation by the angle of (c, s) */
+static void r_rot_block(double *P, int r, double c, double s, double a, double b)
+{
+    double p00 = c * c * a + s * s * b, p11 = s * s * a + c * c * b, p01 = c * s * (a - b);
+    P[r * RN + r] = p00;
+    P[(r + 1) * RN + r + 1] = p11;
+    P[r * RN + r + 1] = P[(r + 1) * RN + r] = p01;
+}
+
+static void r_extent_birth(double *row, const RSens *sen, const double *d, const double *pose, const double *kb, double ps);
+
+/* The row of an object first seen in detection d (kind kb), all of it: the place from the detection, what its kind
+ * may be doing as three stories (it stands; it drives with the traffic; it comes the other way, or crosses when
+ * its box shows it side-on), the free estimate, the probabilities, the first scale rate, the extent. `t`: the
+ * scan's time, `src`: the sensor's number, `level`: the scan's. Returns 1, or 0 when a detection of this kind
+ * cannot start an object (nothing written). */
+static int r_birth(double *row, const RSens *sen, const double *d, const double *pose, const double *kb,
+                   const double *bc, double t, int src, long long level)
+{
+    int kind = (int)d[D_KIND], base = kind & 7;
+    const double *z = d + D_Z, *R = d + D_R;
+    double x0[RN], P0[RNN];
+    memset(x0, 0, sizeof(x0));
+    memset(P0, 0, sizeof(P0));
+    /* sensors._prior */
+    P0[R_VX * RN + R_VX] = P0[R_VY * RN + R_VY] = kb[KB_V0] * kb[KB_V0];
+    P0[R_AX * RN + R_AX] = P0[R_AY * RN + R_AY] = pow(0.6 * kb[KB_ALON], 2.0);
+    P0[R_DP * RN + R_DP] = pow(0.6 * (PI / 180.0), 2.0) + pow(0.2 * (PI / 180.0), 2.0);
+    P0[R_LH * RN + R_LH] = kb[KB_HREL] * kb[KB_HREL];
+    x0[R_LH] = log(kb[KB_H]);
+    double bearing = NAN;
+    if (sen->type == SEN_CAMERA) {
+        double hc = sen->hc, p_dp = sen->bias_var + sen->dp_var;
+        P0[R_DP * RN + R_DP] = p_dp;
+        if (base == K_BT) {
+            /* its feet are out of the picture, its top is not: for a kind whose height is known well and differs
+             * enough from the camera's own the top edge says how far it is */
+            double ho = kb[KB_H], dh = hc - ho;
+            if (kb[KB_KNOWN] == 0.0 || fabs(dh) < sen->top_rel * kb[KB_HREL] * ho)
+                return 0;
+            double a = z[1] - sen->bias;
+            if (a * dh <= 0.0 || fabs(tan(a)) < 1e-4)
+                return 0;
+            double r = dh / tan(a);
+            if (!(1.0 < r && r <= sen->max_range))
+                return 0;
+            double b = z[0], dr_dh = -ho / tan(a), dr_da = -dh / (sin(a) * sin(a));
+            double var_r = dr_dh * dr_dh * kb[KB_HREL] * kb[KB_HREL] + dr_da * dr_da * (R[1] + sen->bias_var);
+            if (var_r > pow(sen->top_range * r, 2.0))
+                return 0;
+            double ang = b + pose[2], ca = cos(ang), sa = sin(ang);
+            x0[R_PX] = pose[0] + r * ca;
+            x0[R_PY] = pose[1] + r * sa;
+            r_rot_block(P0, R_PX, ca, sa, var_r, R[0] * r * r + 0.05);
+            double c_lh = dr_dh * kb[KB_HREL] * kb[KB_HREL];
+            P0[R_PX * RN + R_LH] = P0[R_LH * RN + R_PX] = ca * c_lh;
+            P0[R_PY * RN + R_LH] = P0[R_LH * RN + R_PY] = sa * c_lh;
+            bearing = b;
+        } else if (base == K_RB || base == K_RBH) {
+            double b = z[1];
+            /* the road's range: the angle, the known part of its error taken out; never beyond the sensor's reach */
+            double ang = pymax(z[0] - sen->bias, atan2(hc, sen->max_range));
+            double rg = hc / tan(ang), J = (rg * rg + hc * hc) / hc, var_g = J * J * (R[0] + p_dp);
+            double r = rg, var_r = var_g, wg = 1.0, rh = 0.0;
+            if (base == K_RBH) {
+                /* a second range, independent of the first: the object's own size */
+                rh = exp(sen->logf + x0[R_LH] - z[2]) / pymax(cos(b), 0.3);
+                double var_h = rh * rh * (kb[KB_HREL] * kb[KB_HREL] + R[2]);
+                wg = var_h / (var_g + var_h);
+                r = wg * rg + (1.0 - wg) * rh;
+                var_r = var_g * var_h / (var_g + var_h);
+            }
+            double a = b + pose[2], ca = cos(a), sa = sin(a);
+            x0[R_PX] = pose[0] + r * ca;
+            x0[R_PY] = pose[1] + r * sa;
+            r_rot_block(P0, R_PX, ca, sa, var_r, R[1] * r * r + 0.05);
+            double c_dp = wg * J * p_dp, c_lh = (1.0 - wg) * rh * kb[KB_HREL] * kb[KB_HREL];
+            P0[R_PX * RN + R_DP] = P0[R_DP * RN + R_PX] = ca * c_dp;
+            P0[R_PY * RN + R_DP] = P0[R_DP * RN + R_PY] = sa * c_dp;
+            P0[R_PX * RN + R_LH] = P0[R_LH * RN + R_PX] = ca * c_lh;
+            P0[R_PY * RN + R_LH] = P0[R_LH * RN + R_PY] = sa * c_lh;
+            bearing = b;
+        } else
+            return 0;
+    } else if (sen->type == SEN_MICROWAVE) {
+        double c = cos(pose[2]), sn = sin(pose[2]);
+        double ox = c * sen->mx - sn * sen->my, oy = sn * sen->mx + c * sen->my;
+        double sx = pose[0] + ox, sy = pose[1] + oy, svx = pose[3] - pose[5] * oy, svy = pose[4] + pose[5] * ox;
+        double r = z[0], a = z[1] + sen->yaw + pose[2], ca = cos(a), sa = sin(a);
+        x0[R_PX] = sx + r * ca;
+        x0[R_PY] = sy + r * sa;
+        double vr = z[2] + ca * svx + sa * svy;         /* the object's own speed along the line of sight */
+        x0[R_VX] = vr * ca;
+        x0[R_VY] = vr * sa;
+        r_rot_block(P0, R_PX, ca, sa, R[0] + 0.1, R[1] * r * r + 0.1);
+        /* along the line of sight the speed is measured; across it nothing is known */
+        r_rot_block(P0, R_VX, ca, sa, 4.0 * R[2] + 0.5, kb[KB_V0] * kb[KB_V0]);
+    } else {
+        double c = cos(pose[2]), sn = sin(pose[2]);
+        x0[R_PX] = pose[0] + c * z[0] - sn * z[1];
+        x0[R_PY] = pose[1] + sn * z[0] + c * z[1];
+        r_rot_block(P0, R_PX, c, sn, R[0], R[1]);
+    }
+    for (int j = 0; j < 3; j++) {
+        memcpy(row + RO_XS + j * RN, x0, sizeof(x0));
+        memcpy(row + RO_PS + j * RNN, P0, sizeof(P0));
+    }
+    for (int k = R_VX; k <= R_AY; k++)
+        row[RO_XS + R_STAND * RN + k] = 0.0;
+    memcpy(row + RO_XF, x0, sizeof(x0));
+    memcpy(row + RO_PF, P0, sizeof(P0));
+    double *mu = row + RO_MU, ps = NAN;
+    double cph = cos(pose[2]), sph = sin(pose[2]);
+    if (sen->type == SEN_MICROWAVE) {
+        int moving = hypot(x0[R_VX], x0[R_VY]) > 1.0;
+        mu[0] = moving ? 0.05 : 0.7;
+        mu[1] = moving ? 0.8 : 0.25;
+        mu[2] = moving ? 0.15 : 0.05;
+    } else {
+        double pst = kb[KB_PSTAND], dxo = x0[R_PX] - pose[0], dyo = x0[R_PY] - pose[1];
+        double pa = fabs(-sph * dxo + cph * dyo) > bc[2] ? bc[1] : bc[5];
+        mu[0] = pst;
+        mu[1] = (1.0 - pst) * (1.0 - pa);
+        mu[2] = (1.0 - pst) * pa;
+        /* What a new object may be doing, before anything is known, is not one blur around "no speed": it stands
+         * (its own hypothesis), or it drives with the traffic (the steady hypothesis: about the car's own velocity,
+         * along the road the car is on), or it comes the other way (the manoeuvring hypothesis: about the car's
+         * velocity reversed, and wider across). The faster the car itself drives, the more that says about the
+         * traffic's speed; standing, nothing. A vehicle whose box shows it side-on does neither: it crosses. */
+        int wl = kb[KB_LEN] > 0.0;
+        double v0 = kb[KB_V0], lat = pow(pymin(kb[KB_V0LAT], v0), 2.0), big = v0 * v0;
+        if (d[D_ASPECT] > 0.0 && !isnan(bearing))
+            ps = r_side_on(kb, d[D_ASPECT], bearing);
+        double ve = wl ? pymin(hypot(pose[3], pose[4]), kb[KB_VMAX]) : 0.0;
+        if (isnan(ps) && wl)
+            ps = 0.0;
+        double *xc = row + RO_XS + R_CV * RN, *xa = row + RO_XS + R_CA * RN;
+        if (isnan(ps)) {                                 /* a kind without a direction of its own (a person) */
+            xc[R_VX] = xc[R_VY] = 0.0;
+            r_rot_block(row + RO_PS + R_CV * RNN, R_VX, cph, sph, big, lat);
+            r_rot_block(row + RO_PF, R_VX, cph, sph, big, lat);
+        } else {
+            double w_ = pow(pymax(bc[3] * ve + bc[4], v0 - ve), 2.0), lat2 = pow(pymin(2.0 * kb[KB_V0LAT], v0), 2.0);
+            double m0 = (1.0 - ps) * ve;
+            xc[R_VX] = m0 * cph;
+            xc[R_VY] = m0 * sph;
+            xa[R_VX] = -m0 * cph;
+            xa[R_VY] = -m0 * sph;
+            r_rot_block(row + RO_PS + R_CV * RNN, R_VX, cph, sph, (1.0 - ps) * w_ + ps * lat + ps * (1.0 - ps) * ve * ve,
+                        (1.0 - ps) * lat + ps * big);
+            r_rot_block(row + RO_PS + R_CA * RNN, R_VX, cph, sph, (1.0 - ps) * w_ + ps * lat2 + ps * (1.0 - ps) * ve * ve,
+                        (1.0 - ps) * lat2 + ps * big);
+            r_rot_block(row + RO_PF, R_VX, cph, sph, big, ps == 0.0 ? lat : (1.0 - ps) * lat + ps * big);
+        }
+    }
+    memset(row + RO_ST, 0, (size_t)(RO_M - RO_ST) * sizeof(double));
+    row[RO_ST + 0] = row[RO_ST + 4] = row[RO_ST + 8] = 1.0;
+    double *M = row + RO_M;
+    memset(M, 0, RMETA * sizeof(double));
+    M[M_T] = M[M_THIT] = M[M_RANGE_T] = t;
+    M[M_L] = log(bc[0] / (1.0 - bc[0])) + d[D_SCORE];
+    M[M_HITS] = 1.0;
+    M[M_BOXW] = d[D_W] > 0.0 ? d[D_W] : NAN;
+    M[M_BOXT] = t;
+    M[M_BOXS] = (double)src;
+    M[M_NIS] = NAN;
+    M[M_DET] = -1.0;
+    M[M_LEVEL] = (double)level;
+    M[M_VIS] = 1.0;
+    M[M_PD] = sen->p_d;
+    M[M_SRC] = (double)src;
+    if ((kind & K_SCALE) && sen->type == SEN_CAMERA) {
+        /* its first box already says how fast it comes nearer: its speed along the line of sight over its
+         * distance, before a second box exists. Every hypothesis takes it (for "it stands" it is a range: the
+         * car's own speed over the distance), and how well each had expected it weighs them at once. */
+        int m = 0;
+        if (base == K_RB)
+            m = 2;
+        else if (base == K_RBH)
+            m = 3;
+        else if (base == K_BT)
+            m = 2;
+        else if (base == K_B)
+            m = 1;
+        double zs = z[m], Rs = R[m], like[3] = {0.0, 0.0, 0.0};
+        for (int j = 0; j < 4; j++) {
+            double *x = j == 3 ? row + RO_XF : row + RO_XS + j * RN, *P = j == 3 ? row + RO_PF : row + RO_PS + j * RNN;
+            double nu[4], H[4 * RN], S[16], K[RN * 4];
+            r_innov(sen, K_NONE | K_SCALE, d[D_SDT], x, P, pose, &zs, &Rs, nu, H, S);
+            if (!(S[0] > 0.0) || !isfinite(S[0]))
+                continue;
+            double Si = 1.0 / S[0];
+            r_gain(P, H, 1, &Si, K);
+            r_take(x, P, K, H, &Rs, nu, 1, 1.0);
+            if (j == 3)
+                break;
+            like[j] = exp(-0.5 * pymin(nu[0] * nu[0] / S[0], 400.0)) / sqrt(2.0 * PI * S[0]);
+            if (j == R_STAND)
+                for (int k = R_VX; k <= R_AY; k++)
+                    x[k] = 0.0;
+        }
+        double w[3] = {mu[0] * like[0], mu[1] * like[1], mu[2] * like[2]};
+        double ws = (w[0] + w[1]) + w[2];
+        if (ws > 0.0) {
+            double s2 = 0.0;
+            for (int j = 0; j < 3; j++) {
+                w[j] = pymax(w[j] / ws, bc[6]);
+                s2 += w[j];
+            }
+            for (int j = 0; j < 3; j++)
+                mu[j] = w[j] / s2;
+        }
+    }
+    r_combine(row + RO_XS, row + RO_PS, mu, row + RO_X, row + RO_P);
+    r_extent_birth(row, sen, d, pose, kb, ps);
+    return 1;
+}
+
+/* ---- the extent (length, width, heading) of a leaf ---- */
+static void r_extent_birth(double *row, const RSens *sen, const double *d, const double *pose, const double *kb, double ps)
+{
+    double *e = row + RO_E, *Pe = row + RO_PE;
+    int wl = kb[KB_LEN] > 0.0;
+    e[0] = wl ? kb[KB_LEN] : 0.6;
+    e[1] = wl ? kb[KB_WID] : 0.6;
+    e[2] = pose[2];
+    memset(Pe, 0, 9 * sizeof(double));
+    Pe[0] = pow(0.25 * e[0], 2.0);
+    Pe[4] = pow(0.15 * e[1], 2.0);
+    Pe[8] = PI * PI / 3.0;
+}
+
+static void r_extent_step(double *row, double dt, const double *kin)
+{
+}
+
+static void r_extent_update(double *row, const RSens *sen, const double *d, const double *pose, const double *kin)
+{
+}
+
+/* ---- one scan ---- */
+#define HTI 10                   /* a participating object: dt, sa, sp (the car's movement over dt: along, heading),
+                                    kin[4], vehicle (-1, 0, 1), id, settled (confirmed or coast: 1) */
+
+/* a leaf one scan on: a new row under it with its numbers at the scan's time (the story "not reported"), the
+ * step written down for the smoother. -1: no free row. */
+static int32_t h_step(Hyp *H, double *A, int32_t r, int h, double dt, double sa, double sp, const double *pose,
+                      const double *kin, const RPar *par, double t)
+{
+    int32_t c = h_take(H, h, r);
+    if (c < 0)
+        return -1;
+    double *row = A + (Py_ssize_t)c * RROW;
+    const double *src = A + (Py_ssize_t)r * RROW;
+    memcpy(row, src, RROW * sizeof(double));
+    double *st = row + RO_ST;
+    memset(st, 0, (size_t)(RO_M - RO_ST) * sizeof(double));
+    st[0] = st[4] = st[8] = 1.0;
+    if (fabs(dt) >= 1e-6) {
+        double xs1[3 * RN], Ps1[3 * RNN], cc[3], xf1[RN], Pf1[RNN], T[9];
+        r_evolve_row(src, dt, kin, par, xs1, Ps1, cc, xf1, Pf1, T);
+        if (dt > 0.0) {
+            memcpy(row + RO_MU, cc, sizeof(cc));
+            memcpy(st, T, sizeof(T));
+        }
+        st[ST_DT] = dt;
+        if (sa > 0.0 || sp > 0.0) {
+            /* the car's travel error lies along its heading; its heading error swings the object about the car */
+            double ch = cos(pose[2]), sh = sin(pose[2]);
+            double dx = src[RO_X + R_PX] - pose[0], dy = src[RO_X + R_PY] - pose[1];
+            double a2 = sa * sa, p2 = sp * sp;
+            double e00 = a2 * (ch * ch) + p2 * (dy * dy), e01 = a2 * (ch * sh) + p2 * (-dx * dy),
+                   e11 = a2 * (sh * sh) + p2 * (dx * dx);
+            for (int j = 0; j < 4; j++) {
+                double *P = j < 3 ? Ps1 + j * RNN : Pf1;
+                P[0] += e00;
+                P[1] += e01;
+                P[RN] += e01;
+                P[RN + 1] += e11;
+            }
+            st[ST_E] = e00;
+            st[ST_E + 1] = e01;
+            st[ST_E + 2] = e11;
+        }
+        memcpy(row + RO_XS, xs1, sizeof(xs1));
+        memcpy(row + RO_PS, Ps1, sizeof(Ps1));
+        memcpy(row + RO_XF, xf1, sizeof(xf1));
+        memcpy(row + RO_PF, Pf1, sizeof(Pf1));
+        r_combine(row + RO_XS, row + RO_PS, row + RO_MU, row + RO_X, row + RO_P);
+        r_extent_step(row, dt, kin);
+    }
+    double *M = row + RO_M;
+    M[M_T] = t;
+    M[M_LEVEL] = (double)H->level;
+    M[M_DET] = -1.0;
+    M[M_NIS] = NAN;
+    M[M_DL] = 0.0;
+    H->c_leaves++;
+    return c;
+}
+
+/* the ancestor of row r at or before level `lim` (r itself if it is), -1: its tree does not reach back that far */
+static int32_t h_ancestor(const Hyp *H, const double *A, int32_t r, double lim)
+{
+    while (r >= 0 && A[(Py_ssize_t)r * RROW + RO_M + M_LEVEL] > lim)
+        r = H->parent[r];
+    return r;
+}
+
+static double lse(const double *v, int n)
+{
+    double mx = -INFINITY, s = 0.0;
+    for (int i = 0; i < n; i++)
+        if (v[i] > mx)
+            mx = v[i];
+    if (!isfinite(mx))
+        return mx;
+    for (int i = 0; i < n; i++)
+        s += exp(v[i] - mx);
+    return mx + log(s);
+}
+
+/* hypotheses k of a cluster table (lf: ng x nt, lw) removed where drop[k]; returns the new count */
+static int h_compact(int32_t *lf, double *lw, int ng, int nt, const char *drop)
+{
+    int n = 0;
+    for (int g = 0; g < ng; g++) {
+        if (drop[g])
+            continue;
+        if (n != g) {
+            memmove(lf + (size_t)n * nt, lf + (size_t)g * nt, (size_t)nt * sizeof(int32_t));
+            lw[n] = lw[g];
+        }
+        n++;
+    }
+    return n;
+}
+
+/* a table sorted, the most probable hypothesis first (insertion: tables are short; equal weights keep their order) */
+static void h_sort(int32_t *lf, double *lw, int ng, int nt, int32_t *tmp)
+{
+    for (int g = 1; g < ng; g++) {
+        double w = lw[g];
+        if (!(w > lw[g - 1]))
+            continue;
+        memcpy(tmp, lf + (size_t)g * nt, (size_t)nt * sizeof(int32_t));
+        int k = g;
+        while (k > 0 && w > lw[k - 1]) {
+            memcpy(lf + (size_t)k * nt, lf + (size_t)(k - 1) * nt, (size_t)nt * sizeof(int32_t));
+            lw[k] = lw[k - 1];
+            k--;
+        }
+        memcpy(lf + (size_t)k * nt, tmp, (size_t)nt * sizeof(int32_t));
+        lw[k] = w;
+    }
+}
+
+typedef struct {
+    Hyp *H;
+    double *A;
+    Arena *ar;
+    double t;
+    PyObject *dead;                  /* handles of objects that ended in this call (a list), or NULL */
+    char *mark;                      /* per row, zero between uses */
+} Settle;
+
+/* An object's history is cut where it is older than what the smoother and the pruning look back at. */
+static void h_trim(Hyp *H, const double *A, HTrack *t, double now)
+{
+    int32_t r = t->primary, cut = -1;
+    if (r < 0)
+        return;
+    for (int32_t q = r; q >= 0; q = H->parent[q]) {
+        const double *M = A + (Py_ssize_t)q * RROW + RO_M;
+        if ((double)H->level - M[M_LEVEL] >= (double)H->keep_steps || now - M[M_T] > H->keep_s) {
+            cut = q;
+            break;
+        }
+    }
+    if (cut < 0 || H->parent[cut] < 0)
+        return;
+    for (int32_t q = H->parent[cut]; q >= 0; q = H->parent[q])
+        if (H->nchild[q] != 1)
+            return;                                      /* a branch older than the window: left as it is */
+    int32_t q = H->parent[cut];
+    H->parent[cut] = -1;
+    while (q >= 0) {
+        int32_t p = H->parent[q];
+        h_give(H, q);
+        q = p;
+    }
+}
+
+/* A cluster's table after it changed (hypotheses made, an object taken out): the trees cut N scans back to the
+ * branch of the best hypothesis, the leaves per object bounded, the weights normalised, rows no hypothesis uses
+ * freed, every object's leaves, primary and probabilities set, objects that are in no hypothesis ended, objects
+ * whose leaf no hypothesis doubts given a cluster of their own. The table must be sorted, the best first. */
+static int h_settle(Settle *s, int ci)
+{
+    Hyp *H = s->H;
+    double *A = s->A;
+    HCl *c = &H->cl[ci];
+    int nt = c->nt, ng = c->ng;
+    if (ng == 0 || nt == 0) {
+        for (int i = 0; i < nt; i++) {
+            int h = c->tr[i];
+            if (s->dead) {
+                PyObject *o = PyLong_FromLong(h);
+                if (o == NULL || PyList_Append(s->dead, o) < 0) {
+                    Py_XDECREF(o);
+                    return -1;
+                }
+                Py_DECREF(o);
+            }
+            h_track_free(H, h);
+        }
+        h_cluster_free(H, ci);
+        return 0;
+    }
+    char *drop = (char *)ar_get(s->ar, (size_t)ng);
+    if (drop == NULL)
+        return -1;
+    memset(drop, 0, (size_t)ng);
+    /* N-scan pruning: what the best hypothesis says about each object N scans back is taken as settled */
+    double lim = (double)(H->level - H->n_scan);
+    for (int i = 0; i < nt; i++) {
+        HTrack *t = &H->tr[c->tr[i]];
+        int32_t best = c->lf[i];
+        if (best < 0) {
+            if ((double)t->born <= lim)
+                for (int g = 1; g < ng; g++)
+                    if (c->lf[(size_t)g * nt + i] >= 0)
+                        drop[g] = 1;
+            continue;
+        }
+        int32_t anc = h_ancestor(H, A, best, lim);
+        if (anc < 0)
+            continue;
+        for (int g = 1; g < ng; g++) {
+            int32_t q = c->lf[(size_t)g * nt + i];
+            if (q == best || drop[g])
+                continue;
+            if (q < 0 || h_ancestor(H, A, q, lim) != anc)
+                drop[g] = 1;
+        }
+    }
+    {
+        int before = ng;
+        ng = h_compact(c->lf, c->lw, ng, nt, drop);
+        H->c_pruned += before - ng;
+    }
+    /* no object keeps more than max_leaves leaves: the least probable ones go, with the hypotheses that use them */
+    for (int i = 0; i < nt; i++) {
+        for (;;) {
+            int nleaf = 0;
+            int32_t weakest = -1;
+            double wmin = INFINITY;
+            for (int g = 0; g < ng; g++) {
+                int32_t q = c->lf[(size_t)g * nt + i];
+                if (q < 0 || s->mark[q])
+                    continue;
+                s->mark[q] = 1;
+                nleaf++;
+                double w = 0.0;
+                for (int g2 = g; g2 < ng; g2++)
+                    if (c->lf[(size_t)g2 * nt + i] == q)
+                        w += exp(c->lw[g2] - c->lw[0]);
+                if (q != c->lf[i] && w < wmin) {
+                    wmin = w;
+                    weakest = q;
+                }
+            }
+            for (int g = 0; g < ng; g++)
+                if (c->lf[(size_t)g * nt + i] >= 0)
+                    s->mark[c->lf[(size_t)g * nt + i]] = 0;
+            if (nleaf <= H->max_leaves || weakest < 0)
+                break;
+            memset(drop, 0, (size_t)ng);
+            for (int g = 1; g < ng; g++)
+                if (c->lf[(size_t)g * nt + i] == weakest)
+                    drop[g] = 1;
+            int before = ng;
+            ng = h_compact(c->lf, c->lw, ng, nt, drop);
+            H->c_pruned += before - ng;
+        }
+    }
+    c->ng = ng;
+    double norm = lse(c->lw, ng);
+    for (int g = 0; g < ng; g++)
+        c->lw[g] -= norm;
+    /* rows no hypothesis uses any more; each object's leaves, primary, probabilities */
+    for (int i = 0; i < nt; i++) {
+        HTrack *t = &H->tr[c->tr[i]];
+        for (int g = 0; g < ng; g++) {
+            int32_t q = c->lf[(size_t)g * nt + i];
+            if (q >= 0)
+                s->mark[q] = 1;
+        }
+        int n = 0;
+        for (int k = 0; k < t->nleaf; k++) {
+            int32_t q = t->leaf[k];
+            if (s->mark[q] == 1) {
+                s->mark[q] = 2;                          /* listed once */
+                t->leaf[n++] = q;
+            } else if (s->mark[q] == 0)
+                h_drop_up(H, q);
+        }
+        t->nleaf = n;
+        for (int k = 0; k < n; k++)
+            s->mark[t->leaf[k]] = 0;
+        t->in_map = c->lf[i] >= 0;
+        t->pe = 0.0;
+        t->pp = 0.0;
+        int32_t prim = c->lf[i];
+        if (prim < 0) {                                  /* not in the best story: its likeliest leaf stands for it */
+            double wb = -1.0;
+            for (int k = 0; k < n; k++) {
+                double w = 0.0;
+                for (int g = 0; g < ng; g++)
+                    if (c->lf[(size_t)g * nt + i] == t->leaf[k])
+                        w += exp(c->lw[g]);
+                if (w > wb) {
+                    wb = w;
+                    prim = t->leaf[k];
+                }
+            }
+        }
+        for (int g = 0; g < ng; g++) {
+            int32_t q = c->lf[(size_t)g * nt + i];
+            if (q < 0)
+                continue;
+            double w = exp(c->lw[g]);
+            t->pe += w * sigm(A[(Py_ssize_t)q * RROW + RO_M + M_L]);
+            if (q == prim)
+                t->pp += w;
+        }
+        t->primary = prim;
+        t->cl = ci;
+    }
+    /* objects that are in no hypothesis are gone; objects no hypothesis doubts get a cluster of their own */
+    int *keep = (int *)ar_get(s->ar, (size_t)(nt + 1) * sizeof(int));
+    if (keep == NULL)
+        return -1;
+    int nk = 0, nconst = 0;
+    for (int i = 0; i < nt; i++) {
+        int h = c->tr[i];
+        HTrack *t = &H->tr[h];
+        if (t->nleaf == 0) {
+            if (s->dead) {
+                PyObject *o = PyLong_FromLong(h);
+                if (o == NULL || PyList_Append(s->dead, o) < 0) {
+                    Py_XDECREF(o);
+                    return -1;
+                }
+                Py_DECREF(o);
+            }
+            h_track_free(H, h);
+            keep[i] = -1;
+            continue;
+        }
+        int constant = t->nleaf == 1;
+        for (int g = 0; constant && g < ng; g++)
+            if (c->lf[(size_t)g * nt + i] != t->leaf[0])
+                constant = 0;
+        keep[i] = constant ? 0 : 1;
+        nk += keep[i];
+        nconst += constant;
+    }
+    if (nk == 0 && nconst > 0) {                         /* all settled: the first stays here, alone */
+        for (int i = 0; i < nt; i++)
+            if (keep[i] == 0) {
+                keep[i] = 1;
+                nk = 1;
+                nconst--;
+                break;
+            }
+    }
+    for (int i = 0; i < nt; i++) {
+        if (keep[i] != 0)
+            continue;
+        int h = c->tr[i];
+        int c2 = h_cluster_new(H, 1, 1);
+        if (c2 < 0) {
+            PyErr_NoMemory();
+            return -1;
+        }
+        c = &H->cl[ci];                                  /* the clusters may have moved */
+        H->cl[c2].tr[0] = h;
+        H->cl[c2].lf[0] = H->tr[h].leaf[0];
+        H->cl[c2].lw[0] = 0.0;
+        H->tr[h].cl = c2;
+    }
+    if (nk == 0) {
+        h_cluster_free(H, ci);
+        return 0;
+    }
+    if (nk < nt) {
+        int32_t *nlf = (int32_t *)ar_get(s->ar, (size_t)(ng * nk + 1) * sizeof(int32_t));
+        if (nlf == NULL)
+            return -1;
+        int n = 0;
+        for (int i = 0; i < nt; i++)
+            if (keep[i] == 1) {
+                c->tr[n] = c->tr[i];
+                for (int g = 0; g < ng; g++)
+                    nlf[(size_t)g * nk + n] = c->lf[(size_t)g * nt + i];
+                n++;
+            }
+        memcpy(c->lf, nlf, (size_t)(ng * nk) * sizeof(int32_t));
+        c->nt = nk;
+        /* hypotheses that differed only in what was taken out are one now */
+        memset(drop, 0, (size_t)ng);
+        for (int g = 0; g < ng; g++) {
+            if (drop[g])
+                continue;
+            for (int g2 = g + 1; g2 < ng; g2++)
+                if (!drop[g2] && memcmp(c->lf + (size_t)g * nk, c->lf + (size_t)g2 * nk, (size_t)nk * sizeof(int32_t)) == 0) {
+                    double two[2] = {c->lw[g], c->lw[g2]};
+                    c->lw[g] = lse(two, 2);
+                    drop[g2] = 1;
+                }
+        }
+        c->ng = h_compact(c->lf, c->lw, ng, nk, drop);
+        h_sort(c->lf, c->lw, c->ng, nk, nlf);
+    }
+    for (int i = 0; i < c->nt; i++)
+        H->tr[c->tr[i]].cl = ci;
+    return 0;
+}
+
+/* cluster b joined to cluster a (their objects compete now): every pair of their hypotheses, the K most
+ * probable kept. b is freed. */
+static int h_merge(Hyp *H, Arena *ar, int a, int b)
+{
+    HCl *ca = &H->cl[a], *cb = &H->cl[b];
+    int nt = ca->nt + cb->nt, na = ca->ng, nb = cb->ng, tot = na * nb;
+    int *ord = (int *)ar_get(ar, (size_t)tot * sizeof(int));
+    double *w = (double *)ar_get(ar, (size_t)tot * sizeof(double));
+    if (ord == NULL || w == NULL)
+        return -1;
+    for (int i = 0; i < tot; i++) {
+        w[i] = ca->lw[i / nb] + cb->lw[i % nb];
+        int k = i;
+        while (k > 0 && w[i] > w[ord[k - 1]]) {
+            ord[k] = ord[k - 1];
+            k--;
+        }
+        ord[k] = i;
+    }
+    int ng = tot < H->k_best ? tot : H->k_best;
+    int32_t *tr = (int32_t *)PyMem_Malloc((size_t)nt * sizeof(int32_t));
+    int32_t *lf = (int32_t *)PyMem_Malloc((size_t)(nt * ng) * sizeof(int32_t));
+    double *lw = (double *)PyMem_Malloc((size_t)ng * sizeof(double));
+    if (!tr || !lf || !lw) {
+        PyMem_Free(tr);
+        PyMem_Free(lf);
+        PyMem_Free(lw);
+        return -1;
+    }
+    memcpy(tr, ca->tr, (size_t)ca->nt * sizeof(int32_t));
+    memcpy(tr + ca->nt, cb->tr, (size_t)cb->nt * sizeof(int32_t));
+    for (int g = 0; g < ng; g++) {
+        int ia = ord[g] / nb, ib = ord[g] % nb;
+        memcpy(lf + (size_t)g * nt, ca->lf + (size_t)ia * ca->nt, (size_t)ca->nt * sizeof(int32_t));
+        memcpy(lf + (size_t)g * nt + ca->nt, cb->lf + (size_t)ib * cb->nt, (size_t)cb->nt * sizeof(int32_t));
+        lw[g] = w[ord[g]];
+    }
+    double norm = lse(lw, ng);
+    for (int g = 0; g < ng; g++)
+        lw[g] -= norm;
+    for (int i = 0; i < cb->nt; i++)
+        H->tr[cb->tr[i]].cl = a;
+    PyMem_Free(ca->tr);
+    PyMem_Free(ca->lf);
+    PyMem_Free(ca->lw);
+    ca->tr = tr;
+    ca->lf = lf;
+    ca->lw = lw;
+    ca->nt = nt;
+    ca->ng = ng;
+    h_cluster_free(H, b);
+    return 0;
+}
+
+static int uf_find(int *uf, int i)
+{
+    while (uf[i] != i) {
+        uf[i] = uf[uf[i]];
+        i = uf[i];
+    }
+    return i;
+}
+
+typedef struct {
+    Hyp *H;
+    double *A;
+    Arena ar;
+    int n;                           /* participating objects */
+    int32_t *th;
+    double *ti;
+    int *pk_of;                      /* by handle: its index among the participating, -1 */
+    double t, pose[6], nscan;
+    RSens sen;
+    int src;
+    RPar par;
+    double *D, *KB;
+    Py_ssize_t nd;
+    double acfg[RSCFG], ucfg[2], bcfg[RBCFG];
+    RAs as;
+    /* the leaves after the step */
+    int nl;
+    int32_t *lrow, *lold;
+    int *lk;                         /* its object's index among the participating */
+    double *lpd, *lcov, *lmiss, *lnr;    /* p_detect, coverage, ln(1 - r pd), ln r */
+    double *lr;                      /* nl x nd: ln(pd lk F / lam), -inf: may not be */
+    int32_t *missidx;                /* by row: the old leaf's index among the leaves, -1 */
+    int32_t *detchild;               /* nl x nd: the row of leaf a having taken detection j, -1 */
+    int *det_cl;                     /* per detection: its cluster, -1 */
+    int32_t *birth_h;                /* per detection: the object it started (handle), -1; -2: it cannot start one */
+    int births_left;
+    PyObject *dead, *births;
+    char *mark;
+} Scan;
+
+/* how much of the leaf the sensor can see (1: all of it) */
+static double r_visible(Scan *s, int a, double cx, double cy)
+{
+    s->A[(Py_ssize_t)s->lrow[a] * RROW + RO_M + M_VIS] = 1.0;
+    return 1.0;
+}
+
+/* every leaf against the scan's detections (as they are in s->D, with the sensor's bias as it is in s->sen) */
+static void h_ratios(Scan *s)
+{
+    Hyp *H = s->H;
+    double cph = cos(s->pose[2]), sph = sin(s->pose[2]);
+    ras_dets(&s->as, s->nscan);
+    for (int a = 0; a < s->nl; a++) {
+        const double *row = s->A + (Py_ssize_t)s->lrow[a] * RROW, *x = row + RO_X, *M = row + RO_M;
+        const double *ti = s->ti + (size_t)s->lk[a] * HTI;
+        double dx = x[R_PX] - s->pose[0], dy = x[R_PY] - s->pose[1];
+        double cx = cph * dx + sph * dy, cy = -sph * dx + cph * dy;
+        double vis = r_visible(s, a, cx, cy);
+        double pd = r_p_detect(&s->sen, cx, cy, x) * vis;
+        s->lpd[a] = pd;
+        s->lcov[a] = r_coverage(&s->sen, cx, cy);
+        double r = sigm(M[M_L]);
+        s->lnr[a] = log(pymax(r, 1e-300));
+        s->lmiss[a] = log(pymax(1.0 - r * pd, 1e-12));
+        double lbw = NAN;
+        if (M[M_HITS] >= 2.0 && (int)M[M_BOXS] == s->src && s->t - M[M_BOXT] <= s->acfg[10] && !isnan(M[M_BOXW]))
+            lbw = M[M_BOXW];
+        ras_row(&s->as, row, pd, cx, cy, ti[7], lbw, ti[8], s->lr + (size_t)a * s->nd);
+        (void)H;
+    }
+}
+
+/* What all objects of one scan share: the camera body's pitch at that moment (tracker.py `_common`). The settled
+ * objects' primaries, paired as the scan alone would pair them and sure of it, say what it was (the middle one of
+ * their angle innovations, by weight); the part the sensor's slow pitch error explains goes into that error
+ * (bias: [value, variance], updated), the rest is this scan's own and is taken out of the scan's angles.
+ * Returns 1 when it was taken (the detections and the sensor's bias changed), 0 when not, -1: error. */
+static int h_common(Scan *s, double *bias)
+{
+    Hyp *H = s->H;
+    int n = s->n, nd = (int)s->nd, cmin = (int)s->acfg[11];
+    if (n < cmin || nd < cmin)
+        return 0;
+    /* the primaries' leaves */
+    int *pa = (int *)ar_get(&s->ar, (size_t)n * sizeof(int));
+    double *rat = (double *)ar_get(&s->ar, (size_t)(3 * n * nd + 1) * sizeof(double));
+    Py_ssize_t *pi = (Py_ssize_t *)ar_get(&s->ar, (size_t)(2 * (n + nd) + 2) * sizeof(Py_ssize_t));
+    if (pa == NULL || rat == NULL || pi == NULL)
+        return -1;
+    double *gain = rat + n * nd, *pair = gain + n * nd;
+    Py_ssize_t *pj = pi + n + nd + 1;
+    for (int k = 0; k < n; k++)
+        pa[k] = -1;
+    for (int a = 0; a < s->nl; a++)
+        if (s->lold[a] == H->tr[s->th[s->lk[a]]].primary)
+            pa[s->lk[a]] = a;
+    for (int k = 0; k < n; k++)
+        for (int j = 0; j < nd; j++) {
+            double g = -INFINITY, r = 0.0;
+            if (pa[k] >= 0) {
+                int a = pa[k];
+                double v = s->lr[(size_t)a * nd + j];
+                if (isfinite(v)) {
+                    v -= log(pymax(1.0 - s->lpd[a], 1e-12));     /* against "missed": the object taken as existing */
+                    r = exp(v);
+                    if (v > 0.0)
+                        g = v;
+                }
+            }
+            rat[k * nd + j] = r;
+            gain[k * nd + j] = g;
+        }
+    if (r_marginals(rat, n, nd, pair) < 0)
+        return -1;
+    Py_ssize_t np_ = r_assign(gain, n, nd, pi, pj);
+    if (np_ < 0)
+        return -1;
+    double *v = (double *)ar_get(&s->ar, (size_t)(3 * np_ + 1) * sizeof(double));
+    Py_ssize_t *ko = (Py_ssize_t *)ar_get(&s->ar, (size_t)(np_ + 1) * sizeof(Py_ssize_t));
+    if (v == NULL || ko == NULL)
+        return -1;
+    double *w = v + np_, *cw = w + np_;
+    Py_ssize_t ns = 0;
+    for (Py_ssize_t q = 0; q < np_; q++) {
+        int k = (int)pi[q], j = (int)pj[q], a = pa[k];
+        const double *d = s->D + (size_t)j * RDET, *row = s->A + (Py_ssize_t)s->lrow[a] * RROW;
+        int base = (int)d[D_KIND] & 7;
+        if (!(base == K_RB || base == K_RBH) || s->ti[(size_t)k * HTI + 9] == 0.0 || row[RO_M + M_HITS] < 4.0 ||
+            !(pair[k * nd + j] >= s->acfg[12]))
+            continue;
+        double z[4], Hm[4 * RN];
+        const double *P = row + RO_P;
+        r_h(&s->sen, (int)d[D_KIND], d[D_SDT], row + RO_X, s->pose, z, Hm);
+        double s00 = 0.0;
+        for (int c = 0; c < RN; c++) {
+            double tt = 0.0;
+            for (int i = 0; i < RN; i++)
+                tt += Hm[i] * P[i * RN + c];
+            s00 += tt * Hm[c];
+        }
+        s00 += d[D_R];
+        v[ns] = d[D_Z] - z[0];
+        w[ns] = 1.0 / s00;
+        ns++;
+    }
+    if (ns < cmin)
+        return 0;
+    double m = r_wmedian(v, w, ns, ko, cw);
+    double var_m = 1.57 / cw[ns - 1];                    /* the variance of a weighted median */
+    double jit = s->sen.jit2, tot = bias[1] + jit + var_m;
+    double slow = m * bias[1] / tot, fast = m * jit / tot;
+    bias[0] += slow;
+    bias[1] = pymax(bias[1] * (1.0 - bias[1] / tot), s->sen.bias_floor2);
+    s->sen.bias = bias[0];
+    s->sen.bias_var = bias[1];
+    double left = jit * (1.0 - jit / tot);              /* what is still not known of this scan's own pitch */
+    for (int j = 0; j < nd; j++) {
+        double *d = s->D + (size_t)j * RDET;
+        int base = (int)d[D_KIND] & 7;
+        if (base == K_RB || base == K_RBH) {
+            d[D_Z] -= fast;
+            d[D_R] = pymax(d[D_R] - jit + left, 0.25 * d[D_R]);
+        }
+    }
+    return 1;
+}
+
+/* the row of leaf a having taken detection j (made when first asked for) */
+static int32_t h_detchild(Scan *s, int a, int j)
+{
+    Hyp *H = s->H;
+    int32_t *slot = &s->detchild[(size_t)a * s->nd + j];
+    if (*slot >= 0)
+        return *slot;
+    int h = s->th[s->lk[a]];
+    int32_t r = h_take(H, h, s->lold[a]);
+    if (r < 0)
+        return -1;
+    double *row = s->A + (Py_ssize_t)r * RROW, *M = row + RO_M;
+    const double *d = s->D + (size_t)j * RDET;
+    memcpy(row, s->A + (Py_ssize_t)s->lrow[a] * RROW, RROW * sizeof(double));
+    double nis = NAN, dl = 0.0;
+    int base = (int)d[D_KIND] & 7;
+    if (r_update_full(row, &s->sen, s->pose, d, s->ucfg[0], s->ucfg[1], &nis, &dl) == 0)
+        r_extent_update(row, &s->sen, d, s->pose, s->ti + (size_t)s->lk[a] * HTI + 3);
+    M[M_L] = pymax(-12.0, pymin(12.0, M[M_L] + dl + d[D_SCORE]));
+    M[M_HITS] += 1.0;
+    M[M_THIT] = s->t;
+    if (!(s->sen.type == SEN_CAMERA && (base == K_B || base == K_BT)))
+        M[M_RANGE_T] = s->t;                             /* a box cut at the bottom gives a direction only */
+    if (d[D_W] > 0.0) {
+        M[M_BOXW] = d[D_W];
+        M[M_BOXT] = s->t;
+        M[M_BOXS] = (double)s->src;
+    }
+    M[M_NIS] = nis;
+    M[M_DL] = dl;
+    M[M_DET] = (double)j;
+    M[M_SRC] = (double)s->src;
+    M[M_PD] = s->lpd[a];
+    if (h_leaf_add(&H->tr[h], r) < 0)
+        return -1;
+    *slot = r;
+    H->c_children++;
+    return r;
+}
+
+/* the object detection j starts (made when first asked for): its handle, or -1 when it starts none */
+static int h_birth(Scan *s, int j)
+{
+    Hyp *H = s->H;
+    if (s->birth_h[j] != -1)
+        return s->birth_h[j] >= 0 ? s->birth_h[j] : -1;
+    s->birth_h[j] = -2;
+    if (s->births_left <= 0 || s->KB == NULL)
+        return -1;
+    int h = h_track_new(H);
+    if (h < 0)
+        return -1;
+    int32_t r = h_take(H, h, -1);
+    if (r < 0) {
+        h_track_free(H, h);
+        return -1;
+    }
+    double *row = s->A + (Py_ssize_t)r * RROW;
+    memset(row, 0, RROW * sizeof(double));
+    const double *kb = s->KB + (size_t)j * RKB;
+    if (!r_birth(row, &s->sen, s->D + (size_t)j * RDET, s->pose, kb, s->bcfg, s->t, s->src, H->level)) {
+        h_track_free(H, h);
+        return -1;
+    }
+    row[RO_M + M_DET] = (double)j;
+    HTrack *t = &H->tr[h];
+    t->born = H->level;
+    memcpy(t->kin, kb, 4 * sizeof(double));
+    t->veh = s->D[(size_t)j * RDET + D_VEH];
+    t->idnum = -1.0;
+    t->leaf[0] = r;
+    t->nleaf = 1;
+    t->primary = r;
+    s->birth_h[j] = h;
+    s->births_left--;
+    H->c_births++;
+    return h;
+}
+
+/* One cluster's hypotheses after the scan: for every hypothesis it held, the best assignments of the cluster's
+ * detections to its leaves (each leaf: one detection or none; each detection: one leaf, or "something else",
+ * which starts an object where a detection can), the most probable of them all kept. */
+static int h_generate(Scan *s, int ci)
+{
+    Hyp *H = s->H;
+    HCl *c = &H->cl[ci];
+    int nt = c->nt, ng = c->ng, nd = (int)s->nd, K = H->k_best;
+    int *cdet = (int *)ar_get(&s->ar, (size_t)(nd + 1) * sizeof(int));
+    int *pk = (int *)ar_get(&s->ar, (size_t)(nt + 1) * sizeof(int));
+    if (cdet == NULL || pk == NULL)
+        return -1;
+    int ndc = 0, any = 0;
+    for (int j = 0; j < nd; j++)
+        if (s->det_cl[j] == ci)
+            cdet[ndc++] = j;
+    for (int i = 0; i < nt; i++) {
+        pk[i] = s->pk_of[c->tr[i]];
+        any |= pk[i] >= 0;
+    }
+    if (!any)
+        return 0;
+    /* how many assignments each hypothesis may give: by its weight */
+    int *kg = (int *)ar_get(&s->ar, (size_t)ng * sizeof(int));
+    if (kg == NULL)
+        return -1;
+    int maxc = 0;
+    for (int g = 0; g < ng; g++) {
+        int k = (int)ceil(K * exp(c->lw[g]));
+        kg[g] = k < 1 ? 1 : (k > K ? K : k);
+        if (nt > H->max_cluster)
+            kg[g] = 1;                                   /* a cluster too large to enumerate: the best one only */
+        maxc += kg[g];
+    }
+    int *cg = (int *)ar_get(&s->ar, (size_t)maxc * sizeof(int));
+    double *clw = (double *)ar_get(&s->ar, (size_t)maxc * sizeof(double));
+    int *cas = (int *)ar_get(&s->ar, (size_t)(maxc * nt + 1) * sizeof(int));
+    int *rti = (int *)ar_get(&s->ar, (size_t)(nt + 1) * sizeof(int));
+    int *ra = (int *)ar_get(&s->ar, (size_t)(nt + 1) * sizeof(int));
+    double *C = (double *)ar_get(&s->ar, (size_t)(nt * (ndc + nt) + 1) * sizeof(double));
+    int *cols = (int *)ar_get(&s->ar, (size_t)(K * nt + 1) * sizeof(int));
+    double *costs = (double *)ar_get(&s->ar, (size_t)(K + 1) * sizeof(double));
+    if (!cg || !clw || !cas || !rti || !ra || !C || !cols || !costs)
+        return -1;
+    int nc = 0;
+    for (int g = 0; g < ng; g++) {
+        int n = 0;
+        double base = c->lw[g];
+        for (int i = 0; i < nt; i++) {
+            int32_t q = c->lf[(size_t)g * nt + i];
+            if (q < 0 || pk[i] < 0)
+                continue;
+            int a = s->missidx[q];
+            rti[n] = i;
+            ra[n] = a;
+            base += s->lmiss[a];
+            n++;
+        }
+        int m = ndc + n;
+        for (int r = 0; r < n; r++) {
+            int a = ra[r];
+            for (int jd = 0; jd < ndc; jd++) {
+                double v = s->lr[(size_t)a * nd + cdet[jd]];
+                /* "it took detection j" against "it was missed and j is something else" */
+                C[r * m + jd] = isfinite(v) ? -(s->lnr[a] + v - s->lmiss[a]) : LAP_BIG;
+            }
+            for (int r2 = 0; r2 < n; r2++)
+                C[r * m + ndc + r2] = r2 == r ? 0.0 : LAP_BIG;
+        }
+        Arena tmp = {NULL, 0};
+        int ns = murty(&tmp, C, n, m, kg[g], cols, costs);
+        ar_free(&tmp);
+        if (ns < 0)
+            return -1;
+        H->c_murty += ns;
+        for (int q = 0; q < ns; q++) {
+            cg[nc] = g;
+            clw[nc] = base - costs[q];
+            int *as = cas + (size_t)nc * nt;
+            for (int i = 0; i < nt; i++)
+                as[i] = -1;
+            for (int r = 0; r < n; r++)
+                if (cols[q * n + r] < ndc)
+                    as[rti[r]] = cdet[cols[q * n + r]];
+            nc++;
+        }
+    }
+    if (nc == 0)
+        return 0;
+    /* the most probable of all of them, at most K, none less probable than the best by more than prune_ln */
+    int *ord = (int *)ar_get(&s->ar, (size_t)nc * sizeof(int));
+    if (ord == NULL)
+        return -1;
+    for (int i = 0; i < nc; i++) {
+        int k = i;
+        while (k > 0 && clw[i] > clw[ord[k - 1]]) {
+            ord[k] = ord[k - 1];
+            k--;
+        }
+        ord[k] = i;
+    }
+    int ng2 = nc < K ? nc : K;
+    while (ng2 > 1 && clw[ord[ng2 - 1]] < clw[ord[0]] - H->prune_ln)
+        ng2--;
+    /* the objects started in them: a detection of the cluster that a kept hypothesis leaves over */
+    int nb = 0;
+    int *bj = (int *)ar_get(&s->ar, (size_t)(ndc + 1) * sizeof(int));
+    int *bh = (int *)ar_get(&s->ar, (size_t)(ndc + 1) * sizeof(int));
+    char *usedj = (char *)ar_get(&s->ar, (size_t)(nd + 1));
+    if (!bj || !bh || !usedj)
+        return -1;
+    for (int jd = 0; jd < ndc; jd++) {
+        int j = cdet[jd], left = 0;
+        for (int q = 0; q < ng2 && !left; q++) {
+            const int *as = cas + (size_t)ord[q] * nt;
+            int taken = 0;
+            for (int i = 0; i < nt; i++)
+                if (as[i] == j) {
+                    taken = 1;
+                    break;
+                }
+            left = !taken;
+        }
+        if (!left)
+            continue;
+        int h = h_birth(s, j);
+        if (h >= 0) {
+            bj[nb] = j;
+            bh[nb] = h;
+            nb++;
+        }
+    }
+    int nt2 = nt + nb;
+    int32_t *tr2 = (int32_t *)PyMem_Malloc((size_t)nt2 * sizeof(int32_t));
+    int32_t *lf2 = (int32_t *)PyMem_Malloc((size_t)(nt2 * ng2) * sizeof(int32_t));
+    double *lw2 = (double *)PyMem_Malloc((size_t)ng2 * sizeof(double));
+    if (!tr2 || !lf2 || !lw2) {
+        PyMem_Free(tr2);
+        PyMem_Free(lf2);
+        PyMem_Free(lw2);
+        return -1;
+    }
+    c = &H->cl[ci];
+    memcpy(tr2, c->tr, (size_t)nt * sizeof(int32_t));
+    for (int b = 0; b < nb; b++)
+        tr2[nt + b] = bh[b];
+    int fail = 0;
+    for (int q = 0; q < ng2 && !fail; q++) {
+        int g = cg[ord[q]];
+        const int *as = cas + (size_t)ord[q] * nt;
+        int32_t *o = lf2 + (size_t)q * nt2;
+        memset(usedj, 0, (size_t)nd);
+        for (int i = 0; i < nt; i++) {
+            int32_t old = c->lf[(size_t)g * nt + i];
+            if (old < 0 || pk[i] < 0) {
+                o[i] = old;
+                continue;
+            }
+            int a = s->missidx[old];
+            if (as[i] < 0) {
+                o[i] = s->lrow[a];
+                s->mark[s->lrow[a]] = 3;                 /* the story "not reported" is in use */
+            } else {
+                o[i] = h_detchild(s, a, as[i]);
+                usedj[as[i]] = 1;
+                if (o[i] < 0)
+                    fail = 1;
+            }
+        }
+        for (int b = 0; b < nb; b++)
+            o[nt + b] = usedj[bj[b]] ? -1 : H->tr[bh[b]].leaf[0];
+        lw2[q] = clw[ord[q]];
+    }
+    if (fail) {
+        PyMem_Free(tr2);
+        PyMem_Free(lf2);
+        PyMem_Free(lw2);
+        PyErr_SetString(PyExc_MemoryError, "radar: the state array is full");
+        return -1;
+    }
+    PyMem_Free(c->tr);
+    PyMem_Free(c->lf);
+    PyMem_Free(c->lw);
+    c->tr = tr2;
+    c->lf = lf2;
+    c->lw = lw2;
+    c->nt = nt2;
+    c->ng = ng2;
+    for (int b = 0; b < nb; b++)
+        H->tr[bh[b]].cl = ci;
+    H->c_hyps += ng2;
+    return 0;
+}
+
+/* Hyp.scan(S, objects, info, t, pose, sensor, src, dets, kinds | None, mem | None, nscan, acfg, par, ucfg, bcfg,
+ *          bias | None) -> (objects' results, births, ended, bias | None)   or   rows needed (an int)
+ *   objects: the handles that take part (not too far ahead of the scan's time); info: (n, HTI) per object;
+ *   pose: the car's (X, Y, psi, vx, vy, w) at t; src: the sensor's number; dets: (nd, RDET); kinds: (nd, RKB) what
+ *   each detection's kind can do (None: this scan starts no objects); mem: (nm, 5) the map's entries; bias: the
+ *   sensor's slow angle error [value, variance] where it has one.
+ * Returns per object (alive, primary row, p_detect, coverage, p_exists, p_primary, leaves, in the best story),
+ * the objects started [(handle, detection, primary row)], the handles of objects that ended, and the sensor's
+ * bias after the scan's common angle was taken (None: not taken). An int: the state array needs that many free
+ * rows before the scan can run (nothing was changed). */
+static PyObject *hyp_scan(PyObject *self, PyObject *args)
+{
+    Hyp *H = (Hyp *)self;
+    PyObject *oS, *otr, *oti, *opose, *osen, *oD, *oKB, *omem, *oacfg, *opar, *oucfg, *obcfg, *obias;
+    double t, nscan;
+    int src;
+    if (!PyArg_ParseTuple(args, "OOOdOOiOOOdOOOOO", &oS, &otr, &oti, &t, &opose, &osen, &src, &oD, &oKB, &omem, &nscan,
+                          &oacfg, &opar, &oucfg, &obcfg, &obias))
+        return NULL;
+    PyObject *res = NULL, *out = NULL, *bias_o = NULL;
     View vS;
     vS.held = 0;
-    PyObject *res = NULL;
-    Py_ssize_t cap, n = 0, *rows = NULL, *k = NULL;
-    double *buf = NULL, pose[6];
-    RSens sen;
-    if (store_get(oS, &vS, &cap) < 0 || (rows = idx_get(orows, cap, &n)) == NULL || sens_get(osen, &sen) < 0 ||
-        rnums_get(opose, 6, pose, "pose") < 0)
+    Scan s;
+    memset(&s, 0, sizeof(s));
+    s.H = H;
+    s.t = t;
+    s.nscan = nscan;
+    s.src = src;
+    Py_ssize_t cap, n = 0, *th = NULL, nm = 0;
+    double bias[2] = {0.0, 0.0};
+    int has_bias = obias != Py_None, took = 0;
+    if (store_get(oS, &vS, &cap) < 0 || (th = idx_get(otr, 1 << 30, &n)) == NULL || sens_get(osen, &s.sen) < 0 ||
+        rnums_get(opose, 6, s.pose, "pose") < 0 || rnums_get(oacfg, RSCFG, s.acfg, "acfg") < 0 ||
+        rpar_get(opar, &s.par) < 0 || rnums_get(oucfg, 2, s.ucfg, "ucfg") < 0 || rnums_get(obcfg, RBCFG, s.bcfg, "bcfg") < 0 ||
+        (has_bias && rnums_get(obias, 2, bias, "bias") < 0))
         goto done;
-    if (n == 0) {
-        PyErr_SetString(PyExc_ValueError, "radar_common: no pairs");
+    if (cap < H->cap) {
+        PyErr_SetString(PyExc_ValueError, "Hyp.scan: the state array is smaller than the rows in use");
         goto done;
     }
-    buf = (double *)PyMem_Malloc((size_t)(7 * n) * sizeof(double));
-    k = (Py_ssize_t *)PyMem_Malloc((size_t)n * sizeof(Py_ssize_t));
-    if (buf == NULL || k == NULL) {
+    if (hyp_rows(H, cap) < 0)
+        goto done;
+    s.A = (double *)vS.b.buf;
+    s.n = (int)n;
+    s.nd = batch_len(oD);
+    if (s.nd < 0)
+        goto done;
+    if (omem != Py_None && (nm = batch_len(omem)) < 0)
+        goto done;
+    int nd = (int)s.nd;
+    /* the rows this scan may need */
+    {
+        Py_ssize_t L = 0;
+        for (Py_ssize_t k = 0; k < n; k++) {
+            if (th[k] >= H->ntr || !H->tr[th[k]].alive) {
+                PyErr_SetString(PyExc_ValueError, "Hyp.scan: an object that does not exist");
+                goto done;
+            }
+            for (Py_ssize_t k2 = 0; k2 < k; k2++)
+                if (th[k2] == th[k]) {
+                    PyErr_SetString(PyExc_ValueError, "Hyp.scan: an object named twice");
+                    goto done;
+                }
+            L += H->tr[th[k]].nleaf;
+        }
+        Py_ssize_t kids = L * nd, lim = (Py_ssize_t)H->k_best * (n > 0 ? n : 1);
+        Py_ssize_t need = L + (kids < lim ? kids : lim) + nd;
+        if (H->nfree < need) {
+            res = PyLong_FromSsize_t(need);
+            goto done;
+        }
+        s.nl = (int)L;
+    }
+    H->level++;
+    H->c_scans++;
+    {
+        int nl = s.nl;
+        size_t nlz = (size_t)(nl ? nl : 1), ndz = (size_t)(nd ? nd : 1);
+        s.th = (int32_t *)ar_get(&s.ar, (size_t)(n + 1) * sizeof(int32_t));
+        s.ti = (double *)ar_get(&s.ar, (size_t)(n + 1) * HTI * sizeof(double));
+        s.pk_of = (int *)ar_get(&s.ar, (size_t)(H->ntr + nd + 1) * sizeof(int));
+        s.D = (double *)ar_get(&s.ar, ndz * RDET * sizeof(double));
+        s.KB = oKB == Py_None ? NULL : (double *)ar_get(&s.ar, ndz * RKB * sizeof(double));
+        double *mem = (double *)ar_get(&s.ar, (size_t)(5 * nm + 1) * sizeof(double));
+        s.lrow = (int32_t *)ar_get(&s.ar, 2 * nlz * sizeof(int32_t));
+        s.lk = (int *)ar_get(&s.ar, nlz * sizeof(int));
+        s.lpd = (double *)ar_get(&s.ar, 4 * nlz * sizeof(double));
+        s.lr = (double *)ar_get(&s.ar, nlz * ndz * sizeof(double));
+        s.missidx = (int32_t *)ar_get(&s.ar, (size_t)cap * sizeof(int32_t));
+        s.detchild = (int32_t *)ar_get(&s.ar, nlz * ndz * sizeof(int32_t));
+        s.det_cl = (int *)ar_get(&s.ar, ndz * sizeof(int));
+        s.birth_h = (int32_t *)ar_get(&s.ar, ndz * sizeof(int32_t));
+        s.mark = (char *)ar_get(&s.ar, (size_t)cap);
+        s.as.lam0 = (double *)ar_get(&s.ar, (5 * ndz + ndz * (size_t)(nm ? nm : 1)) * sizeof(double));
+        s.as.J = (Py_ssize_t *)ar_get(&s.ar, ndz * sizeof(Py_ssize_t));
+        s.as.ok = (int *)ar_get(&s.ar, ndz * sizeof(int));
+        if (s.ar.failed) {
+            PyErr_NoMemory();
+            goto fail;
+        }
+        s.lold = s.lrow + nlz;
+        s.lcov = s.lpd + nlz;
+        s.lmiss = s.lcov + nlz;
+        s.lnr = s.lmiss + nlz;
+        s.as.loc = s.as.lam0 + ndz;
+        s.as.qs = s.as.loc + ndz;
+        s.as.dets = s.as.qs + ndz;
+        s.as.lk = s.as.dets + ndz;
+        s.as.kmat = s.as.lk + ndz;
+        s.as.sen = &s.sen;
+        s.as.pose = s.pose;
+        s.as.cfg = s.acfg;
+        s.as.D = s.D;
+        s.as.nd = nd;
+        s.as.nm = nm;
+        s.as.mem = mem;
+        memset(s.mark, 0, (size_t)cap);
+        for (Py_ssize_t r = 0; r < cap; r++)
+            s.missidx[r] = -1;
+        for (int i = 0; i < nl * nd; i++)
+            s.detchild[i] = -1;
+        for (int j = 0; j < nd; j++) {
+            s.det_cl[j] = -1;
+            s.birth_h[j] = -1;
+        }
+        for (int i = 0; i < H->ntr + nd + 1; i++)
+            s.pk_of[i] = -1;
+        if ((n && rows_get(oti, n, HTI, s.ti, "info") < 0) || (nd && rows_get(oD, nd, RDET, s.D, "dets") < 0) ||
+            (nd && s.KB && rows_get(oKB, nd, RKB, s.KB, "kinds") < 0) || (nm && rows_get(omem, nm, 5, mem, "mem") < 0))
+            goto fail;
+        s.births_left = (int)s.bcfg[7];
+        if ((s.dead = PyList_New(0)) == NULL || (s.births = PyList_New(0)) == NULL)
+            goto fail;
+        /* 1. every leaf of the objects that take part, one scan on */
+        int a = 0;
+        for (Py_ssize_t k = 0; k < n; k++) {
+            int h = (int)th[k];
+            HTrack *tr = &H->tr[h];
+            const double *ti = s.ti + (size_t)k * HTI;
+            s.th[k] = h;
+            s.pk_of[h] = (int)k;
+            memcpy(tr->kin, ti + 3, 4 * sizeof(double));
+            tr->veh = ti[7];
+            tr->idnum = ti[8];
+            for (int q = 0; q < tr->nleaf; q++) {
+                int32_t old = tr->leaf[q];
+                int32_t c = h_step(H, s.A, old, h, ti[0], ti[1], ti[2], s.pose, tr->kin, &s.par, t);
+                if (c < 0) {
+                    PyErr_SetString(PyExc_MemoryError, "radar: the state array is full");
+                    goto fail;
+                }
+                s.lrow[a] = c;
+                s.lold[a] = old;
+                s.lk[a] = (int)k;
+                s.missidx[old] = a;
+                tr->leaf[q] = c;
+                a++;
+            }
+        }
+        /* 2. the leaves against the detections; the scan's common angle taken out, and once more without it */
+        h_ratios(&s);
+        if (has_bias && nd) {
+            took = h_common(&s, bias);
+            if (took < 0) {
+                if (!PyErr_Occurred())
+                    PyErr_NoMemory();
+                goto fail;
+            }
+            if (took)
+                h_ratios(&s);
+        }
+        for (a = 0; a < nl; a++) {
+            double *M = s.A + (Py_ssize_t)s.lrow[a] * RROW + RO_M;
+            M[M_PD] = s.lpd[a];
+            M[M_COV] = s.lcov[a];
+        }
+        /* 3. objects that share a detection compete: one cluster */
+        {
+            int *uf = (int *)ar_get(&s.ar, (size_t)(H->ntr + 1) * sizeof(int));
+            int *rep = (int *)ar_get(&s.ar, (size_t)(H->ntr + 1) * sizeof(int));
+            if (uf == NULL || rep == NULL) {
+                PyErr_NoMemory();
+                goto fail;
+            }
+            for (int i = 0; i < H->ntr; i++) {
+                uf[i] = i;
+                rep[i] = -1;
+            }
+            for (int c = 0; c < H->ncl; c++)
+                if (H->cl[c].alive)
+                    for (int i = 1; i < H->cl[c].nt; i++)
+                        uf[uf_find(uf, H->cl[c].tr[i])] = uf_find(uf, H->cl[c].tr[0]);
+            for (int j = 0; j < nd; j++) {
+                int first = -1;
+                for (a = 0; a < nl; a++)
+                    if (isfinite(s.lr[(size_t)a * nd + j])) {
+                        int h = s.th[s.lk[a]];
+                        if (first < 0)
+                            first = h;
+                        else
+                            uf[uf_find(uf, h)] = uf_find(uf, first);
+                    }
+            }
+            int ncl0 = H->ncl;
+            for (int c = 0; c < ncl0; c++) {
+                if (!H->cl[c].alive || H->cl[c].nt == 0)
+                    continue;
+                int r = uf_find(uf, H->cl[c].tr[0]);
+                if (rep[r] < 0)
+                    rep[r] = c;
+                else if (h_merge(H, &s.ar, rep[r], c) < 0) {
+                    PyErr_NoMemory();
+                    goto fail;
+                }
+            }
+            for (int j = 0; j < nd; j++)
+                for (a = 0; a < nl; a++)
+                    if (isfinite(s.lr[(size_t)a * nd + j])) {
+                        s.det_cl[j] = H->tr[s.th[s.lk[a]]].cl;
+                        break;
+                    }
+        }
+        /* 4. each cluster's hypotheses; then its trees cut and its objects' primaries set */
+        Settle st = {H, s.A, &s.ar, t, s.dead, s.mark};
+        int ncl0 = H->ncl;
+        for (int c = 0; c < ncl0; c++) {
+            if (!H->cl[c].alive)
+                continue;
+            int part = 0;
+            for (int i = 0; i < H->cl[c].nt; i++)
+                part |= s.pk_of[H->cl[c].tr[i]] >= 0;
+            if (!part)
+                continue;
+            if (h_generate(&s, c) < 0) {
+                if (!PyErr_Occurred())
+                    PyErr_NoMemory();
+                goto fail;
+            }
+        }
+        /* the stories "not reported" that are in use: a miss tells against the object */
+        for (a = 0; a < nl; a++) {
+            if (s.mark[s.lrow[a]] != 3)
+                continue;
+            s.mark[s.lrow[a]] = 0;
+            if (s.lpd[a] > 0.0)
+                s.A[(Py_ssize_t)s.lrow[a] * RROW + RO_M + M_L] += log(pymax(1.0 - s.lpd[a], 1e-3));
+        }
+        /* a detection no object could have given starts one by itself */
+        for (int j = 0; j < nd; j++) {
+            if (s.det_cl[j] >= 0)
+                continue;
+            int h = h_birth(&s, j);
+            if (h < 0)
+                continue;
+            int c2 = h_cluster_new(H, 1, 1);
+            if (c2 < 0) {
+                PyErr_NoMemory();
+                goto fail;
+            }
+            H->cl[c2].tr[0] = h;
+            H->cl[c2].lf[0] = H->tr[h].leaf[0];
+            H->cl[c2].lw[0] = 0.0;
+            H->tr[h].cl = c2;
+            H->tr[h].in_map = 1;
+            H->tr[h].pp = 1.0;
+            H->tr[h].pe = sigm(s.A[(Py_ssize_t)H->tr[h].leaf[0] * RROW + RO_M + M_L]);
+        }
+        for (int c = 0; c < ncl0; c++) {
+            if (!H->cl[c].alive)
+                continue;
+            int part = 0;
+            for (int i = 0; i < H->cl[c].nt; i++) {
+                int h = H->cl[c].tr[i];
+                part |= (h < H->ntr && s.pk_of[h] >= 0) || H->tr[h].born == H->level;
+            }
+            if (!part)
+                continue;
+            if (h_settle(&st, c) < 0) {
+                if (!PyErr_Occurred())
+                    PyErr_NoMemory();
+                goto fail;
+            }
+        }
+        for (Py_ssize_t k = 0; k < n; k++)
+            if (H->tr[th[k]].alive)
+                h_trim(H, s.A, &H->tr[th[k]], t);
+        /* 5. what the tracker needs back */
+        out = PyList_New(n);
+        if (out == NULL)
+            goto fail;
+        for (Py_ssize_t k = 0; k < n; k++) {
+            HTrack *tr = &H->tr[th[k]];
+            PyObject *o;
+            if (!tr->alive)
+                o = Py_BuildValue("(Oiddddii)", Py_False, -1, 0.0, 0.0, 0.0, 0.0, 0, 0);
+            else {
+                const double *M = s.A + (Py_ssize_t)tr->primary * RROW + RO_M;
+                o = Py_BuildValue("(Oiddddii)", Py_True, (int)tr->primary, M[M_PD], M[M_COV], tr->pe, tr->pp, tr->nleaf,
+                                  tr->in_map);
+            }
+            if (o == NULL)
+                goto fail;
+            PyList_SetItem(out, k, o);
+        }
+        for (int j = 0; j < nd; j++) {
+            int h = s.birth_h[j];
+            if (h < 0 || !H->tr[h].alive || H->tr[h].born != H->level)
+                continue;
+            HTrack *tr = &H->tr[h];
+            PyObject *o = Py_BuildValue("(iiiddi)", h, j, (int)tr->primary, tr->pe, tr->pp, tr->in_map);
+            if (o == NULL || PyList_Append(s.births, o) < 0) {
+                Py_XDECREF(o);
+                goto fail;
+            }
+            Py_DECREF(o);
+        }
+        if (took)
+            bias_o = Py_BuildValue("(dd)", bias[0], bias[1]);
+        else {
+            bias_o = Py_None;
+            Py_INCREF(bias_o);
+        }
+        if (bias_o == NULL)
+            goto fail;
+        res = PyTuple_Pack(4, out, s.births, s.dead, bias_o);
+    }
+fail:
+    Py_XDECREF(out);
+    Py_XDECREF(bias_o);
+    Py_XDECREF(s.dead);
+    Py_XDECREF(s.births);
+done:
+    ar_free(&s.ar);
+    PyMem_Free(th);
+    view_drop(&vS);
+    return res;
+}
+
+/* an object's handle checked */
+static HTrack *h_get(Hyp *H, long h)
+{
+    if (h < 0 || h >= H->ntr || !H->tr[h].alive) {
+        PyErr_SetString(PyExc_ValueError, "Hyp: an object that does not exist");
+        return NULL;
+    }
+    return &H->tr[h];
+}
+
+/* Hyp.drop(S, handle) -> [handles ended]: the object is taken out (the upkeep dropped it, or it was merged
+ * into another); its cluster's hypotheses that differed only in it become one. */
+static PyObject *hyp_drop(PyObject *self, PyObject *args)
+{
+    Hyp *H = (Hyp *)self;
+    PyObject *oS;
+    long h;
+    if (!PyArg_ParseTuple(args, "Ol", &oS, &h))
+        return NULL;
+    HTrack *t = h_get(H, h);
+    if (t == NULL)
+        return NULL;
+    View vS;
+    Py_ssize_t cap;
+    if (store_get(oS, &vS, &cap) < 0)
+        return NULL;
+    PyObject *dead = PyList_New(0);
+    Arena ar = {NULL, 0};
+    char *mark = (char *)ar_get(&ar, (size_t)H->cap);
+    int ci = t->cl;
+    if (dead == NULL || mark == NULL || cap < H->cap) {
+        if (!PyErr_Occurred())
+            PyErr_SetString(PyExc_ValueError, "Hyp.drop: no memory, or a state array that is too small");
+        goto fail;
+    }
+    memset(mark, 0, (size_t)H->cap);
+    if (ci >= 0) {
+        HCl *c = &H->cl[ci];
+        int nt = c->nt;
+        for (int i = 0; i < nt; i++)
+            if (c->tr[i] == h)
+                for (int g = 0; g < c->ng; g++)
+                    c->lf[(size_t)g * nt + i] = -1;     /* in no story any more: h_settle ends it */
+        /* hypotheses that differed only in this object are one now */
+        char *drop = (char *)ar_get(&ar, (size_t)c->ng + 1);
+        int32_t *tmp = (int32_t *)ar_get(&ar, (size_t)(nt + 1) * sizeof(int32_t));
+        if (drop == NULL || tmp == NULL) {
+            PyErr_NoMemory();
+            goto fail;
+        }
+        memset(drop, 0, (size_t)c->ng);
+        for (int g = 0; g < c->ng; g++) {
+            if (drop[g])
+                continue;
+            for (int g2 = g + 1; g2 < c->ng; g2++)
+                if (!drop[g2] && memcmp(c->lf + (size_t)g * nt, c->lf + (size_t)g2 * nt, (size_t)nt * sizeof(int32_t)) == 0) {
+                    double two[2] = {c->lw[g], c->lw[g2]};
+                    c->lw[g] = lse(two, 2);
+                    drop[g2] = 1;
+                }
+        }
+        c->ng = h_compact(c->lf, c->lw, c->ng, nt, drop);
+        h_sort(c->lf, c->lw, c->ng, nt, tmp);
+        Settle st = {H, (double *)vS.b.buf, &ar, 0.0, dead, mark};
+        if (h_settle(&st, ci) < 0) {
+            if (!PyErr_Occurred())
+                PyErr_NoMemory();
+            goto fail;
+        }
+    } else
+        h_track_free(H, (int)h);
+    ar_free(&ar);
+    view_drop(&vS);
+    return dead;
+fail:
+    Py_XDECREF(dead);
+    ar_free(&ar);
+    view_drop(&vS);
+    return NULL;
+}
+
+/* Hyp.rows(handle) -> every row of the object (its whole tree), the primary first */
+static PyObject *hyp_rows_of(PyObject *self, PyObject *arg)
+{
+    Hyp *H = (Hyp *)self;
+    long h = PyLong_AsLong(arg);
+    if (h == -1 && PyErr_Occurred())
+        return NULL;
+    HTrack *t = h_get(H, h);
+    if (t == NULL)
+        return NULL;
+    PyObject *l = PyList_New(0);
+    if (l == NULL)
+        return NULL;
+    for (int pass = 0; pass < 2; pass++)
+        for (Py_ssize_t r = 0; r < H->cap; r++) {
+            if (H->owner[r] != h || (pass == 0) != (r == t->primary))
+                continue;
+            PyObject *o = PyLong_FromSsize_t(r);
+            if (o == NULL || PyList_Append(l, o) < 0) {
+                Py_XDECREF(o);
+                Py_DECREF(l);
+                return NULL;
+            }
+            Py_DECREF(o);
+        }
+    return l;
+}
+
+/* Hyp.chain(handle) -> the primary's story: its rows from now back to the oldest kept */
+static PyObject *hyp_chain(PyObject *self, PyObject *arg)
+{
+    Hyp *H = (Hyp *)self;
+    long h = PyLong_AsLong(arg);
+    if (h == -1 && PyErr_Occurred())
+        return NULL;
+    HTrack *t = h_get(H, h);
+    if (t == NULL)
+        return NULL;
+    PyObject *l = PyList_New(0);
+    if (l == NULL)
+        return NULL;
+    for (int32_t r = t->primary; r >= 0; r = H->parent[r]) {
+        PyObject *o = PyLong_FromLong(r);
+        if (o == NULL || PyList_Append(l, o) < 0) {
+            Py_XDECREF(o);
+            Py_DECREF(l);
+            return NULL;
+        }
+        Py_DECREF(o);
+    }
+    return l;
+}
+
+/* Hyp.leaves(handle) -> [(row, probability)] the object's hypotheses with their probabilities in its cluster */
+static PyObject *hyp_leaves(PyObject *self, PyObject *arg)
+{
+    Hyp *H = (Hyp *)self;
+    long h = PyLong_AsLong(arg);
+    if (h == -1 && PyErr_Occurred())
+        return NULL;
+    HTrack *t = h_get(H, h);
+    if (t == NULL)
+        return NULL;
+    PyObject *l = PyList_New(t->nleaf);
+    if (l == NULL)
+        return NULL;
+    const HCl *c = t->cl >= 0 ? &H->cl[t->cl] : NULL;
+    int col = -1;
+    for (int i = 0; c && i < c->nt; i++)
+        if (c->tr[i] == h)
+            col = i;
+    for (int k = 0; k < t->nleaf; k++) {
+        double w = 0.0;
+        for (int g = 0; c && col >= 0 && g < c->ng; g++)
+            if (c->lf[(size_t)g * c->nt + col] == t->leaf[k])
+                w += exp(c->lw[g]);
+        PyObject *o = Py_BuildValue("(id)", (int)t->leaf[k], w);
+        if (o == NULL) {
+            Py_DECREF(l);
+            return NULL;
+        }
+        PyList_SetItem(l, k, o);
+    }
+    return l;
+}
+
+/* Hyp.start(S, row_values, kin, vehicle, id) -> (handle, row): an object put in from outside (tests, tools): one
+ * leaf with the given row (RROW numbers), a cluster of its own */
+static PyObject *hyp_start(PyObject *self, PyObject *args)
+{
+    Hyp *H = (Hyp *)self;
+    PyObject *oS, *orow, *okin;
+    double veh, idnum;
+    if (!PyArg_ParseTuple(args, "OOOdd", &oS, &orow, &okin, &veh, &idnum))
+        return NULL;
+    View vS;
+    Py_ssize_t cap;
+    if (store_get(oS, &vS, &cap) < 0)
+        return NULL;
+    PyObject *res = NULL;
+    double kin[4];
+    if (cap < H->cap || hyp_rows(H, cap) < 0 || rnums_get(okin, 4, kin, "kin") < 0) {
+        if (!PyErr_Occurred())
+            PyErr_SetString(PyExc_ValueError, "Hyp.start: a state array that is too small");
+        goto done;
+    }
+    int h = h_track_new(H);
+    int32_t r = h >= 0 ? h_take(H, h, -1) : -1;
+    int c = r >= 0 ? h_cluster_new(H, 1, 1) : -1;
+    if (c < 0) {
+        if (h >= 0)
+            h_track_free(H, h);
+        PyErr_SetString(PyExc_MemoryError, "Hyp.start: no free row");
+        goto done;
+    }
+    double *row = (double *)vS.b.buf + (Py_ssize_t)r * RROW;
+    if (rnums_get(orow, RROW, row, "row") < 0) {
+        h_track_free(H, h);
+        h_cluster_free(H, c);
+        goto done;
+    }
+    HTrack *t = &H->tr[h];
+    memcpy(t->kin, kin, sizeof(kin));
+    t->veh = veh;
+    t->idnum = idnum;
+    t->born = H->level;
+    t->leaf[0] = r;
+    t->nleaf = 1;
+    t->primary = r;
+    t->cl = c;
+    t->in_map = 1;
+    t->pp = 1.0;
+    t->pe = sigm(row[RO_M + M_L]);
+    row[RO_M + M_LEVEL] = (double)H->level;
+    H->cl[c].tr[0] = h;
+    H->cl[c].lf[0] = r;
+    H->cl[c].lw[0] = 0.0;
+    res = Py_BuildValue("(ii)", h, (int)r);
+done:
+    view_drop(&vS);
+    return res;
+}
+
+/* Hyp.info() -> the knobs, what is in use, the counters */
+static PyObject *hyp_info(PyObject *self, PyObject *unused)
+{
+    Hyp *H = (Hyp *)self;
+    int nt = 0, nc = 0, nl = 0, ng = 0, gmax = 0, tmax = 0;
+    for (int i = 0; i < H->ntr; i++)
+        if (H->tr[i].alive) {
+            nt++;
+            nl += H->tr[i].nleaf;
+        }
+    for (int i = 0; i < H->ncl; i++)
+        if (H->cl[i].alive) {
+            nc++;
+            ng += H->cl[i].ng;
+            if (H->cl[i].ng > gmax)
+                gmax = H->cl[i].ng;
+            if (H->cl[i].nt > tmax)
+                tmax = H->cl[i].nt;
+        }
+    return Py_BuildValue("{s:n,s:n,s:i,s:i,s:i,s:i,s:i,s:i,s:L,s:L,s:L,s:L,s:L,s:L,s:L,s:L,s:i,s:i,s:i,s:d,s:i,s:d}",
+                         "rows", H->cap, "rows_free", H->nfree, "objects", nt, "leaves", nl, "clusters", nc,
+                         "hypotheses", ng, "hypotheses_max", gmax, "cluster_max", tmax, "level", H->level,
+                         "scans", H->c_scans, "steps", H->c_leaves, "updates", H->c_children, "made", H->c_hyps,
+                         "assignments", H->c_murty, "births", H->c_births, "pruned", H->c_pruned,
+                         "n_scan", H->n_scan, "k_best", H->k_best, "max_leaves", H->max_leaves, "prune_ln", H->prune_ln,
+                         "keep_steps", H->keep_steps, "keep_s", H->keep_s);
+}
+
+/* Hyp.clusters() -> [(objects, [(log weight, leaves)])] for tools and tests */
+static PyObject *h_clusters(Hyp *H, int all)
+{
+    PyObject *l = PyList_New(0);
+    if (l == NULL)
+        return NULL;
+    for (int ci = 0; ci < H->ncl; ci++) {
+        const HCl *c = &H->cl[ci];
+        if (!c->alive && !all)
+            continue;
+        PyObject *tr = PyList_New(c->nt), *gs = PyList_New(c->ng), *item = NULL;
+        if (tr == NULL || gs == NULL)
+            goto bad;
+        for (int i = 0; i < c->nt; i++)
+            PyList_SetItem(tr, i, PyLong_FromLong(c->tr[i]));
+        for (int g = 0; g < c->ng; g++) {
+            PyObject *lf = PyList_New(c->nt);
+            if (lf == NULL)
+                goto bad;
+            for (int i = 0; i < c->nt; i++)
+                PyList_SetItem(lf, i, PyLong_FromLong(c->lf[(size_t)g * c->nt + i]));
+            PyObject *e = Py_BuildValue("(dN)", c->lw[g], lf);
+            if (e == NULL)
+                goto bad;
+            PyList_SetItem(gs, g, e);
+        }
+        item = PyTuple_Pack(2, tr, gs);
+        if (item == NULL || PyList_Append(l, item) < 0)
+            goto bad;
+        Py_DECREF(item);
+        Py_DECREF(tr);
+        Py_DECREF(gs);
+        continue;
+    bad:
+        Py_XDECREF(tr);
+        Py_XDECREF(gs);
+        Py_XDECREF(item);
+        Py_DECREF(l);
+        return NULL;
+    }
+    return l;
+}
+
+static PyObject *hyp_clusters(PyObject *self, PyObject *unused)
+{
+    return h_clusters((Hyp *)self, 0);
+}
+
+/* Hyp.dump() -> everything it holds as plain lists (tests record it; Hyp.load restores it) */
+static PyObject *hyp_dump(PyObject *self, PyObject *unused)
+{
+    Hyp *H = (Hyp *)self;
+    PyObject *rows = PyList_New(0), *trs = PyList_New(0), *cls = h_clusters(H, 1), *fr = PyList_New(H->nfree);
+    PyObject *res = NULL;
+    if (!rows || !trs || !cls || !fr)
+        goto done;
+    for (Py_ssize_t i = 0; i < H->nfree; i++)
+        PyList_SetItem(fr, i, PyLong_FromLong(H->freel[i]));
+    for (Py_ssize_t r = 0; r < H->cap; r++) {
+        if (H->owner[r] < 0)
+            continue;
+        PyObject *o = Py_BuildValue("(niii)", r, (int)H->parent[r], (int)H->nchild[r], (int)H->owner[r]);
+        if (o == NULL || PyList_Append(rows, o) < 0) {
+            Py_XDECREF(o);
+            goto done;
+        }
+        Py_DECREF(o);
+    }
+    for (int i = 0; i < H->ntr; i++) {
+        const HTrack *t = &H->tr[i];
+        PyObject *lv = PyList_New(t->alive ? t->nleaf : 0);
+        if (lv == NULL)
+            goto done;
+        for (int k = 0; t->alive && k < t->nleaf; k++)
+            PyList_SetItem(lv, k, PyLong_FromLong(t->leaf[k]));
+        PyObject *o = Py_BuildValue("(iiiiLddddddddN)", t->alive, t->in_map, (int)t->primary, (int)t->cl, t->alive ? t->born : -1LL, t->kin[0],
+                                    t->kin[1], t->kin[2], t->kin[3], t->veh, t->idnum, t->pe, t->pp, lv);
+        if (o == NULL || PyList_Append(trs, o) < 0) {
+            Py_XDECREF(o);
+            goto done;
+        }
+        Py_DECREF(o);
+    }
+    res = Py_BuildValue("{s:n,s:L,s:(iiididi),s:O,s:O,s:O,s:O}", "cap", H->cap, "level", H->level, "knobs", H->n_scan,
+                        H->k_best, H->max_leaves, H->prune_ln, H->keep_steps, H->keep_s, H->max_cluster, "rows", rows,
+                        "objects", trs, "clusters", cls, "free", fr);
+done:
+    Py_XDECREF(rows);
+    Py_XDECREF(trs);
+    Py_XDECREF(cls);
+    Py_XDECREF(fr);
+    return res;
+}
+
+/* Hyp.load(dump) -> None: this object made what `dump` recorded (it must be new: nothing in use) */
+static PyObject *hyp_load(PyObject *self, PyObject *d)
+{
+    Hyp *H = (Hyp *)self;
+    PyObject *rows, *trs, *cls, *fr, *knobs;
+    Py_ssize_t cap;
+    long long level;
+    if (!PyDict_Check(d) || !(rows = PyDict_GetItemString(d, "rows")) || !(trs = PyDict_GetItemString(d, "objects")) ||
+        !(cls = PyDict_GetItemString(d, "clusters")) || !(fr = PyDict_GetItemString(d, "free")) ||
+        !(knobs = PyDict_GetItemString(d, "knobs")) || !PyDict_GetItemString(d, "cap") || !PyDict_GetItemString(d, "level")) {
+        PyErr_SetString(PyExc_TypeError, "Hyp.load: what Hyp.dump gave is needed");
+        return NULL;
+    }
+    cap = PyLong_AsSsize_t(PyDict_GetItemString(d, "cap"));
+    level = PyLong_AsLongLong(PyDict_GetItemString(d, "level"));
+    int n_scan, k_best, max_leaves, keep_steps, max_cluster;
+    double prune_ln, keep_s;
+    if (PyErr_Occurred() || !PyArg_ParseTuple(knobs, "iiididi", &n_scan, &k_best, &max_leaves, &prune_ln, &keep_steps, &keep_s,
+                                              &max_cluster))
+        return NULL;
+    hyp_release(H);
+    H->n_scan = n_scan;
+    H->k_best = k_best;
+    H->max_leaves = max_leaves;
+    H->prune_ln = prune_ln;
+    H->keep_steps = keep_steps;
+    H->keep_s = keep_s;
+    H->max_cluster = max_cluster;
+    H->level = level;
+    if (hyp_rows(H, cap) < 0)
+        return NULL;
+    H->nfree = 0;
+    for (Py_ssize_t i = 0; i < PyList_Size(fr); i++)
+        H->freel[H->nfree++] = (int32_t)PyLong_AsLong(PyList_GetItem(fr, i));
+    for (Py_ssize_t i = 0; i < PyList_Size(rows); i++) {
+        Py_ssize_t r;
+        int p, nc, ow;
+        if (!PyArg_ParseTuple(PyList_GetItem(rows, i), "niii", &r, &p, &nc, &ow) || r < 0 || r >= cap) {
+            if (!PyErr_Occurred())
+                PyErr_SetString(PyExc_ValueError, "Hyp.load: a row outside the state array");
+            return NULL;
+        }
+        H->parent[r] = p;
+        H->nchild[r] = nc;
+        H->owner[r] = ow;
+    }
+    for (Py_ssize_t i = 0; i < PyList_Size(trs); i++) {
+        int h = h_track_new(H);
+        if (h < 0)
+            return PyErr_NoMemory();
+        HTrack *t = &H->tr[h];
+        int alive, in_map, prim, cl;
+        PyObject *lv;
+        if (!PyArg_ParseTuple(PyList_GetItem(trs, i), "iiiiLddddddddO", &alive, &in_map, &prim, &cl, &t->born, &t->kin[0],
+                              &t->kin[1], &t->kin[2], &t->kin[3], &t->veh, &t->idnum, &t->pe, &t->pp, &lv))
+            return NULL;
+        t->in_map = in_map;
+        t->primary = prim;
+        t->cl = -1;
+        for (Py_ssize_t k = 0; k < PyList_Size(lv); k++)
+            if (h_leaf_add(t, (int32_t)PyLong_AsLong(PyList_GetItem(lv, k))) < 0)
+                return PyErr_NoMemory();
+        if (!alive) {                                    /* a handle that was free: free here too, its number kept */
+            t->alive = 0;
+            t->born = -1;
+        }
+    }
+    for (int i = 0; i < H->ntr; i++)
+        if (!H->tr[i].alive) {
+            PyMem_Free(H->tr[i].leaf);
+            H->tr[i].leaf = NULL;
+            H->tr[i].nleaf = H->tr[i].leafcap = 0;
+        }
+    for (Py_ssize_t i = 0; i < PyList_Size(cls); i++) {
+        PyObject *tr, *gs;
+        if (!PyArg_ParseTuple(PyList_GetItem(cls, i), "OO", &tr, &gs))
+            return NULL;
+        int nt = (int)PyList_Size(tr), ng = (int)PyList_Size(gs);
+        int c = h_cluster_new(H, nt, ng);
+        if (c < 0)
+            return PyErr_NoMemory();
+        for (int k = 0; k < nt; k++) {
+            H->cl[c].tr[k] = (int32_t)PyLong_AsLong(PyList_GetItem(tr, k));
+            if (H->cl[c].tr[k] >= 0 && H->cl[c].tr[k] < H->ntr)
+                H->tr[H->cl[c].tr[k]].cl = c;
+        }
+        for (int g = 0; g < ng; g++) {
+            PyObject *lf;
+            if (!PyArg_ParseTuple(PyList_GetItem(gs, g), "dO", &H->cl[c].lw[g], &lf))
+                return NULL;
+            for (int k = 0; k < nt; k++)
+                H->cl[c].lf[(size_t)g * nt + k] = (int32_t)PyLong_AsLong(PyList_GetItem(lf, k));
+        }        if (nt == 0)                                     /* a slot that was free: its number kept */
+            H->cl[c].alive = 2;
+    }
+    for (int c = 0; c < H->ncl; c++)
+        if (H->cl[c].alive == 2)
+            h_cluster_free(H, c);
+    if (PyErr_Occurred())
+        return NULL;
+    Py_RETURN_NONE;
+}
+
+static PyMethodDef hyp_methods[] = {
+    {"scan", hyp_scan, METH_VARARGS, "one scan: the hypotheses of every cluster, the objects' primaries"},
+    {"drop", hyp_drop, METH_VARARGS, "an object taken out"},
+    {"rows", hyp_rows_of, METH_O, "every row of an object, the primary first"},
+    {"chain", hyp_chain, METH_O, "the primary's rows from now back"},
+    {"leaves", hyp_leaves, METH_O, "an object's hypotheses and their probabilities"},
+    {"start", hyp_start, METH_VARARGS, "an object put in from outside"},
+    {"info", hyp_info, METH_NOARGS, "knobs, sizes, counters"},
+    {"clusters", hyp_clusters, METH_NOARGS, "the clusters' tables"},
+    {"dump", hyp_dump, METH_NOARGS, "everything it holds, as plain lists"},
+    {"load", hyp_load, METH_O, "what dump recorded, restored"},
+    {NULL, NULL, 0, NULL}};
+static PyType_Slot hyp_slots[] = {
+    {Py_tp_new, hyp_new}, {Py_tp_init, hyp_init}, {Py_tp_dealloc, hyp_dealloc}, {Py_tp_methods, hyp_methods}, {0, NULL}};
+static PyType_Spec hyp_spec = {"chris_integrator.native._chris_native.Hyp", sizeof(Hyp), 0, Py_TPFLAGS_DEFAULT, hyp_slots};
+
+/* radar_kbest(cost (n, m), k) -> [(cost, [column of each row])]: the k cheapest assignments of n rows to m >= n
+ * columns in order (the hypotheses' ranked assignment, for tests and tools); a pair that may not be: >= 1e17 */
+static PyObject *n_radar_kbest(PyObject *self, PyObject *args)
+{
+    PyObject *oc;
+    int k;
+    if (!PyArg_ParseTuple(args, "Oi", &oc, &k))
+        return NULL;
+    View v;
+    if (view_get(oc, &v, 0, 'd', 2, "cost") < 0)
+        return NULL;
+    int n = (int)v.b.shape[0], m = (int)v.b.shape[1];
+    PyObject *res = NULL;
+    Arena ar = {NULL, 0};
+    if (n > m || k < 1 || n < 1) {
+        PyErr_SetString(PyExc_ValueError, "radar_kbest: 1 <= rows <= columns, k >= 1");
+        goto done;
+    }
+    int *cols = (int *)ar_get(&ar, (size_t)(k * n) * sizeof(int));
+    double *costs = (double *)ar_get(&ar, (size_t)k * sizeof(double));
+    int ns = cols && costs ? murty(&ar, DATA(v), n, m, k, cols, costs) : -1;
+    if (ns < 0) {
         PyErr_NoMemory();
         goto done;
     }
-    double *it = buf, *v = it + 4 * n, *w = v + n, *cw = w + n;
-    if (rows_get(oit, n, 4, it, "items") < 0)
-        goto done;
-    double *A = (double *)vS.b.buf;
-    for (Py_ssize_t q = 0; q < n; q++) {
-        const double *row = A + rows[q] * RROW, *P = row + RO_P;
-        double z[4], H[4 * RN];
-        r_h(&sen, (int)it[4 * q], it[4 * q + 1], row + RO_X, pose, z, H);
-        double s00 = 0.0;
-        for (int j = 0; j < RN; j++) {
-            double t = 0.0;
-            for (int i = 0; i < RN; i++)
-                t = i ? t + H[i] * P[i * RN + j] : H[i] * P[i * RN + j];
-            s00 = j ? s00 + t * H[j] : t * H[j];
+    res = PyList_New(ns);
+    for (int q = 0; res && q < ns; q++) {
+        PyObject *l = PyList_New(n);
+        if (l == NULL) {
+            Py_CLEAR(res);
+            break;
         }
-        s00 = s00 + it[4 * q + 3];
-        v[q] = it[4 * q + 2] - z[0];
-        w[q] = 1.0 / s00;
+        for (int i = 0; i < n; i++)
+            PyList_SetItem(l, i, PyLong_FromLong(cols[q * n + i]));
+        PyObject *t = Py_BuildValue("(dN)", costs[q], l);
+        if (t == NULL) {
+            Py_CLEAR(res);
+            break;
+        }
+        PyList_SetItem(res, q, t);
     }
-    double m = r_wmedian(v, w, n, k, cw);
-    res = Py_BuildValue("(dd)", m, np_sum(w, n, 1));
 done:
-    PyMem_Free(rows);
-    PyMem_Free(buf);
-    PyMem_Free(k);
-    view_drop(&vS);
+    ar_free(&ar);
+    view_drop(&v);
     return res;
 }
 
@@ -7674,7 +9885,6 @@ static PyMethodDef methods[] = {
     {"round_lists", n_round_lists, METH_VARARGS, "np.round(a, decimals).tolist(), optionally of np.sqrt(a)"},
     {"geom_centre", n_geom_centre, METH_VARARGS, "the road geometry's centre line lists (RoadGeometryFusion._centre)"},
     {"geom_reach", n_geom_reach, METH_VARARGS, "how far the camera's centre line reaches (RoadGeometryFusion._reach)"},
-    {"radar_advance", n_radar_advance, METH_VARARGS, "Tracker._advance_all on the objects' rows"},
     {"radar_peek", n_radar_peek, METH_VARARGS, "Tracker.peek: where objects will be (x, P, mu), into given arrays"},
     {"radar_peek_pos", n_radar_peek_pos, METH_VARARGS, "Tracker.peek_many, the place only (x, y and its covariance)"},
     {"radar_h", n_radar_h, METH_VARARGS, "a sensor's measurement function (sensors.py h) into given arrays"},
@@ -7684,15 +9894,13 @@ static PyMethodDef methods[] = {
     {"radar_transition1", n_radar_transition1, METH_VARARGS, "the switching probabilities over dt (models.transition)"},
     {"radar_marginals", n_radar_marginals, METH_VARARGS, "tracker.marginals into a given array"},
     {"radar_assign", n_radar_assign, METH_O, "tracker.assign"},
-    {"radar_scan", n_radar_scan, METH_VARARGS, "one scan's association (Tracker.process): pairs, p_detect, coverage"},
-    {"radar_update", n_radar_update, METH_VARARGS, "the update of a scan's pairs (Tracker._update's arithmetic)"},
-    {"radar_first_rate", n_radar_first_rate, METH_VARARGS, "a new object's first scale rate into its hypotheses (Tracker._first_rate)"},
+    {"radar_peek_models", n_radar_peek_models, METH_VARARGS, "one row's motion hypotheses after dt, each by itself"},
+    {"radar_kbest", n_radar_kbest, METH_VARARGS, "the k cheapest assignments in order (Murty)"},
     {"radar_frame", n_radar_frame, METH_VARARGS, "the output's per-object numbers (box.py Radar.frame)"},
     {"radar_life", n_radar_life, METH_VARARGS, "Tracker.manage's numbers: stillness, finiteness, out-of-view place"},
     {"radar_merge", n_radar_merge, METH_VARARGS, "Tracker._merge's geometry: the near pairs and their test"},
     {"radar_check", n_radar_check, METH_VARARGS, "Tracker._check for one expectation"},
     {"radar_register", n_radar_register, METH_VARARGS, "Tracker._register for one sensor: the shared offset, taken out"},
-    {"radar_common", n_radar_common, METH_VARARGS, "Tracker._common's numbers: the scan's angle innovations, their weighted median"},
     {NULL, NULL, 0, NULL}};
 
 static struct PyModuleDef moduledef = {PyModuleDef_HEAD_INIT, "_chris_native",
@@ -7726,6 +9934,11 @@ PyMODINIT_FUNC PyInit__chris_native(void)
     Py_INCREF(SelfWinType);
     Py_INCREF(StreamType);
     if (PyModule_AddObject(m, "SelfWindow", SelfWinType) < 0 || PyModule_AddObject(m, "StreamState", StreamType) < 0)
+        goto fail;
+    if ((HypType = PyType_FromSpec(&hyp_spec)) == NULL)
+        goto fail;
+    Py_INCREF(HypType);
+    if (PyModule_AddObject(m, "Hyp", HypType) < 0)
         goto fail;
 #ifdef __FP_FAST_FMA
     /* informational: the target has a fused multiply-add; the build must not contract (see the Makefile) */

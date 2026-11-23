@@ -570,140 +570,30 @@ needs_radar = pytest.mark.skipif(N.radar is None, reason="the native core is not
 
 
 
-def _msg_diffs(u, v, path, out):
-    if isinstance(u, dict) and isinstance(v, dict):
-        if list(u) != list(v):
-            out.append((path, "keys"))
-            return
-        for k in u:
-            _msg_diffs(u[k], v[k], path + "." + k, out)
-    elif isinstance(u, list) and isinstance(v, list):
-        if len(u) != len(v):
-            out.append((path, "length"))
-            return
-        for i, (a, b) in enumerate(zip(u, v)):
-            _msg_diffs(a, b, "%s[%d]" % (path, i), out)
-    elif type(u) is not type(v) or repr(u) != repr(v):
-        out.append((path, u, v))
-
-
-def _last_digit(*vs):
-    """One unit of the last printed digit of the numbers (the finer of them): 0.01 for 7.47, 0.001 for 0.125."""
-    return min(10.0 ** -len(repr(v).split(".")[1]) if "." in repr(v) and "e" not in repr(v) else 1.0 for v in vs)
-
-
-def _golden():
-    z = np.load(os.path.join(HERE, "tests", "data", "radar_golden.npz"))
-    cases = json.loads(bytes(z["index"]).decode())
-
-    def dec(v):
-        if isinstance(v, dict) and "array" in v:
-            return z[v["array"]].copy()
-        if isinstance(v, list):
-            return [dec(x) for x in v]
-        if isinstance(v, dict):
-            return {k: dec(x) for k, x in v.items()}
-        return v
-    return [dict(c, args=dec(c["args"]), ref=dec(c["ref"]), rows=dec(c.get("rows"))) for c in cases]
-
-
-def _rel(a, b):
-    a, b = np.asarray(a, float), np.asarray(b, float)
-    return float(np.max(np.abs(a - b) / np.maximum(np.abs(b), 1.0), initial=0.0))
-
-
-def _rows_rel(a, b):
-    """Rows of objects: the largest difference relative to each block's largest magnitude."""
-    from chris_integrator.radar import tracker as T
-    worst = 0.0
-    for name, lo, hi, sh in T._OFF:
-        u, v = a[:, lo:hi], b[:, lo:hi]
-        if name in ("_xs", "_Ps"):
-            u, v = u.reshape(len(a) * 3, -1), v.reshape(len(b) * 3, -1)
-        scale = np.maximum(np.abs(v).max(axis=1, keepdims=True), 1.0)
-        worst = max(worst, float((np.abs(u - v) / scale).max(initial=0.0)))
-    return worst
-
-
 @needs_radar
 def test_radar_golden():
-    """The native radar functions against what the Python reference gave for the same inputs (frozen in
-    tests/data/radar_golden.npz by tests/make_radar_golden.py while the reference existed): marginals and assignment
-    the same bits, the measurement functions to the last bit of libm; association, update, advance, peeks, upkeep, merge geometry, checks,
-    registration, the common pitch and the message's numbers: the same discrete results, numbers to rounding."""
+    """Calls of the native radar functions and of the hypotheses (Hyp.scan, Hyp.drop) recorded on simulated drives
+    (tests/data/radar_golden.npz, tests/data/make_radar_golden.py), made again: the same results, the same rows
+    written, the same hypotheses afterwards; ints, texts and truth values the same, numbers to rounding."""
+    import radar_golden_lib as G
+    cases, codec = G.load(os.path.join(HERE, "tests", "data", "radar_golden.npz"))
     seen = {}
-    for c in _golden():
-        fn, a, ref = c["fn"], list(c["args"]), c["ref"]
-        seen[fn] = seen.get(fn, 0) + 1
-        S = c["rows"]
-        if S is not None:
-            a[0] = S
-        if fn == "radar_h":
-            z, H = np.empty(4), np.empty((4, 8))
-            m = C.radar_h(a[0], a[1], a[2], a[3], a[4], z, H)
-            # the same bits on the machine that made them; elsewhere libm's atan2, exp, log may differ in the last bit
-            assert _rel(z[:m], ref[0]) < 1e-13 and _rel(H[:m], np.reshape(ref[1], (m, 8))) < 1e-13
-        elif fn == "radar_marginals":
-            L = np.reshape(a[0], c["shape"])
-            out = np.empty(L.shape)
-            C.radar_marginals(np.ascontiguousarray(L), out)
-            assert np.array_equal(out, np.reshape(ref, L.shape))
-        elif fn == "radar_assign":
-            assert C.radar_assign(np.ascontiguousarray(np.reshape(a[0], c["shape"]))) == [tuple(p) for p in ref]
-        elif fn == "radar_scan":
-            nt = len(a[1])
-            pd, cov = np.empty(nt), np.empty(nt)
-            D = np.reshape(a[5], (-1, 13)) if len(a[5]) else np.zeros((0, 13))
-            pairs = C.radar_scan(S, a[1], a[2], a[3], a[4], D, a[6], a[7], a[8], pd, cov, None, None, None)
-            assert [(p[0], p[1]) for p in pairs] == [(int(p[0]), int(p[1])) for p in ref[0]]
-            for p, q in zip(pairs, ref[0]):
-                assert _rel(p[2:], q[2:]) < 1e-9, (p, q)
-            assert _rel(pd, ref[1]) < 1e-12 and _rel(cov, ref[2]) < 1e-12
-        elif fn == "radar_update":
-            out = C.radar_update(S, a[1], a[2], a[3], np.reshape(a[4], (-1, 13)), a[5], a[6])
-            assert _rel(out, ref["out"]) < 1e-9
-            assert _rows_rel(S[a[1]], np.reshape(ref["after"], (len(a[1]), -1))) < 1e-7
-        elif fn == "radar_advance":
-            C.radar_advance(S, a[1], a[2], a[3], a[4], a[5], a[6])
-            assert _rows_rel(S[a[1]], np.reshape(ref["after"], (len(a[1]), -1))) < 1e-9
-        elif fn == "radar_peek_pos":
-            out = np.empty((len(a[1]), 6))
-            C.radar_peek_pos(S, a[1], a[2], a[3], a[4], out)
-            assert _rel(out, ref) < 1e-9
-        elif fn == "radar_life":
-            out = C.radar_life(S, *a[1:])
-            for u, v in zip(out, ref):
-                assert u[1] == v[1] and (u[2] is None) == (v[2] is None)
-                assert _rel([x for x in u if x is not None and not isinstance(x, bool)],
-                            [x for x in v if x is not None and not isinstance(x, bool)]) < 1e-9
-        elif fn == "radar_merge":
-            assert [tuple(r) for r in C.radar_merge(S, *a[1:])] == [tuple(r) for r in ref]
-        elif fn == "radar_frame":
-            out = C.radar_frame(S, *a[1:])
-            for u, v in zip(out, ref):
-                for k, (x, y) in enumerate(zip(u, v)):
-                    if k in (14, 18):                     # the offset and the threat probability as they are
-                        assert _rel(x, y) < 1e-9
-                        continue
-                    d = []
-                    _msg_diffs(y, x, "", d)
-                    for item in d:
-                        assert len(item) == 3 and abs(item[1] - item[2]) <= 1.01 * _last_digit(item[1], item[2]), (k, item)
-        elif fn == "radar_check":
-            out = C.radar_check(S, *a[1:])
-            assert (out is None) == (ref is None) and (out is None or _rel(out, ref) < 1e-9)
-        elif fn == "radar_register":
-            out = C.radar_register(S, *a[1:])
-            assert _rel(out, ref["out"]) < 1e-9
-            rows = sorted(set(a[1]) | set(a[3]))
-            assert _rows_rel(S[rows], np.reshape(ref["after"], (len(rows), -1))) < 1e-9
-        elif fn == "radar_common":
-            assert _rel(C.radar_common(S, *a[1:]), ref) < 1e-9
-        else:
-            raise AssertionError("a golden case of an unknown function: " + fn)
-    assert all(seen.get(k, 0) >= 3 for k in ("radar_h", "radar_marginals", "radar_assign", "radar_scan", "radar_update",
-                                             "radar_advance", "radar_peek_pos", "radar_life", "radar_merge",
-                                             "radar_frame", "radar_check", "radar_register", "radar_common")), seen
+    for n, c in enumerate(cases):
+        seen[c["fn"]] = seen.get(c["fn"], 0) + 1
+        ret, args, hyp = G.replay(C, c, codec)
+        where = "case %d %s" % (n, c["fn"])
+        assert G.same(ret, codec.dec(c["ret"]), where + " result") is None
+        for i, a in c["post"].items():
+            if isinstance(a, dict) and "rows" in a:      # the state array: the rows the call changed
+                rows = codec.arrays[a["rows"] + "i"]
+                assert G.same(args[int(i)][rows], codec.arrays[a["rows"]], where + " rows") is None
+            else:
+                assert G.same(args[int(i)], codec.dec(a), where + " argument %s" % i) is None
+        if c["hyp_after"] is not None:
+            assert G.same(hyp, codec.dec(c["hyp_after"]), where + " hypotheses") is None
+    need = ("Hyp.scan", "Hyp.drop", "radar_h", "radar_peek_pos", "radar_life", "radar_merge", "radar_frame", "radar_check",
+            "radar_register", "radar_combine_rows", "radar_marginals", "radar_assign", "radar_kbest")
+    assert all(seen.get(k, 0) >= 3 for k in need), seen
 
 
 RADAR_DIGEST_RUNS = (("parked_street", 1, True, False), ("adjacent", 1, False, False), ("junction", 1, False, True))
@@ -759,22 +649,33 @@ def test_radar_messages_digests():
 
 @needs_radar
 def test_radar_single_hypothesis_functions():
-    """models.predict / still / transition (one hypothesis, for tests and tools) give what the tracker's batch
-    functions give: the free estimate's prediction of radar_advance is models.predict of the steady hypothesis."""
+    """models.predict / still / transition (one hypothesis, for tests and tools) give what the tracker's rows get:
+    the free estimate's step in a scan (Hyp.scan with no detections) is models.predict of the steady hypothesis."""
     from chris_integrator.radar import models as M, tracker as T
+    from chris_integrator.radar.sensors import MicrowaveRadar
     g = np.random.default_rng(41)
-    for it in range(200):
-        st = T.State(4)
+    sen = MicrowaveRadar((2.0, 0.0, 0.0)).native()
+    for it in range(100):
+        st = T.State(8)
+        H = C.Hyp(8, 3, 4, 4, 9.0, 8, 2.0, 8)
         a = g.standard_normal((8, 8))
         P = a @ a.T + np.eye(8) * 0.1
         x = g.standard_normal(8) * [30, 30, 10, 10, 2, 2, 0.01, 0.3]
-        st.a[0, 219:227], st.a[0, 227:291] = x, P.ravel()
-        st.a[0, 0:24], st.a[0, 24:216], st.a[0, 216:219] = np.tile(x, 3), np.tile(P.ravel(), 3), (0.2, 0.5, 0.3)
-        dt = float(g.choice([0.05, 0.4, 2.0]))
+        row = np.zeros(T.ROW)
+        row[219:227], row[227:291] = x, P.ravel()
+        row[0:24], row[24:216], row[216:219] = np.tile(x, 3), np.tile(P.ravel(), 3), (0.2, 0.5, 0.3)
         label = ["car", "human", None][it % 3]
-        C.radar_advance(st.a, [0], [dt], [M._KIN4.get(label) or M._KIN4[None]], M._native_par(M.CFG), [(0.0, 0.0)], (0.0, 0.0, 0.0))
+        kin = M._KIN4.get(label) or M._KIN4[None]
+        h, r0 = H.start(st.a, row, kin, 0.0, 1.0)
+        dt = float(g.choice([0.05, 0.4, 2.0]))
+        out, births, dead, bias = H.scan(st.a, [h], [(dt, 0.0, 0.0) + tuple(kin) + (0.0, 1.0, 1.0)], dt,
+                                         (0.0, 0.0, 0.0, 0.0, 0.0, 0.0), sen, 1, np.zeros((0, 20)), None, None, 0.0,
+                                         (9.0, 13.8, 16.3, 18.5, 0.25, 0.9, 3.0, 0.01, 0.03, 0.4, 1.0, 3.0, 0.8),
+                                         M._native_par(M.CFG), (2.0, 0.01), (0.2, 0.5, 2.5, 0.3, 3.0, 0.15, 0.01, 0.0), None)
+        r1 = out[0][1]
+        assert out[0][0] and r1 != r0 and H.chain(h) == [r1, r0]
         xf, Pf = M.predict(M.CV, x, P, dt, label)
-        assert np.array_equal(st.a[0, 219:227], xf) and np.array_equal(st.a[0, 227:291], Pf.ravel())
+        assert np.array_equal(st.a[r1, 219:227], xf) and np.array_equal(st.a[r1, 227:291], Pf.ravel())
     T3 = M.transition(0.2, (0.3, 0.1))
     assert T3.shape == (3, 3) and np.allclose(T3.sum(axis=1), 1.0)
     assert M.still(np.zeros(8), np.eye(8) * 1e-4, 0.7) > 0.99
@@ -812,42 +713,56 @@ def test_radar_object_gone_wrong_is_dropped():
 
 @needs_radar
 def test_radar_update_keeps_the_covariance_symmetric_and_positive():
-    """The update's covariance is in Joseph form: symmetric to the bit and positive semi-definite whatever the
-    detection's weight and however much of a variance it takes away (detections up to ten orders of magnitude more
-    precise than the state, far beyond any sensor: the form P - K S K^T subtracts nearly equal numbers there and
-    goes indefinite), also after many in a row."""
+    """The update's covariance is in Joseph form: symmetric to the bit and positive semi-definite however much of a
+    variance a detection takes away (detections up to ten orders of magnitude more precise than the state, far
+    beyond any sensor: the form P - K S K^T subtracts nearly equal numbers there and goes indefinite), also after
+    many in a row. The detections go in through the hypotheses' scan, one object, one detection at its place."""
     from chris_integrator.radar import models as M, tracker as T
     from chris_integrator.radar.sensors import CameraBoxes, MicrowaveRadar
     g = np.random.default_rng(7)
     cam = CameraBoxes({"bearing_min": -0.6, "bearing_max": 0.6, "ground_min_m": 12.0}, None, 975.0, 1.22, 14.0)
     mw = MicrowaveRadar((2.0, 0.0, 0.0))
-    worst = 0.0
-    for it in range(300):
-        st = T.State(1)
+    acfg = (1e9, 1e9, 1e9, 1e9, 0.25, 0.9, 3.0, 0.01, 0.03, 0.4, 1.0, 3.0, 0.8)     # no gate: every pair may be
+    worst, taken = 0.0, 0
+    for it in range(200):
+        st = T.State(64)
+        H = C.Hyp(64, 0, 1, 1, 30.0, 2, 1.0, 4)
         a = g.standard_normal((8, 8))
-        scale = np.array([10.0, 3.0, 8.0, 3.0, 1.0, 1.0, 0.01, 0.2]) * 10.0 ** g.uniform(-2, 1)
+        scale = np.array([10.0, 3.0, 8.0, 3.0, 1.0, 1.0, 0.01, 0.2]) * 10.0 ** g.uniform(-2, 0.5)
         P = (a @ a.T + np.eye(8) * 1e-3) * np.outer(scale, scale)
-        x = np.array([g.uniform(8, 70), g.uniform(-8, 8), g.normal(0, 8), g.normal(0, 2), 0.0, 0.0, 0.0, math.log(1.5)])
-        st.a[0, 0:24], st.a[0, 24:216], st.a[0, 216:219] = np.tile(x, 3), np.tile(P.ravel(), 3), (0.3, 0.5, 0.2)
-        st.a[0, 219:227], st.a[0, 227:291] = x, P.ravel()
-        C.radar_combine_rows(st.a, [0])
+        x = np.array([g.uniform(15, 60), g.uniform(-6, 6), g.normal(0, 8), g.normal(0, 2), 0.0, 0.0, 0.0, math.log(1.5)])
+        row = np.zeros(T.ROW)
+        row[0:24], row[24:216], row[216:219] = np.tile(x, 3), np.tile(P.ravel(), 3), (0.3, 0.5, 0.2)
+        row[219:227], row[227:291] = x, P.ravel()
+        row[T.OFF["m"][0] + T.M_L], row[T.OFF["m"][0] + T.M_HITS] = 5.0, 5.0
+        kin = M._KIN4["car"]
+        h, r = H.start(st.a, row, kin, 1.0, 1.0)
+        C.radar_combine_rows(st.a, [r])
         pose = (0.0, 0.0, 0.0, 10.0, 0.0, 0.0)
-        for step in range(12):
-            r = math.hypot(x[0], x[1])
+        for step in range(10):
+            xc = st.a[r, 291:299]
+            rng = math.hypot(xc[0], xc[1])
             if it % 2:
-                sen, D = mw, [0.0, 0.0, 0.0, 0.0, 0.0, r + g.normal(0, 0.3), math.atan2(x[1], x[0]), -10.0, 0.0]
+                sen = mw
+                D = [2.0, 0.0, 0.0, 0.0, 0.0, math.hypot(xc[0] - 2.0, xc[1]), math.atan2(xc[1], xc[0] - 2.0), -10.0, 0.0]
                 Rv = [10.0 ** g.uniform(-8, -1), 10.0 ** g.uniform(-11, -4), 10.0 ** g.uniform(-8, -1), 0.0]
             else:
                 sen = cam
-                D = [2.0, 0.0, 0.0, 1.0, 0.05, math.atan2(1.22, r), math.atan2(x[1], x[0]), cam.logf + x[7] - math.log(max(x[0], 0.5)), 0.0]
+                D = [2.0, 0.0, 0.0, 1.0, 0.05, math.atan2(1.22, rng), math.atan2(xc[1], xc[0]),
+                     cam.logf + xc[7] - math.log(max(xc[0], 0.5)), 0.0]
                 Rv = [10.0 ** g.uniform(-11, -5), 10.0 ** g.uniform(-11, -5), 10.0 ** g.uniform(-9, -2), 0.0]
-            beta_pair = float(g.choice([float("nan"), 0.3, 0.9]))
-            C.radar_update(st.a, [0], sen.native(), pose, np.array([D + Rv]), [(0.55, 1e-3, beta_pair, 5.0)], (2.0, 0.01))
+            out, _, _, _ = H.scan(st.a, [h], [(0.0, 0.0, 0.0) + tuple(kin) + (1.0, 1.0, 1.0)], 0.0, pose, sen.native(), 1,
+                                  np.array([D + Rv + [0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0]]), None, None, 0.0, acfg,
+                                  M._native_par(M.CFG), (2.0, 0.01), (0.2, 0.5, 2.5, 0.3, 3.0, 0.15, 0.01, 0.0), None)
+            assert out[0][0]
+            r = out[0][1]
+            taken += st.a[r, T.OFF["m"][0] + T.M_DET] >= 0.0
             for lo, n in ((24, 3), (227, 1), (299, 1)):
                 for k in range(n):
-                    Pk = st.a[0, lo + 64 * k:lo + 64 * (k + 1)].reshape(8, 8)
+                    Pk = st.a[r, lo + 64 * k:lo + 64 * (k + 1)].reshape(8, 8)
                     assert np.array_equal(Pk, Pk.T)
+                    assert (np.diag(Pk) >= 0.0).all()
                     d = np.sqrt(np.maximum(np.diag(Pk), 1e-300))
                     worst = min(worst, float(np.linalg.eigvalsh(Pk / np.outer(d, d)).min()))
-                    assert (np.diag(Pk) >= 0.0).all()
+    assert taken > 1000, taken                           # the detections were taken
     assert worst > -1e-9, worst                          # of the correlation matrix: positive to rounding

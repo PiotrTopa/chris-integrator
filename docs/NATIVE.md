@@ -7,8 +7,8 @@ The module is part of the package: it is required, and every function in it exis
 pure-Python implementation of what is native, and no switch between two.
 
     python -m chris_integrator.native      the module in use, and its self-test on this machine
-    GET /v2/health  ->  "native": {"active": true, "implementation": "native", "parts": [...], "version": 7, "module": "..."}
-    the daemon's first log lines: "native core version 7 (_chris_native.abi3.so; json, round, interp, ekf, lanes, radar)"
+    GET /v2/health  ->  "native": {"active": true, "implementation": "native", "parts": [...], "version": 8, "module": "..."}
+    the daemon's first log lines: "native core version 8 (_chris_native.abi3.so; json, round, interp, ekf, lanes, radar)"
 
 A package without the module (or with one of another version) does not import: the error says that the native
 core is not built, does not load, or is of the wrong version, and how to build it (below).
@@ -56,11 +56,10 @@ ZeroDivisionError; a row's prediction, value and variance are read as floats (`f
 becomes a float of the same value: the monitors hold floats where the Python held numpy scalars (the same bits;
 only `round()` of a value next to a decimal tie could differ, numpy rounding by its own rule); a state that is
 not float64 is made a float64 copy; a stream's value beyond 2^53 is read as the nearest double.
-| `radar` | `radar_scan` (one scan's association: p_detect, coverage, the map's density, gate, likelihoods of the hypotheses, the box feature, the pairings' probabilities by loopy belief propagation, the assignment), `radar_update` (every pair of a scan: hypotheses, free estimate, NIS, model probabilities, existence increment, combination), `radar_common`, `radar_check`, `radar_register` (radar/tracker) | the tracker's arithmetic for a scan | golden: pairs and assignment the same; numbers to rounding (below) |
-| `radar` | `radar_first_rate` (radar/tracker: a new object's first scale rate into its hypotheses) | one row into every hypothesis and the free estimate, the hypotheses weighed | the tracker's tests |
-| `radar` | `radar_advance`, `radar_peek`, `radar_peek_pos`, `radar_life`, `radar_merge`, `radar_combine_rows` (radar/tracker, on the rows of the tracker's state array) | the motion model and the objects' upkeep | golden: to rounding |
-| `radar` | `radar_frame` (radar/box) | the message's objects: their numbers, flags with their hysteresis, the dicts | golden: to rounding (printed digits the same but for a last digit now and then); digests of three drives' messages (x86-64) |
-| `radar` | `radar_h` (radar/sensors: camera kinds b, rb, rbh, bt with and without the scale-rate row, microwave radar, position), `radar_marginals`, `radar_assign`, `radar_predict1`, `radar_still1`, `radar_transition1` (radar/models: one hypothesis) | measurement functions, pairings' probabilities, assignment, one hypothesis' step | golden: marginals and assignment the bits, measurement functions to the last bit of libm |
+| `radar` | `Hyp` (radar/tracker: the objects' trees of hypotheses, the clusters and their global hypotheses; `scan`: one scan's step of every leaf, gate and likelihood ratios, the scan's common angle, clusters, ranked assignments (Murty), births, updates in Joseph form, N-scan pruning; `drop`, `rows`, `chain`, `leaves`, `start`, `info`, `clusters`, `dump`, `load`) | which detection is whose, over several scans (docs/RADAR.md) | golden: calls of `scan` and `drop` on simulated drives, the hypotheses and rows after them (discrete results the same, numbers to rounding) |
+| `radar` | `radar_peek`, `radar_peek_pos`, `radar_peek_models`, `radar_life`, `radar_merge`, `radar_check`, `radar_register`, `radar_combine_rows` (radar/tracker, on rows of the state array) | the motion model without committing, and the objects' upkeep | golden: to rounding |
+| `radar` | `radar_frame` (radar/box) | the message's objects: their numbers, flags with their hysteresis, the dicts | golden: to rounding; digests of three drives' messages (x86-64) |
+| `radar` | `radar_h` (radar/sensors: camera kinds b, rb, rbh, bt with and without the scale-rate row, microwave radar, position), `radar_marginals`, `radar_assign`, `radar_kbest`, `radar_predict1`, `radar_still1`, `radar_transition1` (one hypothesis; tests and tools) | measurement functions, pairings' probabilities, assignment, ranked assignments, one hypothesis' step | golden |
 
 The lane tracker's steps are exact because its arithmetic is elementwise, and its two means over the gate points
 are added in sequence, as numpy adds a masked selection. The road geometry's arc length is a sequential sum of
@@ -74,27 +73,29 @@ last printed digit; lane report L50 has the counts.
 
 ### The radar: native only
 
-Since native version 6 the radar (`chris_integrator/radar`) has no Python implementation of its arithmetic either:
-the motion model, the measurement functions, a scan's association and update, the objects' upkeep and the
-message's objects are C only. Python keeps the objects' life (states,
-votes, records, merging), the message's assembly around the objects, and the glue. The objects' numbers live in one
-float64 array of the tracker (`tracker.State`, a row per object), which the native calls read and write in place.
+The radar (`chris_integrator/radar`) has no Python implementation of its arithmetic: the motion model, the
+measurement functions, a scan (step, association over several scans, update, the start of an object), the objects'
+upkeep and the message's objects are C only. Python keeps the objects' life (states, votes, records, merging),
+the message's assembly around the objects, and the glue. The objects' numbers live in one float64 array of the
+tracker (`tracker.State`): a row of 406 numbers per node of an object's tree of hypotheses (`tracker._LAY`: motion
+hypotheses, free estimate, combination, extent, the step that led into the node, the node's record). Which rows
+are in use, the trees' links, the clusters and their global hypotheses are held by the native object `Hyp`
+(docs/RADAR.md), which reads and writes the rows in place; `Hyp.dump()` / `Hyp.load()` give and take all of it as
+plain lists.
 
-How the native radar was held to its Python reference before that was removed (lane report native-radar2): the
-measurement functions, marginals and assignment gave the reference's bits (on one machine: the frozen measurement
-functions hold to the last bit of libm elsewhere); everything else the reference's
-formulas with the products summed in index order and small systems solved by elimination with partial pivoting
-(the reference: BLAS, LAPACK): results to rounding. Scan by scan on simulated drives, native and reference on
-copies of the same tracker agreed to 2e-9 of each block's size (a covariance update that takes most of a variance
-away subtracts nearly equal numbers); whole drives gave the same messages but for a last printed digit in a
-handful of values (12 drives, 1.38 M values: 9; one object whose filter amplifies rounding-level differences).
-What the reference gave is frozen: `tests/data/radar_golden.npz` (the inputs of chosen calls of every native radar
-function on simulated drives and the reference's answers, plus random and edge cases), replayed by
-`test_radar_golden` with those tolerances; `test_radar_messages_digests` holds three simulated drives' radar
-messages byte for byte on the development machine; `python -m chris_integrator.native` checks a few of the
-reference's answers on a target (`native/_radar_selftest.py`). A state that is not finite is computed like any
-other (no hand-over to a reference any more): NaN and inf go where the arithmetic takes them, and the upkeep
-drops such an object as before.
+How it is held: `tests/data/radar_golden.npz` holds calls of every native radar function and of `Hyp.scan` /
+`Hyp.drop` sampled on simulated drives (arguments, the hypotheses before, the result, the rows written, the
+hypotheses after), replayed by `test_radar_golden`: discrete results the same, numbers within 1e-7 of their size.
+`test_radar_messages_digests` holds three simulated drives' messages byte for byte on the development machine;
+`python -m chris_integrator.native` checks a few results on a target (`native/_radar_selftest.py`). All three are
+recorded anew, after a deliberate change, with one command:
+
+    python3 tests/data/make_radar_golden.py
+
+(Until native version 7 the radar's functions were held to what a Python reference had given before it was
+removed; version 8 replaced the association and the update, and the recorded results are the native core's own
+from then on.) A state that is not finite is computed like any other: NaN and inf go where the arithmetic takes
+them, and the upkeep drops such an object.
 
 ### The radar's covariance arithmetic
 

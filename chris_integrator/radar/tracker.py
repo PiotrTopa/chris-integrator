@@ -64,6 +64,14 @@ CFG = dict(
     score_bins=10, score_prior=((0.62, 0.14), (0.50, 0.14), 30.0), score_gain=0.6, score_max=1.2, score_keep=3000.0,
     confirm_exist=0.95, confirm_hits=3, delete_exist=0.04,
     max_objects=64,
+    # the hypotheses (chris_native.c `Hyp`; docs/RADAR.md). Each is a knob of cost against quality, the default
+    # the full setting: how many scans back a doubtful pairing stays open (0: decided at once, the best
+    # assignment of each scan), how many global hypotheses a cluster of competing objects keeps, how many leaves
+    # an object, how much less probable than the best a hypothesis may be (log), the largest cluster whose
+    # assignments are enumerated (a larger one gets the best assignment per hypothesis only)
+    hyp_n_scan=5, hyp_k_best=32, hyp_max_leaves=12, hyp_prune_ln=math.log(1e4), hyp_max_cluster=16,
+    hyp_keep_steps=40, hyp_keep_s=2.0,   # each story's history kept this far back (the smoother's reach)
+    rows=1024,                   # of the state array at the start (it grows as needed)
     oosm_max_s=0.35,             # a scan older than an object's time by more than this does not touch it
     history_s=6.0, history_n=120,
     check_horizons=(0.5, 1.0),   # the object writes down where it will be this far ahead
@@ -76,6 +84,7 @@ CFG = dict(
                                  # else" (oncoming, crossing) as driving with the traffic
     verdict_hits_velocity=2, verdict_s_velocity=0.2,    # with a sensor that measures speed
     merge_m=2.5, merge_rel=0.12, merge_s=0.6, merge_dv=2.0,
+    merge_d2=9.2,                # ... and only within what both know of their places (squared, 2 dof: 99 %)
     # life
     view_gap_s=0.7,              # no scan has covered the object's place for this long: it is out of view
     seen_max_s=5.0,              # inside a field: dropped after this long unseen whatever its existence says
@@ -130,34 +139,43 @@ def marginals(ratio):
     return out
 
 
-# An object's numbers live in one row of the tracker's state array (`State`): the hypotheses (xs, Ps), their
-# probabilities (mu), the free estimate (xf, Pf) and the combination (x, P). The object's attributes are views
-# of its row; the native calls read and write the rows of a scan's objects directly.
-_LAY = (("xs", (3, N)), ("Ps", (3, N, N)), ("mu", (3,)), ("xf", (N,)), ("Pf", (N, N)), ("x", (N,)), ("P", (N, N)))
+# An object's numbers live in rows of the tracker's state array (`State`): one row per node of its tree of
+# hypotheses (chris_native.c, "the radar's hypotheses"). A row holds the motion hypotheses (xs, Ps), their
+# probabilities (mu), the free estimate (xf, Pf), the combination (x, P), the extent (e: length, width, heading;
+# Pe), the step that led into the node (st) and the node's own record (m: `M_*`). The object's attributes are
+# views of its PRIMARY row: its leaf in the best hypothesis of its cluster, which the native scan names.
+_LAY = (("xs", (3, N)), ("Ps", (3, N, N)), ("mu", (3,)), ("xf", (N,)), ("Pf", (N, N)), ("x", (N,)), ("P", (N, N)),
+        ("e", (3,)), ("Pe", (3, 3)), ("st", (13,)), ("m", (18,)))
 _OFF = []
 _o = 0
 for _k, _sh in _LAY:
     _OFF.append(("_" + _k, _o, _o + int(np.prod(_sh)), _sh))
     _o += int(np.prod(_sh))
-ROW = _o                         # numbers per object
+ROW = _o                         # numbers per row
+OFF = {k[1:]: (a, b) for k, a, b, _ in _OFF}
+# a node's record (chris_native.c `M_*`): its time, the log odds that the object exists in this story, sightings,
+# the last sighting's time, the last time a detection said how far it is, its last box (angular width, time,
+# sensor number), the last update's normalised innovation and existence gain, the detection it took at its
+# scan (-1: none), the scan's number, how much of it the sensor could see, its probability of being reported,
+# the scan's sensor, what hides it (0: nothing), the sensor's coverage at its place, the id of what hides it
+(M_T, M_L, M_HITS, M_THIT, M_RANGE_T, M_BOXW, M_BOXT, M_BOXS, M_NIS, M_DL, M_DET, M_LEVEL, M_VIS, M_PD, M_SRC, M_OCC,
+ M_COV, M_OCCBY) = range(18)
 
 
 class State:
-    """The rows of the objects' numbers (an array (capacity, ROW)) and which rows are free."""
+    """The rows of the objects' numbers: an array (capacity, ROW). The native hypotheses (`Hyp`) say which rows are
+    in use; a State by itself (tests, tools) hands out rows in order."""
 
     def __init__(self, cap=96):
         self.a = np.zeros((cap, ROW))
         self.free = list(range(cap - 1, -1, -1))
 
-    def take(self, live):
-        if not self.free:                                # full: twice the rows, every live object re-pointed
-            cap = len(self.a)
-            a = np.zeros((2 * cap, ROW))
-            a[:cap] = self.a
-            self.a = a
-            self.free = list(range(2 * cap - 1, cap - 1, -1))
-            for o in live:
-                o.bind(self)
+    def grow(self, cap):
+        a = np.zeros((cap, ROW))
+        a[:len(self.a)] = self.a
+        self.a = a
+
+    def take(self, live=()):
         return self.free.pop()
 
     def give(self, slot):
@@ -173,28 +191,32 @@ def _view(name):
     return property(get, put)
 
 
-class Obj:
-    __slots__ = ("id", "slot", "_xs", "_Ps", "_mu", "_xf", "_Pf", "_x", "_P", "t", "t0", "logodds", "hits", "state",
-                 "sources", "last_seen", "vote", "history", "checks", "consistency", "pred_err", "n_checks", "nis",
-                 "verdict", "coast_s", "velocity_seen", "merge_t", "flags", "last_cover", "dp0", "gain", "last_box",
-                 "scores", "range_t", "cls", "kin", "store")
-    xs, Ps, mu, xf, Pf, x, P = (_view(k) for k, _ in _LAY)
+def _meta(k, kind=float):
+    def get(self):
+        return kind(self._m[k])
 
-    def __init__(self, oid, x0, P0, mu, t, src, exist, coast_s, store=None, live=()):
+    def put(self, v):
+        self._m[k] = v
+    return property(get, put)
+
+
+class Obj:
+    __slots__ = ("id", "h", "slot", "_xs", "_Ps", "_mu", "_xf", "_Pf", "_x", "_P", "_e", "_Pe", "_st", "_m", "t0", "state",
+                 "sources", "last_seen", "vote", "history", "checks", "consistency", "pred_err", "n_checks", "nis",
+                 "verdict", "coast_s", "velocity_seen", "merge_t", "flags", "last_cover", "dp0", "scores", "cls", "kin",
+                 "store", "pe", "pp", "nleaf", "in_map", "label_code")
+    xs, Ps, mu, xf, Pf, x, P, e, Pe, st, m = (_view(k) for k, _ in _LAY)
+    t = _meta(M_T)                   # the time its numbers are of
+    logodds = _meta(M_L)             # that it exists, in the primary's story (`exist`: over all stories)
+    hits = _meta(M_HITS, int)
+    range_t = _meta(M_RANGE_T)       # the last time a detection said how far it is (not a bearing alone)
+
+    def __init__(self, oid, h, slot, t, src, coast_s, store):
         self.id = oid
-        store = store or State(1)
-        self.slot = store.take(live)
+        self.h = h                   # its handle in the native hypotheses
+        self.slot = slot
         self.bind(store)
-        self.xs = x0[None]                       # (3, N): one state per hypothesis
-        self.Ps = P0[None]                       # (3, N, N)
-        self._xs[STAND][VX:VY + 3] = 0.0         # velocity and acceleration of the standing hypothesis
-        # the free estimate: a steady-velocity filter of its own, fed the same detections, never mixed with the
-        # hypotheses. What it knows of the velocity is what the sightings have shown, no more.
-        self.xf, self.Pf = x0, P0
-        self.mu = mu
-        self.t = self.t0 = t
-        self.logodds = math.log(exist / (1.0 - exist))
-        self.hits = 1
+        self.t0 = t
         self.state = "tentative"
         self.sources = {src}
         self.last_seen = {src: t}
@@ -211,26 +233,27 @@ class Obj:
         self.merge_t = {}
         self.flags = set()
         self.last_cover = t          # the last time a scan's field covered where the object is
-        self.dp0 = float(P0[M.DP, M.DP])   # how unknown its angle offset was at birth
-        self.gain = None             # of its last pairing: log odds for "this detection is mine"
-        self.last_box = None         # (time, sensor, angular width) of its last box
+        self.dp0 = float(self._P[M.DP, M.DP])   # how unknown its angle offset was at birth
         self.scores = []             # (sensor, score) of its boxes while it is not confirmed
-        self.range_t = t             # the last time a detection said how far it is (not a bearing alone)
         self.cls = None              # classvote.result of `vote` without its age (box.py), until the next vote
         self.kin = M._KIN4[None]     # what its kind can do (models._KIN4 of `label`), set with every vote
-        self.store = store
-        _NR.radar_combine_rows(store.a, [self.slot])         # x, P: the hypotheses' combination
+        self.pe = self.pp = 0.0      # probability that it exists; that the primary's story is the true one
+        self.nleaf = 1               # its hypotheses
+        self.in_map = True           # it is in the best hypothesis of its cluster
+        self.label_code = 0.0
 
-    def bind(self, store):
-        """Point the object's arrays at its row of the state array."""
+    def bind(self, store, slot=None):
+        """Point the object's arrays at its (primary) row of the state array."""
         self.store = store
+        if slot is not None:
+            self.slot = slot
         row = store.a[self.slot]
         for k, a, b, sh in _OFF:
             setattr(self, k, row[a:b].reshape(sh))
 
     @property
     def exist(self):
-        return 1.0 / (1.0 + math.exp(-self.logodds))
+        return self.pe
 
     @property
     def label(self):
@@ -254,8 +277,13 @@ class Tracker:
         self.reset()
 
     def reset(self):
+        c = self.cfg
         self.objects = []
-        self.store = State()         # the objects' numbers, one row each
+        self.store = State(c["rows"])    # the objects' numbers: a row per node of their trees
+        self.hyp = _NR.Hyp(c["rows"], c["hyp_n_scan"], c["hyp_k_best"], c["hyp_max_leaves"], c["hyp_prune_ln"],
+                           c["hyp_keep_steps"], c["hyp_keep_s"], c["hyp_max_cluster"])
+        self.by_h = {}               # handle -> object
+        self.src_code = {}           # sensor id -> its number in the rows' records
         self.stats = {}              # sensor id -> counters
         self.sensors = {}            # sensor id -> (last model, time)
         self.bias = {}               # sensor id -> [bias, variance]: what all its objects share (a camera's pitch)
@@ -267,23 +295,6 @@ class Tracker:
         self.score_odds = {}         # sensor id -> the log odds of each bin, as far as asked since the last change
         self.bias_t = None
         self.t = None
-
-    def _advance_all(self, objs, t):
-        """Bring the objects to time t (committed)."""
-        objs = [o for o in objs if abs(t - o.t) >= 1e-6]
-        if not objs:
-            return
-        noise, nz = {}, []
-        for o in objs:
-            if o.t not in noise:
-                noise[o.t] = self.ego.motion_noise(o.t, t)
-            nz.append(noise[o.t])
-        # what the car's own movement over the interval is not sure about goes into where each object is
-        pose = self.ego.pose_at(t) if any(a > 0.0 or b > 0.0 for a, b in nz) else (0.0, 0.0, 0.0)
-        _NR.radar_advance(self.store.a, [o.slot for o in objs], [float(t) - o.t for o in objs],
-                          [o.kin for o in objs], M._native_par(self.mcfg), nz, pose)
-        for o in objs:
-            o.t = t
 
     def peek(self, o, t):
         """Where the object is believed to be at time t, without changing it: (x, P, mu) (for tools)."""
@@ -361,6 +372,7 @@ class Tracker:
         st["scans"] += 1
         st["dets"] += len(dets)
         self.sensors[src] = (sensor, t)
+        b = None
         if getattr(sensor, "has_bias", False):
             b = self.bias.setdefault(src, [0.0, sensor.bias_var])
             sensor.bias, sensor.bias_var = b[0], b[1]
@@ -373,239 +385,125 @@ class Tracker:
                 st["late"] += 1
                 continue
             objs.append(o)
-        self._advance_all(objs, t)
         self.t = t if self.t is None else max(self.t, t)
-        cph, sph = math.cos(pose[2]), math.sin(pose[2])
         if getattr(sensor, "extraneous", None) is not None:
             sensor.extraneous = max(sensor.extraneous, self.new_rate.get(src, 0.0))
-        Rs = [np.asarray(d["R"], float).tolist() for d in dets]          # each detection's variances (R's diagonal)
-        D = self._det_rows(dets)
-        pairs, pds, cover = self._associate(src, t, sensor, pose, objs, D)
-        hit, used = set(), set()
-        if self._common(sensor, src, pose, objs, dets, Rs, pairs):
-            for j, d in enumerate(dets):                 # what _common changed: the first row's angle and variance
-                D[j, 5], D[j, 9] = d["z"][0], Rs[j][0]
-        # One detection into one object, every pair of the scan in one call. Each hypothesis takes it only as far
-        # as it can be this object's at all under that hypothesis: against the other story (the object was missed,
-        # the detection is something else: probability 1 - beta). A hypothesis the detection does not fit is
-        # neither dragged to it nor ruled out by it; it is believed less by exactly the odds of the pairing (IMM with
-        # probabilistic data association). Whose the detection is, is one question for the whole object: if the
-        # object as it is believed owns it, every hypothesis learns from it (a moving hypothesis without a velocity
-        # yet would otherwise never get one); a hypothesis that fits on its own learns even while the object doubts
-        # (the standing car that pulls away); with other objects competing, the pairing's probability in the scan as
-        # a whole is what counts. The free estimate takes it the same way. The hypotheses are weighed by how well
-        # each PREDICTED the detection, from `mu_hold_hits` sightings on (a moving hypothesis cannot predict before it
-        # has a velocity), unless the sensor measures speed or the detection a scale rate; between the moving
-        # hypotheses from the first sighting on; never below `mu_floor`.
-        res = _NR.radar_update(self.store.a, [objs[i].slot for i, *_ in pairs], sensor.native(), pose,
-                               D[[j for _, j, *_ in pairs]], [(pds[i], lam, pr, objs[i].hits) for i, _, _, pr, lam in pairs],
-                               (c["mu_hold_hits"], c["mu_floor"])) if pairs else []
-        for k, (i, j, g, pr, lam) in enumerate(pairs):
-            objs[i].gain = g
-            self._after_update(objs[i], dets[j], sensor, src, t, *res[k])
-            if dets[j].get("w"):
-                objs[i].last_box = (t, src, dets[j]["w"])
-            hit.add(i)
-            used.add(j)
-            st["assigned"] += 1
-        if hit:                                          # written down now, checked when the time has come
-            who = [objs[i] for i in sorted(hit)]
-            hz = c["check_horizons"]
-            ahead = np.empty((len(who) * len(hz), 6))   # where, and how well: (x, y, P00, P01, P10, P11)
-            _NR.radar_peek_pos(self.store.a, [o.slot for o in who for _ in hz], [t + h - o.t for o in who for h in hz],
-                               [o.kin for o in who for _ in hz], M._native_par(self.mcfg), ahead)
-            for k, r in enumerate(ahead.tolist()):
-                who[k // len(hz)].checks.append((t + hz[k % len(hz)], r[0], r[1], r[2:]))
-        for i, o in enumerate(objs):
-            pd = pds[i]
-            if cover[i] > 0.0:
-                o.last_cover = t
-            if i in hit:
-                o.last_cover = t
-                continue
-            if pd > 0.0:
-                o.logodds += math.log(max(1.0 - pd, 1e-3))
-        free = 0
-        mem = self.unexplained.setdefault(src, deque())
-        times = self.scan_times.setdefault(src, deque())
-        times.append(t)
-        while times and times[0] < t - c["map_s"]:
-            times.popleft()
-        while mem and mem[0][0] < t - c["map_s"]:
-            mem.popleft()
-        for j, d in enumerate(dets):
-            if j in used or len(self.objects) >= c["max_objects"]:
-                continue
-            label = classvote.norm_label((d.get("attrs") or {}).get("class"))
-            s0 = sensor.start(d, pose, label)
-            if s0 is None:
-                continue
-            free += 1
-            x0, P0 = s0
-            k = M.kin(label)
-            if sensor.velocity:                          # the speed along the line of sight is measured
-                moving = math.hypot(x0[VX], x0[VY]) > 1.0
-                mu = [0.05, 0.8, 0.15] if moving else [0.7, 0.25, 0.05]
-            else:
-                ps = k["p_stand"]
-                dxo, dyo = x0[PX] - pose[0], x0[PY] - pose[1]
-                pa = c["p_any_side"] if abs(-sph * dxo + cph * dyo) > c["side_m"] else self.mcfg["p_ca0"]
-                mu = [ps, (1.0 - ps) * (1.0 - pa), (1.0 - ps) * pa]
-            o = Obj(self.next_id, x0, P0, mu, t, src, c["new_exist"], sensor.coast_s, self.store, self.objects)
-            self.next_id += 1
-            sc = self._score(d)
-            o.logodds += self._score_odds(src, sc)
-            if sc is not None:
-                o.scores.append((src, sc))
-            if not sensor.velocity:
-                # What a new object may be doing, before anything is known, is not one blur around "no speed":
-                # it stands (its own hypothesis), or it drives with the traffic (the steady hypothesis: about
-                # the car's own velocity, along the road the car is on), or it comes the other way (the
-                # manoeuvring hypothesis: about the car's velocity reversed, and wider across). The faster
-                # the car itself drives, the more that says about the traffic's speed; standing, nothing.
-                # A vehicle whose box shows it side-on does neither: it crosses.
-                U = np.array([[cph, -sph], [sph, cph]])
-                lat = min(k["v0_lat"], k["v0_std"]) ** 2
-                big = k["v0_std"] ** 2
-                at = d.get("attrs") or {}
-                ps = M.side_on(label, at.get("aspect"), float(d["z"][sensor.rows(d)[0]])) if at.get("aspect") else None
-                ve = min(math.hypot(pose[3], pose[4]), k["v_max"]) if "wl" in k else 0.0
-                if ps is None:
-                    ps = 0.0 if "wl" in k else None
-                if ps is None:                           # a kind without a direction of its own (a person)
-                    Pv, mv = U @ np.diag([big, lat]) @ U.T, np.zeros(2)
-                else:
-                    w_ = max(c["with_rel"] * ve + c["with_std"], k["v0_std"] - ve) ** 2
-                    Pv = U @ np.diag([(1.0 - ps) * w_ + ps * lat + ps * (1.0 - ps) * ve * ve,
-                                      (1.0 - ps) * lat + ps * big]) @ U.T
-                    mv = (1.0 - ps) * ve * np.array([cph, sph])
-                o.xs[CV][VX:VY + 1] = mv
-                if ps is not None:
-                    lat2 = min(2.0 * k["v0_lat"], k["v0_std"]) ** 2
-                    o.xs[CA][VX:VY + 1] = -mv
-                    o.Ps[CA][VX:VY + 1, VX:VY + 1] = U @ np.diag([(1.0 - ps) * w_ + ps * lat2 + ps * (1.0 - ps) * ve * ve,
-                                                                   (1.0 - ps) * lat2 + ps * big]) @ U.T
-                o.Ps[CV][VX:VY + 1, VX:VY + 1] = Pv
-                o.Pf[VX:VY + 1, VX:VY + 1] = U @ np.diag([big, lat if not ps else (1.0 - ps) * lat + ps * big]) @ U.T
-                o.combine()
-            o.velocity_seen = sensor.velocity
-            self._vote(o, d, src, t)
-            o.history.append((t, float(x0[PX]), float(x0[PY]), 0.0, 0.0))
-            if d.get("w"):
-                o.last_box = (t, src, d["w"])
-            if (d.get("kind") or "").endswith("s"):      # its first box already says how fast it comes nearer
-                self._first_rate(o, d, sensor, pose)
-            kb = (d.get("kind") or "").rstrip("s")
-            if kb in ("rb", "rbh"):
-                # the map lives in the space of the ground angle, the bearing and the log height: a box with a
-                # scale-rate row enters without it (its third number would be read as a height), a box cut at the
-                # bottom (its rows are another space) not at all
-                mem.append((t, kb, np.asarray(d["z"], float)[:len(kb)], o.id))
-            self.objects.append(o)
-            st["started"] += 1
-        r0 = self.new_rate.get(src, 0.0)
-        self.new_rate[src] = r0 + c["new_rate_gain"] * (free - r0)
-
-    def _det_rows(self, dets):
-        """The scan's detections as the native core reads them (chris_native.c `RDET`): kind, scale-rate baseline,
-        group (kind and baseline: what is predicted alike), vehicle (1) / person (-1) / not known (0), box width,
-        z, the variances (R's diagonal)."""
-        rows = []
-        kinds = {}
-        pad = (0.0, 0.0, 0.0, 0.0)
-        for j, d in enumerate(dets):
-            k = d.get("kind")
-            lab = classvote.norm_label((d.get("attrs") or {}).get("class"))
-            z, R = d["z"], d["R"]
-            z = z.tolist() if isinstance(z, np.ndarray) else list(z)
-            R = R.tolist() if isinstance(R, np.ndarray) else list(R)
-            rows.append([kind_code(k), float(d.get("sdt") or 0.0), kinds.setdefault((k, d.get("sdt")), len(kinds)),
-                         0 if lab is None else (1 if lab in M.VEHICLES else -1), float(d.get("w") or 0.0)]
-                        + z + list(pad[len(z):]) + R + list(pad[len(R):]))
-        return np.array(rows, float).reshape(len(dets), 13)
-
-    def _associate(self, src, t, sensor, pose, objs, D):
-        """Which detection is whose (chris_native.c `radar_scan`): [(object, detection, gain, the pairing's
-        probability, the other story's density over the box feature)], each object's probability of being
-        reported, the sensor's coverage at its place.
-
-        A detection's fit to an object is the likelihood the object's hypotheses give it, each with its own
-        prediction and weight (one blurred Gaussian over "it stands here" and "it may be driving at any speed" would
-        let a standing car claim its neighbour's box), after a chi-square gate on the object as a whole; a
-        pedestrian's box does not continue a vehicle's object; an object's last box from this sensor is a feature
-        (a box does not jump by more than a part of its width). It is weighed against the other explanation: the
-        object was missed this time and the detection is something not known yet (the sensor's density, or the map
-        of where unexplained detections that became objects have been turning up, not counting this object's own
-        first one). Only a pair that is the likelier story may be made, and the scan is settled as a whole for the
-        largest total gain (`assign`, per group of objects and detections that compete); the pairings'
-        probabilities in the scan as a whole come from `marginals`."""
-        c = self.cfg
-        oi = []
+        code = self.src_code.setdefault(src, len(self.src_code) + 1)
+        D, KB = self._det_rows(src, dets)
+        # what the car's own movement over the interval is not sure about goes into where each object is
+        noise, info = {}, []
         for o in objs:
-            la, lb = o.label, o.last_box
-            oi.append((0 if la is None else (1 if la in M.VEHICLES else -1),
-                       lb[2] if lb is not None and o.hits >= 2 and lb[1] == src and t - lb[0] <= c["feat_max_s"] else math.nan,
-                       o.id))
+            ot = o.t
+            nz = noise.get(ot)
+            if nz is None:
+                nz = noise[ot] = self.ego.motion_noise(ot, t)
+            k = o.kin
+            info.append((float(t) - ot, nz[0], nz[1], k[0], k[1], k[2], k[3], o.label_code, o.id,
+                         1.0 if o.state in ("confirmed", "coast") else 0.0))
         mem = self.unexplained.get(src)
         rows = None
         if mem:
             real = self.real_ids
             rows = [(len(zz), zz[0], zz[1], zz[2] if len(zz) > 2 else 0.0, oid) for (_, _, zz, oid) in mem if oid in real] or None
         g, bw = c["gate"], c["map_bw"]
-        nt = len(objs)
-        pds, cover = np.empty(nt), np.empty(nt)
-        pairs = _NR.radar_scan(self.store.a, [o.slot for o in objs], sensor.native(), pose, oi, D, rows,
-                               float(len(self.scan_times.get(src) or ())),
-                               (g.get(1, 16.0), g.get(2, 16.0), g.get(3, 16.0), g.get(4, 16.0), c["feat_sigma"],
-                                c["feat_same"], c["feat_span"], bw[0], bw[1], bw[2]), pds, cover, None, None, None)
-        return pairs, pds.tolist(), cover.tolist()
+        acfg = (g.get(1, 16.0), g.get(2, 16.0), g.get(3, 16.0), g.get(4, 16.0), c["feat_sigma"], c["feat_same"],
+                c["feat_span"], bw[0], bw[1], bw[2], c["feat_max_s"], c["common_min"], c["common_pair"])
+        bcfg = (c["new_exist"], c["p_any_side"], c["side_m"], c["with_rel"], c["with_std"], self.mcfg["p_ca0"],
+                c["mu_floor"], max(0, c["max_objects"] - len(self.objects)))
+        args = ([o.h for o in objs], info, float(t), pose, sensor.native(), code, D, KB, rows,
+                float(len(self.scan_times.get(src) or ())), acfg, M._native_par(self.mcfg),
+                (c["mu_hold_hits"], c["mu_floor"]), bcfg, b)
+        res = self.hyp.scan(self.store.a, *args)
+        if isinstance(res, int):                         # the state array is too small for this scan: more rows
+            self.store.grow(max(2 * len(self.store.a), len(self.store.a) + res + 64))
+            for o in self.objects:
+                o.bind(self.store)
+            res = self.hyp.scan(self.store.a, *args)
+        out, births, dead, bias = res
+        if bias is not None:                             # the scan's common angle: its slow part is the sensor's
+            b[0], b[1] = bias
+            sensor.bias, sensor.bias_var = bias
+        store = self.store
+        hit = []
+        for o, (alive, prim, pd, cover, pe, pp, nleaf, in_map) in zip(objs, out):
+            if not alive:
+                continue
+            o.bind(store, prim)
+            o.pe, o.pp, o.nleaf, o.in_map = pe, pp, nleaf, bool(in_map)
+            if cover > 0.0:
+                o.last_cover = t
+            j = int(o._m[M_DET])
+            if j >= 0:
+                o.last_cover = t
+                self._after_update(o, dets[j], sensor, src, t)
+                hit.append(o)
+                st["assigned"] += 1
+        if dead:
+            gone = set(dead)
+            for o in self.objects:
+                if o.h in gone and self.by_h.get(o.h) is o:
+                    del self.by_h[o.h]
+                    if o.state == "tentative" and o.scores:
+                        self._score_learn(o.scores, False)   # never confirmed and gone: its boxes were false ones
+            self.objects = [o for o in self.objects if o.h not in gone]
+            hit = [o for o in hit if o.h not in gone]
+        if hit:                                          # written down now, checked when the time has come
+            hz = c["check_horizons"]
+            ahead = np.empty((len(hit) * len(hz), 6))    # where, and how well: (x, y, P00, P01, P10, P11)
+            _NR.radar_peek_pos(store.a, [o.slot for o in hit for _ in hz], [t + h - o.t for o in hit for h in hz],
+                               [o.kin for o in hit for _ in hz], M._native_par(self.mcfg), ahead)
+            for k, r in enumerate(ahead.tolist()):
+                hit[k // len(hz)].checks.append((t + hz[k % len(hz)], r[0], r[1], r[2:]))
+        memq = self.unexplained.setdefault(src, deque())
+        times = self.scan_times.setdefault(src, deque())
+        times.append(t)
+        while times and times[0] < t - c["map_s"]:
+            times.popleft()
+        while memq and memq[0][0] < t - c["map_s"]:
+            memq.popleft()
+        for h, j, prim, pe, pp, in_map in births:
+            d = dets[j]
+            o = Obj(self.next_id, h, prim, t, src, sensor.coast_s, store)
+            self.next_id += 1
+            o.pe, o.pp, o.in_map = pe, pp, bool(in_map)
+            sc = self._score(d)
+            if sc is not None:
+                o.scores.append((src, sc))
+            o.velocity_seen = sensor.velocity
+            self._vote(o, d, src, t)
+            o.history.append((t, float(o._x[PX]), float(o._x[PY]), 0.0, 0.0))
+            kb = (d.get("kind") or "").rstrip("s")
+            if kb in ("rb", "rbh"):
+                # the map lives in the space of the ground angle, the bearing and the log height: a box with a
+                # scale-rate row enters without it, a box cut at the bottom (its rows are another space) not at all
+                memq.append((t, kb, np.asarray(d["z"], float)[:len(kb)], o.id))
+            self.objects.append(o)
+            self.by_h[h] = o
+            st["started"] += 1
+        r0 = self.new_rate.get(src, 0.0)
+        self.new_rate[src] = r0 + c["new_rate_gain"] * (len(births) - r0)
 
-    def _common(self, sensor, src, pose, objs, dets, Rs, pairs):
-        """What all objects of one scan share: the camera body's pitch at that moment. Every box of the scan
-        then stands higher or lower by the same angle, which no object's own history predicts and which, left
-        in, moves every range at once. The settled objects of the scan say what it was (the middle one of their
-        angle innovations, by weight: one wrong pairing does not steer it); the part of it that the sensor's
-        slow pitch error explains goes into that error (`bias`), the rest is this scan's own and is taken
-        out of the scan's angles."""
-        c = self.cfg
-        if not getattr(sensor, "has_bias", False) or len(pairs) < c["common_min"]:
-            return False
-        sel = [(objs[i].slot, (kind_code(dets[j].get("kind")), float(dets[j].get("sdt") or 0.0), float(dets[j]["z"][0]),
-                               Rs[j][0]))
-               for i, j, _, pr, _ in pairs
-               if (dets[j].get("kind") or "").rstrip("s") in ("rb", "rbh") and objs[i].state in ("confirmed", "coast")
-               and objs[i].hits >= 4 and pr >= c["common_pair"]]
-        if len(sel) < c["common_min"]:
-            return False
-        m, ws = _NR.radar_common(self.store.a, [q[0] for q in sel], sensor.native(), pose, [q[1] for q in sel])
-        return self._common_take(sensor, src, dets, Rs, m, 1.57 / ws)    # 1.57 / ws: the variance of a weighted median
-
-    def _common_take(self, sensor, src, dets, Rs, m, var_m):
-        """The scan's common angle m (of variance var_m): the slow part into the sensor's bias, the rest out of
-        the scan's angles."""
-        jit = math.radians(sensor.cfg["pitch_jitter_deg"]) ** 2
-        b = self.bias[src]
-        tot = b[1] + jit + var_m
-        slow, fast = m * b[1] / tot, m * jit / tot
-        b[0] += slow
-        b[1] = max(b[1] * (1.0 - b[1] / tot), math.radians(sensor.cfg["bias_floor_deg"]) ** 2)
-        sensor.bias, sensor.bias_var = b[0], b[1]
-        left = jit * (1.0 - jit / tot)                   # what is still not known of this scan's own pitch
+    def _det_rows(self, src, dets):
+        """The scan's detections as the native core reads them (chris_native.c `RDET`: kind, scale-rate baseline,
+        group (kind and baseline: what is predicted alike), vehicle (1) / person (-1) / not known (0), box width, z,
+        the variances (R's diagonal), what the detector's score adds to the log odds of a real thing, the whole
+        box's aspect) and what each detection's kind can do, for an object started by it (`RKB`)."""
+        rows, kb = [], []
+        kinds = {}
+        pad = (0.0, 0.0, 0.0, 0.0)
         for j, d in enumerate(dets):
-            if (d.get("kind") or "").rstrip("s") in ("rb", "rbh"):
-                d["z"] = np.array(d["z"], float)
-                d["z"][0] -= fast
-                Rs[j][0] = max(Rs[j][0] - jit + left, 0.25 * Rs[j][0])
-        return True
-
-    def _first_rate(self, o, d, sensor, pose):
-        """A new object's first box came with a scale rate: how fast its image grows. That is its speed along
-        the line of sight over its distance, measured, before a second box exists. Every hypothesis takes it
-        (for "it stands" it is a range: the car's own speed over the distance), and how well each had expected
-        it weighs them at once: a thing that grows as the car's speed says stands; one that does not grow
-        drives with the traffic."""
-        _NR.radar_first_rate(self.store.a, o.slot, sensor.native(), pose, float(d.get("sdt") or 0.0), float(d["z"][-1]),
-                             float(d["R"][-1]), self.cfg["mu_floor"])
+            k = d.get("kind")
+            at = d.get("attrs") or {}
+            lab = classvote.norm_label(at.get("class"))
+            z, R = d["z"], d["R"]
+            z = z.tolist() if isinstance(z, np.ndarray) else list(z)
+            R = R.tolist() if isinstance(R, np.ndarray) else list(R)
+            rows.append([kind_code(k), float(d.get("sdt") or 0.0), kinds.setdefault((k, d.get("sdt")), len(kinds)),
+                         0 if lab is None else (1 if lab in M.VEHICLES else -1), float(d.get("w") or 0.0)]
+                        + z + list(pad[len(z):]) + R + list(pad[len(R):])
+                        + [self._score_odds(src, self._score(d)), float(at.get("aspect") or 0.0), 1.0, 0.0, 0.0, 0.0, 0.0])
+            kb.append(M.kinb(lab))
+        return np.array(rows, float).reshape(len(dets), 20), np.array(kb, float).reshape(len(dets), 12)
 
     def _vote(self, o, d, src, t):
         at = d.get("attrs") or {}
@@ -613,24 +511,23 @@ class Tracker:
             classvote.vote(o.vote, at.get("class"), at.get("class_conf", at.get("prob")), src, t, at.get("weight", 1.0))
             o.cls = None
             o.kin = M._KIN4.get(o.label) or M._KIN4[None]
+            la = o.label
+            o.label_code = 0.0 if la is None else (1.0 if la in M.VEHICLES else -1.0)
 
-    def _after_update(self, o, d, sensor, src, t, n, dl):
-        """What a detection does to an object besides its numbers: its record (NIS n), its existence (dl: what the
-        fit adds to its log odds), score, sightings, class vote, the checks of its predictions, its trajectory."""
+    def _after_update(self, o, d, sensor, src, t):
+        """What a detection does to an object besides its numbers (those, its existence and its sightings are the
+        native scan's): its record, the detector's score, its sensors, class vote, the checks of its predictions,
+        its trajectory."""
         c = self.cfg
-        o.nis[src] = n if o.nis.get(src) is None else o.nis[src] + 0.2 * (n - o.nis[src])
-        o.logodds += dl
+        n = float(o._m[M_NIS])
+        if n == n:
+            o.nis[src] = n if o.nis.get(src) is None else o.nis[src] + 0.2 * (n - o.nis[src])
         sc = self._score(d)
-        o.logodds += self._score_odds(src, sc)
         if sc is not None:
             if o.state == "tentative":
                 o.scores.append((src, sc))
             else:
                 self._score_learn([(src, sc)], True)
-        o.logodds = max(-12.0, min(12.0, o.logodds))
-        o.hits += 1
-        if (d.get("kind") or "rb").rstrip("s") not in ("b", "bt"):
-            o.range_t = t            # a box cut at the bottom gives a direction, and a range only by the top edge
         o.sources.add(src)
         o.last_seen[src] = t
         o.coast_s = max(o.coast_s, sensor.coast_s) if len(o.sources) == 1 else min(o.coast_s, sensor.coast_s)
@@ -664,10 +561,11 @@ class Tracker:
         o.flags.discard("unpredictable")
         if o.n_checks >= 4 and o.consistency is not None and o.consistency > c["inconsistent"]:
             o.flags.add("unpredictable")                 # it keeps being somewhere else than predicted: believe less
-            for j in range(len(M.MODELS)):
-                o.Ps[j] = o.Ps[j] * c["inflate"]
-            o.Pf = o.Pf * c["inflate"]
-            o.combine()
+            rows = self.hyp.rows(o.h)                   # every story of it
+            a = self.store.a
+            a[rows, OFF["Ps"][0]:OFF["Ps"][1]] *= c["inflate"]
+            a[rows, OFF["Pf"][0]:OFF["Pf"][1]] *= c["inflate"]
+            _NR.radar_combine_rows(a, rows)
             o.consistency = 0.5 * (o.consistency + 1.0)
 
     # ---- life ---------------------------------------------------------------------------------------------
@@ -688,7 +586,7 @@ class Tracker:
                 if T - last > max(o.coast_s, c["seen_max_s"]):
                     continue
                 if o.state == "tentative":
-                    if o.exist >= c["confirm_exist"] and o.hits >= c["confirm_hits"]:
+                    if o.exist >= c["confirm_exist"] and o.hits >= c["confirm_hits"] and o.in_map:
                         o.state = "confirmed"
                         self.real_ids.add(o.id)
                         self._score_learn(o.scores, True)
@@ -710,14 +608,26 @@ class Tracker:
         for o in self.objects:                           # never confirmed and gone: its boxes were false ones
             if o.id not in kept and o.state == "tentative" and o.scores:
                 self._score_learn(o.scores, False)
-        for o in self.objects:
-            if o.id not in kept:
-                self.store.give(o.slot)
+        gone = [o for o in self.objects if o.id not in kept]
         self.objects = keep
+        for o in gone:
+            self._drop(o)
         if len(self.real_ids) > 4096:
             self.real_ids = {o.id for o in keep if o.state != "tentative"}
         self._merge(T)
         self._register(T)
+
+    def _drop(self, o):
+        """The object taken out of the hypotheses (it is no longer in `objects`); what ends with it ends too."""
+        self.by_h.pop(o.h, None)
+        dead = set(self.hyp.drop(self.store.a, o.h)) - {o.h}
+        if dead:
+            for q in self.objects:
+                if q.h in dead:
+                    self.by_h.pop(q.h, None)
+            self.objects = [q for q in self.objects if q.h not in dead]
+        for q in self.objects:                           # their primaries may have changed
+            pass
 
     def _life(self, T, pose, scan):
         """Per object: (p_still, its combined state finite, and for one out of every field (not tentative) where
@@ -754,7 +664,7 @@ class Tracker:
             # what the ripe objects agree on (weights 1 / (P[dp, dp] + the object's own spread); from three on the
             # middle one by weight: one wrong object does not steer it), a share of it out of every object's offset
             m, ws = _NR.radar_register(self.store.a, [o.slot for o in ripe], sen.dp_obj_var,
-                                       [o.slot for o in self.objects if src in o.sources], a)
+                                       [r for o in self.objects if src in o.sources for r in self.hyp.rows(o.h)], a)
             b[0] += a * m
             b[1] = max((1.0 - a) * b[1] + a / ws, math.radians(cc["bias_floor_deg"]) ** 2)
 
@@ -798,7 +708,7 @@ class Tracker:
                 poses[o.t] = self.ego.pose_at(o.t)[:2]
             here.append(poses[o.t])
         for i, j, same in _NR.radar_merge(self.store.a, [o.slot for o in obs], [o.t for o in obs], [o.kin for o in obs],
-                                          M._native_par(self.mcfg), here, e[:2], (c["merge_m"], c["merge_rel"], c["merge_dv"])):
+                                          M._native_par(self.mcfg), here, e[:2], (c["merge_m"], c["merge_rel"], c["merge_dv"], c["merge_d2"])):
             nearj.setdefault(i, []).append((j, same))
             nearset.add((i, j))
         index = {o.id: k for k, o in enumerate(obs)}
@@ -826,19 +736,22 @@ class Tracker:
                     continue
                 rank = lambda o: (o.state != "tentative", o.hits, -o.t0)
                 old, new = (a, b) if rank(a) >= rank(b) else (b, a)
-                old.hits += new.hits
+                rows = self.hyp.rows(old.h)             # every story of the one that lives on
+                am = self.store.a[:, OFF["m"][0]:OFF["m"][1]]
+                am[rows, M_HITS] += new.hits
+                am[rows, M_L] = np.maximum(am[rows, M_L], new.logodds)
+                old.pe = max(old.pe, new.pe)
                 old.sources |= new.sources
                 for s, t in new.last_seen.items():
                     old.last_seen[s] = max(old.last_seen.get(s, -1e18), t)
-                old.logodds = max(old.logodds, new.logodds)
                 if old.state == "tentative" and new.state != "tentative":
                     old.state = new.state
                 dead.add(new.id)
         if dead:
+            self.objects = [o for o in obs if o.id not in dead]
             for o in obs:
                 if o.id in dead:
-                    self.store.give(o.slot)
-            self.objects = [o for o in obs if o.id not in dead]
+                    self._drop(o)
             for o in self.objects:
                 for key in [k for k in o.merge_t if k in dead]:
                     del o.merge_t[key]
