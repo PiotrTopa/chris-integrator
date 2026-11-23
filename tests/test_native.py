@@ -572,6 +572,42 @@ def test_view_line_steps_are_the_python_ones():
                  V._blend_py([1, 2], [1, 2], [0.0, 0.0], [2, 3], [0.5, 0.5], 0.05, False))
 
 
+@needs_native
+def test_geom_centre_is_the_numpy_one():
+    """The road geometry's centre line (`geom_centre`) against `_centre_py` / `_centre_vision_py`: the same lists,
+    bit for bit; NaN deviations, a reach before every point (IndexError on both sides), ints elsewhere."""
+    from chris_integrator.trackers.roadgeom import RoadGeometryFusion as G
+    if N.geom is None:
+        pytest.skip("the native lanes part is not in use in this process")
+    rng = random.Random(37)
+    for _ in range(20000):
+        n = rng.randrange(1, 40)
+        x = np.sort(np.array([rng.uniform(-5, 150) for _ in range(n)]))
+        y = np.array([rng.uniform(-5, 5) for _ in range(n)])
+        sd = np.array([float("nan") if rng.random() < 0.05 else rng.uniform(0, 3) for _ in range(n)])
+        reach = rng.uniform(-10, 160)
+        try:
+            want = G._centre_vision_py(x, y, sd, reach)
+        except IndexError:
+            with pytest.raises(IndexError):
+                G._centre_vision(x, y, sd, reach)
+            continue
+        assert _same(list(G._centre_vision(x, y, sd, reach).items()), list(want.items()))
+        conf = np.array([rng.random() for _ in range(n)])
+        assert _same(list(G._centre(x, y, conf, "vb", reach, 3.0).items()), list(G._centre_py(x, y, conf, "vb", reach, 3.0).items()))
+    x = np.arange(5.0)
+    assert G._centre(x, x[::-1].copy(), [1, 1, 1, 1, 1], "v", 3, None) == G._centre_py(x, x[::-1].copy(), [1, 1, 1, 1, 1], "v", 3, None)
+    g = G()                                            # `_reach`: the same value and kind (a configured int stays one)
+    for _ in range(20000):
+        n = rng.randrange(1, 40)
+        x = np.sort(np.array([rng.uniform(-5, 150) for _ in range(n)]))
+        sd = np.array([float("nan") if rng.random() < 0.05 else rng.uniform(0, 2) for _ in range(n)])
+        g.cfg.update(reach_std_m=rng.choice([0.9, 1, 0.5]), reach_max_m=rng.choice([100.0, 100, 50, 1e9]),
+                     reach_min_m=rng.choice([15.0, 15, 200]))
+        a, b = g._reach(x, sd), g._reach_py(x, sd)
+        assert type(a) is type(b) and (a == b or a != a and b != b)
+
+
 # ---- the estimator's linear algebra ------------------------------------------------------------------------
 def _cov(rng, n):
     a = rng.standard_normal((n, n))

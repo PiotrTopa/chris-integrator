@@ -42,6 +42,7 @@ import math
 import numpy as np
 
 from ..native import round                  # builtins.round, native where built
+from ..native import geom as _NG
 from ..contract import LocalEgo, signal
 
 NS = 1e9
@@ -217,6 +218,15 @@ class RoadGeometryFusion:
         return None
 
     def _reach(self, x, sd):
+        if _NG is not None:
+            c = self.cfg
+            try:
+                return _NG.geom_reach(x, sd, c["reach_std_m"], c["reach_max_m"], c["reach_min_m"])
+            except (TypeError, ValueError, BufferError):
+                pass
+        return self._reach_py(x, sd)
+
+    def _reach_py(self, x, sd):
         c = self.cfg
         bad = np.nonzero((sd > c["reach_std_m"]) | (x > c["reach_max_m"]))[0]
         r = float(x[-1]) if len(bad) == 0 else float(x[max(bad[0] - 1, 0)])
@@ -277,9 +287,7 @@ class RoadGeometryFusion:
         if g is None:
             self.used = False
             if vis is not None:
-                m = vx <= reach + 1e-6
-                out["centre"] = self._centre(vx[m], vy[m], np.clip(1.0 - vsd[m] / 1.5, 0.1, 1.0), "v" * int(m.sum()),
-                                             reach, None)
+                out["centre"] = self._centre_vision(vx, vy, vsd, reach)
             return out
         return out
 
@@ -289,11 +297,38 @@ class RoadGeometryFusion:
                 and self.odo - self.fit_odo <= self.cfg["hold_m"])
 
     @staticmethod
-    def _centre(x, y, conf, src, vision_to, end):
+    def _centre_py(x, y, conf, src, vision_to, end):
         s = np.concatenate([[0.0], np.cumsum(np.hypot(np.diff(x), np.diff(y)))]) + float(x[0])
         return {"s": np.round(s, 1).tolist(), "x": np.round(x, 1).tolist(), "y": np.round(y, 2).tolist(),
                 "conf": np.round(conf, 2).tolist(), "src": src,       # per point: v camera, b blend, m map
                 "vision_to_m": round(vision_to, 1), "end": end}
+
+    @staticmethod
+    def _centre_vision_py(vx, vy, vsd, reach):
+        """The centre line of the camera alone, up to its reach."""
+        m = vx <= reach + 1e-6
+        return RoadGeometryFusion._centre_py(vx[m], vy[m], np.clip(1.0 - vsd[m] / 1.5, 0.1, 1.0), "v" * int(m.sum()),
+                                             reach, None)
+
+    if _NG is None:
+        _centre, _centre_vision = _centre_py, _centre_vision_py
+    else:
+        @staticmethod
+        def _centre(x, y, conf, src, vision_to, end, _n=_NG.geom_centre):
+            try:
+                s, xl, yl, cl = _n(x, y, conf, None)
+            except (TypeError, ValueError, BufferError):       # (not contiguous float64 arrays)
+                return RoadGeometryFusion._centre_py(x, y, conf, src, vision_to, end)
+            return {"s": s, "x": xl, "y": yl, "conf": cl, "src": src, "vision_to_m": round(vision_to, 1), "end": end}
+
+        @staticmethod
+        def _centre_vision(vx, vy, vsd, reach, _n=_NG.geom_centre):
+            try:
+                s, xl, yl, cl = _n(vx, vy, vsd, reach)
+            except (TypeError, ValueError, BufferError):
+                return RoadGeometryFusion._centre_vision_py(vx, vy, vsd, reach)
+            return {"s": s, "x": xl, "y": yl, "conf": cl, "src": "v" * len(s), "vision_to_m": round(reach, 1),
+                    "end": None}
 
     def _map_part(self, ts, vis, reach, dt, turn, out):
         """Fill the map part of `out`; None when the map is not used (out["map"]["why"] says why)."""

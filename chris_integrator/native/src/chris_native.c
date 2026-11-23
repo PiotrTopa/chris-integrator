@@ -2811,6 +2811,172 @@ fail:
 }
 
 /* ====================================================================================================
+ * The road geometry's centre line from the camera (trackers/roadgeom.py: `on_lanes` and `_centre`; numpy's
+ * elementwise steps in its order, cumsum in sequence, np.round as rint(v * 10^d) / 10^d)
+ * ==================================================================================================== */
+static PyObject *rint_list(const double *v, Py_ssize_t n, int dec)
+{
+    PyObject *out = PyList_New(n);
+    if (out == NULL)
+        return NULL;
+    double sc = POW10[dec];
+    for (Py_ssize_t i = 0; i < n; i++) {
+        PyObject *o = PyFloat_FromDouble(rint(v[i] * sc) / sc);
+        if (o == NULL) {
+            Py_DECREF(out);
+            return NULL;
+        }
+        PyList_SetItem(out, i, o);
+    }
+    return out;
+}
+
+/* geom_centre(x, y, c, reach) -> (s, x, y, conf) as lists, rounded to 1, 1, 2, 2 decimals:
+ *     reach None:  `_centre(x, y, c, ...)` (c: the confidence per point)
+ *     else:        m = x <= reach + 1e-6;  `_centre(x[m], y[m], np.clip(1.0 - c[m] / 1.5, 0.1, 1.0), ...)` (c: std)
+ * x, y, c: float64 arrays of one length. No point (left): IndexError, as x[0] of an empty array. */
+static PyObject *n_geom_centre(PyObject *self, PyObject *args)
+{
+    PyObject *ox, *oy, *oc, *oreach;
+    if (!PyArg_ParseTuple(args, "OOOO", &ox, &oy, &oc, &oreach))
+        return NULL;
+    double reach = 0.0;
+    int masked = oreach != Py_None;
+    if (masked) {
+        reach = PyFloat_AsDouble(oreach);
+        if (reach == -1.0 && PyErr_Occurred())
+            return NULL;
+    }
+    View vx, vy, vc;
+    vx.held = vy.held = vc.held = 0;
+    PyObject *res = NULL;
+    double *buf = NULL;
+    if (view_get(ox, &vx, 0, 'd', 1, "x") < 0 || view_get(oy, &vy, 0, 'd', 1, "y") < 0 || view_get(oc, &vc, 0, 'd', 1, "c") < 0)
+        goto done;
+    Py_ssize_t n = vx.b.shape[0];
+    if (vy.b.shape[0] != n || vc.b.shape[0] != n) {
+        PyErr_SetString(PyExc_ValueError, "geom_centre: arrays of one length");
+        goto done;
+    }
+    buf = PyMem_Malloc((size_t)(n > 0 ? n : 1) * 5 * sizeof(double));
+    if (buf == NULL) {
+        PyErr_NoMemory();
+        goto done;
+    }
+    double *X = buf, *Y = buf + n, *C = buf + 2 * n, *S = buf + 3 * n;
+    const double *x = DATA(vx), *y = DATA(vy), *c = DATA(vc);
+    Py_ssize_t m = 0;
+    for (Py_ssize_t i = 0; i < n; i++) {
+        if (masked && !(x[i] <= reach + 1e-6))
+            continue;
+        X[m] = x[i];
+        Y[m] = y[i];
+        if (masked) {
+            double v = 1.0 - c[i] / 1.5;
+            if (!isnan(v)) {                           /* np.clip: NaN stays NaN */
+                v = v > 0.1 ? v : 0.1;
+                v = v < 1.0 ? v : 1.0;
+            }
+            C[m] = v;
+        } else
+            C[m] = c[i];
+        m++;
+    }
+    if (m == 0) {
+        PyErr_SetString(PyExc_IndexError, "index 0 is out of bounds for axis 0 with size 0");
+        goto done;
+    }
+    /* s = concatenate([0], cumsum(hypot(diff(x), diff(y)))) + x[0] */
+    double acc = 0.0;
+    S[0] = 0.0;
+    for (Py_ssize_t i = 1; i < m; i++) {
+        double h = hypot(X[i] - X[i - 1], Y[i] - Y[i - 1]);
+        acc = i == 1 ? h : acc + h;
+        S[i] = acc;
+    }
+    for (Py_ssize_t i = 0; i < m; i++)
+        S[i] = S[i] + X[0];
+    PyObject *ls = rint_list(S, m, 1), *lx = rint_list(X, m, 1), *ly = rint_list(Y, m, 2), *lc = rint_list(C, m, 2);
+    if (ls && lx && ly && lc)
+        res = Py_BuildValue("(NNNN)", ls, lx, ly, lc);
+    else {
+        Py_XDECREF(ls);
+        Py_XDECREF(lx);
+        Py_XDECREF(ly);
+        Py_XDECREF(lc);
+    }
+done:
+    PyMem_Free(buf);
+    view_drop(&vx);
+    view_drop(&vy);
+    view_drop(&vc);
+    return res;
+}
+
+/* geom_reach(x, sd, reach_std, reach_max, reach_min): RoadGeometryFusion._reach (the min / max of Python on the
+ * same values, so the result is the same object kind: a float, or one of the configured numbers) */
+static PyObject *n_geom_reach(PyObject *self, PyObject *args)
+{
+    PyObject *ox, *os, *ostd, *omax, *omin;
+    if (!PyArg_ParseTuple(args, "OOOOO", &ox, &os, &ostd, &omax, &omin))
+        return NULL;
+    double rstd, rmax, rmin;
+    if (!get_num(ostd, &rstd) || !get_num(omax, &rmax) || !get_num(omin, &rmin)) {
+        PyErr_SetString(PyExc_TypeError, "geom_reach: plain numbers are needed");
+        return NULL;
+    }
+    View vx, vs;
+    vx.held = vs.held = 0;
+    PyObject *res = NULL;
+    if (view_get(ox, &vx, 0, 'd', 1, "x") < 0 || view_get(os, &vs, 0, 'd', 1, "sd") < 0)
+        goto done;
+    Py_ssize_t n = vx.b.shape[0];
+    if (vs.b.shape[0] != n) {
+        PyErr_SetString(PyExc_ValueError, "geom_reach: arrays of one length");
+        goto done;
+    }
+    if (n == 0) {
+        PyErr_SetString(PyExc_IndexError, "index -1 is out of bounds for axis 0 with size 0");
+        goto done;
+    }
+    const double *x = DATA(vx), *sd = DATA(vs);
+    double xl = x[n - 1], r = xl;
+    for (Py_ssize_t i = 0; i < n; i++)
+        if (sd[i] > rstd || x[i] > rmax) {
+            r = x[i > 0 ? i - 1 : 0];
+            break;
+        }
+    /* a = min(r, reach_max, x[-1]); b = min(reach_min, x[-1]); max(a, b) */
+    double a = r, b = rmin;
+    PyObject *ao = NULL, *bo = omin;                   /* NULL: a float of the value */
+    if (rmax < a) {
+        a = rmax;
+        ao = omax;
+    }
+    if (xl < a) {
+        a = xl;
+        ao = NULL;
+    }
+    if (xl < b) {
+        b = xl;
+        bo = NULL;
+    }
+    if (b > a) {
+        a = b;
+        ao = bo;
+    }
+    if (ao != NULL) {
+        Py_INCREF(ao);
+        res = ao;
+    } else
+        res = PyFloat_FromDouble(a);
+done:
+    view_drop(&vx);
+    view_drop(&vs);
+    return res;
+}
+
+/* ====================================================================================================
  * The radar's motion model (radar/models.py is the reference: still_b, transition_b, mix_b, predict_b,
  * combine_b; radar/tracker.py `_evolve`, `p_still_many`). State [px, py, vx, vy, ax, ay, dp, lh], three
  * hypotheses (stand, cv, ca). The reference builds dense 8x8 transitions and multiplies them; here only the
@@ -3416,6 +3582,8 @@ static PyMethodDef methods[] = {
     {"lanes_fit", n_lanes_fit, METH_VARARGS, "measurement noise, gate, innovation and fit of every line"},
     {"lanes_apply", n_lanes_apply, METH_VARARGS, "the scalar-gain update of the fitted lines, in place"},
     {"round_lists", n_round_lists, METH_VARARGS, "np.round(a, decimals).tolist(), optionally of np.sqrt(a)"},
+    {"geom_centre", n_geom_centre, METH_VARARGS, "the road geometry's centre line lists (RoadGeometryFusion._centre)"},
+    {"geom_reach", n_geom_reach, METH_VARARGS, "how far the camera's centre line reaches (RoadGeometryFusion._reach)"},
     {"radar_evolve", n_radar_evolve, METH_VARARGS, "Tracker._evolve (+ combine_b, + the free estimate's prediction) for B objects"},
     {"radar_combine", n_radar_combine, METH_VARARGS, "combine_b for B objects into given arrays"},
     {"radar_p_still", n_radar_p_still, METH_VARARGS, "Tracker.p_still_many: a list of floats"},
