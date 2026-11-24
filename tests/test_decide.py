@@ -142,6 +142,54 @@ class Futures(unittest.TestCase):
         orow = res[0][3]
         self.assertLess(orow[TH.DO_PC], 0.05)
 
+    def test_a_box_heading_the_radar_did_not_resolve_and_a_margin_breach_without_contact_do_not_alarm(self):
+        """A standing car beside the path whose box the radar turned a quarter turn with a wide heading spread is
+        drawn along the road; an oncoming car the prediction puts in its lane is drawn along it whatever its box
+        says; a pair whose mean futures miss (only the margin breached) has no time margin."""
+        self.assertTrue(FU.heading_resolved(0.08, 0.15) and FU.heading_resolved(math.nan, 0.15))
+        self.assertFalse(FU.heading_resolved(0.33, 0.15))
+        self.assertAlmostEqual(FU.along_lane_p({"onc": 0.9, "park": 0.1}), 0.9)
+        t = np.arange(0.0, 4.01, 0.25)
+
+        def judge(o, ms, lane=None, v=11.0):
+            F = FU.FrameFutures(t)
+            F.ego = [("path", 1.0, v * t, 0.0 * t, v + 0.0 * t)]
+            F.objects = [(o, ms, "contract")]
+            F.road_hdg[o["id"]] = 0.0
+            if lane:
+                F.lane[o["id"]] = lane
+            res, _ = TH.ThreatModel().evaluate(F, {"speed_mps": v})
+            return res[0][3], res[0][4]
+        # parked 2.8 m right of the path (centre), its box turned to 1.6 rad with a heading spread of 0.33 rad
+        o = {"id": 3, "state": "confirmed", "x_m": 20.0, "y_m": -1.9, "ctr": [21.5, -2.8], "len": 3.2, "wid": 1.8,
+             "hdg": 1.6, "ext_std": [0.4, 0.18, 0.33], "motion": "stationary", "std": [1.0, 0.3, 0.1, 0.1]}
+        stand = [("stopped", 1.0, 1.0, np.full(len(t), 20.0), np.full(len(t), -1.9), 0.3 + 0 * t, 0.3 + 0 * t, 0 * t)]
+        orow, _ = judge(o, stand)
+        self.assertLess(orow[TH.DO_PC], 0.05)
+        self.assertEqual(int(orow[TH.DO_LE]), 0)
+        orow, _ = judge(dict(o, ext_std=[0.4, 0.18, 0.05]), stand)          # resolved: a bay-parked car, as stated
+        self.assertGreater(orow[TH.DO_PC], 0.2)                          # (its length across: 0.3 m off the side)
+        # an oncoming truck in its lane (centre 3.6 m left), its 9.6 m box turned 0.35 rad toward the car
+        tr = {"id": 4, "state": "confirmed", "x_m": 30.0, "y_m": 2.7, "ctr": [34.8, 3.6], "len": 9.6, "wid": 2.5,
+              "hdg": 0.35, "ext_std": [1.9, 0.18, 0.06], "motion": "moving", "class": {"label": "truck"},
+              "std": [2.0, 0.4, 2.0, 0.5]}
+        onc = [("onc_keep", 1.0, 1.0, 30.0 - 12.0 * t, np.full(len(t), 2.7), 0.5 + 0.3 * t, 0.4 + 0 * t, 0 * t)]
+        orow, _ = judge(tr, onc)
+        self.assertGreater(orow[TH.DO_PC], 0.3)                          # its box's corner in the car's lane
+        orow, _ = judge(tr, onc, lane={"onc": 0.94, "ego": 0.02})
+        self.assertLess(orow[TH.DO_PC], 0.05)
+        # a car beside the path, 0.15 m clear of the car's side on the mean futures, a wide spread: the margin is
+        # breached, there is no collision to time
+        b = {"id": 5, "state": "confirmed", "x_m": 15.0, "y_m": -1.9, "ctr": [17.25, -2.8], "len": 4.5, "wid": 1.8,
+             "hdg": 0.0, "ext_std": [0.4, 0.18, 0.05], "motion": "stationary", "std": [1.0, 0.8, 0.1, 0.1]}
+        ms = [("stopped", 1.0, 1.0, np.full(len(t), 15.0), np.full(len(t), -1.9 + 0.95), 0.8 + 0 * t,
+               0.8 + 0 * t, 0 * t)]
+        orow, prow = judge(b, ms)
+        p = prow[0, 0]
+        self.assertTrue(math.isnan(p[TH.DP_TTC]) and p[TH.DP_COURSE] > 0.5)    # mean miss, the margin breached
+        self.assertTrue(math.isnan(p[TH.DP_TM]))
+        self.assertLessEqual(int(p[TH.DP_LE]), 1)
+
 
 def rec(oid, le, lx=None, tn=0.5, tm=0.5, kind="vehicle", ab=3.0, al=2.0, ar=2.0, mass=None):
     return {"id": oid, "level": le, "level_exit": le if lx is None else lx, "kind": kind, "tn": tn, "tm_s": tm,

@@ -996,7 +996,11 @@ driver would have to do: for the car against every object, over the object's pre
   condition, the share a driver gets, falling with speed, the turning circle at low speed): the brake, steer and
   combined threat numbers;
 * **time-to-brake and time-to-steer**: the last onset of full braking or steering that still avoids, and the
-  **time margin** tm = max(ttb, tts) - the driver's reaction time (0.9 quantile of a log-normal, median 1 s);
+  **time margin** tm = max(ttb, tts) - the driver's reaction time (0.9 quantile of a log-normal, median 1 s),
+  only where the mean futures make contact with the footprint as it is: a time margin needs a collision to have a
+  time. Against the margin alone a car passed 0.2 m wider than its spread "had" none left (the margin breached at
+  once; a quarter of the false warnings of the degraded futures in the simulated parked streets, 2026-11-24). The
+  margin's inflation is scaled down to the gap the car has now (no demand keeps a margin wider than that);
 * time to collision, time headway and the least separation on the mean futures, secondary;
 * a **level** per pair from per-class thresholds on the threat number and the time margin, and per object the
   highest level whose probability mass (weight x pc over the pairs at or above it) reaches its minimum, with

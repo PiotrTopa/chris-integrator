@@ -53,6 +53,11 @@ DEFAULT_CFG = dict(
     k_sigma=1.0,                              # the threat numbers keep clear of the mean +- k sigma ...
     k_sigma_cap_m=(1.0, 0.3),                 # ... at most this much (along, across the object)
     margin_long_m=0.3, margin_lat_m=0.15,
+    # a time margin needs a collision to have a time: only where the mean futures make contact (the footprint as it
+    # is) is the time left to act measured (against the margin, as the threat numbers); where they miss and only the
+    # margin is breached, the pair's level is its threat number's. Against the margin alone a car passed 0.2 m wider
+    # than its spread "had" no time left (breached at once, the last full steer before the driver could react)
+    tm_needs_contact=True,
     pc_method="mc",                           # "mc": quasi-Monte Carlo over the horizon | "analytic": per time
     samples=256,                              # draws of the Monte Carlo (full quality; cost scales with it)
     sim_dt_s=0.05,                            # the horizon's step (collision tests, evasions)
@@ -73,6 +78,19 @@ DEFAULT_CFG = dict(
     # points (the radar's rectangle turned the wrong way by 0.2-0.55 rad on bends), the road does: the stated heading
     # snapped to the road's axis at its place when within road_axis_snap_rad of it (else as stated: a bay-parked car)
     road_axis_standing=True, road_axis_snap_rad=0.7, road_axis_std_rad=0.1,
+    # ... and the stated heading is evidence only where the radar resolved it (its 1 sigma, `ext_std`, at most
+    # hdg_resolved_rad: the boxes of whole vehicles state 0.04-0.11 rad; partial side-on views 0.2-0.8 rad, often a
+    # quarter turn off, which turned cars parked along the road across it, into the car's footprint). An unresolved
+    # box heading gives way to the direction of travel (resolved speed) or the road's axis at the object's place
+    # (either direction, nearer the stated one), whatever the turn; standing or not
+    hdg_resolved_rad=0.15,
+    # a vehicle the prediction puts in a lane along the road (P(ego) + P(left) + P(right) + P(onc) at least
+    # lane_axis_p: more likely than not) points along it: its footprint's heading now is the road's axis at its
+    # place (the direction nearer the stated one). A box seen head-on states a heading it cannot see (an oncoming
+    # truck's 9.6 m box turned 0.35 rad across the centre line, sigma 0.06, its corner in the car's lane). Without
+    # the prediction's lanes, the degraded adapter's judgement stands in: it drives along the path or against it
+    # (futures.cv_future, "cv_path")
+    lane_axis_p=0.5,
     # the prediction's lane probabilities (contract futures): a mode that stands (moves less than stand_move_m over
     # the horizon) can only be hit where the object is in the car's lane or across it: its weight is scaled by
     # P(lane ego) + P(lane cross), at least lane_weight_floor; not where the radar's own corridor test says it surely
@@ -156,7 +174,7 @@ class ThreatModel:
                          float(c["combo_dirs"]), c["search_factor"], c["tol_accel"], c["tol_time"],
                          1.0 if c["obj_ref"] == "nearest" else 0.0, 1.0 if c["others"] else 0.0, c["p_mode_min"],
                          c["horizon_s"], c["horizon_ext_s"], c["ego_long_cap_m"], c["ego_lat_cap_m"],
-                         c["k_sigma_cap_m"][0], c["k_sigma_cap_m"][1]])
+                         c["k_sigma_cap_m"][0], c["k_sigma_cap_m"][1], 1.0 if c["tm_needs_contact"] else 0.0])
 
     def evaluate(self, F, ego, road=None):
         """Per object of FrameFutures F: (object, modes, source, native object row, native pair rows (K_obj x E)).
@@ -179,8 +197,16 @@ class ThreatModel:
         for i, (o, ms, _) in enumerate(F.objects):
             L, W, sL, sW, h, sh, label, esrc = FU.extent(o)
             rh = F.road_hdg.get(o.get("id"))
-            if not math.isfinite(h) and rh is not None:
+            if math.isfinite(h) and not FU.heading_resolved(sh, self.cfg["hdg_resolved_rad"]):
+                if FU.heading_from_motion(o):
+                    h, sh = FU.travel_heading(o)
+                elif rh is not None:
+                    h, sh = FU.road_axis(h, math.nan, rh, math.pi, self.cfg["road_axis_std_rad"])
+            elif not math.isfinite(h) and rh is not None:
                 h = F.road_hdg[o.get("id")]
+            elif rh is not None and FU.kind_of(label) == "vehicle" and (
+                    FU.along_lane_p(F.lane.get(o.get("id"))) >= self.cfg["lane_axis_p"] or o.get("id") in F.along):
+                h, sh = FU.road_axis(h, sh, rh, math.pi, self.cfg["road_axis_std_rad"])
             elif rh is not None and self.cfg["road_axis_standing"] and FU.stands(o) and not FU.heading_from_motion(o):
                 h, sh = FU.road_axis(h, sh, rh, self.cfg["road_axis_snap_rad"], self.cfg["road_axis_std_rad"])
             ext.append((L, W, label, esrc))
