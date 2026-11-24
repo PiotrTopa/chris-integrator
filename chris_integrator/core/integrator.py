@@ -432,18 +432,22 @@ class Integrator:
             return
         t = ts / NS
         fused = False
-        self.fdi.stamp((msg["type"], msg.get("sensor")), specs[0].group, t)
+        has_sensor = "sensor" in msg
+        sensor = msg["sensor"] if has_sensor else None
+        self.fdi.stamp((msg["type"], sensor), specs[0].group, t)
+        src_t, objects = self.src_t, self.objects
         for spec in specs:
             # ordering is per stream: several sensors may share a message type (`objects` of each radar and camera)
-            key = spec.id if "sensor" not in msg else (spec.id, msg["sensor"])
-            last = self.src_t.get(key)
+            key = (spec.id, sensor) if has_sensor else spec.id
+            last = src_t.get(key)
             if last is not None and t <= last:
                 if t < last - self.cfg["epoch_back_s"]:
                     self._new_epoch()
+                    src_t = self.src_t             # (a new epoch starts a new table)
                 else:
                     self.counts["dropped"][spec.id] = self.counts["dropped"].get(spec.id, 0) + 1
                     continue
-            self.src_t[key] = t
+            src_t[key] = t
             if self.now is None or t > self.now:
                 self.now = t
             g = self.groups[spec.group]
@@ -455,14 +459,14 @@ class Integrator:
                     g.last_t = t if g.last_t is None else max(g.last_t, t)
                 for m in ms:
                     fused |= self._measure(spec, g, m)
-            if self.objects is not None:
+            if objects is not None:
                 sc = spec.scan(msg, ctx)
                 if sc is not None:
                     if spec.counts and not ms:
                         g.arrivals.append(t)
                         g.last_t = t if g.last_t is None else max(g.last_t, t)
                     if g.fault is None:
-                        self.objects.add_scan(sc)
+                        objects.add_scan(sc)
         if self.disputed and self.now - self._dispute_t > 0.5:      # a pending vote has a deadline
             self._dispute_t = self.now
             self._isolate()
