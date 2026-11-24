@@ -231,6 +231,7 @@ def run(name, seed, night, radar_cfg=None, det_params=None):
                 if q["id"] == o.id:
                     row["flags"], row["off"] = q["flags"], q["path_offset_m"]
                     row["len"], row["wid"] = q.get("len"), q.get("wid")
+                    row["xm"], row["ym"] = q.get("x_m"), q.get("y_m")     # the near face, as the message has it
             if a is not None:
                 r = max(a["range"], 0.5)
                 ux, uy = a["ref_x"] / r, a["ref_y"] / r
@@ -242,7 +243,7 @@ def run(name, seed, night, radar_cfg=None, det_params=None):
                 fx, fy = xc - a["x"], yc - a["y"]
                 row.update(moving=a["moving"], role=a["role"], tx=a["ref_x"], ty=a["ref_y"], tvx=a["vx"], tvy=a["vy"],
                            along=ex * ux + ey * uy, across=-ex * uy + ey * ux, range=r, tlab=a["stationary_label"],
-                           tH=a["H"], tL=a.get("len"), lane_off=a["lane_offset"], tcx=a["x"], tcy=a["y"],
+                           tH=a["H"], tL=a.get("len"), lane_off=a["lane_offset"], tcx=a["x"], tcy=a["y"], thd=a.get("heading"),
                            along_c=fx * cx + fy * cy, across_c=-fx * cy + fy * cx)
             R["frames"].append(row)
         return out
