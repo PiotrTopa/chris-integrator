@@ -647,8 +647,12 @@ class ViewBuilder:
         if gkey == self._gains_key:
             gains = self._gains
         else:
-            gains = [1.0 - math.exp(-dt / (c["line_tau_s"] + c["line_tau_rel"] * x)) if dt > 0 and c["line_tau_s"] > 0
-                     else 1.0 for x in xs]
+            tau, tau_rel = c["line_tau_s"], c["line_tau_rel"]
+            if dt > 0 and tau > 0:
+                exp = math.exp
+                gains = [1.0 - exp(-dt / (tau + tau_rel * x)) for x in xs]
+            else:
+                gains = [1.0] * len(xs)
             self._gains_key, self._gains = gkey, gains
         mv, mr = self._mv                                       # (on_frame's _motion of this frame)
         seen = set()
