@@ -510,6 +510,15 @@ class SpeedLimit:
                "area_source": self.area["source"]}
         return val, src, round(conf, 3), None
 
+    def limit_key(self):
+        """(value, source kind, source track_id) of `current()`, without building its source, confidence and
+        expiry: what a change key needs (RulesInEffect._key, every message). Must follow `current()`."""
+        lim = self.limit
+        if lim:
+            return lim["value_kmh"], "sign", lim["info"].get("track_id")
+        val = self.default_limit()[0]
+        return val, "default" if val is not None else "unknown", None
+
     def pending(self):
         out = []
         for t in self.tracks.values():
