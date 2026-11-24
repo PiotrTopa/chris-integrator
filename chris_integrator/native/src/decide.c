@@ -139,6 +139,57 @@ static double DK_Z[DK_MAXS][5];
 static double DK_RZ[DK_MAXS];        /* the largest |(z0, z1)| of the draws up to this one */
 static int dk_z_n = 0;
 
+/* The draws' places (z0, z1) ordered along DK_ND directions (dk_pc: which draws lie beyond a line is read off the
+ * order along the direction nearest the line's normal). Eight directions per octant, at equal steps of the
+ * smaller over the larger component of the normal. */
+#define DK_ND 64
+static double DK_DU[DK_ND][2];               /* the directions (unit vectors) */
+static double DK_DP[DK_ND][DK_MAXS];         /* per direction: the draws' projections, the largest first */
+static unsigned short DK_DI[DK_ND][DK_MAXS]; /* ... and which draws they are */
+static int dk_d_n = 0;                       /* the number of draws the order is of */
+
+static int dk_dir(double a, double b)        /* the direction's index for the normal (a, b), not both zero */
+{
+    double fa = fabs(a), fb = fabs(b);
+    int oct = (a < 0.0 ? 1 : 0) | (b < 0.0 ? 2 : 0) | (fb > fa ? 4 : 0);
+    double r = fb > fa ? fa / fb : fb / fa;          /* the smaller over the larger: 0 ... 1 */
+    int sub = (int)(r * 8.0);
+    if (!(sub >= 0))
+        sub = 0;
+    if (sub > 7)
+        sub = 7;
+    return oct * 8 + sub;
+}
+
+static void dk_order(int n)
+{
+    if (n == dk_d_n)
+        return;
+    for (int d = 0; d < DK_ND; d++) {
+        int oct = d / 8, sub = d % 8;
+        double big = 1.0, small = (sub + 0.5) / 8.0, nn = sqrt(big * big + small * small);
+        double a = (oct & 4 ? small : big) / nn, b = (oct & 4 ? big : small) / nn;
+        if (oct & 1)
+            a = -a;
+        if (oct & 2)
+            b = -b;
+        DK_DU[d][0] = a;
+        DK_DU[d][1] = b;
+        for (int q = 0; q < n; q++) {            /* insertion sort, the largest first */
+            double pr = DK_Z[q][0] * a + DK_Z[q][1] * b;
+            int r = q - 1;
+            while (r >= 0 && DK_DP[d][r] < pr) {
+                DK_DP[d][r + 1] = DK_DP[d][r];
+                DK_DI[d][r + 1] = DK_DI[d][r];
+                r--;
+            }
+            DK_DP[d][r + 1] = pr;
+            DK_DI[d][r + 1] = (unsigned short)q;
+        }
+    }
+    dk_d_n = n;
+}
+
 static void dk_draws(int n)
 {
     static const int base[5] = {2, 3, 5, 7, 11};
@@ -349,6 +400,8 @@ typedef struct {               /* one ego mode, sampled: pose and the path by ar
     double *x, *y, *th, *v, *s;   /* per step */
     DkRect *er;                   /* per step: the car's footprint there (dk_ego_rect of x, y, th) */
     double *exx, *exy, *eyy;      /* per step of the horizon: the car's own covariance there (dk_ego_cov) */
+    const double *X, *Y, *V;      /* the mode on the futures' grid */
+    int done;                     /* steps sampled so far (dk_ego_sample) */
     double *ps, *px, *py, *pth;   /* the path: per grid point arc length, position, heading */
     int np;
 } DkEgo;
@@ -357,6 +410,9 @@ typedef struct {               /* one object mode, sampled */
     double *cx, *cy, *c, *s;      /* centre and heading */
     double *sxx, *sxy, *syy;      /* the object's covariance */
     double hl, hw, sdl, sdw, sdh; /* half extents and the extents' 1 sigma */
+    const double *row, *hd;       /* the mode on the futures' grid (MD) and its object's header (OH) */
+    double hprev, ch, sh, offb_x, offb_y;        /* where the sampling stands: heading, its cos / sin, the centre's offset */
+    int done;                     /* steps sampled so far (dk_obj_sample) */
 } DkObj;
 
 /* the car's own covariance of position at time tau: along and across its heading (a demand it holds with some
@@ -727,8 +783,10 @@ static double dk_pc(const DkCtx *C, int j, int k, double *t_contact)
     if (ns > DK_MAXS)
         ns = DK_MAXS;
     dk_draws(ns);
+    dk_order(ns);
     /* the draws' footprints (extent and, where a draw comes near, the turn of its heading) */
-    static double QHL[DK_MAXS], QHW[DK_MAXS], QR[DK_MAXS];
+    static double QHL[DK_MAXS], QHW[DK_MAXS], QR[DK_MAXS], QCD[DK_MAXS], QSD[DK_MAXS];
+    static unsigned char qhit[DK_MAXS], qturned[DK_MAXS];
     double rmax = 0.0;
     for (int q = 0; q < ns; q++) {
         const double *z = DK_Z[q];
@@ -742,47 +800,62 @@ static double dk_pc(const DkCtx *C, int j, int k, double *t_contact)
         QR[q] = sqrt(hl * hl + hw * hw) + Re;
         if (!(QR[q] <= rmax))
             rmax = QR[q] > rmax ? QR[q] : INFINITY;      /* (not a number: no step is left out) */
+        qhit[q] = qturned[q] = 0;
     }
     /* Which (draw, step) can touch at all, decided before the draw is placed. The draw moves the object's centre
      * by e = L z; with u the unit vector from the object's mean centre to the car's (their distance D), the moved
      * centre is at least D - e.u = D - (pa z0 + pb z1) from the car's, so where that exceeds the two bounding
      * circles (the test below: R) the draw is clear at that step, and the test below would say so. Only such
      * (draw, step) are left out, with a margin (1e-9 of the numbers' sizes: a million times their rounding), and a
-     * step no draw can reach (|e.u| <= |(pa, pb)| max |z|) is left out for all: the hits and their times are the
-     * same draws' at the same steps. */
-    static int LI[DK_MAXSIM];
-    static double PA[DK_MAXSIM], PB[DK_MAXSIM], PT[DK_MAXSIM];
-    int nl = 0;
+     * step no draw can reach (|e.u| <= |(pa, pb)| max |z|) is left out for all. The draws that pass lie beyond a
+     * line in the plane of (z0, z1): they are read off the draws' order along the direction nearest the line's
+     * normal (dk_order), with the difference of the two directions allowed for, and each is then tested as it
+     * is. The steps are gone through in time and a draw that has touched is done, so every draw's first contact
+     * is the step it always was: the hits and their times are the same. */
     const double zmax = DK_RZ[ns - 1] * (1.0 + 1e-9), rpad = rmax * (1.0 + 1e-9);
-    for (int i = 0; i < n; i++) {
+    int hits = 0;
+    static double th_hit[DK_MAXS];
+    for (int i = 0; i < n && hits < ns; i++) {
         if (!live[i])
             continue;
         double pa = 0.0, pb = 0.0, pt = -INFINITY, D = DD[i];
+        const unsigned short *cand = NULL;       /* the draws to test: NULL: all of them */
+        const double *cproj = NULL;
+        double cut = -INFINITY;
         if (D > 0.0 && D < INFINITY) {
             double ux = (ER[i].cx - o->cx[i]) / D, uy = (ER[i].cy - o->cy[i]) / D;
             pa = L11[i] * ux + L21[i] * uy;
             pb = L22[i] * uy;
             pt = D - 1e-9 * (1.0 + fabs(o->cx[i]) + fabs(o->cy[i]) + fabs(ER[i].cx) + fabs(ER[i].cy) +
                              8.0 * (fabs(pa) + fabs(pb)));
-            if (sqrt(pa * pa + pb * pb) * zmax + rpad < pt)
+            double nn = sqrt(pa * pa + pb * pb);
+            if (nn * zmax + rpad < pt)
                 continue;                        /* beyond every draw's reach */
+            if (nn > 0.0 && nn < INFINITY) {
+                /* a draw that passes has z.u >= (pt - rpad) / nn = tau for the normal u = (pa, pb) / nn; along
+                 * the tabulated direction ud its projection is then at least tau - max|z| |ud - u| */
+                int d = dk_dir(pa, pb);
+                double vx = DK_DU[d][0] - pa / nn, vy = DK_DU[d][1] - pb / nn, tau = (pt - rpad) / nn;
+                cut = tau - zmax * sqrt(vx * vx + vy * vy) - 1e-9 * (1.0 + fabs(tau));
+                if (cut == cut) {                /* (not a number: all draws) */
+                    cand = DK_DI[d];
+                    cproj = DK_DP[d];
+                }
+            }
         }
-        PA[nl] = pa;
-        PB[nl] = pb;
-        PT[nl] = pt;
-        LI[nl++] = i;
-    }
-    int hits = 0;
-    static double th_hit[DK_MAXS];
-    for (int q = 0; q < ns; q++) {
-        const double *z = DK_Z[q];
-        const double z0 = z[0], z1 = z[1], hl = QHL[q], hw = QHW[q], R = QR[q], rq = R * (1.0 + 1e-9);
-        double cd = 0.0, sd = 0.0;
-        int turned = 0;
-        for (int m = 0; m < nl; m++) {
-            if (PA[m] * z0 + PB[m] * z1 + rq < PT[m])
+        for (int r = 0; r < ns; r++) {
+            int q = r;
+            if (cand != NULL) {
+                if (cproj[r] < cut)
+                    break;                       /* the rest lie further back along the direction */
+                q = cand[r];
+            }
+            if (qhit[q])
                 continue;
-            int i = LI[m];
+            const double *z = DK_Z[q];
+            const double z0 = z[0], z1 = z[1], R = QR[q];
+            if (pa * z0 + pb * z1 + R * (1.0 + 1e-9) < pt)
+                continue;
             double ex = L11[i] * z0, ey = L21[i] * z0 + L22[i] * z1;
             DkRect orr;
             orr.cx = o->cx[i] + ex;
@@ -790,19 +863,20 @@ static double dk_pc(const DkCtx *C, int j, int k, double *t_contact)
             double dx = orr.cx - ER[i].cx, dy = orr.cy - ER[i].cy;
             if (dx * dx + dy * dy > R * R)
                 continue;
-            if (!turned) {
+            if (!qturned[q]) {
                 double dh = o->sdh * z[4];
-                cd = cos(dh);
-                sd = sin(dh);
-                turned = 1;
+                QCD[q] = cos(dh);
+                QSD[q] = sin(dh);
+                qturned[q] = 1;
             }
+            const double cd = QCD[q], sd = QSD[q];
             orr.c = o->c[i] * cd - o->s[i] * sd;
             orr.s = o->s[i] * cd + o->c[i] * sd;
-            orr.hl = hl;
-            orr.hw = hw;
+            orr.hl = QHL[q];
+            orr.hw = QHW[q];
             if (dk_sep(&ER[i], &orr) < 0.0) {
                 th_hit[hits++] = i * dt;
-                break;
+                qhit[q] = 1;
             }
         }
     }
@@ -884,6 +958,135 @@ static int dk_level(const double *thr, int set, int exit, double course, double 
     return L;
 }
 
+/* The futures are sampled over the horizon; over its extension (where only a simulated evasion looks: dk_clear)
+ * when a pair on a collision course asks for it. Every future is read at the same times: step i's place on the
+ * grid (dk_interp_idx of t[0] + i dt) and, for an object's direction of travel, the place a second later (the
+ * grid's end at most) are worked out once per frame. */
+typedef struct {
+    const double *cfg, *t;
+    int N, ohw;
+    double dt;
+    const int *I0, *J0;
+    const double *FI, *FJ, *TJ;         /* TJ: the later time less the step's (the travel's time) */
+    double ex0, ey0;                    /* the car now (the first ego mode's first step) */
+} DkSamp;
+
+/* an ego mode's steps [e->done, to) */
+static void dk_ego_sample(const DkSamp *S, DkEgo *e, int nh, int to)
+{
+    const double *X = e->X, *Y = e->Y, *V = e->V;
+    for (int i = e->done; i < to; i++) {
+        const double f = S->FI[i];
+        const int i0 = S->I0[i];
+        e->x[i] = X[i0] + f * (X[i0 + 1] - X[i0]);
+        e->y[i] = Y[i0] + f * (Y[i0 + 1] - Y[i0]);
+        e->v[i] = V[i0] + f * (V[i0 + 1] - V[i0]);
+        if (e->v[i] < 0.0)
+            e->v[i] = 0.0;
+        e->s[i] = e->ps[i0] + f * (e->ps[i0 + 1] - e->ps[i0]);
+        double dx = X[i0 + 1] - X[i0], dy = Y[i0 + 1] - Y[i0];
+        e->th[i] = (dx * dx + dy * dy > 0.0025) ? atan2(dy, dx) : e->pth[i0];
+        /* the mode's footprint and (within the horizon) its own covariance at the step: the same for every
+         * object mode it is judged against */
+        dk_ego_rect(S->cfg, e->x[i], e->y[i], e->th[i], &e->er[i]);
+        if (i < nh)
+            dk_ego_cov(S->cfg, i * S->dt, e->th[i], &e->exx[i], &e->exy[i], &e->eyy[i]);
+    }
+    if (to > e->done)
+        e->done = to;
+}
+
+/* an object mode's steps [o->done, to).
+ *
+ * The heading per step: now the stated one (the rectangle the radar measured; the offset of its centre is taken in
+ * that frame); later the direction of the mode's travel over the next second where it travels at least DK_HMOVE
+ * m/s on average, else held. The rectangle's axis, not its front: a step's heading is taken modulo a half turn
+ * nearest the last. Before 2026-11-23 every grid interval's own direction counted from 0.6 m/s on, now included: a
+ * mode starting 0.4 m beside the radar's point (the first quarter second, a prepended "now") turned a car parked
+ * beside the path across it, its centre offset swung by 90 degrees onto the path (parked_street object 400,
+ * move_off, pc 1.0). */
+static void dk_obj_sample(const DkSamp *S, DkObj *o, int to)
+{
+    const double *cfg = S->cfg, *hd = o->hd;
+    const int N = S->N;
+    const double *X = o->row + 2, *Y = o->row + 2 + N, *SX = o->row + 2 + 2 * N, *SY = o->row + 2 + 3 * N,
+                 *RR = o->row + 2 + 4 * N;
+    const double h0 = isfinite(hd[6]) ? hd[6] : 0.0;
+    double hprev = o->hprev, c = o->ch, s = o->sh;       /* cos, sin of the step's heading */
+    double offb_x = o->offb_x, offb_y = o->offb_y;       /* the reference point to the centre, in the body frame */
+    for (int i = o->done; i < to; i++) {
+        const double f = S->FI[i];
+        const int i0 = S->I0[i];
+        double x = X[i0] + f * (X[i0 + 1] - X[i0]), y = Y[i0] + f * (Y[i0 + 1] - Y[i0]);
+        double hm = NAN;
+        if (S->TJ[i] > 0.2) {
+            const double f2 = S->FJ[i];
+            const int j0 = S->J0[i];
+            double mx = X[j0] + f2 * (X[j0 + 1] - X[j0]) - x, my = Y[j0] + f2 * (Y[j0 + 1] - Y[j0]) - y;
+            if (mx * mx + my * my > DK_HMOVE * DK_HMOVE * S->TJ[i] * S->TJ[i])
+                hm = atan2(my, mx);
+        }
+        double h;
+        if (i == 0)
+            h = isfinite(hd[6]) ? hd[6] : (isfinite(hm) ? hm : h0);
+        else {
+            h = isfinite(hm) ? hm : hprev;
+            double dh = remainder(h - hprev, 2.0 * M_PI);
+            if (fabs(dh) > 0.5 * M_PI)
+                h = remainder(h + M_PI, 2.0 * M_PI);
+        }
+        if (i == 0 || h != hprev || signbit(h) != signbit(hprev)) {      /* a held heading keeps its cos, sin */
+            c = cos(h);
+            s = sin(h);
+        }
+        hprev = h;
+        if (i == 0 && cfg[DC_REF] > 0.5 && S->ohw == DK_OHC && hd[9] > 0.5 && isfinite(hd[10]) && isfinite(hd[11])) {
+            /* the radar said where the centre is: its offset from the reference point, held in the body
+             * frame (it turns with the object) */
+            offb_x = hd[10] * c + hd[11] * s;
+            offb_y = -hd[10] * s + hd[11] * c;
+        } else if (i == 0 && cfg[DC_REF] > 0.5) {
+            /* the radar's point is the nearest of the footprint as the camera sees it: the centre lies
+             * half the footprint's extent further along the line of sight */
+            double lx = x - S->ex0, ly = y - S->ey0, ll = sqrt(lx * lx + ly * ly);
+            if (ll > 1e-6) {
+                lx /= ll;
+                ly /= ll;
+                double sup = o->hl * fabs(lx * c + ly * s) + o->hw * fabs(-lx * s + ly * c);
+                double ox = sup * lx, oy = sup * ly;
+                offb_x = ox * c + oy * s;
+                offb_y = -ox * s + oy * c;
+            }
+        }
+        o->cx[i] = x + offb_x * c - offb_y * s;
+        o->cy[i] = y + offb_x * s + offb_y * c;
+        o->c[i] = c;
+        o->s[i] = s;
+        double sx = SX[i0] + f * (SX[i0 + 1] - SX[i0]), sy = SY[i0] + f * (SY[i0 + 1] - SY[i0]);
+        double r = RR[i0] + f * (RR[i0 + 1] - RR[i0]);
+        if (!isfinite(r))
+            r = 0.0;
+        if (r > 0.99)
+            r = 0.99;
+        if (r < -0.99)
+            r = -0.99;
+        if (sx < 0.0)
+            sx = 0.0;
+        if (sy < 0.0)
+            sy = 0.0;
+        o->sxx[i] = sx * sx;
+        o->syy[i] = sy * sy;
+        o->sxy[i] = r * sx * sy;
+    }
+    o->hprev = hprev;
+    o->ch = c;
+    o->sh = s;
+    o->offb_x = offb_x;
+    o->offb_y = offb_y;
+    if (to > o->done)
+        o->done = to;
+}
+
 /* the evaluation of one frame (the arrays of the file's head; N >= 2, E >= 1): 0 and the steps of the horizon and
  * of the simulation, or -1 with an exception set */
 static int dk_eval(const double *t, int N, const double *EG, int E, const double *OH, int ohw, int M, const double *MD,
@@ -925,10 +1128,8 @@ static int dk_eval(const double *t, int N, const double *EG, int E, const double
     }
     double *w = buf;
     DkGrid g = {n, nh, dt, t, N};
-    /* every future is read at the same times: step i's place on the grid (dk_interp_idx of t[0] + i dt) and, for
-     * an object's direction of travel, the place a second later (the grid's end at most), worked out once */
     int *I0 = ibuf + M + 2 * K + 1, *J0 = I0 + n;
-    double *FI = w, *FJ = w + n, *TJ = w + 2 * n;        /* TJ: the later time less the step's (the travel's time) */
+    double *FI = w, *FJ = w + n, *TJ = w + 2 * n;
     w += 3 * n;
     for (int i = 0; i < n; i++) {
         double tau = t[0] + i * dt;
@@ -940,6 +1141,7 @@ static int dk_eval(const double *t, int N, const double *EG, int E, const double
         if (TJ[i] > 0.2)
             dk_interp_idx(&g, tau2, &J0[i], &FJ[i]);
     }
+    DkSamp S = {cfg, t, N, ohw, dt, I0, J0, FI, FJ, TJ, 0.0, 0.0};
     /* the ego modes */
     for (int j = 0; j < E; j++) {
         const double *row = EG + (size_t)j * (1 + 3 * N);
@@ -970,24 +1172,14 @@ static int dk_eval(const double *t, int N, const double *EG, int E, const double
             e->ps[i] = s;
             e->pth[i] = h;
         }
-        for (int i = 0; i < n; i++) {
-            const double f = FI[i];
-            const int i0 = I0[i];
-            e->x[i] = X[i0] + f * (X[i0 + 1] - X[i0]);
-            e->y[i] = Y[i0] + f * (Y[i0 + 1] - Y[i0]);
-            e->v[i] = V[i0] + f * (V[i0 + 1] - V[i0]);
-            if (e->v[i] < 0.0)
-                e->v[i] = 0.0;
-            e->s[i] = e->ps[i0] + f * (e->ps[i0 + 1] - e->ps[i0]);
-            double dx = X[i0 + 1] - X[i0], dy = Y[i0 + 1] - Y[i0];
-            e->th[i] = (dx * dx + dy * dy > 0.0025) ? atan2(dy, dx) : e->pth[i0];
-            /* the mode's footprint and (within the horizon) its own covariance at the step: the same for every
-             * object mode it is judged against */
-            dk_ego_rect(cfg, e->x[i], e->y[i], e->th[i], &e->er[i]);
-            if (i < nh)
-                dk_ego_cov(cfg, i * dt, e->th[i], &e->exx[i], &e->exy[i], &e->eyy[i]);
-        }
+        e->X = X;
+        e->Y = Y;
+        e->V = V;
+        e->done = 0;
+        dk_ego_sample(&S, e, nh, nh);
     }
+    S.ex0 = eg[0].x[0];
+    S.ey0 = eg[0].y[0];
     /* the object modes */
     int *mode_obj = ibuf, *top = ibuf + K, *used = ibuf + K + M + 1;
     for (int k = 0; k < K; k++)
@@ -1022,8 +1214,6 @@ static int dk_eval(const double *t, int N, const double *EG, int E, const double
             mode_obj[k] = m;
             if (!used[k])
                 continue;
-            const double *row = MD + (size_t)k * (2 + 5 * N);
-            const double *X = row + 2, *Y = row + 2 + N, *SX = row + 2 + 2 * N, *SY = row + 2 + 3 * N, *RR = row + 2 + 4 * N;
             DkObj *o = &ob[k];
             o->cx = w; o->cy = w + n; o->c = w + 2 * n; o->s = w + 3 * n; o->sxx = w + 4 * n; o->sxy = w + 5 * n;
             o->syy = w + 6 * n; w += 7 * n;
@@ -1033,99 +1223,18 @@ static int dk_eval(const double *t, int N, const double *EG, int E, const double
             o->sdl = hd[4] > 0.0 ? hd[4] : 0.0;
             o->sdw = hd[5] > 0.0 ? hd[5] : 0.0;
             o->sdh = isfinite(hd[7]) && hd[7] > 0.0 ? hd[7] : 0.0;
-            double h0 = isfinite(hd[6]) ? hd[6] : 0.0, hprev = h0;
-            /* the heading per step: now the stated one (the rectangle the radar measured; the offset of its centre
-             * is taken in that frame); later the direction of the mode's travel over the next second where it
-             * travels at least DK_HMOVE m/s on average, else held. The rectangle's axis, not its front: a step's
-             * heading is taken modulo a half turn nearest the last. Before 2026-11-23 every grid interval's own
-             * direction counted from 0.6 m/s on, now included: a mode starting 0.4 m beside the radar's point (the
-             * first quarter second, a prepended "now") turned a car parked beside the path across it, its centre
-             * offset swung by 90 degrees onto the path (parked_street object 400, move_off, pc 1.0). */
-            double offb_x = 0.0, offb_y = 0.0;           /* the reference point to the centre, in the body frame */
-            double c = 1.0, s = 0.0;                     /* cos, sin of the step's heading */
-            for (int i = 0; i < n; i++) {
-                const double f = FI[i];
-                const int i0 = I0[i];
-                double x = X[i0] + f * (X[i0 + 1] - X[i0]), y = Y[i0] + f * (Y[i0 + 1] - Y[i0]);
-                double hm = NAN;
-                if (TJ[i] > 0.2) {
-                    const double f2 = FJ[i];
-                    const int j0 = J0[i];
-                    double mx = X[j0] + f2 * (X[j0 + 1] - X[j0]) - x, my = Y[j0] + f2 * (Y[j0 + 1] - Y[j0]) - y;
-                    if (mx * mx + my * my > DK_HMOVE * DK_HMOVE * TJ[i] * TJ[i])
-                        hm = atan2(my, mx);
-                }
-                double h;
-                if (i == 0)
-                    h = isfinite(hd[6]) ? hd[6] : (isfinite(hm) ? hm : h0);
-                else {
-                    h = isfinite(hm) ? hm : hprev;
-                    double dh = remainder(h - hprev, 2.0 * M_PI);
-                    if (fabs(dh) > 0.5 * M_PI)
-                        h = remainder(h + M_PI, 2.0 * M_PI);
-                }
-                if (i == 0 || h != hprev || signbit(h) != signbit(hprev)) {      /* a held heading keeps its cos, sin */
-                    c = cos(h);
-                    s = sin(h);
-                }
-                hprev = h;
-                if (i == 0 && cfg[DC_REF] > 0.5 && ohw == DK_OHC && hd[9] > 0.5 && isfinite(hd[10]) &&
-                    isfinite(hd[11])) {
-                    /* the radar said where the centre is: its offset from the reference point, held in the body
-                     * frame (it turns with the object) */
-                    offb_x = hd[10] * c + hd[11] * s;
-                    offb_y = -hd[10] * s + hd[11] * c;
-                } else if (i == 0 && cfg[DC_REF] > 0.5) {
-                    /* the radar's point is the nearest of the footprint as the camera sees it: the centre lies
-                     * half the footprint's extent further along the line of sight */
-                    double lx = x - eg[0].x[0], ly = y - eg[0].y[0], ll = sqrt(lx * lx + ly * ly);
-                    if (ll > 1e-6) {
-                        lx /= ll;
-                        ly /= ll;
-                        double sup = o->hl * fabs(lx * c + ly * s) + o->hw * fabs(-lx * s + ly * c);
-                        double ox = sup * lx, oy = sup * ly;
-                        offb_x = ox * c + oy * s;
-                        offb_y = -ox * s + oy * c;
-                    }
-                }
-                o->cx[i] = x + offb_x * c - offb_y * s;
-                o->cy[i] = y + offb_x * s + offb_y * c;
-                o->c[i] = c;
-                o->s[i] = s;
-                double sx = SX[i0] + f * (SX[i0 + 1] - SX[i0]), sy = SY[i0] + f * (SY[i0 + 1] - SY[i0]);
-                double r = RR[i0] + f * (RR[i0 + 1] - RR[i0]);
-                if (!isfinite(r))
-                    r = 0.0;
-                if (r > 0.99)
-                    r = 0.99;
-                if (r < -0.99)
-                    r = -0.99;
-                if (sx < 0.0)
-                    sx = 0.0;
-                if (sy < 0.0)
-                    sy = 0.0;
-                o->sxx[i] = sx * sx;
-                o->syy[i] = sy * sy;
-                o->sxy[i] = r * sx * sy;
-            }
-            (void)h0;
+            o->row = MD + (size_t)k * (2 + 5 * N);
+            o->hd = hd;
+            o->hprev = isfinite(hd[6]) ? hd[6] : 0.0;
+            o->ch = 1.0;
+            o->sh = 0.0;
+            o->offb_x = o->offb_y = 0.0;
+            o->done = 0;
+            dk_obj_sample(&S, o, nh);
         }
     }
     DkCtx C = {cfg, g, eg, ob, E, K, top, mode_obj, M, rects, n, rects + n};
-    for (int m = 0; m < M; m++)                  /* the others: their most probable modes, with the margins */
-        for (int i = 0; i < n; i++) {
-            DkRect *r = &C.oth[(size_t)m * n + i];
-            if (top[m] < 0) {
-                r->hl = r->hw = 0.0;
-                r->cx = r->cy = 1e9;
-                r->c = 1.0;
-                r->s = 0.0;
-                continue;
-            }
-            dk_obj_rect(cfg, &ob[top[m]], i, 0.0, 0.0, 0.0, 0.0, r);
-            r->hl += cfg[DC_MLONG];
-            r->hw += cfg[DC_MLAT];
-        }
+    int extended = 0;                            /* the extension is there: the car's modes, the others' rectangles */
     double along = cfg[DC_ALONG], alat = cfg[DC_ALAT], amax = cfg[DC_AFAC] * (along > alat ? along : alat);
     int ndirs = (int)cfg[DC_NDIRS];
     double tmax = (nh - 1) * dt;
@@ -1177,6 +1286,29 @@ static int dk_eval(const double *t, int N, const double *EG, int E, const double
                     pp[DP_BTN] = pp[DP_STN] = pp[DP_TN] = 0.0;
                 } else {
                     pp[DP_COURSE] = 1.0;
+                    /* an evasion is simulated beyond the horizon: the futures' extension, where it is not there yet */
+                    if (!extended) {
+                        extended = 1;
+                        for (int q = 0; q < E; q++)
+                            dk_ego_sample(&S, &eg[q], nh, n);
+                        for (int q = 0; q < M; q++)      /* the others: their most probable modes, with the margins */
+                            for (int i = 0; i < n; i++) {
+                                DkRect *r = &C.oth[(size_t)q * n + i];
+                                if (top[q] < 0) {
+                                    r->hl = r->hw = 0.0;
+                                    r->cx = r->cy = 1e9;
+                                    r->c = 1.0;
+                                    r->s = 0.0;
+                                    continue;
+                                }
+                                if (i == 0)
+                                    dk_obj_sample(&S, &ob[top[q]], n);
+                                dk_obj_rect(cfg, &ob[top[q]], i, 0.0, 0.0, 0.0, 0.0, r);
+                                r->hl += cfg[DC_MLONG];
+                                r->hw += cfg[DC_MLAT];
+                            }
+                    }
+                    dk_obj_sample(&S, &ob[k], n);
                     dk_pair_ext(&C, k, infl);
                     double ab = dk_required(&C, j, k, 0.0, amax);
                     double al = dk_required(&C, j, k, M_PI / 2, amax), ar = dk_required(&C, j, k, -M_PI / 2, amax);
