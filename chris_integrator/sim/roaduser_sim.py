@@ -414,6 +414,7 @@ DET_DAY = dict(
     lamp_scale_min_n=3, lamp_scale_min_px=10.0, lamp_scale_step=0.25, lamp_scale_x=1.5,  # signd scale.cc's lamp
                              # line: >= 3 passes, separations >= 10 px, no step above 0.25 in ln, std x 1.5 (M)
     lamp_scale_tail=(0.1, 3.0),  # a lamp sample is off by tail[1] x its noise with probability tail[0] (A: heavier tail)
+    pose=None,               # the pose head (lane viewhead, contract "pose1"): None = off; True or a dict of POSE overrides
 )
 DET_NIGHT = dict(
     DET_DAY,
@@ -442,20 +443,151 @@ ROADSIDE = dict(post_per_km=25.0, tree_per_km=15.0, hedge_per_km=6.0, lat=(4.0, 
 DETIN = dict(visible_boxes=True, roadside=ROADSIDE, flags=True, low=0.10, emb="yuv3x3", lamps=True, scale_corr=True,
              world={"dims_spread": True})   # "world": read by scenario() / ScenarioWorld (DetectorSim ignores it)
 DETIN_REID = dict(DETIN, emb="reid32+yuv3x3")
-DETIN_KEYS = ("visible_boxes", "roadside", "flags", "low", "emb", "lamps", "scale_corr")
+DETIN_KEYS = ("visible_boxes", "roadside", "flags", "low", "emb", "lamps", "scale_corr", "pose")
+
+# The pose head (lane viewhead; roadsense docs/ARCHITECTURE.md "Pose of a road user", contract "pose1"; how a tracker
+# takes it: docs/lanes/detin-consumption-design.md section 9, the numbers: chris-pose MODEL_CARD.md). M = measured
+# there (held-out KITTI drives, the detector's own boxes), F = fitted here to M numbers (a fitted model parameter,
+# the M targets named beside it), A = assumed. Error units: degrees; ground-point rows in box heights (the emitted
+# box's on a whole box, the TRUE box's where the bottom is hidden, as the card measures them), columns in box widths.
+# The time structure of every error: a unit-variance mixture of a per-actor constant (share f_off), a first-order
+# autoregressive part (share f_ar, time constant T s) and a white rest; per-actor state carried across passes.
+# A heteroscedastic scale exp(s_lam y) (y one standard normal per actor and quantity: the head knows it, the stated
+# sigma carries it) and unstated outliers (a second process of the same time structure times kout, switched on with
+# probability pi by a per-actor state redrawn on average every out_T s, so the tails do not break the time
+# correlation) give the heavy tails with an honest core: *_tail = (s_lam, kappa = stated sigma / scale, pi, kout), F
+# by simulation to the M within-1/2/3-sigma shares and 90 %-point-to-median ratios. Medians are the M medians: the
+# scale is normalised so that the median |error| of the mixture is the stated median.
+POSE = dict(
+    max_n=4,                 # boxes a pass; more take turns over the passes (signd --lights-ru-pose-max default, M)
+    min_px=8.0,              # no pose on a box under 8 px a side (signd pose.cc, M)
+    classes=("car", "truck", "bus", "train"),   # vehicle classes of either list, first list by area then low (signd, M)
+    night="open",            # "open" (open roads: as by day) | "city" (a lit city street, rides 9.5: flips x city_q, `p`
+                             # and `flip` stated as by day, i.e. too sure; A, no labels at night)
+    city_q=2.0,              # A (design 9.6)
+    out_T=5.0,               # time constant of the outlier switch (A: long, so the tails keep the errors' time correlation)
+    # ---- heading: truth (the heading against the line of sight, clockwise from above) + e, or the opposite + e
+    yaw_med=dict(rear=1.36, front=1.6, threequarter=3.44, side=5.9),  # median |e| in the lobe of a VISIBLE box by the
+                             # TRUE view class: the card's rear / front / three-quarter medians 1.7 / 2.0 / 4.3 (M, all
+                             # boxes) x 0.8 (M: visible 2.0 against all 2.5 deg); side A: x4 of rear/front (design 9.6;
+                             # the card's 14.2 deg median includes its 17.6 % flips and 19 % errors over 30 deg)
+    yaw_occ=((0.1, 1.6), (0.5, 1.75)),   # x factor above cover 0.1 / 0.5 (M: 3.2 / 3.5 deg partly / largely occluded
+                             # against 2.0 visible; truth cover of the silhouette by nearer things)
+    yaw_cut_side=(0.1, 1.9),  # a side cut by the view or the frame by more than 0.1 of the box width: x1.9 (M: 4.8
+                             # against 2.5 deg for truncation > 0.1)
+    yaw_cut_bottom=2.0,      # x (1 + 2 s) for a bottom cut by share s of the true box height (M: 1.8 -> 3.7 deg at 0.55)
+    yaw_time=(0.209, 0.607, 0.65),  # (f_off, f_ar, T): F to the M correlations 0.73 / 0.65 / 0.50 / 0.33 / 0.24 at
+                             # 0.1 / 0.2 / 0.5 / 1 / 2 s (fit: 0.729 / 0.655 / 0.490 / 0.339 / 0.237); white 0.184
+    yaw_tail=(0.654, 1.219, 0.249, 2.07),   # F to M: 68.6 / 91.7 % within 1 / 2 stated, 2.8 % beyond 3, 90 % point /
+                             # median 4 (rear 7.7 / 1.7, front 6.7 / 2.0); fit 68.6 / 91.7 / 2.77 %, 4.00
+    # flips (within 52.5 deg of the opposite heading) and "elsewhere" (52.5-127.5 deg off): a per-actor three-state
+    # process redrawn on average once every flip_T s (lobe / flip / elsewhere with the box's q, qe)
+    flip_T=0.35,             # F to M: 45 % of KITTI's 137 tracks (about 5 s each at 10 Hz, 5.4 % of the boxes flipped)
+                             # have no flipped box: exp-distributed track lengths, 0.946 / (1 + 0.054 x 5 s / flip_T) =
+                             # 0.45 gives 0.25-0.36 s (a redraw "about once a second" would leave 70-75 % unflipped);
+                             # then 4 % of the poses 0.2 s apart change their end (rides by day: 1.4-4.7 %)
+    q_flip=dict(rear=0.038, front=0.033, threequarter=0.057, side=0.066),  # F: M over-90-deg shares 4.9 / 3.4 / 8.9 /
+                             # 17.6 % less half of qe (an "elsewhere" error is over 90 deg half the time); all boxes
+    q_else=dict(rear=0.022, front=0.002, threequarter=0.064, side=0.22),   # F: twice the M share between 30 and 90 deg
+                             # (1.4 / 0.1 / 4.2 / 19.3 %) less the in-lobe tails beyond 30 deg; all boxes
+    q_vis=0.65,              # q, qe of a visible box = the all-box numbers x this (M: 4.8 % over 90 deg visible, 6.2 all:
+                             # x 0.77, less the confused actors' share below, F)
+    p_confused=0.015,        # share of actors the head reads the wrong way round most of the time (M: 1.5 % of the tracks
+                             # flipped in more than half their boxes; transient flips alone give none)
+    q_confused=0.7,          # their flip probability (A); the stated `flip` knows it (honest)
+    q_cut_side=(0.116, 0.086),  # (q, qe) at least this with a side cut > 0.1 (F: M 15.9 % over 90, 22.2 % over 30)
+    q_occ=((0.1, 1.46), (0.5, 1.67)),   # x factor above cover 0.1 / 0.5 (M: 7.0 / 8.0 % over 90 deg partly / largely
+                             # occluded against 4.8 % visible)
+    q_cut_bottom=(0.12, 0.08),  # + (dq, dqe) x s for a bottom cut by share s (F to M: over 30 deg 3.1 -> 15.2 % at
+                             # s = 0.55 on whole vehicles cut artificially)
+    q_max=0.6,               # cap of q + qe (A)
+    p_conc=7.0,              # the stated (p, flip, else) ~ Dirichlet(p_conc x (1-q-qe, q, qe) + one-hot(true state)):
+                             # honest by construction (P(state | stated) = stated), skewed: most flips near 0, a few
+                             # near 0.4 (A: the card's stated flip bins run 0.004 .. 0.415)
+    vp_acc=dict(rear=0.904, front=0.928, side=0.486, threequarter=0.885),  # view class right, by class (M)
+    vp_conc=8.0,             # vp_conf ~ Beta(c acc + right, c (1 - acc) + wrong): honest (A shape)
+    # ---- near-face row `gn`
+    gn_med=0.028,            # median |e| on whole boxes, emitted box heights (M: 0.028; robust sigma 0.0436)
+    gn_view=dict(rear=(1.06, -0.0027), front=(0.95, 0.0036), side=(1.44, -0.0137), threequarter=(0.91, 0.0196)),
+                             # (x median, bias) by view on whole boxes (M: robust sigmas 0.0463 / 0.0413 / 0.0628 /
+                             # 0.0398 against 0.0436; biases as the card's)
+    gn_occ=1.39,             # x on a box covered by more than 0.1 but its bottom seen (M: 0.039 against 0.028)
+    gn_cut_side=(0.1, 0.3, 5.0),   # x up to 5 for a side cut from 0.1 to 0.3 of the box width (M: 0.140 against 0.028
+                             # for truncation > 0.1; the ramp A); with a hidden bottom the larger of the two models (A)
+    gn_box_corr=0.72,        # on whole boxes the error's core shares the detector's own bottom-edge error of that box
+                             # (same pixels): core = sqrt(1-k^2) x own + k x the standardised bottom-edge error (M: the
+                             # two errors correlate 0.72; the sim's bottom edge is white from pass to pass, so this lowers
+                             # gn's time correlation on whole boxes, see the lane report)
+    gn_time=(0.197, 0.803, 0.394),  # F (no white part) to the M correlations 0.68 / 0.26 at 0.2 / 1 s (0.82 at 0.1 s
+                             # against M 0.86)
+    gn_tail=(0.293, 1.017, 0.0, 0.0),   # F to M whole boxes: 70.2 / 93.3 % within 1 / 2, 1.27 % beyond 3, 90 % /
+                             # median 0.075 / 0.028, without outliers (they would break the box correlation): fit 69.3 /
+                             # 95.8 / 0.25 %, 2.68 (the tails beyond 2 sigma lighter than M)
+    # hidden bottom, cut by the view (crop margin keeps the pixels) or the frame (black beyond); rows: cut share s,
+    # median |e| / TRUE box height, bias, kappa (stated / scale, F to the M within-one-sigma share); M table
+    gn_cut_view=((0.0, 0.028, 0.004, 1.25), (0.10, 0.037, 0.004, 1.73), (0.25, 0.075, 0.005, 1.26),
+                 (0.40, 0.076, 0.000, 1.49), (0.55, 0.059, -0.006, 1.90)),   # M medians, biases; kappa F to M within one
+                             # sigma 70.2 / 90.5 / 79.6 / 86.6 / 92.2 % (within two 93.3 / 99.3 / 98.0 / 98.9 / 98.9 %)
+    gn_cut_frame=((0.0, 0.028, 0.004, 1.25), (0.10, 0.059, 0.031, 1.53), (0.25, 0.067, 0.017, 1.38),
+                  (0.40, 0.072, 0.015, 1.55), (0.55, 0.055, -0.012, 1.79)),  # M; kappa F to 70.2 / 86.7 / 82.8 / 86.6 /
+                             # 91.2 %; beyond 0.55 the median grows by (1 + s - 0.55) (A)
+    gn_cut_tail=(0.1, None, 0.03, 2.5),   # A (the cut rows are near-Gaussian: 90 % point / median 2.4-3.0)
+    gn_under=(0.051, 0.0),   # near face under a nearer box: median, bias (M: median 0.051, 90 % point 0.236)
+    gn_under_tail=(0.880, 0.790, 0.073, 1.28),   # F to M: 61.1 / 80.9 % within 1 / 2 stated (too small), 90 % point
+                             # / median 0.236 / 0.051; fit 55.8 / 87.1 %, 4.60
+    # ---- footprint centre `gc`: column + e x emitted box width; row = gn's row + the half depth as the head sees it
+    gc_u_med=(0.021, 0.046),  # median |e| whole / covered (M); a side cut multiplies as gc_u_cut_side
+    gc_u_cut_side=(0.1, 0.3, 6.0),   # up to x6 (M: 0.127 against 0.021 box widths; 22 px against the box centre's 60)
+    gc_u_tail=(0.862, 1.369, 0.122, 1.82),   # F to M: 79.0 / 97.1 % within 1 / 2, 0.51 % beyond 3, 90 % / median
+                             # 7.04 / 1.51 px; fit 79.0 / 97.2 / 0.59 %, 4.66
+    gc_depth=(0.093, 0.039),  # ln error of the half depth: per-actor offset / scatter sigmas (A: as the head's length)
+    gc_v_extra=0.10,         # stated gc sigma_v = hypot(gn's, 0.10 x |half depth| px) (A)
+    # ---- footprint corners `gl` / `gr` (leftmost / rightmost bottom corner on the faces seen)
+    corner_u_med=(0.027, 0.048),   # median |e| in box widths, whole / covered (M: gl 0.029 / 0.045, gr 0.025 / 0.052)
+    corner_v_med=(0.035, 0.041),   # median |e| in box heights (M: gl 0.036 / 0.040, gr 0.034 / 0.042)
+    corner_v_share=0.6,      # the corner rows share this x gn's error (A: same pixels)
+    corner_cut_side=(0.1, 0.3, 2.7),   # x up to 2.7 with a side cut (M: 0.059-0.080 against 0.027 box widths)
+    corner_tail=(0.582, 1.202, 0.127, 1.94),   # F to M (gl u): 72.8 / 95.1 % within 1 / 2, 1.19 % beyond 3, 90 % /
+                             # median 7.71 / 2.16 px; fit 72.8 / 95.2 / 1.28 %, 3.57 (used for all corner coordinates)
+    # ---- dimensions (ln error per actor offset + scatter; M for cars: no information beyond the prior)
+    dim_err=dict(car=((0.0, 0.0, 0.0), (0.093, 0.047, 0.069), (0.039, 0.021, 0.030)),
+                 truck=((-0.40, -0.10, -0.382), (0.10, 0.05, 0.08), (0.04, 0.02, 0.03))),
+                             # (bias, offset sigma, scatter sigma) of ln length / width / height: car M (track offsets
+                             # 0.093 / 0.047 / 0.069, scatter 0.039 / 0.021 / 0.030); truck (the sim's lorry): height bias
+                             # M (lorries read 0.382 low), the rest A (read as a van)
+    dim_std=dict(car=(0.10, 0.05, 0.075), truck=(0.12, 0.06, 0.09)),   # stated: car M-honest, truck A (too sure)
+    # ---- occlusion, truncation, kind, seen
+    occ_true=0.1,            # truth "partly occluded or more": silhouette cover above this or the bottom under a box (A)
+    occ_agree=0.877,         # `occ` on the right side of 0.5 (M)
+    trunc_noise=0.03,        # `trunc` = the true share outside the picture + N(0, this) (A)
+    kind_right=0.996,        # kind[0] >= 0.5 on a vehicle (M: 99.6 %)
+    seen_right=0.94,         # the seen probabilities on the right side of 0.5 (M: 93.0 / 94.2 / 93.0 / 90.8 %)
+)
+DETIN_POSE = dict(DETIN, pose=POSE)
+
+
+def pose_params(v):
+    """The `pose` option's parameter dict: None for off, POSE for True, POSE updated by a dict."""
+    if not v:
+        return None
+    out = dict(POSE)
+    if isinstance(v, dict):
+        out.update(v)
+    return out
 
 
 def det_params_arg(s):
     """A DetectorSim parameter dict from a command line / environment string: "detin" (DETIN), "detin_reid"
-    (DETIN_REID), or a JSON object ({"detin": true, ...} starts from DETIN and overrides)."""
+    (DETIN_REID), "detin_pose" (DETIN_POSE), or a JSON object ({"detin": true, ...} / {"detin_pose": true, ...} start
+    from the preset and override; "pose": true or a dict of POSE overrides switches the pose head on)."""
     s = s.strip()
-    if s in ("detin", "detin_reid"):
-        return dict(DETIN if s == "detin" else DETIN_REID)
+    if s in ("detin", "detin_reid", "detin_pose"):
+        return dict({"detin": DETIN, "detin_reid": DETIN_REID, "detin_pose": DETIN_POSE}[s])
     d = json.loads(s)
     if not isinstance(d, dict):
-        raise ValueError("detector parameters: a JSON object, 'detin' or 'detin_reid'")
+        raise ValueError("detector parameters: a JSON object, 'detin', 'detin_reid' or 'detin_pose'")
     base = {}
-    for k, pre in (("detin", DETIN), ("detin_reid", DETIN_REID)):
+    for k, pre in (("detin", DETIN), ("detin_reid", DETIN_REID), ("detin_pose", DETIN_POSE)):
         if d.pop(k, None):
             base = dict(pre)
     base.update(d)
@@ -729,6 +861,389 @@ def _wls_slope(samples):
 FP_CLASSES = (("car", 0.55), ("person", 0.45))
 
 
+# ---- the pose head (POSE; contract "pose1") ----------------------------------------------------------------------
+def _view_class(yaw):
+    """The contract's view class of a heading against the line of sight (deg)."""
+    a = abs(yaw)
+    if a <= 22.5:
+        return "rear"
+    if a >= 157.5:
+        return "front"
+    if 67.5 <= a <= 112.5:
+        return "side"
+    return "threequarter"
+
+
+def _wrap180(a):
+    return (a + 180.0) % 360.0 - 180.0
+
+
+_MED_UNIT = {}
+
+
+def _med_unit(tail):
+    """Median |e| of the unit error mixture lam z + [u < pi] kout lam z' (lam = exp(s_lam y), y, z, z' standard
+    normal): the scale that turns a stated median into the mixture's (by simulation, fixed seed, cached)."""
+    key = tuple(round(float(v), 6) for v in tail)
+    if key not in _MED_UNIT:
+        s, _, pi, kout = key
+        g = np.random.default_rng(12345)
+        n = 400_000
+        lam = np.exp(s * g.standard_normal(n))
+        e = lam * g.standard_normal(n) + np.where(g.random(n) < pi, kout * lam * g.standard_normal(n), 0.0)
+        _MED_UNIT[key] = float(np.median(np.abs(e)))
+    return _MED_UNIT[key]
+
+
+def _ramp_x(v, spec):
+    """1 below spec[0], rising linearly to spec[2] at spec[1]."""
+    lo, hi, x = spec
+    if v <= lo:
+        return 1.0
+    return 1.0 + (x - 1.0) * min(1.0, (v - lo) / max(1e-9, hi - lo))
+
+
+class PoseGen:
+    """The pose head's answers for the vehicle boxes of a pass (POSE has the model and its numbers). Errors are a
+    function of per-actor state carried across passes (offset, autoregressive scatter, flip state, heteroscedastic
+    scale), drawn from a random stream of its own (seed * 53 + 11), so switching it on changes nothing else."""
+
+    def __init__(self, cfg, night, seed, calib, p):
+        self.c, self.night, self.calib, self.p = cfg, night, calib, p
+        self.city = bool(night) and cfg.get("night") == "city"
+        self.r = random.Random(seed * 53 + 11)
+        self.st = {}             # actor -> {process name: state}
+        self.rr = 0              # signd's turn pointer (pass k starts where pass k - 1 stopped)
+
+    # -- random processes --
+    def _proc(self, st, name, t, ftime):
+        """A unit-variance draw of the process `name` at t: offset (share f_off) + AR(1) (share f_ar, time constant
+        T) + white rest."""
+        f_off, f_ar, T = ftime
+        r = self.r
+        s = st.get(name)
+        if s is None:
+            s = st[name] = [r.gauss(0.0, 1.0), r.gauss(0.0, 1.0), t]
+        else:
+            rho = math.exp(-max(0.0, t - s[2]) / T)
+            s[1] = rho * s[1] + math.sqrt(1.0 - rho * rho) * r.gauss(0.0, 1.0)
+            s[2] = t
+        wh = 1.0 - f_off - f_ar
+        z = math.sqrt(f_off) * s[0] + math.sqrt(f_ar) * s[1]
+        if wh > 1e-9:
+            z += math.sqrt(wh) * r.gauss(0.0, 1.0)
+        return z
+
+    def _err(self, st, name, t, ftime, tail, med):
+        """(error, stated sigma, scale, lam, the error's outlier part) with median |error| = med (tail: s_lam,
+        kappa, pi, kout)."""
+        s_lam, kappa, pi, kout = tail
+        r = self.r
+        y = st.get(name + ":lam")
+        if y is None:
+            y = st[name + ":lam"] = r.gauss(0.0, 1.0)
+        lam = math.exp(s_lam * y)
+        sc = med / _med_unit(tail)
+        e = sc * lam * self._proc(st, name, t, ftime)
+        e_out = 0.0
+        if pi > 0:
+            z2 = self._proc(st, name + ":out", t, ftime)
+            bs = st.get(name + ":B")
+            if bs is None or r.random() < 1.0 - math.exp(-max(0.0, t - bs[1]) / self.c["out_T"]):
+                bs = st[name + ":B"] = [r.random() < pi, t]
+            bs[1] = t
+            if bs[0]:
+                e_out = sc * lam * kout * z2
+        return e + e_out, kappa * sc * lam, sc, lam, e_out
+
+    def _seen(self, truth):
+        hi = truth if self.r.random() < self.c["seen_right"] else not truth
+        return self.r.betavariate(12.0, 1.0) if hi else self.r.betavariate(1.0, 12.0)
+
+    def _flip_state(self, st, t, q, qe):
+        """The per-actor (day) state 0 lobe / 1 flip / 2 elsewhere, the realised one (city: extra flips) and the
+        probabilities it was drawn with."""
+        c, r = self.c, self.r
+        s = st.get("hs")
+        redraw = s is None or r.random() < 1.0 - math.exp(-max(0.0, t - s[1]) / c["flip_T"])
+        if redraw:
+            u = r.random()
+            hs = 1 if u < q else (2 if u < q + qe else 0)
+            hx = False
+            if self.city:
+                qx = min(1.0, (c["city_q"] - 1.0) * q / max(1e-6, 1.0 - q - qe))
+                hx = r.random() < qx
+            st["hs"] = [hs, t, hx, (1.0 - q - qe, q, qe)]
+        else:
+            s[1] = t
+        hs, _, hx, m = st["hs"]
+        return hs, (1 if hs == 0 and hx else hs), m
+
+    # -- geometry --
+    def truth(self, o, R):
+        """Truth of the pose fields for an actor at the pass's camera R, or None (camera inside its footprint, a
+        point behind the camera)."""
+        c = self.calib
+        f, cx, cy, Hc = float(c["focal_px"]), float(c["cx"]), float(c["cy"]), float(c["height_m"])
+        x, y, h = o["x"], o["y"], o["heading"]
+        ch, sh = math.cos(h), math.sin(h)
+        px, py = -x * ch - y * sh, x * sh - y * ch                   # the camera in the actor's frame
+        L2, W2 = o["L"] / 2.0, o["W"] / 2.0
+        if abs(px) <= L2 and abs(py) <= W2:
+            return None
+        lam = min(L2 / abs(px) if px else 1e9, W2 / abs(py) if py else 1e9)
+        xn, yn = x * (1.0 - lam), y * (1.0 - lam)                    # where the line of sight to the centre enters
+        zg = Hc - o["dz"]
+        pts = [(x, -y, zg), (xn, -yn, zg)]
+        for lx in (-L2, L2):
+            for ly in (-W2, W2):
+                pts.append((x + lx * ch - ly * sh, -(y + lx * sh + ly * ch), zg))
+        u, v, d = project(R, f, cx, cy, np.array(pts))
+        if not np.all(d > 0.5):
+            return None
+        bear = math.atan2(y, x)
+        k_l, k_r = 2 + int(np.argmin(u[2:])), 2 + int(np.argmax(u[2:]))
+        return {"yaw": _wrap180(math.degrees(bear - h)), "bearing": bear, "heading": h, "uc": float(u[0]),
+                "vc": float(v[0]), "un": float(u[1]), "vn": float(v[1]), "gl": (float(u[k_l]), float(v[k_l])),
+                "gr": (float(u[k_r]), float(v[k_r])), "near": (xn, yn), "range_near": math.hypot(xn, yn)}
+
+    # -- one pass --
+    def annotate(self, t, R, roi, dets, ents, low, lents, vis_on):
+        c = self.c
+        cls_ok = set(c["classes"])
+        bx = []
+        for lst, el, is_low in ((dets, ents, False), (low, lents, True)):
+            grp = [(d, en, is_low) for d, en in zip(lst, el) if d["cls"] in cls_ok]
+            grp.sort(key=lambda g: -(g[0]["box"][2] - g[0]["box"][0]) * (g[0]["box"][3] - g[0]["box"][1]))
+            bx += grp
+        nb, cap = len(bx), int(c["max_n"])
+        start = 0
+        if nb > cap > 0:
+            start = self.rr % nb
+            self.rr = (start + cap) % nb
+        else:
+            self.rr = 0
+        n = 0
+        for k in range(nb):
+            if n >= cap:
+                break
+            d, en, is_low = bx[(start + k) % nb]
+            b = d["box"]
+            if b[2] - b[0] < c["min_px"] or b[3] - b[1] < c["min_px"]:
+                continue
+            n += 1
+            o = en.get("o")
+            tr = None
+            if o is not None and not en.get("beside") and o["kind"] in VEHICLE_KINDS and en.get("b") is not None:
+                tr = self.truth(o, R)
+            if tr is None:
+                d["pose"] = self._junk(d)
+                en["pose_true"] = {"junk": True}
+            else:
+                d["pose"], en["pose_true"] = self._pose(t, R, roi, d, en, o, tr, is_low)
+
+    def _ctx(self, roi, d, en):
+        """Bottom and side state of a box: s cut shares of the TRUE box, under a nearer box, cover."""
+        b, V = en["b"], en.get("V") or {}
+        Ht, Wt = max(1e-6, b[3] - b[1]), max(1e-6, b[2] - b[0])
+        clip = d.get("clip") or ""
+        out, hid = V.get("out") or "", V.get("hidden") or ""
+        FW, FH = FRAME
+        s_view = max(0.0, b[3] - roi[3]) / Ht if "b" in clip else 0.0
+        s_frame = max(0.0, b[3] - FH) / Ht if "b" in out else 0.0
+        left = max(0.0, roi[0] - b[0]) if "l" in clip else 0.0
+        right = max(0.0, b[2] - roi[2]) if "r" in clip else 0.0
+        if "l" in out:
+            left = max(left, -b[0])
+        if "r" in out:
+            right = max(right, b[2] - FW)
+        ib = [max(0.0, b[0]), max(0.0, b[1]), min(float(FW), b[2]), min(float(FH), b[3])]
+        inside = max(0.0, ib[2] - ib[0]) * max(0.0, ib[3] - ib[1]) / (Ht * Wt)
+        return {"Ht": Ht, "Wt": Wt, "s_view": min(1.0, s_view), "s_frame": min(1.0, s_frame),
+                "under": "b" in hid, "side": min(1.0, (left + right) / Wt), "cover": float(V.get("cover") or 0.0),
+                "trunc": max(0.0, 1.0 - inside), "clip": clip}
+
+    def _pose(self, t, R, roi, d, en, o, tr, is_low):
+        c, r, p = self.c, self.r, self.p
+        st = self.st.setdefault(o["id"], {})
+        x = self._ctx(roi, d, en)
+        b = d["box"]
+        we, he = b[2] - b[0], b[3] - b[1]
+        view = _view_class(tr["yaw"])
+        cover, side = x["cover"], x["side"]
+        sb = max(x["s_view"], x["s_frame"])
+        occ_t = cover > c["occ_true"] or x["under"]
+        # ---- heading ----
+        # the conditions (cover, a side cut, a bottom cut) do not stack: each M number pools the others, so the worst
+        # of them sets the box's error (A)
+        fo = 1.0
+        for thr, fx in c["yaw_occ"]:
+            if cover > thr:
+                fo = fx
+        med = c["yaw_med"][view] * max(fo, c["yaw_cut_side"][1] if side > c["yaw_cut_side"][0] else 1.0,
+                                       1.0 + c["yaw_cut_bottom"] * sb)
+        q0, qe0 = c["q_flip"][view] * c["q_vis"], c["q_else"][view] * c["q_vis"]
+        fq = 1.0
+        for thr, fx in c["q_occ"]:
+            if cover > thr:
+                fq = fx
+        q, qe = max(q0 * fq, q0 + c["q_cut_bottom"][0] * sb), max(qe0 * fq, qe0 + c["q_cut_bottom"][1] * sb)
+        if side > c["yaw_cut_side"][0]:
+            q, qe = max(q, c["q_cut_side"][0]), max(qe, c["q_cut_side"][1])
+        if "confused" not in st:
+            st["confused"] = r.random() < c["p_confused"]
+        if st["confused"]:
+            q = max(q, c["q_confused"])
+        if q + qe > c["q_max"]:
+            q, qe = q * c["q_max"] / (q + qe), qe * c["q_max"] / (q + qe)
+        hs_day, hs, m_draw = self._flip_state(st, t, q, qe)
+        e_y, yaw_std, _, _, _ = self._err(st, "yaw", t, c["yaw_time"], c["yaw_tail"], med)
+        if hs == 0:
+            yaw = tr["yaw"] + e_y
+        elif hs == 1:
+            yaw = tr["yaw"] + 180.0 + e_y
+        else:
+            yaw = tr["yaw"] + r.choice((-1.0, 1.0)) * r.uniform(52.5, 127.5)
+        yaw = round(_wrap180(yaw), 1)
+        # stated from the probabilities the state was drawn with (honest: P(state | stated) = stated)
+        al = [c["p_conc"] * m_draw[0], c["p_conc"] * m_draw[1], c["p_conc"] * m_draw[2]]
+        al[hs_day] += 1.0
+        g = [r.gammavariate(max(1e-3, a), 1.0) for a in al]
+        sg = sum(g) or 1.0
+        p_main, p_flip = g[0] / sg, g[1] / sg
+        vp = _view_class(yaw)
+        right = vp == view
+        acc, vc = c["vp_acc"][vp], c["vp_conc"]
+        vp_conf = max(0.25, r.betavariate(vc * acc + (1.0 if right else 0.0), vc * (1.0 - acc) + (0.0 if right else 1.0)))
+        # ---- near-face row ----
+        bottom = "whole"
+        if x["s_view"] > 0.0 or x["s_frame"] > 0.0 or x["under"]:
+            bottom = "under" if x["under"] else "cut"
+        if bottom == "whole":
+            fm, bias = c["gn_view"][view]
+            mg = c["gn_med"] * fm * (c["gn_occ"] if cover > c["occ_true"] else 1.0) * _ramp_x(side, c["gn_cut_side"])
+            e_own, s_gn, sc, lam, e_out = self._err(st, "gn", t, c["gn_time"], c["gn_tail"], mg)
+            # the detector's own bottom-edge error of this box (standardised): the head reads the same pixels
+            if is_low:
+                s_b = p["low_edge_x"] * p["bottom_px"] / max(1.0, he) + p["low_edge_rel"]
+            else:
+                s_b = p["bottom_px"] / max(1.0, he) + p["bottom_rel"]
+            s_b = math.hypot(s_b, p["bottom_bias_rel"])
+            e_b = (b[3] - en["b"][3]) / max(1.0, he)
+            # on the core (outliers stay the head's own), corrected for the heteroscedastic scale's loss of correlation
+            k = min(0.95, c["gn_box_corr"] * math.exp(0.5 * c["gn_tail"][0] ** 2))
+            e_g = bias + math.sqrt(1.0 - k * k) * (e_own - e_out) + k * sc * lam * (e_b / s_b) + e_out
+            unit = he
+        else:
+            tab = c["gn_cut_frame"] if x["s_frame"] > 0.0 else c["gn_cut_view"]
+            s = min(1.0, sb)
+            rows = list(tab)
+            if s >= rows[-1][0]:
+                mgc, biasc, kap = rows[-1][1] * (1.0 + (s - rows[-1][0])), rows[-1][2], rows[-1][3]
+            else:
+                j = max(i for i in range(len(rows)) if rows[i][0] <= s)
+                a_ = (s - rows[j][0]) / (rows[j + 1][0] - rows[j][0])
+                mgc, biasc, kap = (rows[j][m] + a_ * (rows[j + 1][m] - rows[j][m]) for m in (1, 2, 3))
+            tail = (c["gn_cut_tail"][0], kap, c["gn_cut_tail"][2], c["gn_cut_tail"][3])
+            mg, bias = mgc, biasc
+            if x["under"] and (bottom == "under" or c["gn_under"][0] > mgc):
+                mg, bias, tail = c["gn_under"][0], c["gn_under"][1], c["gn_under_tail"]
+                bottom = "under"
+            mg = max(mg, c["gn_med"] * _ramp_x(side, c["gn_cut_side"]))
+            e_own, s_gn, _, _, _ = self._err(st, "gn", t, c["gn_time"], tail, mg)
+            e_g = bias + e_own
+            e_b = None
+            unit = x["Ht"]
+        vn = tr["vn"] + e_g * unit
+        s_gn_px = s_gn * unit
+        # seen: the point in the crop (the box x 1.3 about its centre), in the picture, not under a nearer box
+        bcx, bcy = 0.5 * (b[0] + b[2]), 0.5 * (b[1] + b[3])
+
+        def in_crop(u, v):
+            return (abs(u - bcx) <= 0.65 * we and abs(v - bcy) <= 0.65 * he and 0.0 <= u <= FRAME[0]
+                    and 0.0 <= v <= FRAME[1])
+        # ---- footprint centre ----
+        mu = c["gc_u_med"][1 if cover > c["occ_true"] else 0] * _ramp_x(side, c["gc_u_cut_side"])
+        e_u, s_u, _, _, _ = self._err(st, "gcu", t, c["gn_time"], c["gc_u_tail"], mu)
+        uc = tr["uc"] + e_u * we
+        do, ds = c["gc_depth"]
+        tot = math.hypot(do, ds)
+        e_d = tot * self._proc(st, "depth", t, (do * do / (tot * tot), ds * ds / (tot * tot), c["gn_time"][2]))
+        dv = tr["vc"] - tr["vn"]
+        vc = vn + dv * math.exp(e_d)
+        s_vc = math.hypot(s_gn_px, c["gc_v_extra"] * abs(dv))
+        # ---- corners ----
+        corners = []
+        for nm, (tu, tv) in (("gl", tr["gl"]), ("gr", tr["gr"])):
+            mcu = c["corner_u_med"][1 if cover > c["occ_true"] else 0] * _ramp_x(side, c["corner_cut_side"])
+            eu, su, _, _, _ = self._err(st, nm + "u", t, c["gn_time"], c["corner_tail"], mcu)
+            if bottom == "whole":
+                mcv = c["corner_v_med"][1 if cover > c["occ_true"] else 0] * _ramp_x(side, c["corner_cut_side"])
+            else:
+                mcv = c["corner_v_med"][0] * mg / c["gn_med"]
+            ev, sv, _, _, _ = self._err(st, nm + "v", t, c["gn_time"], c["corner_tail"], mcv)
+            k2 = c["corner_v_share"]
+            ev = k2 * (e_g - bias) + math.sqrt(1.0 - k2 * k2) * ev
+            seen = in_crop(tu, tv) and not x["under"]
+            corners.append([tu + eu * we, tv + ev * unit, su * we, sv * unit, self._seen(seen)])
+        seen_n = in_crop(tr["un"], tr["vn"]) and not x["under"]
+        seen_c = in_crop(tr["uc"], tr["vc"]) and not x["under"]
+        # ---- dimensions, occlusion, truncation, kind ----
+        kd = o["kind"] if o["kind"] in c["dim_err"] else "car"
+        bias_d, so, ss = c["dim_err"][kd]
+        dim = []
+        for i, (true_v, nm) in enumerate(((o["L"], "dL"), (o["W"], "dW"), (o["H"], "dH"))):
+            tt = math.hypot(so[i], ss[i])
+            z = self._proc(st, nm, t, (so[i] ** 2 / tt ** 2, ss[i] ** 2 / tt ** 2, 1.0))
+            dim.append(true_v * math.exp(bias_d[i] + tt * z))
+        hi = occ_t if r.random() < c["occ_agree"] else not occ_t
+        occ = 0.5 + 0.5 * r.betavariate(1.5, 1.2) if hi else 0.5 * r.betavariate(1.2, 1.5)
+        trunc = min(1.0, max(0.0, x["trunc"] + r.gauss(0.0, c["trunc_noise"])))
+        if r.random() < c["kind_right"]:
+            k0 = r.betavariate(40.0, 0.6)
+        else:
+            k0 = r.uniform(0.05, 0.49)
+        k1 = (1.0 - k0) * r.random()
+        pose = {"yaw": round(yaw, 1), "yaw_std": round(max(0.0, yaw_std), 1), "p": round(p_main, 2),
+                "flip": round(p_flip, 2), "vp": vp, "vp_conf": round(vp_conf, 2),
+                "gc": [round(uc, 1), round(vc, 1), round(s_u * we, 1), round(s_vc, 1), round(self._seen(seen_c), 2)],
+                "gn": [round(uc, 1), round(vn, 1), round(s_gn_px, 1), round(self._seen(seen_n), 2)],
+                "gl": [round(v, 1) for v in corners[0][:4]] + [round(corners[0][4], 2)],
+                "gr": [round(v, 1) for v in corners[1][:4]] + [round(corners[1][4], 2)],
+                "dim": [round(v, 2) for v in dim], "dim_std": [round(v, 2) for v in c["dim_std"].get(kd, c["dim_std"]["car"])],
+                "occ": round(occ, 2), "trunc": round(trunc, 2), "kind": [round(k0, 2), round(k1, 2), round(1.0 - k0 - k1, 2)]}
+        truth = dict(tr, view=view, state=hs, state_day=hs_day, q=q, qe=qe, bottom=bottom, s_cut=sb, under=x["under"],
+                     side=side, cover=cover, Ht=x["Ht"], he=he, we=we, e_b=e_b, unit=unit, e_gn=e_g, occ_true=occ_t,
+                     trunc_true=x["trunc"], seen_n=seen_n, is_low=is_low, aid=o["id"], L=o["L"], W=o["W"], H=o["H"],
+                     kind=o["kind"], x=o["x"], y=o["y"], dz=o["dz"], R=tuple(float(v) for v in R.ravel()))
+        return pose, truth
+
+    def _junk(self, d):
+        """A pose on a box of no vehicle (a false box, a box beside one): the head still answers (A: vague)."""
+        r = self.r
+        b = d["box"]
+        we, he = b[2] - b[0], b[3] - b[1]
+        g = [r.gammavariate(a, 1.0) for a in (2.0, 0.5, 0.7)]
+        sg = sum(g)
+        yaw = r.uniform(-180.0, 180.0)
+        uc = 0.5 * (b[0] + b[2]) + r.gauss(0.0, 0.1 * we)
+        vn = b[3] + r.gauss(0.0, 0.06 * he)
+        vc = vn - r.uniform(0.02, 0.15) * he
+        k0 = r.uniform(0.2, 0.95)
+        k1 = (1.0 - k0) * r.random()
+        cr = [[b[0] + r.gauss(0.0, 0.05 * we), b[3] + r.gauss(0.0, 0.05 * he)],
+              [b[2] + r.gauss(0.0, 0.05 * we), b[3] + r.gauss(0.0, 0.05 * he)]]
+        return {"yaw": round(yaw, 1), "yaw_std": round(r.uniform(10.0, 60.0), 1), "p": round(g[0] / sg, 2),
+                "flip": round(g[1] / sg, 2), "vp": _view_class(yaw), "vp_conf": round(r.uniform(0.3, 0.7), 2),
+                "gc": [round(uc, 1), round(vc, 1), round(0.08 * we, 1), round(0.08 * he, 1), round(r.uniform(0.3, 0.9), 2)],
+                "gn": [round(uc, 1), round(vn, 1), round(0.07 * he, 1), round(r.uniform(0.3, 0.9), 2)],
+                "gl": [round(cr[0][0], 1), round(cr[0][1], 1), round(0.06 * we, 1), round(0.06 * he, 1), round(r.uniform(0.3, 0.9), 2)],
+                "gr": [round(cr[1][0], 1), round(cr[1][1], 1), round(0.06 * we, 1), round(0.06 * he, 1), round(r.uniform(0.3, 0.9), 2)],
+                "dim": [round(v * math.exp(r.gauss(0.0, 0.1)), 2) for v in DIMS["car"]], "dim_std": [0.1, 0.05, 0.08],
+                "occ": round(r.random(), 2), "trunc": round(trunc_of(b) and 0.1 or 0.0, 2),
+                "kind": [round(k0, 2), round(k1, 2), round(1.0 - k0 - k1, 2)]}
+
+
 class DetectorSim:
     """`lights` messages with `road_users` as the phone's unit sends them. Deterministic per seed.
 
@@ -757,6 +1272,7 @@ class DetectorSim:
         self.log_low = []        # [(t, view, [(actor id | "fp:clutter" | "fp:clutter_fixed" | "fp:beside:<id>", cls, box, clip)])]
         self.log_x = []          # [{"t", "view", "first": [truth per box], "low": [truth per box]}]
         self._detin = any(self.p.get(k) for k in DETIN_KEYS) or self.p.get("low") is not None
+        self.pose_cfg = pose_params(self.p.get("pose"))     # the pose head (POSE): None = off
 
     def calib_msg(self, ts_ns):
         return dict(self.calib, ts_mono_ns=ts_ns, ts_real_ns=ts_ns + 1_700_000_000 * NS)
@@ -1239,6 +1755,7 @@ class DetectorSim:
         thr_cls = dict(p["low_thr"])
         items = self._roadside_items(w) if p.get("roadside") else []
         emb = EmbGen(p["emb"], self.night, r2, p["emb_level"]) if p.get("emb") else None
+        posegen = PoseGen(self.pose_cfg, self.night, self.seed, self.calib, p) if self.pose_cfg else None
         lamp_S = {}
         chains = {}          # actor -> [(t, ln size + error, sigma)]   (scale_corr: the pass's own log-size error)
         lchains = {}         # actor -> [(t, ln sep, sigma, colour)]    (lamp-pair separations)
@@ -1582,6 +2099,8 @@ class DetectorSim:
                         if mix <= 0.0:
                             mix = 0.0
                     d["emb"] = emb_hex(emb.observe(en["key"], t, mix, other))
+            if posegen is not None:
+                posegen.annotate(t, R, roi, dets, ents, low, lents, vis_on)
             ts = int(round(t * NS))
             msg = {"type": "lights", "seq": seq, "ts_mono_ns": ts, "ts_real_ns": ts + 1_700_000_000 * NS,
                    "lights_ms": 100.0, "frame": [1280, 720], "roi": list(roi), "view": view, "lights": [],
@@ -1590,6 +2109,8 @@ class DetectorSim:
                 msg["road_users_low"] = low
             if emb is not None:
                 msg["emb_kind"] = p["emb"]
+            if posegen is not None:
+                msg["pose_kind"] = "pose1"
             self.log.append((t, view, logd))
             if low_on:
                 self.log_low.append((t, view, [(en["aid"], en["cls"], en["box"], en["clip"]) for en in lents]))
@@ -1606,7 +2127,7 @@ class DetectorSim:
         if V is not None:
             out = {"id": en["aid"], "cover": round(V["cover"], 3), "cover_box": round(V["cover_box"], 3),
                    "hidden": V["hidden"], "out": V["out"], "by": V["by"]}
-        for k in ("scale_true", "sep_true"):
+        for k in ("scale_true", "sep_true", "pose_true"):
             if k in en:
                 out[k] = en[k]
         if en.get("b") is not None:
