@@ -12,7 +12,8 @@ Stages: 0 none, 1 information, 2 caution, 3 warning, 4 imminent. Per alert (`ALE
   to the primary's exit level once that has held below the stage for `exit_hold_s[stage]` and the stage has been
   shown for `min_hold_s[stage]`; `imminent` latches until the exit level is at most information (held) or the
   car stands;
-* suppression (the stage is kept, nothing is said, the reason is given): the driver already brakes at least
+* suppression (the stage is kept, nothing is said, the reason is given; `object_gone`: a stage never said whose
+  object has left, cfg `unsaid_needs_object`): the driver already brakes at least
   `brake_share` of what is required (and at least `brake_min_mps2`); the driver steers away (lateral acceleration
   `steer_min_mps2` towards a side whose required demand it already covers); speed below the kind's
   `min_speed_mps`; the sensors degraded (the radar's newest sensor sample older than `sensor_max_age_s`, or the
@@ -38,6 +39,9 @@ ALERT_DEFAULTS = dict(
     show_from=2,                                   # mode on: active from this stage (caution)
     kinds=("vehicle", "vru", "unknown"),
     entry_hold_s=(0.3, 0.2, 0.1, 0.0),             # per stage 1..4: the level must hold this long to enter
+    # ... for a pedestrian or a cyclist (None: the same). Someone stepping out is in the lane a second and a half
+    # after the first step: two tenths of that are a fifth of the warning there can be
+    entry_hold_vru_s=None,
     exit_hold_s=(0.5, 0.6, 0.8, 1.0),              # ... and be below the stage this long to leave it
     min_hold_s=(0.5, 1.0, 1.5, 2.0),               # a stage is shown at least this long
     # Entry by evidence (0: by time alone, as before). A level is entered once the conflict's probability mass at it
@@ -48,10 +52,21 @@ ALERT_DEFAULTS = dict(
     # down again second for second.
     entry_evidence=0.6,
     entry_evidence_of="mass",                       # what adds up: the object's whole collision probability | "mass" at the level
+    # ... only while waiting for the evidence costs nothing: once the object's time margin (decide.objects[].tm_s:
+    # what the driver has left to begin the last avoiding action, reaction time taken off) is at or below this, the
+    # level is entered by time as ever. None: the evidence rule whatever the margin (a car half in the lane, P(in
+    # the way) 0.4 for a second and a half, margin gone, was not said: the sum had not added up)
+    entry_evidence_tm_s=None,
     mass_min=None,                                  # {kind: (4 minima)}; None: threat.THRESHOLDS
     latch_imminent=True,
     switch_hold_s=0.3,
     exist_min=0.6, seen_max_s=2.5,
+    # An alert that has not been said since it left none (below show_from, or suppressed: the driver braked, steered
+    # away, the car crawled) and whose object is no longer a candidate is not said then: suppressed "object_gone"
+    # for the rest of its holds. (With no record the suppression rules have nothing to judge: on a bend the driver's
+    # steering suppressed a stage, the object left, and the held stage was then said without an object: 2-7 of
+    # the said episodes of a set of the simulator's streets.) False: as before
+    unsaid_needs_object=True,
     # an object whose velocity is not observed yet (the radar's verdict unknown, its velocity's 1 sigma above
     # this, whichever futures are judged): its "it stands" is near the radar's prior, not evidence; it raises at
     # most `immature_max_stage` until p_stationary has moved to `immature_stand_p` (a lead appearing far ahead
@@ -69,7 +84,8 @@ ALERT_DEFAULTS = dict(
     brake_share=0.9, brake_min_mps2=2.0,
     steer_min_mps2=1.5,
     sensor_max_age_s=1.0,
-    source="threat",                               # "threat": the threat levels | "headway": time headway
+    source="threat",                               # "threat": the threat levels | "headway": time headway |
+                                                   # "gap": what is hidden between parked vehicles (ctx["gap"])
     headway_s=(1.5, 0.9, 0.6),                     # source headway: information, caution, warning below these
     headway_exit_s=0.2,
     headway_min_mps=13.9,
@@ -79,10 +95,15 @@ ALERTS = {
     "headway": {"source": "headway", "kinds": ("vehicle",), "entry_hold_s": (2.0, 2.0, 1.0, 0.0),
                 "exit_hold_s": (1.0, 1.0, 1.0, 1.0), "min_hold_s": (1.0, 2.0, 2.0, 2.0), "latch_imminent": False},
 }
+# What is hidden (decide cfg `gaps`; not an alert unless that is on): gaps between vehicles standing beside the car's
+# way, from which someone could step out, at a speed above the one the car could still stop from (decide.c
+# decide_gaps). At most caution: it says "slower here", not "brake". Its record is the frame's `gap`.
+GAP_ALERT = {"source": "gap", "kinds": (), "entry_hold_s": (0.5, 0.5, 0.5, 0.5), "exit_hold_s": (1.0, 1.0, 1.0, 1.0),
+             "min_hold_s": (1.0, 2.0, 2.0, 2.0), "latch_imminent": False, "min_speed_mps": 3.0}
 
 
 def alert_cfg(name, cfg=None):
-    c = dict(ALERT_DEFAULTS, **ALERTS.get(name, {}))
+    c = dict(ALERT_DEFAULTS, **(GAP_ALERT if name == "hidden_gap" else ALERTS.get(name, {})))
     for k, v in (cfg or {}).items():
         c[k] = dict(c[k], **v) if isinstance(c.get(k), dict) and isinstance(v, dict) else v
     if c["mode"] not in MODES:
@@ -113,6 +134,7 @@ class Alert:
         self.challenger = None          # (id, since)
         self.latched = False
         self.suppressed = None
+        self.shown = False              # a stage from show_from on has been said (not suppressed) since the alert last was at none
         self.said = (0, None, None)     # (stage, object, suppressed) last logged
 
     # ---- candidates ------------------------------------------------------------------------------------------
@@ -167,6 +189,12 @@ class Alert:
             self.reset()
             return {"id": self.name, "mode": "off", "stage": 0, "stage_name": STAGES[0], "active": False}, []
         cand = {}
+        if c["source"] == "gap":                    # one candidate: the frame's gap record (ctx["gap"])
+            g = ctx.get("gap")
+            recs = ()
+            if g is not None and (g.get("level") or g.get("level_exit")):
+                le, lx = min(2, g.get("level", 0)), min(2, g.get("level_exit", 0))
+                cand["gap"] = (le, lx, (le, -(g.get("v_stop_mps") or 0.0), 0.0), g)
         for r in recs:
             ob = objs.get(r["id"])
             if self._eligible(r, ob, T):
@@ -209,7 +237,7 @@ class Alert:
             else:
                 self.up_since.pop(L, None)
         ref = c["entry_evidence"]
-        if ref and c["source"] != "headway":
+        if ref and c["source"] == "threat":
             dt = 0.0 if self._T is None else min(0.5, max(0.0, T - self._T))
             mass = (rec.get("mass") if rec is not None else None) or (0.0,) * 4
             if c["mass_min"] is None:
@@ -221,6 +249,9 @@ class Alert:
             # the lane enter by time as ever
             pp = (rec or {}).get("p_place")
             doubt = isinstance(pp, (int, float)) and pp < ref
+            tm = (rec or {}).get("tm_s")
+            if doubt and c["entry_evidence_tm_s"] is not None and isinstance(tm, (int, float)) and tm <= c["entry_evidence_tm_s"]:
+                doubt = False                       # acting cannot wait for the evidence
             for L in range(1, 5):
                 if le >= L:
                     # how sure the conflict is: its whole collision probability (the level is held by the mass at it;
@@ -237,8 +268,11 @@ class Alert:
             doubt = False
         self._T = T
         new = self.stage
+        hold = c["entry_hold_s"]
+        if c["entry_hold_vru_s"] is not None and rec is not None and rec.get("kind") == "vru":
+            hold = c["entry_hold_vru_s"]
         for L in range(4, self.stage, -1):
-            if L in self.up_since and (self.ev.get(L, 0.0) if doubt else T - self.up_since[L]) >= c["entry_hold_s"][L - 1] - 1e-9:
+            if L in self.up_since and (self.ev.get(L, 0.0) if doubt else T - self.up_since[L]) >= hold[L - 1] - 1e-9:
                 new = L
                 break
         if new > self.stage:
@@ -262,13 +296,24 @@ class Alert:
         sup = None
         if self.stage > 0:
             sup = self._suppress(rec, ctx)
+            if sup is None and rec is None and not self.shown and c["unsaid_needs_object"] and c["source"] == "threat":
+                sup = "object_gone"
+            if sup is None and self.stage >= c["show_from"]:
+                self.shown = True
+        else:
+            self.shown = False
         self.suppressed = sup
         out = {"id": self.name, "mode": c["mode"], "stage": self.stage, "stage_name": STAGES[self.stage],
                "active": c["mode"] == "on" and self.stage >= c["show_from"] and sup is None,
                "object": self.primary if self.stage > 0 else None,
                "since_s": _r(T - self.since) if self.stage > 0 else None, "suppressed": sup,
                "latched": self.latched}
-        if self.stage > 0 and rec is not None:
+        if self.stage > 0 and rec is not None and c["source"] == "gap":
+            out["object"] = None
+            out["reason"] = dict(rec, v_mps=_r(ctx.get("v", 0.0), 1))
+            out["text"] = "%s GAP %s %.0f km/h" % (STAGES[self.stage].upper(), (rec.get("side") or "").upper(),
+                                                   3.6 * (rec.get("v_stop_mps") or 0.0))
+        elif self.stage > 0 and rec is not None:
             out["reason"] = self._reason(rec, le, lx)
             out["text"] = self._text(rec)
         ev = []
@@ -298,7 +343,7 @@ class Alert:
         sa, ra = ctx.get("sensor_age_s"), ctx.get("radar_age_s")
         if (sa is not None and sa > c["sensor_max_age_s"]) or (ra is not None and ra > c["sensor_max_age_s"]):
             return "sensor_degraded"
-        if rec is None or c["source"] == "headway":
+        if rec is None or c["source"] != "threat":
             return None
         req = rec.get("a_req") or {}
         ab = req.get("brake")
@@ -358,7 +403,7 @@ class AlertSet:
 
     def __init__(self, cfg=None, log_max=500):
         cfg = dict(cfg or {})
-        names = list(ALERTS) + [k for k in cfg if k not in ALERTS]
+        names = list(ALERTS) + [k for k in cfg if k not in ALERTS]              # ("hidden_gap": the decide plug-in, cfg `gaps`)
         self.alerts = {n: Alert(n, cfg.get(n)) for n in names}
         self.events = collections.deque(maxlen=log_max)
         self.counts = {n: {"raise": 0, "would_show": 0} for n in names}

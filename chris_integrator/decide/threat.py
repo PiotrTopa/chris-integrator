@@ -98,6 +98,17 @@ DEFAULT_CFG = dict(
     # P(lane ego) + P(lane cross), at least lane_weight_floor; not where the radar's own corridor test says it surely
     # stands in the path (flags in_path, threat). Moving modes (pulling out, crossing) keep their weight.
     lane_weight=True, lane_weight_floor=0.05, stand_move_m=1.0,
+    # A standing vehicle the prediction gave two places along its needle (`lane_res`), the one in the car's way
+    # with a probability below place_hold_p: it is at ONE of them and does not move, and the car learns which as
+    # it closes (the range's spread shrinks with the range, to place_hold_range_rel of it: the tracker states
+    # 8-10 % at 15-40 m for a clean track). The two places, d apart on the ground, are told apart
+    # (place_hold_sigma spreads between them) once the car is within d / (sigma x rel) of their middle: in t_res.
+    # The driver must act, at the latest, when braking at place_hold_decel after the reaction time still stops
+    # short of the place in the way: in t_act. While t_res <= t_act the object's entry level is held at
+    # place_hold_level (information); once acting cannot wait, the level is what the masses say. Off: measured
+    # 2026-11-24 it holds none of the false episodes with comfortable braking (docs/DESIGN.md 17.2)
+    place_hold=False, place_hold_decel=3.0, place_hold_range_rel=0.09, place_hold_sigma=2.0, place_hold_p=0.9,
+    place_hold_level=1,
 )
 
 
@@ -183,7 +194,10 @@ class ThreatModel:
                          c["brake_share"], c["steer_share"], c["speed_fade"], c["turn_radius_m"], c["hdg_resolved_rad"],
                          1.0 if c["road_axis_standing"] else 0.0, c["road_axis_snap_rad"], c["road_axis_std_rad"],
                          c["lane_axis_p"], 1.0 if c["lane_weight"] else 0.0, c["lane_weight_floor"], c["stand_move_m"],
-                         list_min_p], float)
+                         list_min_p,
+                         # (DX_HOLD..): a standing vehicle of two places: the level held while the range can still resolve
+                         1.0 if c["place_hold"] else 0.0, c["place_hold_decel"], c["place_hold_range_rel"],
+                         c["place_hold_sigma"], c["place_hold_p"], float(c["place_hold_level"])], float)
 
     def frame(self, objects, ego, futures=None, path=None, road=None, shown=None, opt=0):
         """One radar message's decision (decide.c `decide_frame`): objects, ego: the message's; futures: a

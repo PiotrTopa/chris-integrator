@@ -223,5 +223,30 @@ class InTheStack(unittest.TestCase):
         self.assertEqual(stack_run("stopped_cruise_25", {"mode": "fixed", "idle_hz": 8.0})[2], 1.67)
 
 
+class HiddenGaps(unittest.TestCase):
+    """The caution of what is hidden between parked vehicles (decide `gaps`, alert `hidden_gap`) is no sign that
+    something could matter: along a parked row it is said most of the time, and holding the full rate for it would
+    undo the pace on every such street."""
+
+    def test_the_gap_alert_at_a_stage_does_not_hold_the_full_rate(self):
+        from chris_integrator.plugins.decide import Decide
+        d = Decide({"gaps": True})
+        pc = dict(Pace.DEFAULT_CFG)
+        gap = d.alerts.alerts["hidden_gap"]
+        gap.stage, gap.up_since, gap.challenger = 2, {1: 0.0, 2: 0.0}, ("gap", 0.0)
+        self.assertFalse(d._hot([], pc))
+        d.alerts.alerts["obstacle_ahead"].up_since = {1: 0.0}          # the threat's alert on its way to a stage: hot
+        self.assertTrue(d._hot([], pc))
+
+    def test_a_parked_row_is_thinned_as_without_the_alert(self):
+        pace = {"mode": "adaptive", "idle_hz": 8.0}
+        _, off, _ = stack_run("ped_kerb_stands_early_13", pace)
+        st, on, _ = stack_run("ped_kerb_stands_early_13", pace, cfg={"decide": {"rate_hz": 1000.0, "gaps": True}})
+        self.assertEqual(on["decide"], off["decide"])                    # the same messages looked at
+        self.assertLess(len(on["decide"]), 0.95 * len(on["radar"]))      # and not all of them
+        gap = st.mixer.plugin("decide").alerts.counts["hidden_gap"]
+        self.assertGreaterEqual(gap["would_show"], 1)                     # while the caution was said
+
+
 if __name__ == "__main__":
     unittest.main()

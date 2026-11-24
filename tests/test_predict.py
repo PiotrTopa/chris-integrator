@@ -128,7 +128,13 @@ def test_the_radars_objects_as_the_native_core_reads_them():
             # a velocity that is no number: no motion, wide spreads, p_stationary one half
             [30.0, 1.0, 0.0, 0.0, 0.0, 0.0, 2.0, 1.0, 2.0, 1.0, 8.0, 0.5, nan, nan, nan, nan, 1.0, 1.0, 0.0, nan, 0.0, 2.0,
              0.0, 0.0, 0.0, nan, nan]]
-    assert np.array_equal(a, np.array(want), equal_nan=True)
+    assert np.array_equal(a[:, :27], np.array(want), equal_nan=True)
+    # ... and the 28th number, the correlation of the place's x and y errors (`std_rho`): none where not given
+    assert a.shape[1] == 28 and np.isnan(a[:, 27]).all()
+    rho = [o(id=1, std_rho=0.93), o(id=2, std_rho=-1.0), o(id=3, std_rho=1.5), o(id=4, std_rho=nan), o(id=5, std_rho=None),
+           o(id=6, std_rho="x"), o(id=7, std_rho=1)]
+    r = np.frombuffer(native.predict.predict_pack(rho, False, 48)[0]).reshape(-1, PM.NO)[:, 27]
+    assert np.array_equal(r, np.array([0.93, -0.999, nan, nan, nan, nan, 0.999]), equal_nan=True)   # within +-0.999, else none
     assert native.predict.predict_pack(objs, True, 48)[1] == [1, 2, 3, 5]             # tentative ones too
     rows, ids, _, sel = native.predict.predict_pack(objs, True, 2)                   # the nearest two, nearest first
     assert ids == [3, 2] and sel == {3: 0, 2: 1} and np.frombuffer(rows).reshape(-1, PM.NO)[:, PM.O_ID].tolist() == [0.0, 1.0]

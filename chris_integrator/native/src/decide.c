@@ -1613,7 +1613,7 @@ static PyObject *n_decide_draws(PyObject *self, PyObject *arg)
     X(t_contact_s) X(lane) X(shown) X(pairs) X(w0) X(w) X(course) X(radar) X(cv) X(contract) X(vehicle) X(vru)         \
     X(unknown) X(stand) X(stand_path) X(cv_path) X(path) X(turn) X(none) X(information) X(caution) X(warning)          \
     X(imminent) X(threat_number) X(time_margin) X(collision_course) X(confirmed) X(coast) X(stationary) X(moving)   \
-    X(p_place)
+    X(p_place) X(hold) X(act_s) X(res_s) X(held) X(gaps) X(in_reach) X(side) X(s_m) X(clear_m) X(v_stop_mps) X(t_reach_s)
 #define X(n) S_##n,
 enum { DF_STRS(X) S_N };
 #undef X
@@ -1640,8 +1640,11 @@ enum {
 /* the threat model's cfg beyond the evaluation's (threat.py DEFAULT_CFG) */
 enum {
     DX_BRAKE_SHARE = DC_NC, DX_STEER_SHARE, DX_SPEED_FADE, DX_TURN_R, DX_HDG_RES, DX_AXIS_STANDING, DX_AXIS_SNAP,
-    DX_AXIS_STD, DX_LANE_AXIS_P, DX_LANE_WEIGHT, DX_LANE_FLOOR, DX_STAND_MOVE, DX_LIST_MIN_P, DX_NC
+    DX_AXIS_STD, DX_LANE_AXIS_P, DX_LANE_WEIGHT, DX_LANE_FLOOR, DX_STAND_MOVE, DX_LIST_MIN_P, DX_NC,
+    /* further constants, read where the array reaches them (an array of DX_NC numbers: all off) */
+    DX_HOLD = DX_NC, DX_HOLD_DECEL, DX_HOLD_REL, DX_HOLD_SIGMA, DX_HOLD_P, DX_HOLD_LEVEL, DX_NX
 };
+#define DX_GET(tc, ntc, i, absent) ((ntc) > (i) ? (tc)[i] : (absent))
 #define DF_G 9.81
 
 /* classes: prior footprint (length, width, 1 sigma of each) and the threshold set (0 vehicle, 1 vru, 2 unknown) */
@@ -2813,6 +2816,51 @@ static PyObject *n_decide_frame(PyObject *self, PyObject *args)
             const DfObj *q = &Q[m];
             const double *oo = OO + (size_t)m * DK_OF;
             int lv = (int)oo[DO_LE], lx = (int)oo[DO_LX];
+            /* A standing vehicle at one of two places along its needle (lane_res), the one in the car's way not
+             * sure (cfg place_hold). It is at ONE of them, it does not move, and the car learns which as it closes:
+             * the range's spread shrinks with the range (to `place_hold_range_rel` of it), so the two places,
+             * |rA - rB| apart on the ground, are told apart (place_hold_sigma spreads between them) once the car is
+             * within |rA - rB| / (sigma rel) of their middle: in t_res. The driver must act, at the latest, when
+             * comfortable braking (place_hold_decel) after the reaction time still stops short of the place in the
+             * way: in t_act, from the time of contact with that place's footprint (inflated) on the car's futures.
+             * While t_res <= t_act the decision can wait for the range and costs nothing: the object's entry level
+             * is held at place_hold_level. Once acting cannot wait, the level is what the masses say, as before. A
+             * car that is in the lane has no second place (no lane_res, or p_place at or above place_hold_p); a level
+             * carried by a future in which the object moves is not held. */
+            double h_act = NAN, h_res = NAN;
+            int held = 0;
+            if (DX_GET(tc, ntc, DX_HOLD, 0.0) > 0.5 && q->lane_res && !q->cv && q->p_place < DX_GET(tc, ntc, DX_HOLD_P, 1.0)) {
+                int ka = -1, kb = -1;
+                for (int i = 0; i < q->nm; i++) {
+                    if (ka < 0 && PyUnicode_CompareWithASCIIString(mname[q->first + i], "stopped") == 0)
+                        ka = q->first + i;
+                    if (kb < 0 && PyUnicode_CompareWithASCIIString(mname[q->first + i], "parked") == 0)
+                        kb = q->first + i;
+                }
+                if (ka >= 0 && kb >= 0) {
+                    const double *A = MD + (size_t)ka * wM + 2, *B = MD + (size_t)kb * wM + 2;
+                    const double ra = hypot(A[0], A[N]), rb = hypot(B[0], B[N]), vv = v0 > 0.5 ? v0 : 0.5;
+                    double tcon = INFINITY;
+                    for (int j = 0; j < E; j++) {
+                        const double *p = PO + ((size_t)ka * E + j) * DK_PF;
+                        if (p[DP_W0] >= tc[DC_PMIN] && p[DP_TTCI] < tcon)
+                            tcon = p[DP_TTCI];
+                    }
+                    const double rel = DX_GET(tc, ntc, DX_HOLD_REL, 0.09), sg = DX_GET(tc, ntc, DX_HOLD_SIGMA, 2.0);
+                    const double dec = DX_GET(tc, ntc, DX_HOLD_DECEL, 3.0);
+                    h_res = (0.5 * (ra + rb) - fabs(ra - rb) / (sg * rel)) / vv;
+                    if (h_res < 0.0)
+                        h_res = 0.0;
+                    h_act = tcon - vv / (2.0 * dec) - 0.5 * tc[DC_TAUB] - tc[DC_TREACT];     /* inf: no contact within the horizon */
+                    const int cap = (int)DX_GET(tc, ntc, DX_HOLD_LEVEL, 1.0);
+                    /* only where the place in the way is what carries the level (not a future in which it moves) */
+                    const int best = (int)oo[DO_BEST];
+                    if (isfinite(tcon) && best >= 0 && q->first + best / E == ka && h_res <= h_act && lv > cap) {
+                        held = 1;
+                        lv = cap;
+                    }
+                }
+            }
             PyObject *pc = df_r(oo[DO_PC], 3);
             if (pc == NULL) {
                 bad = 1;
@@ -2916,6 +2964,15 @@ static PyObject *n_decide_frame(PyObject *self, PyObject *args)
             bad |= df_set(r, S_shown, x) < 0 || df_setb(r, S_in_path, q->in_path ? Py_True : Py_False) < 0;
             if (q->lane_res && !q->cv)
                 bad |= df_set(r, S_p_place, df_r(q->p_place, 3)) < 0;
+            if (!isnan(h_res)) {                  /* (None for act_s: no contact with the place in the way within the horizon) */
+                PyObject *hd = PyDict_New();
+                if (hd == NULL || df_set(hd, S_act_s, df_r(h_act, 2)) < 0 || df_set(hd, S_res_s, df_r(h_res, 2)) < 0 ||
+                    df_setb(hd, S_held, held ? Py_True : Py_False) < 0) {
+                    Py_XDECREF(hd);
+                    bad = 1;
+                } else
+                    bad |= df_set(r, S_hold, hd) < 0;
+            }
             int list = lv || sh || pr >= tc[DX_LIST_MIN_P] || thw;
             if (list && pairs && !bad) {          /* threat.pairs_record */
                 PyObject *pl = PyList_New(0);
@@ -3022,9 +3079,225 @@ done:
     return res;
 }
 
+/* ====================================================================================================
+ * What is hidden: the gaps between vehicles standing beside the car's way (decide_gaps)
+ *
+ * Behind the far end of a vehicle standing beside the road a pedestrian is not seen until it has passed the
+ * vehicle's road-side face, g metres from the strip the car's body sweeps: g / v_ped seconds before it is in the
+ * car's way. For a pedestrian stepping out at the worst moment the car can still stop only below
+ *
+ *     v_stop = 2 a (g / v_ped - t_react)        (0 where the pedestrian is in the strip before the driver reacts)
+ *
+ * (the car reaches the place in x / v; it stops within x where x >= v t_react + v^2 / 2a; the pedestrian is there
+ * first where x >= v g / v_ped: no x is in both sets exactly when v <= v_stop). A gap is "in reach" while the car's
+ * front is still further from it than the pedestrian's time (x > v g / v_ped: it could be hit) and nearer than the
+ * car's stopping distance (x < v t_react + v^2 / 2a: the car could not stop for it).
+ *
+ * decide_gaps(objects, v, path | None, cfg) -> None | {"level", "level_exit", "side", "s_m", "clear_m",
+ *                                                      "v_stop_mps", "t_reach_s", "gaps", "in_reach"}
+ *   objects   the radar message's (confirmed or coast); vehicles that stand (futures.stands) are the screens,
+ *             pedestrians and cyclists already tracked at a gap make it a seen one (the prediction's matter)
+ *   path      the plan's polyline (decide_path), or None: straight ahead
+ *   cfg       front_m, half width, v_ped, t_react, decel, clear_max, gap_min, seen_m, margin_v, clear_min
+ *   level     2 (caution): a gap in reach and v > v_stop + margin_v; 1: a gap within twice the stopping distance and
+ *             v > v_stop; else None is returned. The gap reported is the one in reach with the least v_stop.
+ * ==================================================================================================== */
+enum { GC_FRONT, GC_HALFW, GC_VPED, GC_TREACT, GC_DECEL, GC_CLEAR_MAX, GC_GAP_MIN, GC_SEEN, GC_MARGIN, GC_CLEAR_MIN, GC_N };
+
+typedef struct {
+    double s0, s1, face, off;     /* along the path: its near and far end; its road-side face and its centre across it */
+    int side;
+} DgVeh;
+
+static int dg_cmp(const void *a, const void *b)
+{
+    const DgVeh *u = (const DgVeh *)a, *v = (const DgVeh *)b;
+    return u->s0 < v->s0 ? -1 : u->s0 > v->s0 ? 1 : 0;
+}
+
+static PyObject *n_decide_gaps(PyObject *self, PyObject *args)
+{
+    PyObject *objects, *path, *ocfg, *res = NULL;
+    double v;
+    if (!PyArg_ParseTuple(args, "OdOO", &objects, &v, &path, &ocfg))
+        return NULL;
+    if (df_strings() < 0)
+        return NULL;
+    View vc, vpx, vpy, vps;
+    vc.held = vpx.held = vpy.held = vps.held = 0;
+    const double *gc;
+    Py_ssize_t ngc;
+    DgVeh *V = NULL;
+    double *seen = NULL, *hd = NULL;
+    if (df_buf(ocfg, &vc, &gc, &ngc, "gaps cfg") < 0)
+        goto done;
+    if (ngc < GC_N) {
+        PyErr_SetString(PyExc_ValueError, "decide_gaps: the constants' array is too short");
+        goto done;
+    }
+    DfPath P;
+    P.n = 0;
+    if (path != Py_None) {
+        Py_ssize_t a, b, c;
+        if (!PyTuple_Check(path) || PyTuple_Size(path) != 3 || df_buf(PyTuple_GetItem(path, 0), &vpx, &P.px, &a, "path x") < 0 ||
+            df_buf(PyTuple_GetItem(path, 1), &vpy, &P.py, &b, "path y") < 0 || df_buf(PyTuple_GetItem(path, 2), &vps, &P.ps, &c, "path s") < 0)
+            goto done;
+        if (a < 2 || a != b || a != c) {
+            PyErr_SetString(PyExc_ValueError, "decide_gaps: path: three arrays of one length, two points at least");
+            goto done;
+        }
+        P.n = (int)a;
+        hd = (double *)PyMem_Malloc((size_t)2 * P.n * sizeof(double));
+        if (hd == NULL) {
+            PyErr_NoMemory();
+            goto done;
+        }
+        P.hd = hd;
+        P.mid = hd + P.n;
+        for (int i = 0; i < P.n - 1; i++) {
+            hd[i] = atan2(P.py[i + 1] - P.py[i], P.px[i + 1] - P.px[i]);
+            hd[P.n + i] = 0.5 * (P.ps[i + 1] + P.ps[i]);
+        }
+        P.c0 = cos(hd[0]);
+        P.s0 = sin(hd[0]);
+        P.c1 = cos(hd[P.n - 2]);
+        P.s1 = sin(hd[P.n - 2]);
+    }
+    Py_ssize_t no = objects != Py_None && PyList_Check(objects) ? PyList_Size(objects) : 0;
+    V = (DgVeh *)PyMem_Malloc((size_t)(no + 1) * sizeof(DgVeh));
+    seen = (double *)PyMem_Malloc((size_t)(2 * no + 1) * sizeof(double));
+    if (V == NULL || seen == NULL) {
+        PyErr_NoMemory();
+        goto done;
+    }
+    int nv = 0, ns = 0;
+    double s_car = 0.0, off_car = 0.0;
+    if (P.n > 0)
+        df_project(&P, 0.0, 0.0, &s_car, &off_car);
+    for (Py_ssize_t i = 0; i < no; i++) {
+        PyObject *o = PyList_GetItem(objects, i);
+        if (!PyDict_Check(o))
+            continue;
+        PyObject *st = df_get(o, S_state);
+        if (!(df_is(st, S_confirmed) || df_is(st, S_coast)))
+            continue;
+        DfObj q;
+        if (df_parse(o, &q) < 0)
+            goto done;
+        /* its centre: the radar's, else half its length beyond its near face along the line of sight */
+        double r = hypot(q.x, q.y), cx = q.x, cy = q.y;
+        if (q.has_ctr) {
+            cx += q.cdx;
+            cy += q.cdy;
+        } else if (r > 1e-6) {
+            cx += 0.5 * q.L * q.x / r;
+            cy += 0.5 * q.L * q.y / r;
+        }
+        double s = cx, off = cy;
+        if (P.n > 0) {
+            df_project(&P, cx, cy, &s, &off);
+            s -= s_car;
+        }
+        if (DF_SET[q.cls] == 1) {                 /* someone seen there: the gap is no hidden one */
+            seen[2 * ns] = s;
+            seen[2 * ns + 1] = off;
+            ns++;
+            continue;
+        }
+        if (DF_SET[q.cls] != 0 || !q.stands)
+            continue;
+        const double face = fabs(off) - 0.5 * q.W, clear = face - gc[GC_HALFW];
+        if (clear < gc[GC_CLEAR_MIN] || clear > gc[GC_CLEAR_MAX])
+            continue;                             /* in the car's way itself (the threat's matter), or too far beside it */
+        V[nv].s0 = s - 0.5 * q.L;
+        V[nv].s1 = s + 0.5 * q.L;
+        V[nv].face = face;
+        V[nv].off = off;
+        V[nv].side = off >= 0.0 ? 1 : -1;
+        nv++;
+    }
+    if (nv == 0 || !(v > 0.5)) {
+        res = Py_None;
+        Py_INCREF(res);
+        goto done;
+    }
+    qsort(V, (size_t)nv, sizeof(DgVeh), dg_cmp);
+    const double a = gc[GC_DECEL], tr = gc[GC_TREACT], stop = v * tr + v * v / (2.0 * a);
+    int level = 0, lx = 0, n_gaps = 0, n_reach = 0, best = -1, best_reach = 0;
+    double best_vs = INFINITY, best_x = 0.0, best_clear = 0.0;
+    for (int i = 0; i < nv; i++) {
+        /* the far end of vehicle i: a gap where the next vehicle of its side begins gap_min further on (or none does) */
+        double next = INFINITY;
+        for (int j = 0; j < nv; j++)
+            if (j != i && V[j].side == V[i].side && V[j].s1 > V[i].s1 && V[j].s0 < next)
+                next = V[j].s0;
+        if (next - V[i].s1 < gc[GC_GAP_MIN])
+            continue;
+        const double x = V[i].s1 - gc[GC_FRONT];              /* the car's front to the gap */
+        if (x <= 0.0)
+            continue;
+        int taken = 0;
+        for (int k = 0; k < ns && !taken; k++)
+            taken = fabs(seen[2 * k] - V[i].s1) < gc[GC_SEEN] + (next < INFINITY ? 0.5 * (next - V[i].s1) : 0.0) &&
+                    (seen[2 * k + 1] >= 0.0) == (V[i].side > 0);
+        if (taken)
+            continue;
+        n_gaps++;
+        const double clear = V[i].face - gc[GC_HALFW], tg = clear / gc[GC_VPED];
+        double vs = 2.0 * a * (tg - tr);
+        if (vs < 0.0)
+            vs = 0.0;
+        const int reach = x > v * tg && x < stop, near = x > v * tg && x < 2.0 * stop;
+        if (reach)
+            n_reach++;
+        if (reach && v > vs + gc[GC_MARGIN] && level < 2)
+            level = 2;
+        if (near && v > vs && level < 1)
+            level = 1;
+        if (x > v * tg && x < 1.2 * stop && v > vs)
+            lx = 2;
+        else if (near && v > 0.8 * vs && lx < 1)
+            lx = 1;
+        /* the gap reported: the one in reach with the least v_stop (none in reach: of those further on) */
+        if ((reach && (!best_reach || vs < best_vs)) || (near && !reach && !best_reach && (best < 0 || vs < best_vs))) {
+            best = i;
+            best_reach = reach;
+            best_vs = vs;
+            best_x = x;
+            best_clear = clear;
+        }
+    }
+    if (level == 0 && lx == 0) {
+        res = Py_None;
+        Py_INCREF(res);
+        goto done;
+    }
+    res = PyDict_New();
+    if (res != NULL) {
+        int bad = df_set(res, S_level, PyLong_FromLong(level)) < 0 || df_set(res, S_level_exit, PyLong_FromLong(lx > level ? lx : level)) < 0 ||
+                  df_set(res, S_gaps, PyLong_FromLong(n_gaps)) < 0 || df_set(res, S_in_reach, PyLong_FromLong(n_reach)) < 0;
+        if (best >= 0)
+            bad |= df_setb(res, S_side, df_s[V[best].side > 0 ? S_left : S_right]) < 0 || df_set(res, S_s_m, df_r(best_x + gc[GC_FRONT], 1)) < 0 ||
+                   df_set(res, S_clear_m, df_r(best_clear, 2)) < 0 || df_set(res, S_v_stop_mps, df_r(best_vs, 1)) < 0 ||
+                   df_set(res, S_t_reach_s, df_r(best_x / v, 2)) < 0;
+        if (bad)
+            Py_CLEAR(res);
+    }
+done:
+    PyMem_Free(V);
+    PyMem_Free(seen);
+    PyMem_Free(hd);
+    view_drop(&vc);
+    view_drop(&vpx);
+    view_drop(&vpy);
+    view_drop(&vps);
+    return res;
+}
+
 #define DECIDE_METHODS                                                                                                 \
     {"decide_eval", n_decide_eval, METH_VARARGS, "the decision layer's threat measures per object, mode and ego mode (decide.c)"},   \
     {"decide_inst_prob", n_decide_inst_prob, METH_VARARGS, "the exact probability that two footprints overlap at one time (decide.c)"}, \
     {"decide_draws", n_decide_draws, METH_O, "the decision layer's fixed standard-normal draws (decide.c)"},          \
     {"decide_path", n_decide_path, METH_VARARGS, "the road model's plan as the decision layer's path polyline (decide.c)"}, \
-    {"decide_frame", n_decide_frame, METH_VARARGS, "one radar message's decision: futures, footprints, threat, records (decide.c)"},
+    {"decide_frame", n_decide_frame, METH_VARARGS, "one radar message's decision: futures, footprints, threat, records (decide.c)"},                                                                    \
+    {"decide_gaps", n_decide_gaps, METH_VARARGS, "what is hidden: the gaps between vehicles standing beside the car's way (decide.c)"},

@@ -3194,3 +3194,83 @@ ALERT_SCENARIOS.update({
 })
 TRUE_BEND_SCENARIOS = ("bend_stopped_13", "bend_stopped_clear_13", "bend_exit_stopped_13", "right_bend_stopped_13",
                        "half_in_lane_13", "half_in_lane_straight_13", "ped_between_parked_13")
+
+
+# ---- lane SPREAD: a pedestrian at a parked row (the ego never reacts; collision_t as above) --------------------------
+_CHILD = (0.35, 0.45, 1.15)
+_VAN = (6.0, 2.1, 2.6)
+
+
+def _ped_row(v, curv, s_ped, lat0, v_ped, k, seed, night, clear_m=3.0, vans=False, dims=None, steps=True, t_after=4.0):
+    """A parked row on the right (2.6-3.2 m) from arc 60 to 330 with a pedestrian in a gap of it at arc s_ped +- 3 m,
+    standing at lateral lat0 (m left of the lane's centre: negative). steps: it walks out at v_ped so that it is at
+    lateral -0.3 m (inside the strip the car sweeps) exactly when the car's front reaches its arc (collision_t), and
+    on to the left after; not steps: it stands there throughout (role `kerb_ped`, no collision; the run ends t_after
+    seconds after the car's front has passed it). clear_m: row cars whose footprint comes within this of the
+    pedestrian's arc are removed. vans: a van (6.0 x 2.1 x 2.6 m, lateral -3.0) stands on either side of the gap,
+    0.9 m of arc from the pedestrian's: what stands behind their road-side faces is hidden from the car."""
+    rng = random.Random(seed * 101 + k)
+    s_p = s_ped + rng.uniform(-3.0, 3.0)
+    t_at = _t_front_at(s_p, v)
+    t_go = t_at - (abs(lat0) - 0.3) / v_ped
+
+    def actors(w):
+        row = _parked_row(rng, 100, 60.0, 330.0, -1, lat=(2.6, 3.2), p_gap=0.1)
+        gap = (0.9 + _VAN[0]) if vans else 0.0
+        row = [a for a in row if abs(a.s0 - s_p) >= a.L / 2 + max(clear_m, gap + (0.8 if vans else 0.0))]
+        if vans:
+            row += [Actor(190 + i, "truck", "parked", s_p + sg * (0.9 + _VAN[0] / 2), lateral=[(0, -3.0)],
+                          yaw_rel=rng.gauss(0.0, 0.02), dims=_VAN) for i, sg in enumerate((-1, 1))]
+        if steps:
+            ped = Actor(610, "human", "crossing_ped", s_p, speed=[(0, 0.0)], dims=dims,
+                        lateral=[(0, lat0), (t_go, lat0), (t_at, -0.3), (t_at + 6.0, -0.3 + 6.0 * v_ped)])
+        else:
+            ped = Actor(610, "human", "kerb_ped", s_p, speed=[(0, 0.0)], lateral=[(0, lat0)], dims=dims)
+        return row + [ped]
+    if steps:
+        return _alert_spec(v, curv, t_at, actors, night)
+    return dict(T=t_at + t_after, speed=[(0, v)], curv=curv, actors=actors, lead_range_m=70.0 if night else 100.0)
+
+
+def sc_ped_early_13(seed, night):
+    """A straight road, ego 13 m/s, never reacting; parked row on the right with a WIDE gap (row cars within 9 m of
+    arc removed) ~135 m ahead; a pedestrian stands in it at the lane's edge (lateral -2.4 m), in view from far off,
+    and steps out at 1.4 m/s 1.5 s before the car's front arrives (collision_t, ~10 s)."""
+    return _ped_row(13.0, [(0, 0.0)], 135.0, -2.4, 1.4, 51, seed, night, clear_m=9.0)
+
+
+def sc_ped_hidden_13(seed, night):
+    """The `curve_parked` road (LEFT curve R 110 m from arc 80), ego 13 m/s, never reacting; in the parked row on the
+    outside two VANS stand 1.8 m apart at arc ~135; a pedestrian stands between them at lateral -3.6 m, behind their
+    road-side faces (-1.95 m), and walks out at 1.4 m/s from 2.36 s before the car's front arrives: it passes the
+    vans' faces, into view, about 1.2 s before (collision_t, ~10 s)."""
+    return _ped_row(13.0, _CURVE_PARKED_CURV, 135.0, -3.6, 1.4, 52, seed, night, vans=True)
+
+
+def sc_child_between_parked_13(seed, night):
+    """As ped_between_parked_13 (left curve, a gap in the parked row at arc ~135) with a CHILD (0.35 x 0.45 x 1.15 m)
+    standing in the gap at lateral -2.9 m, which runs out at 2.2 m/s 1.18 s before the car's front arrives."""
+    return _ped_row(13.0, _CURVE_PARKED_CURV, 135.0, -2.9, 2.2, 53, seed, night, dims=_CHILD)
+
+
+def sc_ped_kerb_stands_13(seed, night):
+    """The false-warning control of ped_between_parked_13: the same road, row and gap, the pedestrian standing in
+    the gap at lateral -2.9 m and NOT stepping out; the car passes it (no collision)."""
+    return _ped_row(13.0, _CURVE_PARKED_CURV, 135.0, -2.9, 1.4, 47, seed, night, steps=False)
+
+
+def sc_ped_kerb_stands_early_13(seed, night):
+    """The false-warning control of ped_early_13: the straight road and the wide gap, the pedestrian standing at the
+    lane's edge (lateral -2.4 m) and NOT stepping out."""
+    return _ped_row(13.0, [(0, 0.0)], 135.0, -2.4, 1.4, 51, seed, night, clear_m=9.0, steps=False)
+
+
+ALERT_SCENARIOS.update({
+    "ped_early_13": sc_ped_early_13,
+    "ped_hidden_13": sc_ped_hidden_13,
+    "child_between_parked_13": sc_child_between_parked_13,
+    "ped_kerb_stands_13": sc_ped_kerb_stands_13,
+    "ped_kerb_stands_early_13": sc_ped_kerb_stands_early_13,
+})
+PED_SCENARIOS = ("ped_early_13", "ped_hidden_13", "child_between_parked_13")
+PED_CONTROL_SCENARIOS = ("ped_kerb_stands_13", "ped_kerb_stands_early_13")
