@@ -67,6 +67,16 @@ def class_of(tr, T):
     return _cv.result(tr.mem.get("cls"), T)
 
 
+_LEAD_OUT = None
+
+
+def _lead_out():
+    global _LEAD_OUT
+    from . import lead
+    _LEAD_OUT = lead
+    return lead
+
+
 class Det:
     """One detection: measurement vector, its covariance (or variances), free attributes."""
     __slots__ = ("z", "R", "attrs", "used")
@@ -589,7 +599,7 @@ class ObjectLayer:
     # ---- one output frame ----------------------------------------------------------------------------
     def frame(self, integ, road, es):
         """Process every queued scan up to the frame's time, then build `tracks` and `lead`."""
-        from . import lead as lead_out
+        lead_out = _LEAD_OUT or _lead_out()          # (core/lead.py imports this module: imported on first use)
         ts = es["ts_mono_ns"]
         T = ts / NS
         sp = es.get("speed") or {}
