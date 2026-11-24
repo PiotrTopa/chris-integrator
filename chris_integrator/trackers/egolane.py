@@ -99,25 +99,46 @@ _WIN = {}                       # (lo, hi) -> (a copy of the last xs, the indice
 
 
 def _at(xs, ys, lo, hi):
-    """Mean of ys over lo <= x <= hi (None when nothing there). The points within the window are a function of
-    xs (the same distances every frame): found once and kept per window; the mean is taken over the same values
-    in the same order as `_at_scan`."""
-    if not xs or not ys:
-        return None
+    """Mean of ys over lo <= x <= hi (None when nothing there)."""
+    return _at_fn(xs, lo, hi)(ys)
+
+
+def _none(ys):
+    return None
+
+
+def _at_fn(xs, lo, hi):
+    """The function ys -> _at(xs, ys, lo, hi) for a frame's xs. The points within the window are a function of xs
+    (the same distances every frame): found once and kept per window, as a slice when they are a run (xs in
+    order; a slice of a shorter ys ends with it, as zip does); the mean is taken over the same values in the
+    same order as `_at_scan`."""
+    if not xs:
+        return _none
     w = _WIN.get((lo, hi))
     if w is None or w[0] != xs:
         try:
-            w = _WIN[(lo, hi)] = (list(xs), [i for i, x in enumerate(xs) if lo <= x <= hi])
+            idx = [i for i, x in enumerate(xs) if lo <= x <= hi]
         except TypeError:                       # a point that does not compare (beyond ys, it would not count)
-            return _at_scan(xs, ys, lo, hi)
+            return lambda ys: _at_scan(xs, ys, lo, hi) if ys else None
+        sel = slice(idx[0], idx[-1] + 1) if idx and idx[-1] - idx[0] + 1 == len(idx) else idx
+        w = _WIN[(lo, hi)] = (list(xs), sel)
         if len(_WIN) > 16:
             _WIN.clear()
-    idx = w[1]
-    n = len(ys)
-    if n < len(w[0]):
-        idx = [i for i in idx if i < n]         # (zip: the points beyond ys do not count)
-    v = [y for i in idx if (y := ys[i]) is not None]
-    return sum(v) / len(v) if v else None
+    sel = w[1]
+    if sel.__class__ is slice:
+        def at(ys):
+            if not ys:
+                return None
+            v = [y for y in ys[sel] if y is not None]
+            return sum(v) / len(v) if v else None
+    else:
+        def at(ys):
+            if not ys:
+                return None
+            n = len(ys)
+            v = [y for i in sel if i < n and (y := ys[i]) is not None]
+            return sum(v) / len(v) if v else None
+    return at
 
 
 def _at_scan(xs, ys, lo, hi):
@@ -279,13 +300,14 @@ class EgoLaneEstimator:
         if self.evidence_side:
             ev["new_lanes"] = self.evidence_side
         if spd >= c["min_speed_mps"]:
-            yl = _at(xs, (lines[1] or {}).get("y"), lo, hi) if (lines[1] or {}).get("present") else None
-            yr = _at(xs, (lines[2] or {}).get("y"), lo, hi) if (lines[2] or {}).get("present") else None
+            at = _at_fn(xs, lo, hi)             # (_at over this frame's xs and the window)
+            yl = at((lines[1] or {}).get("y")) if (lines[1] or {}).get("present") else None
+            yr = at((lines[2] or {}).get("y")) if (lines[2] or {}).get("present") else None
             like = [1.0] * size
             # right side: k lanes to the right
             er = edges[1] or {}
             if er.get("present") and (er.get("conf") or 0.0) >= c["edge_min_conf"] and yr is not None:
-                yer = _at(xs, er.get("y"), lo, hi)
+                yer = at(er.get("y"))
                 if yer is not None:
                     g = yer - yr
                     ev["edge_right_m"] = round(g, 2)
@@ -295,7 +317,7 @@ class EgoLaneEstimator:
             seen_r = bool(fr.get("present")) and (fr.get("conf") or 0.0) >= c["line_min_conf"]
             if yr is not None:
                 if seen_r:
-                    yfr = _at(xs, fr.get("y"), lo, hi)
+                    yfr = at(fr.get("y"))
                     seen_r = yfr is not None and 0.6 * w <= yfr - yr <= 1.6 * w
                 ev["lane_right"] = seen_r
                 for k in range(size):
@@ -306,12 +328,12 @@ class EgoLaneEstimator:
             fl = lines[0] or {}
             seen_l = bool(fl.get("present")) and (fl.get("conf") or 0.0) >= c["line_min_conf"]
             if yl is not None and seen_l:
-                yfl = _at(xs, fl.get("y"), lo, hi)
+                yfl = at(fl.get("y"))
                 seen_l = yfl is not None and 0.6 * w <= yl - yfl <= 1.6 * w
             if ml:
                 n = ml["forward"]
                 if el.get("present") and (el.get("conf") or 0.0) >= c["edge_min_conf"] and yl is not None:
-                    yel = _at(xs, el.get("y"), lo, hi)
+                    yel = at(el.get("y"))
                     if yel is not None:
                         g = yl - yel
                         ev["edge_left_m"] = round(g, 2)
@@ -361,7 +383,8 @@ class EgoLaneEstimator:
         if len(ln) != 4 or not (ln[1] or {}).get("present") or not (ln[2] or {}).get("present"):
             return None
         xs = lanes.get("x") or []
-        ya, yb = _at(xs, ln[1].get("y"), 3.0, 10.0), _at(xs, ln[2].get("y"), 3.0, 10.0)
+        at = _at_fn(xs, 3.0, 10.0)
+        ya, yb = at(ln[1].get("y")), at(ln[2].get("y"))
         if ya is None or yb is None or not 0.6 * w <= yb - ya <= 1.5 * w:
             return None
         cur = 0.5 * (ya + yb)
