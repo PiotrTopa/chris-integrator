@@ -266,8 +266,8 @@ static void pp_eval(const PPath *p, double s, double *x, double *y, double *th, 
 /* the nearest point of the path to (x, y): its arc length and the offset to the LEFT of the path */
 static void pp_project(const PPath *p, double x, double y, double *s, double *d)
 {
-    double best = P_BIG;
-    int n = p->n;
+    double best = P_BIG, bt = 0.0;
+    int n = p->n, bi = -1;
     *s = p->s[0];
     *d = 0.0;
     for (int i = 0; i + 1 < n; i++) {
@@ -280,16 +280,26 @@ static void pp_project(const PPath *p, double x, double y, double *s, double *d)
             t = 1.0;
         double ex = rx - t * dx, ey = ry - t * dy, e2 = ex * ex + ey * ey;
         if (e2 < best) {
-            double L = sqrt(L2);
             best = e2;
-            *s = p->s[i] + t * L;
+            bi = i;
+            bt = t;
+        }
+    }
+    if (bi >= 0) {                                /* the nearest segment's numbers, once it is known */
+        const int i = bi;
+        const double t = bt;
+        double dx = p->x[i + 1] - p->x[i], dy = p->y[i + 1] - p->y[i];
+        double L2 = dx * dx + dy * dy, rx = x - p->x[i], ry = y - p->y[i];
+        double L = sqrt(L2);
+        *s = p->s[i] + t * L;
+        if (t >= 0.0 && t <= 1.0)
+            *d = (dx * ry - dy * rx) / L;
+        else {
             /* the offset is measured across the path's own direction at that point: by the vertex tangents */
             double u = t < 0.0 ? 0.0 : t > 1.0 ? 1.0 : t;
             double th = p->th[i] + u * (p->th[i + 1] - p->th[i]);
             double px = p->x[i] + t * dx, py = p->y[i] + t * dy;
             *d = -(x - px) * sin(th) + (y - py) * cos(th);
-            if (t >= 0.0 && t <= 1.0)
-                *d = (dx * ry - dy * rx) / L;
         }
     }
 }
