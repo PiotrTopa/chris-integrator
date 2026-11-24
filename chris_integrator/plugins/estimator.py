@@ -93,7 +93,8 @@ class Estimator(Plugin):
         store = ctx.service("store")
         if store is None:
             return
-        key = sorted(self.integ.faults())
+        # (the faulted groups' names, as sorted(faults()) gives them, without copying every fault each frame)
+        key = sorted([n for n, g in self.integ.groups.items() if g.fault is not None])
         if key != self.saved:
             self.saved = key
             store.save(self.name, self.state_dump())

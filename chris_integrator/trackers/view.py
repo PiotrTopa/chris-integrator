@@ -57,7 +57,7 @@ import bisect
 import math
 
 from ..native import core as _C, round, round_list
-from ..contract import LocalEgo, validity
+from ..contract import LocalEgo, from_vehicle, validity
 from .roadview import RoadView
 
 NS = 1e9
@@ -205,6 +205,10 @@ class _Static:
         self.leaving = False
 
 
+_LANE_IDS = ("lane:0", "lane:1", "lane:2", "lane:3")      # the line ids of `view` ("lane:%d", "edge:%d")
+_EDGE_IDS = ("edge:0", "edge:1")
+
+
 class _Line:
     def __init__(self, ys, ts):
         self.a = list(ys)                       # first stage
@@ -239,6 +243,9 @@ class ViewBuilder:
         if not hasattr(self, "ext_scale"):     # kept across a reset of the channel: it describes the camera
             self.ext_scale, self.scale_ts = None, None
         self.seen = {}                         # id -> first-seen ts (age across fade-out / back in)
+        self._mv = (0.0, 0.0)                  # (speed, yaw rate) of the frame being built (_motion)
+        self._gains_key = self._gains = None   # _lines: the smoothing gains of the last dt
+        self._xs_of = None                     # _lines: the xs of _xs_n / _xs_rising
         self.road = RoadView(self.road_cfg)    # the road part (roadview.py)
 
     # ---- inputs ------------------------------------------------------------------------------------------
@@ -424,7 +431,7 @@ class ViewBuilder:
         if es is None:
             return 0.0, 0.0, "none"
         sp, yr = es.get("speed") or {}, es.get("yaw_rate") or {}
-        src = "vehicle" if any(x.startswith("vehicle.") for x in sp.get("sources") or ()) else \
+        src = "vehicle" if from_vehicle(sp.get("sources")) else \
             "vision" if sp.get("valid") else "none"
         return (sp["value"] if sp.get("valid") else 0.0), (-yr["value"] if yr.get("valid") else 0.0), src
 
@@ -538,6 +545,7 @@ class ViewBuilder:
         dt = 0.0 if self.ts is None else (ts - self.ts) / NS
         self.ts = ts
         v, r, src = self._motion(ts)
+        self._mv = (v, r)
         fade = dt / c["fade_s"] if c["fade_s"] > 0 else 1.0
         objects = []
         lo = self._lead(lead, ts, dt, fade)
@@ -630,44 +638,59 @@ class ViewBuilder:
         out = []
         src = []
         if isinstance(lanes, dict) and isinstance(lanes.get("x"), list):
-            for kind, key, names in (("lane_line", "lines", 4), ("road_edge", "edges", 2)):
-                for i, ln in enumerate((lanes.get(key) or [])[:names]):
-                    src.append(("%s:%d" % ("lane" if kind == "lane_line" else "edge", i), kind, ln))
-        gains = [1.0 - math.exp(-dt / (c["line_tau_s"] + c["line_tau_rel"] * x)) if dt > 0 and c["line_tau_s"] > 0 else 1.0
-                 for x in xs]
-        mv, mr, _ = self._motion(ts)
+            for kind, key, ids in (("lane_line", "lines", _LANE_IDS), ("road_edge", "edges", _EDGE_IDS)):
+                for lid, ln in zip(ids, (lanes.get(key) or [])[:len(ids)]):
+                    src.append((lid, kind, ln))
+        # the gains are a function of dt and the configuration only: the last frame's list again when they are
+        # the same (frames come at a steady rate; the list is only read)
+        gkey = (dt, c["line_tau_s"], c["line_tau_rel"], xs)
+        if gkey == self._gains_key:
+            gains = self._gains
+        else:
+            tau, tau_rel = c["line_tau_s"], c["line_tau_rel"]
+            if dt > 0 and tau > 0:
+                exp = math.exp
+                gains = [1.0 - exp(-dt / (tau + tau_rel * x)) for x in xs]
+            else:
+                gains = [1.0] * len(xs)
+            self._gains_key, self._gains = gkey, gains
+        mv, mr = self._mv                                       # (on_frame's _motion of this frame)
         seen = set()
-        nx = len(xs)
-        xs_rising = all(a <= b for a, b in zip(xs, xs[1:]))     # then "x <= reach" holds for a leading run of points
+        if xs is not self._xs_of:
+            # then "x <= reach" holds for a leading run of points
+            self._xs_of, self._xs_n, self._xs_rising = xs, len(xs), all(a <= b for a, b in zip(xs, xs[1:]))
+        nx, xs_rising = self._xs_n, self._xs_rising
         flat, todo = [], []
+        reach_std, shift_m, shift_s, motion = c["line_reach_std_m"], c["shift_m"], c["shift_s"], c["line_motion"]
+        prep, blend, lines, seen_ts = _C.view_prep, _C.view_blend, self.lines, self.seen     # (_prep, _blend)
         for lid, kind, ln in src:
             seen.add(lid)
-            st = self.lines.get(lid)
+            st = lines.get(lid)
             ok = isinstance(ln, dict) and ln.get("present") and isinstance(ln.get("y"), list)
             if ok:
                 gx = lanes["x"] if kind == "lane_line" else lanes.get("edges_x") or lanes["x"]
                 fresh = st is None or not st.present and st.alpha == 0.0
-                r = _prep(gx, ln["y"], ln.get("y_std") or [], xs, c["line_reach_std_m"], None if fresh else st.b)
+                r = prep(gx, ln["y"], ln.get("y_std") or [], xs, reach_std, None if fresh else st.b)
                 ok = r is not None
             if ok:
                 ys, reach, jump = r
                 if fresh:
-                    st = self.lines[lid] = _Line(ys, ts)
-                    self.seen.setdefault(lid, ts)
+                    st = lines[lid] = _Line(ys, ts)
+                    seen_ts.setdefault(lid, ts)
                 else:
                     # a restart on another marking moves the near part too; a turn sweeps only the far part
-                    if jump > c["shift_m"] and st.shift_t is None:
+                    if jump > shift_m and st.shift_t is None:
                         st.shift_t = ts
                     k = None
                     if st.shift_t is not None:
                         since = (ts - st.shift_t) / NS
-                        if since < c["shift_s"]:
-                            k = min(1.0, dt / max(1e-3, c["shift_s"] - since + dt))   # linear over shift_s
+                        if since < shift_s:
+                            k = min(1.0, dt / max(1e-3, shift_s - since + dt))   # linear over shift_s
                         else:
                             st.shift_t = None
                     ks = gains if k is None else [k] * len(xs)
                     prev = st.b
-                    if c["line_motion"]:
+                    if motion:
                         # where the drawn line is now if it stands still in the world, then a correction
                         # towards the tracked line: the smoothing acts on the difference only
                         pred, rate = self._carry(prev, xs, mv, mr, dt)
@@ -675,7 +698,7 @@ class ViewBuilder:
                         st.a = list(st.b)
                         st.dy = rate
                     else:
-                        st.a, st.b, st.dy = _blend(st.a, st.b, st.dy, ys, ks, dt, st.shift_t is not None)
+                        st.a, st.b, st.dy = blend(st.a, st.b, st.dy, ys, ks, dt, st.shift_t is not None)
                 st.present, st.reach, st.conf = True, reach, ln.get("conf")
                 st.alpha = min(1.0, st.alpha + fade)
             elif st is not None:
@@ -685,15 +708,15 @@ class ViewBuilder:
             if st is None:
                 continue
             if not st.present and st.alpha == 0.0:
-                del self.lines[lid]
-                self.seen.pop(lid, None)
+                del lines[lid]
+                seen_ts.pop(lid, None)
                 continue
             phase = "leave" if not st.present else "appear" if st.alpha < 1.0 else \
                 "shift" if st.shift_t is not None else "coast" if (ln or {}).get("mode") == "coast" else "steady"
             # the points within reach, offsets then rates: rounded for all lines at once below
             m = bisect.bisect_right(xs, st.reach) if xs_rising else None      # (xs in order: the count of x <= reach)
             o = {"id": lid, "kind": kind, "y": None, "dy": None,
-                 "reach_m": st.reach, "conf": st.conf, "age_s": round((ts - self.seen.get(lid, st.t0)) / NS, 2),
+                 "reach_m": st.reach, "conf": st.conf, "age_s": round((ts - seen_ts.get(lid, st.t0)) / NS, 2),
                  "phase": phase, "alpha": round(st.alpha, 2)}
             if m is None or len(st.b) != nx or len(st.dy) != nx:
                 o["y"] = [round(y, 2) if x <= st.reach else None for x, y in zip(xs, st.b)]

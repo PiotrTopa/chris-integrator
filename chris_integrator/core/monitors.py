@@ -11,6 +11,16 @@ from ..native import core as _C
 from ..native import round                  # builtins.round (its results; the native core)
 
 
+def _median(data):
+    """statistics.median of a non-empty list (its arithmetic, without its generic overhead)."""
+    data = sorted(data)
+    n = len(data)
+    if n % 2 == 1:
+        return data[n // 2]
+    i = n // 2
+    return (data[i - 1] + data[i]) / 2
+
+
 class Series:
     """Raw measurements of one group for one quantity: (t, value, sigma), newest last."""
 
@@ -62,7 +72,18 @@ class _Window:
 
     def last(self, span_s):
         lim = self.ev - span_s
-        return [it for ev, it in self.q if ev >= lim]
+        q = self.q
+        if not q or q[0][0] >= lim:
+            return [it for ev, it in q]
+        # (the evidence clock never runs back: the items within the span are the newest ones, walked from the end;
+        # `not ev >= lim` stops where the comprehension would have dropped every older item, NaN included)
+        out = []
+        for ev, it in reversed(q):
+            if not ev >= lim:
+                break
+            out.append(it)
+        out.reverse()
+        return out
 
     def span(self):
         return self.ev - self.q[0][0] if self.q else 0.0
@@ -123,11 +144,13 @@ class Pair:
 
     def _sample(self, t, v, s, rv, rs):
         c = self.c
+        hs = None                                  # hypot(s, rs), computed once where it is needed
         if c["mode"] == "share" and c.get("cusum_h"):
             # beside the share-of-bad-samples test: a CUSUM of the normalised difference, for what never puts a
             # single sample beyond z_bad (a bias, a 10 % scale error, a slow drift). It sees every sample, also
             # those too small to be evidence for the share test (a gyro bias shows on a straight road).
-            z = max(-6.0, min(6.0, (v - rv) / math.hypot(s, rs)))
+            hs = math.hypot(s, rs)
+            z = max(-6.0, min(6.0, (v - rv) / hs))
             self.gp = min(max(0.0, self.gp + z - c["cusum_k"]), 2.0 * c["cusum_h"])
             self.gn = min(max(0.0, self.gn - z - c["cusum_k"]), 2.0 * c["cusum_h"])
             self.recent.append((v - rv, abs(rv)))
@@ -145,13 +168,15 @@ class Pair:
             if c["mode"] == "share" and c.get("cusum_h") and self.cusum_on != (self.verdict == "disagree") and self.verdict != "unknown":
                 return self._evaluate(t)
             return False
-        z = (v - rv) / math.hypot(s, rs)
+        if hs is None:
+            hs = math.hypot(s, rs)
+        z = (v - rv) / hs
         self.win.add(t, (abs(z) > c["z_bad"], v, rv))
         self.last_delta = v - rv
         self.times.append(t)
         self.sample_t = t
         if c["mode"] == "mean":
-            return self._evaluate_mean(t, math.hypot(s, rs))
+            return self._evaluate_mean(t, hs)
         return self._evaluate(t)
 
     def _evaluate_mean(self, t, sigma):
@@ -201,11 +226,11 @@ class Pair:
         c = self.c
         fire = self.win.last(c["fire_window_s"])
         n = len(fire)
-        share = sum(1 for b, _, _ in fire if b) / n if n else None
+        share = sum([1 for b, _, _ in fire if b]) / n if n else None
         ratio = None
         if n >= 3:
-            mr = statistics.median(r for _, _, r in fire)
-            ratio = statistics.median(v for _, v, _ in fire) / mr if abs(mr) > 1e-3 else None
+            mr = _median([r for _, _, r in fire])
+            ratio = _median([v for _, v, _ in fire]) / mr if abs(mr) > 1e-3 else None
         self.stats = {"n": n, "share": share, "ratio": ratio}
         if n >= c["min_n"] and c["mode"] == "share":
             self._peak("share", share / c["fire_share"])

@@ -28,8 +28,11 @@ from .vehicle import scale_reg
 AXLE = 1.5                       # the car frame's origin (reference camera) is this far ahead of the rear axle
 
 
+_PI, _TWO_PI = math.pi, 2.0 * math.pi
+
+
 def _wrap(a):
-    return (a + math.pi) % (2.0 * math.pi) - math.pi
+    return (a + _PI) % _TWO_PI - _PI
 
 
 class RadarModel(SensorModel):
@@ -47,6 +50,8 @@ class RadarModel(SensorModel):
         return v - w * self.my, w * (self.mx + AXLE)
 
     def h(self, x, ego):
+        if type(x) is np.ndarray and x.dtype == np.float64:
+            x = x.tolist()                 # (Python floats: the same IEEE arithmetic as numpy's scalars, less overhead)
         dx, dy = x[X] - self.mx, x[Y] - self.my
         r = max(math.hypot(dx, dy), 0.5)
         vsx, vsy = self._sensor_vel(ego)
@@ -62,7 +67,8 @@ class RadarModel(SensorModel):
 
     def residual(self, z, zp):
         d = z - zp
-        d[1] = _wrap(d[1])
+        # (in a Python float: the same IEEE sum and remainder as numpy's scalar arithmetic, without its overhead)
+        d[1] = (float(d[1]) + _PI) % _TWO_PI - _PI
         return d
 
     def initiate(self, det, ego):
@@ -102,6 +108,24 @@ class RadarModel(SensorModel):
         return self.p_d
 
 
+def _ill(N, lim=1e4):
+    """np.linalg.cond(N) > lim for a 2 x 2 matrix, the same decision without the SVD where it is clear: the
+    condition number in closed form (s1^2 + s2^2 = |N|_F^2, s1 s2 = |det N|) is accurate to ~1e-12 relative at
+    these sizes, so outside a factor 2 of the limit its side of the limit is the SVD's; near the limit, for a
+    singular or non-finite matrix, the SVD decides as before."""
+    (a, b), (c, d) = N.tolist()
+    f = a * a + b * b + c * c + d * d
+    dt = abs(a * d - b * c)
+    if dt > 0.0 and math.isfinite(f) and math.isfinite(dt):
+        s1sq = 0.5 * (f + math.sqrt(max(f * f - 4.0 * dt * dt, 0.0)))
+        k = s1sq / dt                      # s1 / s2 = s1^2 / (s1 s2)
+        if k < 0.5 * lim:
+            return False
+        if k > 2.0 * lim and math.isfinite(k):
+            return True
+    return bool(np.linalg.cond(N) > lim)
+
+
 def ego_velocity(az, rr, rng, tol=0.35, iters=24):
     """The sensor's own velocity (vx, vy in its frame) from detections of the stationary world:
     rr_i = -(vx cos az_i + vy sin az_i). RANSAC over pairs, then least squares on the inliers.
@@ -109,10 +133,16 @@ def ego_velocity(az, rr, rng, tol=0.35, iters=24):
     n = len(az)
     if n < 5:
         return None
-    A = -np.column_stack([np.cos(az), np.sin(az)])
+    # (column_stack and outer without their Python-level wrappers: the same arrays, the same products)
+    A = np.empty((n, 2))
+    A[:, 0], A[:, 1] = np.cos(az), np.sin(az)
+    A = -A
     # all candidate pairs at once
-    ii = np.array([rng.randrange(n) for _ in range(iters)])
-    jj = np.array([rng.randrange(n) for _ in range(iters)])
+    # (`_randbelow(n)` is what `randrange(n)` returns for n > 0, without its argument checks: the same stream; a
+    # generator without it is asked as before)
+    rb = getattr(rng, "_randbelow", None) or rng.randrange
+    ii = np.array([rb(n) for _ in range(iters)])
+    jj = np.array([rb(n) for _ in range(iters)])
     a, b, c, d = A[ii, 0], A[ii, 1], A[jj, 0], A[jj, 1]
     det = a * d - b * c
     ok = np.abs(det) > 0.02
@@ -121,7 +151,7 @@ def ego_velocity(az, rr, rng, tol=0.35, iters=24):
     det = np.where(ok, det, 1.0)
     vx = (d * rr[ii] - b * rr[jj]) / det
     vy = (a * rr[jj] - c * rr[ii]) / det
-    res = np.abs(np.outer(vx, A[:, 0]) + np.outer(vy, A[:, 1]) - rr[None, :]) < tol
+    res = np.abs(vx[:, None] * A[:, 0][None, :] + vy[:, None] * A[:, 1][None, :] - rr[None, :]) < tol
     cnt = np.where(ok, res.sum(axis=1), -1)
     k = int(cnt.argmax())
     best = (int(cnt[k]), res[k])
@@ -131,7 +161,7 @@ def ego_velocity(az, rr, rng, tol=0.35, iters=24):
     for _ in range(2):
         Ai, ri = A[inl], rr[inl]
         N = Ai.T @ Ai
-        if np.linalg.cond(N) > 1e4:
+        if _ill(N):
             return None
         v = np.linalg.solve(N, Ai.T @ ri)
         res = A @ v - rr
@@ -257,13 +287,18 @@ class RadarSource(Source):
         model = RadarModel(self.mount, yaw, self.fov, self.max_range, self.sigma)
         static = ctx.mem.get("static")
         dets = []
-        for i in range(len(r)):
-            if static is not None and static[i]:
+        # (the arrays as Python floats: the same numbers and the same IEEE arithmetic, without numpy's scalars)
+        rl, azl, rrl = r.tolist(), az.tolist(), rr.tolist()
+        sl = None if static is None else static.tolist()
+        my, side, ss, vv = self.mount.y, self.roadside_m, sa * sa, sv * sv
+        for i in range(len(rl)):
+            ri = rl[i]
+            if sl is not None and sl[i]:
                 # the stationary world: roadside returns start no tracks; what stands on the road ahead does
-                if abs(self.mount.y + r[i] * math.sin(az[i] + yaw)) > self.roadside_m:
+                if abs(my + ri * math.sin(azl[i] + yaw)) > side:
                     continue
-            R = np.array([sr * sr + (0.005 * r[i]) ** 2, sa * sa, sv * sv])
-            dets.append(Det([r[i], az[i], rr[i]], R, at[i]))
+            R = np.array([sr * sr + (0.005 * ri) ** 2, ss, vv])
+            dets.append(Det([ri, azl[i], rrl[i]], R, at[i]))
         return Scan(self.id, self.group, ts / NS - ctx.val("tau"), dets, model, ts)
 
     def report(self, ctx):

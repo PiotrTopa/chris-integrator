@@ -8,6 +8,11 @@ NS = 1e9
 
 
 def fin(v):
+    t = type(v)
+    if t is float or t is int:             # (the common cases first: the same answer as the general test below)
+        return math.isfinite(v)
+    if v is None:
+        return False
     return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
 
 
@@ -74,8 +79,20 @@ EH_LIN, EH_SCALE, EH_ACCEL, EH_PRODUCT, EH_VSPEED, EH_HEADING = range(6)
 _NOPAR = np.zeros(0)
 
 
+_IX = {}
+
+
 def _ix(idx):
-    return np.array(idx, dtype=np.intp)
+    # (a source's index lists are few and fixed: each array is made once, read-only, and shared by the rows, as
+    # `_NOPAR` is; the filter pass only reads them)
+    key = tuple(idx)
+    a = _IX.get(key)
+    if a is None:
+        a = np.array(idx, dtype=np.intp)
+        a.flags.writeable = False
+        if len(_IX) < 4096:
+            _IX[key] = a
+    return a
 
 
 def lin(idx, coef, const=0.0):

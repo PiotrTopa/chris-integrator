@@ -266,8 +266,8 @@ static void pp_eval(const PPath *p, double s, double *x, double *y, double *th, 
 /* the nearest point of the path to (x, y): its arc length and the offset to the LEFT of the path */
 static void pp_project(const PPath *p, double x, double y, double *s, double *d)
 {
-    double best = P_BIG;
-    int n = p->n;
+    double best = P_BIG, bt = 0.0;
+    int n = p->n, bi = -1;
     *s = p->s[0];
     *d = 0.0;
     for (int i = 0; i + 1 < n; i++) {
@@ -280,16 +280,26 @@ static void pp_project(const PPath *p, double x, double y, double *s, double *d)
             t = 1.0;
         double ex = rx - t * dx, ey = ry - t * dy, e2 = ex * ex + ey * ey;
         if (e2 < best) {
-            double L = sqrt(L2);
             best = e2;
-            *s = p->s[i] + t * L;
+            bi = i;
+            bt = t;
+        }
+    }
+    if (bi >= 0) {                                /* the nearest segment's numbers, once it is known */
+        const int i = bi;
+        const double t = bt;
+        double dx = p->x[i + 1] - p->x[i], dy = p->y[i + 1] - p->y[i];
+        double L2 = dx * dx + dy * dy, rx = x - p->x[i], ry = y - p->y[i];
+        double L = sqrt(L2);
+        *s = p->s[i] + t * L;
+        if (t >= 0.0 && t <= 1.0)
+            *d = (dx * ry - dy * rx) / L;
+        else {
             /* the offset is measured across the path's own direction at that point: by the vertex tangents */
             double u = t < 0.0 ? 0.0 : t > 1.0 ? 1.0 : t;
             double th = p->th[i] + u * (p->th[i + 1] - p->th[i]);
             double px = p->x[i] + t * dx, py = p->y[i] + t * dy;
             *d = -(x - px) * sin(th) + (y - py) * cos(th);
-            if (t >= 0.0 && t <= 1.0)
-                *d = (dx * ry - dy * rx) / L;
         }
     }
 }
@@ -495,6 +505,22 @@ static void roll_out(const PRoll *r, const double *cfg, const double *times, int
     double prev[6] = {0, 0, 0, 0, 0, 0};
     double tprev = 0.0;
     double b = cfg[PC_idm_b], T = cfg[PC_idm_t_s], s0g = cfg[PC_idm_s0_m], amax = r->a_go, bmax = cfg[PC_brake_max];
+    /* what does not change from step to step is taken once: the decay over a step, the car-following law's root;
+     * and what depends on the step's time alone (exp(-t / 2), t summed up step by step as below) is the same for
+     * every future rolled out with this step: kept from one roll-out to the next */
+    const double eh2 = exp(-h / 2.0), sab = sqrt(amax * b);
+    static double et_h = -1.0, et_t = 0.0, ET[P_STEPS_MAX + 1];
+    static int et_n = 0;
+    if (h != et_h) {
+        et_h = h;
+        et_t = 0.0;
+        et_n = 0;
+    }
+    const int tabled = nstep <= P_STEPS_MAX;
+    while (tabled && et_n <= nstep) {
+        ET[et_n++] = exp(-et_t / 2.0);
+        et_t += h;
+    }
     for (int k = 0; k <= nstep; k++) {
         /* the lateral reference */
         if (r->t_dur > 0.0) {
@@ -507,15 +533,18 @@ static void roll_out(const PRoll *r, const double *cfg, const double *times, int
             d = r->d0 + r->drift * t;
             dr = r->drift;
         }
-        pp_point(p, s, d, &px, &py, &pth, &pk);
+        /* the point at arc length s, offset d to the left (pp_point), its tangent's cos and sin kept */
+        pp_eval(p, s, &px, &py, &pth, &pk);
+        const double c = cos(pth), sn = sin(pth);
+        px -= d * sn;
+        py += d * c;
         if (sprof != NULL) {
             sprof[k] = s;
             vprof[k] = v;
         }
         /* this step's covariance in the frame */
-        double c = cos(pth), sn = sin(pth);
         double vss = Ps[0] + p_sq(v * r->onset_lon_sd);            /* a start that comes sooner or later */
-        double vdd = Pl[0] + p_sq(dr * r->onset_sd) + p_sq(r->extra_lat) * (1.0 - exp(-t / 2.0));
+        double vdd = Pl[0] + p_sq(dr * r->onset_sd) + p_sq(r->extra_lat) * (1.0 - (tabled ? ET[k] : exp(-t / 2.0)));
         double beyond = s > r->known_hi ? s - r->known_hi : s < r->known_lo ? r->known_lo - s : 0.0;
         if (beyond > 0.0)
             vdd += p_sq(0.5 * r->kappa_sd * beyond * beyond);
@@ -559,8 +588,9 @@ static void roll_out(const PRoll *r, const double *cfg, const double *times, int
         if (v > 1.0) {
             for (int j = 0; j < 4; j++) {
                 double la = (j == 0 ? 0.0 : j == 1 ? 0.6 : j == 2 ? 1.5 : 3.0) * v + (j == 0 ? 0.0 : 2.0);
-                double qx, qy, qth, qk;
-                pp_eval(p, s + r->dir * la, &qx, &qy, &qth, &qk);
+                double qx, qy, qth, qk = pk;              /* (at the place itself: the curvature just read) */
+                if (!(la == 0.0))
+                    pp_eval(p, s + r->dir * la, &qx, &qy, &qth, &qk);
                 double ak = fabs(qk);
                 if (ak > 1e-3) {
                     double vc = sqrt(r->a_lat / ak);
@@ -590,7 +620,7 @@ static void roll_out(const PRoll *r, const double *cfg, const double *times, int
             if (which == 0) {
                 if (gap < 0.3)
                     gap = 0.3;
-                double ss = s0g + v * T + v * dv / (2.0 * sqrt(amax * b));
+                double ss = s0g + v * T + v * dv / (2.0 * sab);
                 if (ss < s0g)
                     ss = s0g;
                 ai = amax * (1.0 - p_sq(ss / gap));
@@ -660,7 +690,7 @@ static void roll_out(const PRoll *r, const double *cfg, const double *times, int
             double nrr = f10 * f10 * dd + 2.0 * f10 * f11 * dq + f11 * f11 * rr + r->q_lat * h;
             Pl[0] = ndd, Pl[1] = ndq, Pl[2] = nrr;
         }
-        psd *= exp(-h / 2.0);
+        psd *= eh2;
         t += h;
     }
     for (; ko < nt; ko++)                                        /* (times beyond the last step: held) */
@@ -2334,9 +2364,19 @@ static int traj_dir(const double *t, int nt, int k, double *cx, double *sy)
 /* The probability that two futures meet: at each sample the two places are Gaussian; the pair is in conflict when
  * the other's centre lies inside the rectangle the two bodies cover together, lengthened behind a road user that
  * drives the same way by the gap the follower keeps. The largest over the horizon. *now: the plain overlap of the
- * bodies at the first sample (two tracks that already lie on each other say nothing about the future). */
+ * bodies at the first sample (two tracks that already lie on each other say nothing about the future).
+ *
+ * now == NULL: only whether the largest exceeds P_CONF_ANY (1.0) or not (0.0), the question pair_table asks of
+ * every pair of futures before it needs a number. A sample further than 2.2 sigma outside the rectangle along or
+ * across has a share there below 1 - Phi(2.2) = 0.014, so a product below P_CONF_ANY: it is left out without its
+ * four erfc; the other samples are computed as they are. */
+#define P_CONF_ANY 0.02
 static double pair_conflict(const PCtx *c, const PAgent *A, int ma, const PAgent *B, int mb, double *now)
 {
+    const int screen = now == NULL;
+    double now_;
+    if (screen)
+        now = &now_;
     const double *ta = A->traj + ma * A->stride, *tb = B->traj + mb * B->stride;
     double hw = c->cfg[PC_conflict_headway_s], best = 0.0;
     int nt = c->nt;
@@ -2379,12 +2419,28 @@ static double pair_conflict(const PCtx *c, const PAgent *A, int ma, const PAgent
             Lm += hw * vb;
         }
         if (k == 0) {
-            *now = (p_phi((Lh - dl) / sl) - p_phi((-Lh - dl) / sl)) * (p_phi((W - dw) / sw) - p_phi((-W - dw) / sw));
+            if (!screen)
+                *now = (p_phi((Lh - dl) / sl) - p_phi((-Lh - dl) / sl)) * (p_phi((W - dw) / sw) - p_phi((-W - dw) / sw));
             continue;
         }
         if (fabs(dl) > (Lp > Lm ? Lp : Lm) + 4.0 * sl || fabs(dw) > W + 4.0 * sw)
             continue;
-        double P = (p_phi((Lp - dl) / sl) - p_phi((-Lm - dl) / sl)) * (p_phi((W - dw) / sw) - p_phi((-W - dw) / sw));
+        if (screen) {
+            if (fabs(dw) > W + 2.2 * sw || dl > Lp + 2.2 * sl || dl < -Lm - 2.2 * sl)
+                continue;
+            if ((p_phi((Lp - dl) / sl) - p_phi((-Lm - dl) / sl)) * (p_phi((W - dw) / sw) - p_phi((-W - dw) / sw)) > P_CONF_ANY)
+                return 1.0;
+            continue;
+        }
+        /* the largest over the horizon: a sample whose share across alone (a probability: at most one times the
+         * share along) does not exceed the largest so far cannot raise it, and its share along is not computed */
+        double Pw = p_phi((W - dw) / sw) - p_phi((-W - dw) / sw);
+        if (Pw >= 0.0 && Pw <= best)
+            continue;
+        double Pl = p_phi((Lp - dl) / sl) - p_phi((-Lm - dl) / sl);
+        if (Pl >= 0.0 && Pl <= best)
+            continue;
+        double P = Pl * Pw;
         if (P > best)
             best = P;
     }
@@ -2421,6 +2477,26 @@ static int pair_table(const PCtx *c, int a, int b, double *psi)
     agent_of(c, b, &B);
     double conf[P_KMAX][P_KMAX];
     int any = 0;
+    /* most pairs of road users never meet: whether any pair of their futures does (a conflict above P_CONF_ANY)
+     * is asked first, without the numbers; only a pair that does is worked out (below, as it always was) */
+    for (int i = 0; i < A.nm && !any; i++)
+        for (int j = 0; j < B.nm && !any; j++) {
+            const double *ba = A.bb[i], *bq = B.bb[j];
+            const double *fa = A.traj + i * A.stride, *fb = B.traj + j * B.stride;
+            int last = 6 * (c->nt - 1) + 5;
+            double vm = fa[5] > fa[last] ? fa[5] : fa[last];
+            if (fb[5] > vm)
+                vm = fb[5];
+            if (fb[last] > vm)
+                vm = fb[last];
+            double m = 0.5 * (A.len + B.len) + vm * c->cfg[PC_conflict_headway_s] + 1.0;
+            if (ba[0] > bq[2] + m || bq[0] > ba[2] + m || ba[1] > bq[3] + m || bq[1] > ba[3] + m)
+                continue;
+            any = pair_conflict(c, &A, i, &B, j, NULL) > 0.5;
+        }
+    if (!any)
+        return 0;
+    any = 0;
     for (int i = 0; i < A.nm; i++)
         for (int j = 0; j < B.nm; j++) {
             conf[i][j] = 0.0;
@@ -2441,7 +2517,7 @@ static int pair_table(const PCtx *c, int a, int b, double *psi)
             if (now > 0.3)
                 return 0;                                       /* they lie on each other now: no statement */
             conf[i][j] = v;
-            if (v > 0.02)
+            if (v > P_CONF_ANY)
                 any = 1;
         }
     if (!any)

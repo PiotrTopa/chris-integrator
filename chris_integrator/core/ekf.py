@@ -296,3 +296,77 @@ class Filter:
                 if age is None or d < age:
                     age = d
         return age, sorted(srcs)
+
+    def near_many(self, T, window_s, kinds_seq, reach_s=1.0):
+        """[near(T, window_s, kinds, reach_s) for kinds in kinds_seq], the window's entries walked once for all."""
+        reach = max(window_s, reach_s)
+        times, entries = self.times, self.entries
+        lo, hi = bisect.bisect_left(times, T - reach), bisect.bisect_right(times, T + reach)
+        wl = max(lo, bisect.bisect_left(times, T - window_s - 1e-6))
+        wh = min(hi, bisect.bisect_right(times, T + window_s + 1e-6))
+        m = len(kinds_seq)
+        ages = [None] * m
+        carried = [None] * m
+        srcs = [set() for _ in range(m)]
+        js = tuple(zip(range(m), kinds_seq, srcs))
+        # an entry's applied rows (`usedq`) repeat from entry to entry (the same sources at their rates): what a
+        # set of rows means for each query, (j, its sources, the sources of the rows of its kinds), is found once
+        # per distinct set and call; the entry's age counts for a query when one of its rows is of its kinds
+        memo = {}
+        for e in entries[wl:wh]:
+            u = e.usedq
+            if not u:
+                continue
+            d = abs(e.t - T)
+            inw = d <= window_s
+            tu = type(u) is tuple          # (the filter pass leaves tuples; anything else is not memoised)
+            hit = memo.get(u) if tu else None
+            if hit is None:
+                hit = []
+                for j, kinds, sj in js:
+                    ss = tuple(src for q, src in u if kinds is None or q in kinds)
+                    if ss:
+                        hit.append((j, sj, ss))
+                hit = tuple(hit)
+                if tu:
+                    memo[u] = hit
+            for j, sj, ss in hit:
+                if inw:
+                    sj.update(ss)
+                a = ages[j]
+                if a is None or d < a:
+                    ages[j] = d
+        # what was measured before the buffer was restarted, walked once for all the queries (a restart carries up
+        # to the rows of two seconds, and they stay until the next restart, however old)
+        for tt, q, src in getattr(self, "carry", ()):
+            d = abs(tt - T)
+            if d <= reach and q != "pos":
+                for j, kinds, sj in js:
+                    if kinds is None or q in kinds:
+                        cj = carried[j]
+                        if cj is None:
+                            cj = carried[j] = []
+                        cj.append((d, src))
+        out = []
+        for j, kinds, sj in js:
+            age = ages[j]
+            if age is None:
+                for k in range(wl - 1, lo - 1, -1):
+                    u = entries[k].usedq
+                    if u and (kinds is None or any(q in kinds for q, _ in u)):
+                        age = abs(entries[k].t - T)
+                        break
+                for k in range(wh, hi):
+                    u = entries[k].usedq
+                    if u and (kinds is None or any(q in kinds for q, _ in u)):
+                        d = abs(entries[k].t - T)
+                        if age is None or d < age:
+                            age = d
+                        break
+            for d, src in carried[j] or ():
+                if d <= window_s:
+                    sj.add(src)
+                if age is None or d < age:
+                    age = d
+            out.append((age, sorted(sj)))
+        return out

@@ -75,16 +75,29 @@ def own_grid(cfg):
     return np.arange(0.0, cfg["horizon_s"] + 1e-9, cfg["grid_dt_s"])
 
 
+_GRID = [None, None, None, 1.0]    # the last grid read: the list it came as, a copy of it, the array made of it,
+                                   # the sign of its first time (the one member that may be a zero: 0.0 == -0.0)
+
+
 def _grid(top):
     t = (top or {}).get("t") if isinstance(top, dict) else None
     if t is None:
         return None
+    # a producer in this process sends the same list with every message (the predictor's sample times): the array
+    # made of it is kept while the list is that one and still holds what it held
+    kept = _GRID
+    if t is kept[0] and t == kept[1] and math.copysign(1.0, t[0]) == kept[3]:
+        return kept[2]
+    src = t
     try:
         t = np.asarray(t, float).ravel()
     except (TypeError, ValueError):
         return None
     if len(t) < 1 or not np.all(np.isfinite(t)) or (len(t) > 1 and not np.all(np.diff(t) > 0)) or t[0] < 0.0:
         return None
+    if src.__class__ is list and all(v.__class__ is float for v in src):
+        t.flags.writeable = False              # shared from now on: nobody may write into it
+        kept[0], kept[1], kept[2], kept[3] = src, list(src), t, math.copysign(1.0, src[0])
     return t
 
 

@@ -96,6 +96,16 @@ class Stream(_C.StreamState):
         return out
 
 
+def _median(data):
+    """statistics.median of a non-empty collection (its arithmetic, without its generic overhead)."""
+    data = sorted(data)
+    n = len(data)
+    if n % 2 == 1:
+        return data[n // 2]
+    i = n // 2
+    return (data[i - 1] + data[i]) / 2
+
+
 class Clock:
     """Timing integrity of one message stream: how far its stamp is ahead of the newest stamp of any *other*
     stream when it arrives. Normally a constant of the stream (its latency); a step in it is a stamp offset or a
@@ -123,7 +133,7 @@ class Clock:
             return None
         if len(self.win) < self.win.maxlen:
             return None
-        med = statistics.median(self.win)
+        med = _median(self.win)
         self.shift = med - self.base
         if abs(self.shift) < 0.5 * self.c["clock_jump_s"]:
             self.base += 0.02 * (med - self.base)           # the latency may creep; a step may not

@@ -43,7 +43,8 @@ import numpy as np
 
 from ..native import round                  # builtins.round (its results; the native core)
 from ..native import core as _C
-from ..contract import LocalEgo, signal
+from ..contract import LocalEgo, from_vehicle, signal
+from .lanes import same_list, zero_signs
 
 NS = 1e9
 
@@ -93,6 +94,8 @@ class RoadGeometryFusion:
         if cfg:
             self.cfg.update(cfg)
         self._local = LocalEgo()
+        self._xl = self._xa = None     # _vision: the last lanes' distances (a copy of the list) and their array
+        self._xz = ()                  # ... and the signs of its zeros (lanes.same_list)
         self.reset()
 
     def reset(self):
@@ -195,7 +198,12 @@ class RoadGeometryFusion:
         """(x, y, sigma, source) of the ego-lane centre from the camera, or None."""
         c = self.cfg
         if isinstance(lanes, dict) and isinstance(lanes.get("x"), list):
-            x = np.asarray(lanes["x"], dtype=float)
+            lx = lanes["x"]
+            if same_list(lx, self._xl, self._xz):
+                x = self._xa                    # the same distances as the last frame: their array (only read)
+            else:
+                x = np.asarray(lx, dtype=float)
+                self._xl, self._xa, self._xz = list(lx), x, zero_signs(lx)
             ln = lanes.get("lines") or []
             if len(ln) >= 3:
                 le, ri = ln[1], ln[2]
@@ -252,7 +260,7 @@ class RoadGeometryFusion:
             yr = es.get("yaw_rate") or {}
             if yr.get("valid"):
                 yaw_r = -yr["value"]
-                motion = "vehicle" if any(x.startswith("vehicle.") for x in yr.get("sources") or ()) else "vision"
+                motion = "vehicle" if from_vehicle(yr.get("sources")) else "vision"
             sig = signal(es, "turn_signal", c["intent_max_age_s"])
             if sig in ("left", "right"):
                 turn = sig

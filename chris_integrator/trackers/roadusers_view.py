@@ -24,6 +24,7 @@ of the distance at 20 m, 30 % at 40 m, plus the calibration's share; they are in
 measurement topic.
 """
 import math
+import operator
 
 from ..native import round                  # builtins.round (its results; the native core)
 from ..core import classvote
@@ -228,6 +229,8 @@ RADAR_CFG = dict(
 AROUND_MIN_CONF = 0.5
 AROUND_MIN_CONF_VRU = 0.35
 _VRU_LABELS = ("human", "bike", "motorbike")
+_MOTION = {"stationary": "s", "moving": "m"}     # `view.around` "mv"
+_K0, _K1 = operator.itemgetter(0), operator.itemgetter(1)
 
 
 def _r1(v):
@@ -277,11 +280,16 @@ class RadarDisplay:
         """(threat, obstacle, ttc_s) of a radar object. From `decide`: threat = its level as shown is warning or
         above; obstacle = caution, or information on an object the radar says stands on the path (`in_path`);
         ttc_s the decision layer's time to collision. Without a fresh `decide`: the radar's flags."""
-        fl = o.get("flags") or ()
         d = self._dec()
+        return self._flags_of(o, d, None if d is None else self._dec_by_id(d))
+
+    @staticmethod
+    def _flags_of(o, d, by_id):
+        """`_flags` with the frame's `_dec()` and its objects by id (`_dec_by_id`) found once by the caller."""
+        fl = o.get("flags") or ()
         if d is None:
             return "threat" in fl, "in_path" in fl, o.get("ttc_s")
-        r = self._dec_by_id(d).get(o.get("id"))
+        r = by_id.get(o.get("id"))
         if r is None:
             return False, False, o.get("ttc_s")
         sh = r.get("shown", r.get("level", 0)) or 0
@@ -300,31 +308,33 @@ class RadarDisplay:
         if self.msg is not None and t < self.msg["ts_mono_ns"] / NS - 2.0:
             self.reset()             # a new time axis
         self.msg = msg
-        if self.cfg["around"]:
-            listed = set()
-            for o in msg.get("objects") or ():
-                if o.get("state") not in self.cfg["around_states"]:
-                    continue
-                s = self.ar.get(o["id"])
+        # one pass over the objects for both tables (each table sees the same entries in the same order as in a
+        # pass of its own)
+        around = self.cfg["around"]
+        states = self.cfg["around_states"]
+        ar, seen = self.ar, self.seen
+        listed_ar, listed = set(), set()
+        for o in msg.get("objects") or ():
+            st = o.get("state")
+            if around and st in states:
+                s = ar.get(o["id"])
                 if s is None:
-                    s = self.ar[o["id"]] = {"t0": t}
+                    s = ar[o["id"]] = {"t0": t}
+                s["t"], s["o"] = t, o
+                s.pop("lost", None)
+                listed_ar.add(o["id"])
+            if st in ("confirmed", "coast"):
+                s = seen.get(o["id"])
+                if s is None:
+                    s = seen[o["id"]] = {"t0": t}
                 s["t"], s["o"] = t, o
                 s.pop("lost", None)
                 listed.add(o["id"])
-            for oid, s in self.ar.items():
-                if oid not in listed:
+        if around:
+            for oid, s in ar.items():
+                if oid not in listed_ar:
                     s.setdefault("lost", t)
-        listed = set()
-        for o in msg.get("objects") or ():
-            if o.get("state") not in ("confirmed", "coast"):
-                continue
-            s = self.seen.get(o["id"])
-            if s is None:
-                s = self.seen[o["id"]] = {"t0": t}
-            s["t"], s["o"] = t, o
-            s.pop("lost", None)
-            listed.add(o["id"])
-        for oid, s in self.seen.items():                 # not in this message any more: it starts to leave
+        for oid, s in seen.items():                      # not in this message any more: it starts to leave
             if oid not in listed:
                 s.setdefault("lost", t)
 
@@ -354,6 +364,8 @@ class RadarDisplay:
             dec_al = next((a for a in dec.get("alerts") or () if a.get("id") == "obstacle_ahead"), None)
             if dec_al is None or dec_al.get("mode") == "off" or (dec_al.get("stage") or 0) < 2 or dec_al.get("suppressed"):
                 dec_al = None
+        by_id = None if dec is None else self._dec_by_id(dec)
+        flags_of = self._flags_of
         place = {}
         for oid in list(self.seen):
             s = self.seen[oid]
@@ -366,8 +378,15 @@ class RadarDisplay:
             place[oid] = (float(o["x_m"]) + (float(o["vx_mps"]) - v_ego) * dt,      # the car frame of now: relative motion
                           -(float(o["y_m"]) + float(o["vy_mps"]) * dt), gone)        # view frame: y right
         # the one radar object the lead is drawn from: the nearest to it in range among those in its place
-        near = [(abs(x - float(lead["x"])), oid) for oid, (x, y, _) in place.items()
-                if self._same_as_lead(x, y, lead, float((self.seen[oid]["o"].get("std") or [0.0])[0]))]
+        near = []
+        if lead is not None:                             # (_same_as_lead written out, the lead's place read once)
+            lx, ly = float(lead["x"]), float(lead["y"])
+            hw, rm, rr = c["lead_halfwidth_m"], c["lead_range_m"], c["lead_range_rel"]
+            seen = self.seen
+            for oid, (x, y, _) in place.items():
+                sx = float((seen[oid]["o"].get("std") or [0.0])[0])
+                if abs(y - ly) <= hw and abs(x - lx) <= max(rm, rr * lx, 2.0 * sx):
+                    near.append((abs(x - lx), oid))
         lead_ids = set()
         if near:
             # ... and what the radar holds twice at that place (a second object on the same vehicle, until the
@@ -378,26 +397,32 @@ class RadarDisplay:
                 sx = float((self.seen[oid]["o"].get("std") or [0.0])[0])
                 if abs(place[oid][0] - place[first][0]) <= max(3.0, 2.0 * sx):
                     lead_ids.add(oid)
+        alert_states, max_x, max_y, fade_s = c["alert_states"], c["max_range_m"], c["max_lateral_m"], c["fade_s"]
         for oid, (x, y, gone) in place.items():
             s = self.seen[oid]
             o = s["o"]
             fl = o.get("flags") or ()
             is_lead = oid in lead_ids
-            th, ob, ttc = self._flags(o)
-            if dec is None and gone is None and o.get("state") in c["alert_states"] and (th or ob):
+            # the flags (a pure function of o and the frame's decide) only where an alert or a drawn object uses them
+            fla = None
+            if dec is None and gone is None and o.get("state") in alert_states:
+                fla = th, ob, ttc = flags_of(o, dec, by_id)
+            if fla is not None and (th or ob):
                 level = "threat" if th else "obstacle"
                 if alert is None or (level == "threat") > (alert["level"] == "threat") or \
                         (level == alert["level"] and x < alert["x"]):
                     alert = {"level": level, "id": "ru:%d" % oid, "x": round(x, 2), "y": round(y, 2),
                              "ttc_s": ttc, "lead": is_lead}
             if dec_al is not None and dec_al.get("object") == oid and gone is None:
+                if fla is None:
+                    fla = th, ob, ttc = flags_of(o, dec, by_id)
                 st = dec_al["stage"]
                 rs = dec_al.get("reason") or {}
                 alert = {"level": "threat" if st >= 3 else "obstacle", "id": "ru:%d" % oid, "x": round(x, 2),
                          "y": round(y, 2), "ttc_s": ttc, "lead": is_lead, "stage": st, "stage_name": dec_al.get("stage_name"),
                          "mode": dec_al.get("mode"), "source": "decide", "tn": rs.get("tn"), "p_coll": rs.get("p_coll"),
                          "tm_s": rs.get("tm_s")}
-            if is_lead or not (0.5 < x <= c["max_range_m"] and abs(y) <= c["max_lateral_m"]):
+            if is_lead or not (0.5 < x <= max_x and abs(y) <= max_y):
                 s.pop("d0", None)                        # not drawn now: it fades in again when it is
                 continue
             cls = o.get("class") or None
@@ -405,10 +430,12 @@ class RadarDisplay:
             parked = "parked" in fl
             if label in ("bike", "motorbike") and o.get("motion") != "moving" and "on_path" not in fl:
                 continue
+            if fla is None:
+                th, ob, ttc = flags_of(o, dec, by_id)
             if gone is not None:
-                phase, alpha = "leave", max(0.0, 1.0 - max(gone, 0.0) / c["fade_s"])
+                phase, alpha = "leave", max(0.0, 1.0 - max(gone, 0.0) / fade_s)
             else:
-                fin = (T - s.setdefault("d0", T)) / c["fade_s"]      # from the frame it is first DRAWN in
+                fin = (T - s.setdefault("d0", T)) / fade_s      # from the frame it is first DRAWN in
                 phase = "appear" if fin < 1.0 else ("coast" if o.get("state") == "coast" else "steady")
                 alpha = min(1.0, max(0.0, fin))
             sd = o.get("std") or [0.0, 0.0, 0.0, 0.0]
@@ -446,6 +473,10 @@ class RadarDisplay:
         T = ts_ns / NS
         v_ego = float(((self.msg or {}).get("ego") or {}).get("speed_mps") or 0.0)
         R = c["around_range_m"]
+        fade_s = c["fade_s"]
+        dec = self._dec()                                # (the same for every object of the frame: _flags)
+        by_id = None if dec is None else self._dec_by_id(dec)
+        flags_of = self._flags_of
         place = {}
         for oid in list(self.ar):
             s = self.ar[oid]
@@ -461,9 +492,15 @@ class RadarDisplay:
         # there): the lead stands for them
         lead_ids, lead_obj = set(), None
         if lead is not None:
-            near = [(abs(x - float(lead["x"])), oid) for oid, (x, y, gone) in place.items()
-                    if gone is None and self.ar[oid]["o"].get("state") != "memory"
-                    and self._same_as_lead(x, y, lead, float((self.ar[oid]["o"].get("std") or [0.0])[0]))]
+            near = []                                    # (_same_as_lead written out, the lead's place read once)
+            lx, ly = float(lead["x"]), float(lead["y"])
+            hw, rm, rr = c["lead_halfwidth_m"], c["lead_range_m"], c["lead_range_rel"]
+            ar = self.ar
+            for oid, (x, y, gone) in place.items():
+                if gone is None and ar[oid]["o"].get("state") != "memory":
+                    sx = float((ar[oid]["o"].get("std") or [0.0])[0])
+                    if abs(y - ly) <= hw and abs(x - lx) <= max(rm, rr * lx, 2.0 * sx):
+                        near.append((abs(x - lx), oid))
             if near:
                 first = min(near)[1]
                 lead_obj = self.ar[first]["o"]
@@ -479,36 +516,43 @@ class RadarDisplay:
             o = s["o"]
             fl = o.get("flags") or ()
             st = o.get("state")
-            label = self._label(o.get("class"))
-            raw = (o.get("class") or {}).get("label") if isinstance(o.get("class"), dict) else None
-            if raw in ("bike", "motorbike") and o.get("motion") != "moving" and "on_path" not in fl:
+            ocls, motion = o.get("class"), o.get("motion")
+            label = self._label(ocls)
+            raw = (ocls or {}).get("label") if isinstance(ocls, dict) else None
+            if raw in ("bike", "motorbike") and motion != "moving" and "on_path" not in fl:
                 continue                                 # a riderless two-wheeler beside the road
-            e = {"id": "ru:%d" % oid, "x": _r1(x), "y": _r1(y)}
+            # (_r1 written out for the floats here: round to 0.1, no "-0.0")
+            rx, ry = round(x, 1), round(y, 1)
+            e = {"id": "ru:%d" % oid, "x": 0.0 if rx == 0 else rx, "y": 0.0 if ry == 0 else ry}
             gx, gy = float(o.get("vx_mps") or 0.0), -float(o.get("vy_mps") or 0.0)
             if math.hypot(gx, gy) >= 0.5:
-                e["gx"], e["gy"] = _r1(gx), _r1(gy)
+                rx, ry = round(gx, 1), round(gy, 1)
+                e["gx"], e["gy"] = 0.0 if rx == 0 else rx, 0.0 if ry == 0 else ry
             sd = o.get("std") or (0.0, 0.0)
-            e["sd"] = _r1(max(float(sd[0]), float(sd[1])))
+            rx = round(max(float(sd[0]), float(sd[1])), 1)
+            e["sd"] = 0.0 if rx == 0 else rx
             if st != "confirmed":
                 e["st"] = st
                 e["ago"] = _r1(min((o.get("seen") or {"": 0.0}).values()) + max(T - s["t"], 0.0))
             if label:
                 e["k"] = label
-            mv = {"stationary": "s", "moving": "m"}.get(o.get("motion"))
+            mv = _MOTION.get(motion)
             if mv:
                 e["mv"] = mv
             # a remembered object is never an obstacle or a threat: nothing sees it
-            th, ob, ttc = self._flags(o)
-            f = "".join(ch for ch, on in (("t", th), ("o", ob), ("p", "parked" in fl), ("w", "with_traffic" in fl))
-                        if on and not (st == "memory" and ch in "to"))
+            th, ob, ttc = flags_of(o, dec, by_id)
+            mem = st == "memory"
+            to = (th and not mem, ob and not mem)
+            f = ("t" if to[0] else "") + ("o" if to[1] else "") + ("p" if "parked" in fl else "") + \
+                ("w" if "with_traffic" in fl else "")
             if f:
                 e["fl"] = f
-            if ("t" in f or "o" in f) and isinstance(ttc, (int, float)):
+            if (to[0] or to[1]) and isinstance(ttc, (int, float)):
                 e["ttc"] = _r1(ttc)
             if gone is not None:
-                a = max(0.0, 1.0 - max(gone, 0.0) / c["fade_s"])
+                a = max(0.0, 1.0 - max(gone, 0.0) / fade_s)
             else:
-                a = min(1.0, max(0.0, (T - s.setdefault("d0", T)) / c["fade_s"]))
+                a = min(1.0, max(0.0, (T - s.setdefault("d0", T)) / fade_s))
             if a < 1.0:
                 e["a"] = round(a, 2)
             rows.append(e)
@@ -532,7 +576,7 @@ class RadarDisplay:
                 lth, lob, _ = self._flags(lead_obj)
                 lfl = tuple(k for k in lfl if k not in ("threat", "in_path")) + (("threat",) if lth else ()) + \
                     (("in_path",) if lob else ())
-            mv = {"stationary": "s", "moving": "m"}.get((lead_obj or {}).get("motion"))
+            mv = _MOTION.get((lead_obj or {}).get("motion"))
             if mv is None and isinstance(at.get("standing"), bool):
                 mv = "s" if at["standing"] else "m"
             if mv:
@@ -546,7 +590,14 @@ class RadarDisplay:
             if isinstance(a, (int, float)) and a < 1.0:
                 e["a"] = round(a, 2)
             rows.append(e)
-        rows.sort(key=lambda e: (0 if any(ch in e.get("fl", "") for ch in "toL") else 1, math.hypot(e["x"], e["y"])))
-        rows = rows[:c["around_max"]]
-        rows.sort(key=lambda e: math.hypot(e["x"], e["y"]))
-        return rows
+        # flagged first, then by distance; the first around_max of those, by distance. (The keys are made once per
+        # row: the same tuples and distances the two sorts compare, the sorts stable as before.)
+        keyed = []
+        for e in rows:
+            fs = e.get("fl", "")
+            d = math.hypot(e["x"], e["y"])
+            keyed.append(((0 if ("t" in fs or "o" in fs or "L" in fs) else 1, d), d, e))
+        keyed.sort(key=_K0)
+        keyed = keyed[:c["around_max"]]
+        keyed.sort(key=_K1)
+        return [k[2] for k in keyed]

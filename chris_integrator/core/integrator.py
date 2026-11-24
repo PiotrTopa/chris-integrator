@@ -1,5 +1,6 @@
 """The integrator: source registry, ego estimator, monitors and fault isolation, object layer, outputs
 (docs/DESIGN.md). No I/O and no wall clock: times come from the messages (`ts_mono_ns`)."""
+import bisect
 import collections
 import math
 
@@ -10,6 +11,7 @@ from ..native import core as _C
 from .ekf import Filter, Row, wrap_pi
 from .fdi import Diagnostics
 from .monitors import NisMonitor, Pair, SelfCheck, Series
+from . import output                       # (imported here once, not per ego state: it imports nothing of this module)
 from .registry import NS, Ctx, Meas, lin
 
 API = 3
@@ -323,7 +325,6 @@ class Integrator:
     def yaw_between(self, t0, t1):
         """The heading change (rad) from t0 to t1 as the yaw sensors measured it, or None (a gap in between, or
         outside what is remembered: about a minute)."""
-        import bisect
         ts = getattr(self, "_yaw_t", None)
         if not ts or t0 < ts[0] - 0.2 or max(t0, t1) > ts[-1] + 0.5:
             return None
@@ -334,17 +335,17 @@ class Integrator:
     def dist_between(self, t0, t1):
         """The distance over ground (m, signed: backwards is negative) the car drove from t0 to t1 as its speed
         sensors measured it, or None (a gap in between, or outside what is remembered)."""
-        import bisect
         ts = getattr(self, "_yaw_t", None)
         if not ts or t0 < ts[0] - 0.2 or max(t0, t1) > ts[-1] + 0.5:
             return None
+        yc, n, br = self._yaw_c, len(ts), bisect.bisect_right
         out = []
         for t in (t0, t1):
-            k = max(bisect.bisect_right(ts, t) - 1, 0)
-            a = self._yaw_c[k]
+            k = max(br(ts, t) - 1, 0)
+            a = yc[k]
             d = a[2]
-            if k + 1 < len(ts) and self._yaw_c[k + 1][1] == a[1] and ts[k + 1] > ts[k]:      # between two notes of one stretch
-                d += (self._yaw_c[k + 1][2] - a[2]) * min(max((t - ts[k]) / (ts[k + 1] - ts[k]), 0.0), 1.0)
+            if k + 1 < n and yc[k + 1][1] == a[1] and ts[k + 1] > ts[k]:      # between two notes of one stretch
+                d += (yc[k + 1][2] - a[2]) * min(max((t - ts[k]) / (ts[k + 1] - ts[k]), 0.0), 1.0)
             out.append((d, a[1]))
         return None if out[0][1] != out[1][1] else out[1][0] - out[0][0]
 
@@ -431,18 +432,22 @@ class Integrator:
             return
         t = ts / NS
         fused = False
-        self.fdi.stamp((msg["type"], msg.get("sensor")), specs[0].group, t)
+        has_sensor = "sensor" in msg
+        sensor = msg["sensor"] if has_sensor else None
+        self.fdi.stamp((msg["type"], sensor), specs[0].group, t)
+        src_t, objects = self.src_t, self.objects
         for spec in specs:
             # ordering is per stream: several sensors may share a message type (`objects` of each radar and camera)
-            key = spec.id if "sensor" not in msg else (spec.id, msg["sensor"])
-            last = self.src_t.get(key)
+            key = (spec.id, sensor) if has_sensor else spec.id
+            last = src_t.get(key)
             if last is not None and t <= last:
                 if t < last - self.cfg["epoch_back_s"]:
                     self._new_epoch()
+                    src_t = self.src_t             # (a new epoch starts a new table)
                 else:
                     self.counts["dropped"][spec.id] = self.counts["dropped"].get(spec.id, 0) + 1
                     continue
-            self.src_t[key] = t
+            src_t[key] = t
             if self.now is None or t > self.now:
                 self.now = t
             g = self.groups[spec.group]
@@ -454,14 +459,14 @@ class Integrator:
                     g.last_t = t if g.last_t is None else max(g.last_t, t)
                 for m in ms:
                     fused |= self._measure(spec, g, m)
-            if self.objects is not None:
+            if objects is not None:
                 sc = spec.scan(msg, ctx)
                 if sc is not None:
                     if spec.counts and not ms:
                         g.arrivals.append(t)
                         g.last_t = t if g.last_t is None else max(g.last_t, t)
                     if g.fault is None:
-                        self.objects.add_scan(sc)
+                        objects.add_scan(sc)
         if self.disputed and self.now - self._dispute_t > 0.5:      # a pending vote has a deadline
             self._dispute_t = self.now
             self._isolate()
@@ -585,8 +590,10 @@ class Integrator:
                 return False
         if role == "fuse" and not g.witness:
             sig = m.sigma * self.fdi.noise_scale(g.name, m.q)     # a noise burst: weighted by its present noise
-            self._fuse(m.t, Row(m.q, m.z, sig * sig, m.h, m.src, g.name, robust=m.robust, wrap=m.wrap,
-                                cb=m.cb, freeze=self._freeze(spec, m)))
+            # (Row's arguments by position; `_fuse` written out)
+            row = Row(m.q, m.z, sig * sig, m.h, m.src, g.name, m.robust, m.wrap, m.cb, self._freeze(spec, m))
+            if not self.ekf.insert(m.t, row):
+                self.counts["late"][row.src] = self.counts["late"].get(row.src, 0) + 1
             fused = True
         if m.mon is not None or (role == "monitor"):
             v, s = m.mon if m.mon is not None else (m.z, m.sigma)
@@ -594,10 +601,18 @@ class Integrator:
         return fused
 
     def _freeze(self, spec, m):
-        f = self._foreign(spec) if m.local else None
-        if m.consider:
+        if not m.consider:
+            return self._foreign(spec) if m.local else None
+        # (a pure function of the source, `local` and the consider indices, all fixed per source and row kind: made
+        # once and shared by the rows, as `_foreign`'s array is; the filter only reads it. Dropped with the model.)
+        key = (spec.id, bool(m.local), tuple(m.consider))
+        f = self._foreign_ix.get(key)
+        if f is None:
+            f = self._foreign(spec) if m.local else None
             c = np.array(list(m.consider), dtype=np.intp)
             f = c if f is None else np.concatenate([f, c])
+            f.flags.writeable = False      # (shared by rows: a write must fail, not change other rows)
+            self._foreign_ix[key] = f
         return f
 
     def _aux_ix(self):
@@ -1118,7 +1133,6 @@ class Integrator:
 
     # ---- output --------------------------------------------------------------------------------------
     def state(self, ts_mono_ns, ts_real_ns=None):
-        from . import output
         if self.now is not None:
             ex = False
             for p in self.pairs.values():

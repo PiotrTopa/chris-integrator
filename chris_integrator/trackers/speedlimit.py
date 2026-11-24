@@ -12,7 +12,7 @@ import os
 import re
 
 from ..native import round                  # builtins.round (its results; the native core)
-from ..contract import LocalEgo
+from ..contract import LocalEgo, from_vehicle
 
 RULES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rules")
 LIVE_TRACK_TIMEOUT_S = 2.0
@@ -174,7 +174,7 @@ class SpeedLimit:
         sp, yr = (es or {}).get("speed") or {}, (es or {}).get("yaw_rate") or {}
         v = max(0.0, abs(sp["value"])) if sp.get("valid") else None
         self.ego_source = None if v is None else \
-            "vehicle" if any(x.startswith("vehicle.") for x in sp.get("sources") or ()) else "vision"
+            "vehicle" if from_vehicle(sp.get("sources")) else "vision"
         yaw_rate = -yr["value"] if yr.get("valid") else 0.0          # positive right, as the heading always was
         if self._last_road_ns is not None and ts > self._last_road_ns and v is not None:
             dt = min((ts - self._last_road_ns) / NS, self.cfg["max_dt_s"])
@@ -510,6 +510,17 @@ class SpeedLimit:
                "area_source": self.area["source"]}
         return val, src, round(conf, 3), None
 
+    def limit_key(self):
+        """(value, source kind, source track_id, source rule) of `current()`, without building its source,
+        confidence and expiry: what the change keys need (`_update_output`, RulesInEffect._key: every message).
+        Must follow `current()`."""
+        lim = self.limit
+        if lim:
+            info = lim["info"]
+            return lim["value_kmh"], "sign", info.get("track_id"), info.get("rule")
+        val, rule, _ = self.default_limit()
+        return val, "default" if val is not None else "unknown", None, rule
+
     def pending(self):
         out = []
         for t in self.tracks.values():
@@ -526,9 +537,8 @@ class SpeedLimit:
         return out
 
     def _update_output(self):
-        val, src, conf, _ = self.current()
-        key = (val, src.get("kind"), src.get("track_id"), src.get("rule"), self.area["type"],
-               self.zone["type"], self.road_class["type"])
+        val, kind, tid, rule = self.limit_key()        # (= current()'s value and source fields)
+        key = (val, kind, tid, rule, self.area["type"], self.zone["type"], self.road_class["type"])
         if key != self._last_key:
             if self._last_key is None or val != self._last_key[0]:
                 self._since = {"ts_mono_ns": self.now_ns, "ts_real_ns": self.now_real_ns, "odo": self.odo}

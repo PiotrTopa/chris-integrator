@@ -45,7 +45,7 @@ import numpy as np
 
 from ..native import round                  # builtins.round (its results; the native core)
 from ..native import core as _C
-from ..contract import LocalEgo, validity
+from ..contract import LocalEgo, from_vehicle, validity
 
 NS = 1e9
 N_LANE, N_EDGE = 4, 2
@@ -93,6 +93,23 @@ def _fin(v):
     return isinstance(v, (int, float)) and math.isfinite(v)
 
 
+def zero_signs(seq):
+    """((index, sign) of every element == 0): what list equality does not see (0.0 == -0.0); kept with a list a
+    cache compares by ==, so that a hit also has the same signed zeros (see same_list)."""
+    return tuple((i, math.copysign(1.0, v)) for i, v in enumerate(seq) if v == 0)
+
+
+def same_list(seq, kept, zeros):
+    """seq holds the same numbers as the kept list (== element by element, and the zeros of the same sign: the
+    float values of the two are then the same bit for bit; True == 1 and 5 == 5.0 give the same floats too)."""
+    if seq != kept:
+        return False
+    for i, sg in zeros:
+        if math.copysign(1.0, seq[i]) != sg:
+            return False
+    return True
+
+
 def _arr(v, n):
     try:
         a = np.asarray(v, float)
@@ -121,14 +138,18 @@ def _median(a):
 _FIT_PAR = {}                   # the constants of `_fit` as the native function takes them, per configuration
 
 
-def _fit(c, x, zs, zy, prob, y, p):
+def _fit(c, x, zs, zy, prob, y, p, out=None):
     """(r, gate, nu, jumps, nsigs): measurement noise (the deviations scaled and floored, lines and edges with
     their own constants, inflated for a weak frame), the gate points (all of them when none lies in gate_x), the
     innovation of every line, and how well the frame fits each track over the gate (mean absolute innovation;
-    the same in sigmas)."""
+    the same in sigmas). out: (r, nu, gate, jumps, nsigs) arrays of the right shapes to fill (the native function
+    writes every element) instead of new ones."""
     n = x.shape[0]
-    r, nu = np.empty((N_LINES, n)), np.empty((N_LINES, n))
-    gate, jumps, nsigs = np.empty(n, bool), np.empty(N_LINES), np.empty(N_LINES)
+    if out is None:
+        r, nu = np.empty((N_LINES, n)), np.empty((N_LINES, n))
+        gate, jumps, nsigs = np.empty(n, bool), np.empty(N_LINES), np.empty(N_LINES)
+    else:
+        r, nu, gate, jumps, nsigs = out
     key = (c["r_floor"], c["r_scale"], c["edge_r_floor"], c["edge_r_scale"], c["gate_x"][0], c["gate_x"][1],
            c["on_conf"], c["low_prob_inflate"])
     par = _FIT_PAR.get(key)
@@ -195,6 +216,11 @@ class RoadGeometryTracker:
             self.cfg.update(cfg)
         self._local = LocalEgo()    # the integrator of a tracker that is not handed an ego state (docs/DESIGN.md)
         self._map = None            # the last `map` message
+        self._xl = self._xa = None  # _measure: the last distances (a copy of the list) and their array
+        self._xz = ()               # ... and the signs of its zeros (same_list)
+        self._wx = None             # _message: (x, width_x) -> the slice or index array of the width points
+        self._xr = None             # _message: (x, its rounded list)
+        self._mbuf = None           # (n, the arrays of _measure, those of _fit) reused frame to frame
         self.reset()
 
     # ---- life cycle ------------------------------------------------------
@@ -228,11 +254,13 @@ class RoadGeometryTracker:
         """(speed, source, yaw rate positive right) of the frame from the integrator's `ego_state`."""
         sp, yr = es.get("speed") or {}, es.get("yaw_rate") or {}
         v = abs(sp["value"]) if sp.get("valid") else 0.0
-        src = "vehicle" if any(x.startswith("vehicle.") for x in sp.get("sources") or ()) else "vision"
+        src = "vehicle" if from_vehicle(sp.get("sources")) else "vision"
         return v, src, (-yr["value"] if yr.get("valid") else 0.0)
 
-    def _measure(self, road):
-        """-> (x[n], y[6,n], std[6,n], prob[6], ok[6]) from a road message, or None when it carries no lines."""
+    def _measure(self, road, reuse=False):
+        """-> (x[n], y[6,n], std[6,n], prob[6], ok[6]) from a road message, or None when it carries no lines.
+        reuse (on_road only): the arrays are the tracker's frame buffers, overwritten by the next frame; else new
+        ones (a caller may keep them)."""
         c = self.cfg
         ll = road.get("lane_lines") or []
         re = road.get("road_edges") or []
@@ -241,15 +269,32 @@ class RoadGeometryTracker:
         x = None
         for ln in list(ll) + list(re):
             if isinstance(ln, dict) and isinstance(ln.get("x"), list) and len(ln["x"]) >= 4:
-                x = _arr(ln["x"], len(ln["x"]))
+                lx = ln["x"]
+                if same_list(lx, self._xl, self._xz):
+                    # the model's distances are the same every frame: the array of the last frame (checked
+                    # finite then; it is only read)
+                    x = self._xa
+                    break
+                x = _arr(lx, len(lx))
                 if x is not None:
+                    self._xl, self._xa, self._xz = list(lx), x, zero_signs(lx)
                     break
         if x is None:
             return None
         n = len(x)
         srcs = [ll[i] if i < N_LANE and i < len(ll) else re[i - N_LANE] if i >= N_LANE and i - N_LANE < len(re) else None
                 for i in range(N_LINES)]
-        y, s, prob, ok = np.empty((N_LINES, n)), np.empty((N_LINES, n)), np.empty(N_LINES), np.empty(N_LINES, bool)
+        # the frame's arrays: for on_road the same ones every frame while n stays (the native function writes
+        # every element; nothing keeps them past the frame: rows taken into a track are copied), else new ones
+        b = self._mbuf
+        if not reuse:
+            b = (n, (np.empty((N_LINES, n)), np.empty((N_LINES, n)), np.empty(N_LINES), np.empty(N_LINES, bool)))
+        elif b is None or b[0] != n:
+            b = self._mbuf = (n, (np.empty((N_LINES, n)), np.empty((N_LINES, n)), np.empty(N_LINES),
+                                  np.empty(N_LINES, bool)),
+                              (np.empty((N_LINES, n)), np.empty((N_LINES, n)), np.empty(n, bool), np.empty(N_LINES),
+                               np.empty(N_LINES)))
+        y, s, prob, ok = b[1]
         _C.lanes_measure(srcs, x, c["edge_std_x"][0], c["edge_std_x"][1], c["edge_std_bad"], c["edge_std_good"],
                          y, s, prob, ok)
         return x, y, s, prob, ok
@@ -265,7 +310,7 @@ class RoadGeometryTracker:
         if not _fin(ts):
             return None
         es = ego if ego is not None else self._local.at(road)
-        z = self._measure(road)
+        z = self._measure(road, True)
         if z is None:
             return None
         x, zy, zs, prob, ok = z
@@ -300,7 +345,7 @@ class RoadGeometryTracker:
 
         a = 1.0 - math.exp(-dt / c["conf_tau_s"]) if dt > 0 else 1.0
         # measurement noise, and how well this frame fits every track, for all lines at once
-        r, gate, nu_all, jumps, nsigs = _fit(c, x, zs, zy, prob, self.y, self.p)
+        r, gate, nu_all, jumps, nsigs = _fit(c, x, zs, zy, prob, self.y, self.p, self._mbuf[2])
         upd = []
         probs, oks, jumps, nsigs = prob.tolist(), ok.tolist(), jumps.tolist(), nsigs.tolist()   # (the same values)
 
@@ -416,14 +461,16 @@ class RoadGeometryTracker:
         lines = [self._line(i, prob, ok, ys, sds) for i in range(N_LINES)]
         width = None
         if lines[1]["present"] and lines[2]["present"]:
-            m = (self.x >= c["width_x"][0]) & (self.x <= c["width_x"][1])
-            if m.any():
-                width = round(_median(self.y[2][m] - self.y[1][m]), 2)
+            width = self._width(c["width_x"])
+        x = self.x
+        xr = self._xr
+        if xr is None or xr[0] is not x:
+            xr = self._xr = (x, _round2(x))
         return {
             "type": "lanes", "seq": road.get("seq"), "ts_mono_ns": road.get("ts_mono_ns"),
             "ts_real_ns": road.get("ts_real_ns"),
             "road_model": road.get("road_model"),      # which model's lines these are (lane L27)
-            "x": _round2(self.x),
+            "x": list(xr[1]),                       # (x is the same array while the distances are: rounded once)
             "lines": lines[:N_LANE],                  # far left, left, right, far right
             "edges": lines[N_LANE:],                  # left, right
             "lane_to_left": bool(lines[0]["present"] and lines[1]["present"]),
@@ -436,6 +483,39 @@ class RoadGeometryTracker:
             # the integrator's ego motion of the frame (yaw rate positive right, the device frame's convention)
             "ego": {"speed_mps": round(v, 2), "yaw_rate": round(yaw, 4), "source": vsrc},
         }
+
+    def _width(self, wx):
+        """The lane width: the median of right - left over the points of x within wx (None when there is none).
+        The same values as round(_median(y[2][m] - y[1][m]), 2) with m the mask of those points: the points (a
+        function of x, which stays the same array while the model's distances do) are found once, and the
+        median of a few plain floats is taken without numpy (the same sort and the same middle arithmetic)."""
+        x = self.x
+        w = self._wx
+        if w is None or w[0] is not x or w[1] != tuple(wx):
+            m = (x >= wx[0]) & (x <= wx[1])
+            idx = np.flatnonzero(m)
+            if idx.size == 0:
+                sel = None
+            elif idx[-1] - idx[0] + 1 == idx.size:
+                sel = slice(int(idx[0]), int(idx[-1]) + 1)      # a run of points (x in order): a view, no copy
+            else:
+                sel = m
+            w = self._wx = (x, tuple(wx), sel)
+        sel = w[2]
+        if sel is None:
+            return None
+        a = self.y[2][sel] - self.y[1][sel]
+        d = a.tolist()
+        t = sum(d)
+        if t != t:                              # a NaN (or infinities): np.median's own handling
+            return round(_median(a), 2)
+        d.sort()
+        n = len(d)
+        h = n // 2
+        v = d[h] if n % 2 else (d[h - 1] + d[h]) / 2.0
+        if v == 0.0:                            # (-0.0 and 0.0 may sort apart in the two sorts: numpy decides)
+            return round(_median(a), 2)
+        return round(v, 2)
 
     def summary(self, msg):
         """Short form for /v1/health."""

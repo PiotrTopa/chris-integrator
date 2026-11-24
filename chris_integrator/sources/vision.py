@@ -109,23 +109,25 @@ class VisionSource(Source):
         if msg.get("valid") is False or not fin(v):
             return out
         v = float(v)
-        itau, isc, im, idy, idp, isw = (self.ix[k] for k in ("tau", "s", "m", "dyaw", "dpitch", "s_w"))
+        ix = self.ix
+        itau, isc, im, idy, idp, isw = ix["tau"], ix["s"], ix["m"], ix["dyaw"], ix["dpitch"], ix["s_w"]
         x = ctx.x
-        tau = float(x[itau])
+        P = ctx.P                                        # (read once: nothing below changes the estimate before the
+        tau = float(x[itau])                             # mount rows, where it is last read)
         t = ts - tau
         # (the turn is taken from the estimate, which a gyro holds on a car that has one: a model out of its range
         # reports any yaw rate; the pose's own is used only while nothing else knows the yaw rate)
         r_own = pose.get("yaw_rate")
-        w_est = float(ctx.x[E.W]) if float(ctx.P[E.W, E.W]) < 0.01 ** 2 else (float(r_own) if fin(r_own) else 0.0)
+        w_est = float(x[E.W]) if float(P[E.W, E.W]) < 0.01 ** 2 else (float(r_own) if fin(r_own) else 0.0)
         char = speed_sigma(v, w_est)
         vs = pose.get("vx_std")
         white = WHITE_SHARE * char
         if fin(vs) and float(vs) > 2.0 * char:
             white = float(vs)                            # the model itself says it is lost: believed
-        imf = self.ix["mf"]
+        imf = ix["mf"]
         fz = TAIL * char                                 # the sigma that covers the error's tails (as fused)
         white = max(white, WHITE_SHARE * fz, math.sqrt(max(fz * fz - SLOW_SIGMA ** 2 - FAST_SIGMA ** 2, 0.0)))
-        vv, vw = float(ctx.P[E.V, E.V]), float(ctx.P[E.W, E.W])
+        vv, vw = float(P[E.V, E.V]), float(P[E.W, E.W])
         # (1 + s) (v - a (tau - tau0)) + m + mf: the scale's regressor judged by how well the speed is known
         h_speed = delayed_speed(E.V, isc, im, imf, itau, tau, vv, SCALE_MIN_SPEED)
         # without a speed reference the scale cannot be told from the speed: it then stays at its prior and its
@@ -156,7 +158,7 @@ class VisionSource(Source):
             sig_f = 0.009 + 0.08 * abs(r)                # as fused: the gain error is a state, not noise
             # (the delay is estimated from the speed rows only: the yaw acceleration the delay's Jacobian would
             # need here is itself too poorly known, and a noisy regressor biases what it teaches)
-            ref_w = ctx.P[E.W, E.W] < 0.01 ** 2          # a gyro (or wheels) holds the yaw rate
+            ref_w = P[E.W, E.W] < 0.01 ** 2              # a gyro (or wheels) holds the yaw rate
             sg_w = max(sig_f, float(rs)) if fin(rs) else sig_f
             # The yaw rate's time offset (docs/EGO_MOTION.md). The row is inserted with the speed row, at the
             # delay state's time; where the yaw rate's own lag behind the gyro is configured, or estimated and
@@ -177,7 +179,7 @@ class VisionSource(Source):
             out.append(Meas("yaw_rate", t, r, sg_w, h_w, "vision.pose",
                             robust=True, mon=(r, sig), local=True, consider=None if ref_w else (isw,), cb=cb_w))
         # camera mounting: the direction of travel in the device frame, judged at the integrator's speed
-        sp = ctx.speed_known()
+        sp = sp0                                         # (the same query as above: nothing between changed the estimate)
         vy, vz = pose.get("vy"), pose.get("vz")
         if sp is not None and sp[0] >= MOUNT_MIN_SPEED and abs(float(x[E.W])) < MOUNT_MAX_YAW and fin(vy) and fin(vz) \
                 and not ctx.faulted() and v > 0.5 * sp[0]:

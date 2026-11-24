@@ -53,24 +53,29 @@ class Rates:
         if latency_ms is None and msg is not None:
             ts = msg.get("ts_real_ns")
             latency_ms = (self.mixer.bus.clock.real_ns() - ts) / 1e6 if isinstance(ts, int) and ts > 0 else None
-        idle_hz, floor_hz = self.idle(topic, msg), None
+        idle_src = topic in self.IDLE_SOURCE
+        idle_hz, floor_hz = self.idle(topic, msg) if idle_src else None, None      # (idle(): None for the others)
         if idle_hz is not None:
             floor_hz = self.IDLE_TOLERANCE * idle_hz
             if hz is None:
                 hz = self.idle_rate(topic, idle_hz)
         if hz is None:
             hz = self.mixer.fps(topic) or None
-        g = self.governor()
+        g = self.mixer.bus.get("governor") or {}
         caps = g.get("caps") or {}
         why = []
-        if any(caps.get(k, -1) >= 0 for k in self.TOPIC_CAPS.get(topic, ())):
-            why.append("shed")
+        if caps:
+            for k in self.TOPIC_CAPS.get(topic, ()):
+                if caps.get(k, -1) >= 0:
+                    why.append("shed")
+                    break
         if g.get("limited"):
             why.append("limited")
         fl = self.floors.get(topic) or {}
-        if fl.get("hz") and floor_hz is not None:
+        fl_hz = fl.get("hz")
+        if fl_hz and floor_hz is not None:
             floor_hz = min(fl["hz"], floor_hz)
-        elif fl.get("hz"):
+        elif fl_hz:
             floor_hz = fl["hz"]
         if hz is not None and floor_hz and hz < floor_hz:
             why.append("slow")
@@ -78,8 +83,10 @@ class Rates:
             why.append("late")
         out = {"hz": None if hz is None else round(hz, 1),
                "latency_ms": None if latency_ms is None else round(latency_ms, 1),
-               "degraded": any(w != "limited" for w in why), "why": why, "level": g.get("level", 0)}
-        if topic in self.IDLE_SOURCE:
+               # (only "limited" is not a degradation; it is the second entry when there are two or more)
+               "degraded": bool(why) and (why[0] != "limited" or len(why) > 1), "why": why,
+               "level": g.get("level", 0)}
+        if idle_src:
             out["idle_hz"] = None if idle_hz is None else round(idle_hz, 2)
         return out
 
