@@ -7413,6 +7413,7 @@ typedef struct {
     long long born;                  /* the level of its first node */
     long long freed;                 /* the level at which its handle became free (not taken again in that scan) */
     double kin[4], veh, idnum;       /* what its kind can do; vehicle (1) / person (-1) / not known (0); its id */
+    int settled;                     /* confirmed or coasting, as its last scan was told (h_settle: shared existence) */
     double pe, pp;                   /* probability that it exists; that the primary's story is the true one */
     double sm_t, sm_age;             /* the smoother (Hyp.after): its sighting's time when its past was last smoothed, and
                                       * how far back the lag's node was then (read only while its table row has a
@@ -9603,9 +9604,10 @@ static int h_settle(Settle *s, int ci)
          * (this object's, or one started by its second box): each of the rivals then exists in a part of them only,
          * and none is confirmed although every story has a thing there. With `shared`: a story in which another
          * object took this object's last box (the same detection of the same scan) counts with that object's
-         * existence (docs/RADAR.md, section 10) */
+         * existence (docs/RADAR.md, section 10). Only for an object that is in the best story: its rivals keep
+         * what they have by themselves (given the same, both were confirmed on one car) */
         double alev = -1.0, adet = -1.0, asrc = -1.0;
-        if (s->shared && prim >= 0 && nt > 1)
+        if (s->shared && prim >= 0 && nt > 1 && c->lf[i] == prim)     /* (an object of the best story only) */
             for (int32_t q = prim; q >= 0; q = H->parent[q]) {
                 const double *M = A + (Py_ssize_t)q * RROW + RO_M;
                 if (M[M_LEVEL] < (double)(H->level - H->n_scan))
@@ -9629,7 +9631,7 @@ static int h_settle(Settle *s, int ci)
                 }
                 for (int i2 = 0; !own && i2 < nt; i2++) {
                     int32_t q2 = c->lf[(size_t)g * nt + i2];
-                    if (i2 == i || q2 < 0)
+                    if (i2 == i || q2 < 0 || H->tr[c->tr[i2]].settled)    /* (a settled rival IS the thing there) */
                         continue;
                     int32_t an = h_ancestor(H, A, q2, alev);
                     if (an < 0)
@@ -10939,6 +10941,7 @@ static int scan_core(Hyp *H, Scan *sc, Py_ssize_t cap, const Py_ssize_t *th, Py_
             tr->veh = ti[7];
             tr->idnum = ti[8];
             sc->prim0[k] = tr->primary;
+            tr->settled = ti[9] != 0.0;
             for (int q = 0; q < tr->nleaf; q++) {
                 int32_t old = tr->leaf[q];
                 int32_t c = h_step(H, sc->A, old, h, ti[0], ti[1], ti[2], sc->pose, tr->kin, &sc->par, t, sc->xc);
