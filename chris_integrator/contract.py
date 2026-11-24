@@ -17,14 +17,19 @@ def inputs_health(es, groups):
 def validity(es, depends=("vision",), need=("speed",)):
     """(valid, reason, inputs) of a product made from the source groups `depends` and the ego quantities `need`."""
     src = (es or {}).get("sources") or {}
-    groups = list(depends) + [g for g in ("vehicle",) if g in src and g not in depends]
-    inputs = inputs_health(es, groups)
-    if es is None:
-        return False, "integrator: no state", inputs
+    # inputs_health(es, depends + vehicle when present), written out: the state of every group, read once
+    inputs, fault = {}, None
     for g in depends:
         s = src.get(g) or {}
-        if s.get("state") == "fault":
-            return False, "%s: %s" % (g, s.get("reason")), inputs
+        inputs[g] = st = s.get("state", "absent")
+        if fault is None and st == "fault":
+            fault = (g, s)
+    if "vehicle" in src and "vehicle" not in depends:
+        inputs["vehicle"] = (src.get("vehicle") or {}).get("state", "absent")
+    if es is None:
+        return False, "integrator: no state", inputs
+    if fault is not None:
+        return False, "%s: %s" % (fault[0], fault[1].get("reason")), inputs
     for q in need:
         e = (es or {}).get(q) or {}
         if not e.get("valid"):
