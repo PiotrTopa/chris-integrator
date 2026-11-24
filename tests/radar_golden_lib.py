@@ -4,7 +4,9 @@ tests/test_native.py::test_radar_golden).
 
 A case: {"fn": name, "hyp": Hyp.dump() before the call (a method of the hypotheses) or None, "args": [...],
 "ret": the result, "post": {argument index: the array after the call} for arrays the call wrote into,
-"hyp_after": Hyp.dump() after}. The state array travels as its rows that are not all zero."""
+"hyp_after": Hyp.dump() after}. The state array travels as its rows that are not all zero; a function among the
+arguments (Hyp.cycle asks the tracker for the car's motion noise, a kind's code, a label's numbers, a score bin's
+odds) as what it was asked and what it said (`Calls`)."""
 import json
 
 import numpy as np
@@ -14,11 +16,25 @@ from chris_integrator.radar import tracker as T
 ROW = T.ROW
 
 
+class Calls:
+    """A function given to a native call, with what it was asked and what it answered."""
+
+    def __init__(self, fn, codec):
+        self.fn, self.codec, self.log = fn, codec, []
+
+    def __call__(self, *a):
+        r = self.fn(*a)
+        self.log.append([self.codec.enc(list(a)), self.codec.enc(r)])
+        return r
+
+
 class Codec:
     def __init__(self, arrays=None):
         self.arrays = {} if arrays is None else arrays
 
     def enc(self, v):
+        if isinstance(v, Calls):
+            return {"calls": v.log}                      # (filled while the call runs)
         if isinstance(v, np.ndarray):
             key = "a%d" % len(self.arrays)
             if v.ndim == 2 and v.shape[1] == ROW and v.dtype == np.float64:
@@ -60,6 +76,15 @@ class Codec:
                 return set(self.dec(x) for x in v["set"])
             if "dict" in v:
                 return {self.dec(k): self.dec(x) for k, x in v["dict"]}
+            if "calls" in v:
+                table = [(self.dec(a), self.dec(r)) for a, r in v["calls"]]
+
+                def answer(*a):
+                    for q, r in table:
+                        if q == list(a):
+                            return r
+                    raise KeyError("a recorded function asked something new: %r" % (a,))
+                return answer
             if "nan" in v:
                 return float("nan")
             if "inf" in v:

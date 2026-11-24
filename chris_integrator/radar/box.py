@@ -66,10 +66,12 @@ from ..native import round                  # builtins.round, native where built
 from . import models as M
 from .ego import EgoMotion
 from .sensors import CAMERA_CFG, CameraBoxes, MicrowaveRadar
-from .tracker import Tracker
+from .tracker import (M_HITS, M_RANGE_T, M_T, OT_CONS, OT_HASVS, OT_NCHECKS, OT_NLEAF, OT_PE, OT_PERR, OT_UNPRED, OT_VS,
+                      Tracker)
 
 NS = 1e9
 _NR = M.NR                      # the native core (the message's objects: radar_frame)
+_UNPREDICTABLE = ("unpredictable",)
 
 CFG = dict(
     corridor_m=1.3, corridor_rel=0.012,      # on the path: |offset| <= corridor_m + corridor_rel x distance
@@ -345,7 +347,13 @@ class Radar:
         X, Y, psi = self.ego.pose_at(T)
         es = self.ego.state_at(T)
         v_ego, w_ego = es[3], es[4]
-        shown = [o for o in tr.objects if o.state != "tentative" or c["tentative"]]
+        slots, tb, rec = tr.looked()                     # the objects' numbers in the tracker's arrays
+        if not c["tentative"]:
+            keep = [o.state != "tentative" for o in tr.objects]
+            slots, tb, rec = ([v for v, k in zip(q, keep) if k] for q in (slots, tb, rec))
+            shown = [o for o, k in zip(tr.objects, keep) if k]
+        else:
+            shown = tr.objects
         # the objects of the message in one native call (chris_native.c `radar_frame`): each one taken to now and
         # to the horizons, in the car frame; on the path (inside its corridor) or not; "it stands in the way" (the
         # strongest thing the radar says: the place inside the corridor beyond what its own uncertainty could
@@ -355,26 +363,28 @@ class Radar:
         # keeps following the road as the car does; and the message's dict of it
         hz = (0.0,) + tuple(c["predict_s"])
         kin = [o.kin for o in shown]
-        out = _NR.radar_frame(tr.store.a, [o.slot for o in shown], [[T + h - o.t for h in hz] for o in shown], kin,
+        out = _NR.radar_frame(tr.store.a, slots, [[T + h - m[M_T] for h in hz] for m in rec], kin,
                               M._native_par(tr.mcfg), (X, Y, psi), (v_ego, w_ego), self._ncfg(), tuple(c["predict_s"]),
                               path[0] if path is not None else None, path[1] if path is not None else None,
                               [0.0 if o.state == "tentative" else 1.0 for o in shown], [k[3] for k in kin],
-                              [(o.id, o.state, math.log(max(o.pe, 1e-6) / max(1.0 - o.pe, 1e-6)), o.t0, o.hits, o.sources, o.last_seen, o.verdict, o.flags,
-                                o.label, o.range_t, o.consistency, o.pred_err, self._class(o, T)) for o in shown],
+                              [(o.id, o.state, math.log(max(r[OT_PE], 1e-6) / max(1.0 - r[OT_PE], 1e-6)), o.t0, int(m[M_HITS]),
+                                o.sources, o.last_seen, o.verdict, _UNPREDICTABLE if r[OT_UNPRED] else (), o.label,
+                                m[M_RANGE_T], r[OT_CONS] if r[OT_NCHECKS] else None, r[OT_PERR] if r[OT_NCHECKS] else None,
+                                self._class(o, T)) for o, r, m in zip(shown, tb, rec)],
                               self._in_since, self._threat_since, T,
                               (c["in_path_hold_s"], c["threat_p"], c["threat_range_s"], c["threat_hold_s"],
                                c["parked_offset_m"]))
         ch, sh = math.cos(psi), math.sin(psi)
-        for o, d in zip(shown, out):                     # the smoothed velocity (car axes) and the group
-            vs = o.vs
-            if vs is None:
+        for o, d, r, m in zip(shown, out, tb, rec):      # the smoothed velocity (car axes) and the group
+            if not r[OT_HASVS]:
                 d["vs"] = d["vs_std"] = d["vs_age_s"] = None
             else:
-                d["vs"] = [round(ch * vs[0] + sh * vs[1], 2), round(-sh * vs[0] + ch * vs[1], 2)]
-                d["vs_std"] = round(math.hypot(vs[2], vs[3]), 2)
-                d["vs_age_s"] = round(vs[4] + T - o.t, 2)
+                vx, vy, sx, sy, age = r[OT_VS:OT_VS + 5]
+                d["vs"] = [round(ch * vx + sh * vy, 2), round(-sh * vx + ch * vy, 2)]
+                d["vs_std"] = round(math.hypot(sx, sy), 2)
+                d["vs_age_s"] = round(age + T - m[M_T], 2)
             d["grp"], d["grp_kind"] = o.grp, o.grp_kind
-            d["hyp"] = o.nleaf
+            d["hyp"] = int(r[OT_NLEAF])
         live = {o.id for o in tr.objects}
         for k in [k for k in self._in_since if k not in live]:
             del self._in_since[k]

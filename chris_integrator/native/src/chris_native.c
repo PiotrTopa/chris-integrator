@@ -7103,6 +7103,21 @@ static double r_wmedian(const double *v, const double *w, Py_ssize_t n, Py_ssize
     return v[k[idx]];
 }
 
+/* An expectation (px, py, its covariance Pp) against the object's row taken `back` seconds back: half the squared
+ * distance in both uncertainties (+ 0.05 m2 each way) and the distance; -1: singular */
+static int r_check(const double *row, double back, double px, double py, const double *Pp, double *m2, double *e)
+{
+    const double *x = row + RO_X, *P = row + RO_P;
+    double ex = x[R_PX] - x[R_VX] * back - px, ey = x[R_PY] - x[R_VY] * back - py;
+    double S[4] = {Pp[0] + P[0] + 0.05, Pp[1] + P[1] + 0.0, Pp[2] + P[RN] + 0.0, Pp[3] + P[RN + 1] + 0.05};
+    double nu[2] = {ex, ey}, d2;
+    if (r_mahal(S, 2, nu, &d2, NULL) < 0)
+        return -1;
+    *m2 = d2 / 2.0;
+    *e = py_hypot(ex, ey);
+    return 0;
+}
+
 /* radar_check(S, row, back, px, py, Pp) -> (m2, e) | None. Tracker._check for one expectation: the object's
  * present estimate taken back by `back` seconds against where it said it would be then (px, py; Pp: the 2 x 2
  * covariance it gave): half the squared distance in both uncertainties (+ 0.05 m2 each way), and the distance.
@@ -7126,15 +7141,12 @@ static PyObject *n_radar_check(PyObject *self, PyObject *args)
     if (rnums_get(oPp, 4, Pp, "Pp") < 0)
         goto done;
     {
-        const double *row = (const double *)vS.b.buf + slot * RROW, *x = row + RO_X, *P = row + RO_P;
-        double ex = x[R_PX] - x[R_VX] * back - px, ey = x[R_PY] - x[R_VY] * back - py;
-        double S[4] = {Pp[0] + P[0] + 0.05, Pp[1] + P[1] + 0.0, Pp[2] + P[RN] + 0.0, Pp[3] + P[RN + 1] + 0.05};
-        double nu[2] = {ex, ey}, d2;
-        if (r_mahal(S, 2, nu, &d2, NULL) < 0) {
+        double m2, e;
+        if (r_check((const double *)vS.b.buf + slot * RROW, back, px, py, Pp, &m2, &e) < 0) {
             res = Py_None;
             Py_INCREF(res);
         } else
-            res = Py_BuildValue("(dd)", d2 / 2.0, py_hypot(ex, ey));
+            res = Py_BuildValue("(dd)", m2, e);
     }
 done:
     view_drop(&vS);
@@ -10843,8 +10855,752 @@ done:
     return res;
 }
 
+/* ====================================================================================================
+ * One scan's whole cycle (radar/tracker.py `Tracker.process`): the objects that take part and what the scan needs
+ * to know of each, the detections as rows, the scan, what it did to every object, and after the tracker's own
+ * bookkeeping of the sightings (class vote, score, sensors: Python) the checks of earlier predictions, the
+ * trajectories, the predictions written down and the smoothed past.
+ *
+ * Beside the state array the tracker holds a table of its objects (one row per handle, tracker.py `OT_*`) and
+ * their trajectories (one row per handle: the count, then (t, x, y, vx, vy) per point, the oldest first).
+ * ==================================================================================================== */
+#define ROT_MAXCHK 12             /* predictions an object has written down and not yet checked, at most (8 + horizons) */
+enum { ROT_SLOT, ROT_PE, ROT_PP, ROT_NLEAF, ROT_INMAP, ROT_COVER, ROT_HIDDEN, ROT_DP0, ROT_ID, ROT_STATE, ROT_KIN,
+       ROT_LABEL = ROT_KIN + 4, ROT_RANGE, ROT_CONS, ROT_PERR, ROT_NCHECKS, ROT_UNPRED, ROT_HIST_T, ROT_HASVS, ROT_VS,
+       ROT_FS = ROT_VS + 5, ROT_PSLAG = ROT_FS + 5, ROT_NCHK, ROT_CHK, ROTW = ROT_CHK + 7 * ROT_MAXCHK };
+
+/* a writable float64 array of two dimensions; width > 0: of that many columns */
+static int tab_get(PyObject *o, View *v, Py_ssize_t width, Py_ssize_t *rows, Py_ssize_t *cols, const char *what)
+{
+    if (view_get(o, v, 1, 'd', 2, what) < 0)
+        return -1;
+    if (width > 0 && v->b.shape[1] != width) {
+        view_drop(v);
+        PyErr_Format(PyExc_TypeError, "%s: rows of %zd numbers are needed", what, width);
+        return -1;
+    }
+    *rows = v->b.shape[0];
+    if (cols)
+        *cols = v->b.shape[1];
+    return 0;
+}
+
+/* the keys of a detection (tracker.py `process`: dets), interned once */
+enum { RDK_KIND, RDK_ATTRS, RDK_CLASS, RDK_CONF, RDK_PROB, RDK_SDT, RDK_W, RDK_Z, RDK_R, RDK_ASPECT, RDK_CELL, RDK_WOK, RDK_N };
+static PyObject *dkey[RDK_N + 1];
+static const char *const DKEYS[RDK_N + 1] = {"kind", "attrs", "class", "class_conf", "prob", "sdt", "w", "z", "R",
+                                            "aspect", "cell", "wok", NULL};
+
+static int dkeys_init(void)
+{
+    for (int k = 0; DKEYS[k]; k++)
+        if (dkey[k] == NULL && (dkey[k] = PyUnicode_InternFromString(DKEYS[k])) == NULL)
+            return -1;
+    return 0;
+}
+
+/* d.get(key) (borrowed; NULL without an error: not there); *err set on an error */
+static PyObject *dget(PyObject *d, int key, int *err)
+{
+    PyObject *v = PyDict_GetItemWithError(d, dkey[key]);
+    if (v == NULL && PyErr_Occurred())
+        *err = 1;
+    return v;
+}
+
+/* at most `most` numbers of a float64 array or of a sequence into out; how many, -1: an error is set */
+static int det_nums(PyObject *o, double *out, int most, const char *what)
+{
+    PyObject *l = NULL;
+    int is_list = PyList_Check(o);
+    if (!(is_list || PyTuple_Check(o))) {
+        Py_buffer b;
+        if (PyObject_GetBuffer(o, &b, PyBUF_C_CONTIGUOUS | PyBUF_FORMAT) == 0) {
+            const char *f = b.format ? b.format : "B";
+            if (*f == '@' || *f == '=' || *f == '<')
+                f++;
+            if (f[0] == 'd' && f[1] == 0 && b.itemsize == 8 && b.ndim == 1) {
+                Py_ssize_t n = b.shape[0];
+                if (n > most) {
+                    PyBuffer_Release(&b);
+                    PyErr_Format(PyExc_ValueError, "%s: more than %d numbers", what, most);
+                    return -1;
+                }
+                memcpy(out, b.buf, (size_t)n * sizeof(double));
+                PyBuffer_Release(&b);
+                return (int)n;
+            }
+            PyBuffer_Release(&b);
+        } else
+            PyErr_Clear();
+        l = PySequence_List(o);
+        if (l == NULL)
+            return -1;
+        o = l;
+        is_list = 1;
+    }
+    Py_ssize_t n = is_list ? PyList_Size(o) : PyTuple_Size(o);
+    if (n > most) {
+        Py_XDECREF(l);
+        PyErr_Format(PyExc_ValueError, "%s: more than %d numbers", what, most);
+        return -1;
+    }
+    for (Py_ssize_t k = 0; k < n; k++) {
+        double v = PyFloat_AsDouble(seq_item(o, is_list, k));
+        if (v == -1.0 && PyErr_Occurred()) {
+            Py_XDECREF(l);
+            return -1;
+        }
+        out[k] = v;
+    }
+    Py_XDECREF(l);
+    return (int)n;
+}
+
+/* float(v or 0.0) of d.get(key); -1: an error is set */
+static int det_float(PyObject *d, int key, double *out)
+{
+    int err = 0;
+    PyObject *v = dget(d, key, &err);
+    *out = 0.0;
+    if (err)
+        return -1;
+    if (v == NULL)
+        return 0;
+    int tr = PyObject_IsTrue(v);
+    if (tr < 0)
+        return -1;
+    if (tr) {
+        *out = PyFloat_AsDouble(v);
+        if (*out == -1.0 && PyErr_Occurred())
+            return -1;
+    }
+    return 0;
+}
+
+#define RDET_BINS 64
+/* The scan's detections as rows (RDET) and what each one's kind can do for an object started by it (RKB): a
+ * detection is a dict {"z", "R", "kind", "sdt", "w", "wok", "cell", "attrs": {"class", "class_conf" | "prob",
+ * "aspect"}}. dcfg: (kinds: {kind: its code}, kind_fn(kind) -> code, labels: {class as given: (vehicle 1 / person -1
+ * / not known 0, the RKB numbers)}, label_fn(class) -> that tuple, odds_fn(bin) -> what a score of that bin adds
+ * to the log odds of a real thing, the number of score bins). The dicts are the tracker's memory of what the
+ * functions said; a function is asked where its dict does not know. -1: an error is set. */
+static int det_rows(PyObject *dets, Py_ssize_t nd, PyObject *dcfg, double *D, double *KB)
+{
+    PyObject *okinds, *okfn, *olabs, *olfn, *oofn, *groups = NULL;
+    int bins, rc = -1;
+    double odds[RDET_BINS];
+    char have[RDET_BINS];
+    if (!PyTuple_Check(dcfg) || !PyArg_ParseTuple(dcfg, "OOOOOi", &okinds, &okfn, &olabs, &olfn, &oofn, &bins))
+        return -1;
+    if (!PyDict_Check(okinds) || !PyDict_Check(olabs) || bins < 1 || bins > RDET_BINS) {
+        PyErr_SetString(PyExc_TypeError, "radar: the detections' tables");
+        return -1;
+    }
+    if (dkeys_init() < 0 || (groups = PyDict_New()) == NULL)
+        return -1;
+    memset(have, 0, sizeof(have));
+    for (Py_ssize_t j = 0; j < nd; j++) {
+        PyObject *d = PyList_GetItem(dets, j), *at, *v, *k, *sdt;
+        double *row = D + (size_t)j * RDET, *kb = KB + (size_t)j * RKB;
+        int err = 0;
+        if (d == NULL)
+            goto done;
+        if (!PyDict_Check(d)) {
+            PyErr_SetString(PyExc_TypeError, "radar: a detection must be a dict");
+            goto done;
+        }
+        memset(row, 0, RDET * sizeof(double));
+        /* its kind, and its group: the detections of one kind and scale-rate baseline are predicted alike */
+        k = dget(d, RDK_KIND, &err);
+        sdt = dget(d, RDK_SDT, &err);
+        if (err)
+            goto done;
+        if (k == NULL)
+            k = Py_None;
+        if (sdt == NULL)
+            sdt = Py_None;
+        v = PyDict_GetItemWithError(okinds, k);
+        if (v == NULL) {
+            if (PyErr_Occurred())
+                goto done;
+            PyObject *r = PyObject_CallFunctionObjArgs(okfn, k, NULL);
+            if (r == NULL)
+                goto done;
+            row[D_KIND] = PyFloat_AsDouble(r);
+            Py_DECREF(r);
+        } else
+            row[D_KIND] = PyFloat_AsDouble(v);
+        if (row[D_KIND] == -1.0 && PyErr_Occurred())
+            goto done;
+        if (det_float(d, RDK_SDT, &row[D_SDT]) < 0)
+            goto done;
+        {
+            PyObject *key = PyTuple_Pack(2, k, sdt);
+            if (key == NULL)
+                goto done;
+            v = PyDict_GetItemWithError(groups, key);
+            if (v == NULL) {
+                PyObject *num = PyErr_Occurred() ? NULL : PyLong_FromSsize_t(PyDict_Size(groups));
+                if (num == NULL || PyDict_SetItem(groups, key, num) < 0) {
+                    Py_XDECREF(num);
+                    Py_DECREF(key);
+                    goto done;
+                }
+                row[D_GROUP] = PyLong_AsDouble(num);
+                Py_DECREF(num);
+            } else
+                row[D_GROUP] = PyLong_AsDouble(v);
+            Py_DECREF(key);
+        }
+        /* its attributes: the class (what its kind can do), the detector's score, the box's aspect */
+        at = dget(d, RDK_ATTRS, &err);
+        if (err)
+            goto done;
+        if (at != NULL) {
+            int tr = PyObject_IsTrue(at);
+            if (tr < 0)
+                goto done;
+            if (!tr)
+                at = NULL;
+            else if (!PyDict_Check(at)) {
+                PyErr_SetString(PyExc_TypeError, "radar: a detection's attrs must be a dict");
+                goto done;
+            }
+        }
+        {
+            PyObject *cls = at ? dget(at, RDK_CLASS, &err) : NULL, *lr = NULL, *got;
+            if (err)
+                goto done;
+            if (cls == NULL)
+                cls = Py_None;
+            got = PyDict_GetItemWithError(olabs, cls);
+            if (got == NULL) {
+                PyErr_Clear();                           /* (a class that cannot be a key: asked every time) */
+                lr = got = PyObject_CallFunctionObjArgs(olfn, cls, NULL);
+                if (got == NULL)
+                    goto done;
+            }
+            if (!PyTuple_Check(got) || PyTuple_Size(got) != RKB + 1) {
+                Py_XDECREF(lr);
+                PyErr_SetString(PyExc_TypeError, "radar: a label's numbers");
+                goto done;
+            }
+            row[D_VEH] = PyFloat_AsDouble(PyTuple_GetItem(got, 0));
+            for (int q = 0; q < RKB; q++)
+                kb[q] = PyFloat_AsDouble(PyTuple_GetItem(got, q + 1));
+            Py_XDECREF(lr);
+            if (PyErr_Occurred())
+                goto done;
+        }
+        if (det_float(d, RDK_W, &row[D_W]) < 0)
+            goto done;
+        {
+            PyObject *z = dget(d, RDK_Z, &err), *R = dget(d, RDK_R, &err);
+            if (err)
+                goto done;
+            if (z == NULL || R == NULL) {
+                PyErr_SetString(PyExc_KeyError, z == NULL ? "z" : "R");
+                goto done;
+            }
+            if (det_nums(z, row + D_Z, 4, "z") < 0 || det_nums(R, row + D_R, 4, "R") < 0)
+                goto done;
+        }
+        if (at != NULL) {
+            /* the score: a number in 0..1 (not a truth value), `class_conf` where the key is there, else `prob` */
+            v = dget(at, RDK_CONF, &err);
+            if (v == NULL && !err)
+                v = dget(at, RDK_PROB, &err);
+            if (err)
+                goto done;
+            if (v != NULL && !PyBool_Check(v) && (PyFloat_Check(v) || PyLong_Check(v))) {
+                double sc = PyFloat_AsDouble(v);
+                if (sc == -1.0 && PyErr_Occurred())
+                    PyErr_Clear();                       /* (an int beyond a float: not in 0..1) */
+                else if (0.0 <= sc && sc <= 1.0) {
+                    int b = (int)(sc * bins);
+                    if (b > bins - 1)
+                        b = bins - 1;
+                    if (!have[b]) {
+                        PyObject *r = PyObject_CallFunction(oofn, "i", b);
+                        if (r == NULL)
+                            goto done;
+                        odds[b] = PyFloat_AsDouble(r);
+                        Py_DECREF(r);
+                        if (odds[b] == -1.0 && PyErr_Occurred())
+                            goto done;
+                        have[b] = 1;
+                    }
+                    row[D_SCORE] = odds[b];
+                }
+            }
+            if (det_float(at, RDK_ASPECT, &row[D_ASPECT]) < 0)
+                goto done;
+        }
+        /* a cell of several returns: their number and scatter; one detection: (1, 0, 0, 0) */
+        row[D_NRET] = 1.0;
+        v = dget(d, RDK_CELL, &err);
+        if (err)
+            goto done;
+        if (v != NULL) {
+            int tr = PyObject_IsTrue(v);
+            if (tr < 0)
+                goto done;
+            if (tr) {
+                double c4[4];
+                int nc = det_nums(v, c4, 4, "cell");
+                if (nc < 0)
+                    goto done;
+                if (nc != 4) {
+                    PyErr_SetString(PyExc_ValueError, "radar: a cell is four numbers");
+                    goto done;
+                }
+                memcpy(row + D_NRET, c4, sizeof(c4));
+            }
+        }
+        v = dget(d, RDK_WOK, &err);
+        if (err)
+            goto done;
+        if (v != NULL) {
+            int tr = PyObject_IsTrue(v);
+            if (tr < 0)
+                goto done;
+            row[D_WOK] = tr ? 1.0 : 0.0;
+        }
+    }
+    rc = 0;
+done:
+    Py_DECREF(groups);
+    return rc;
+}
+
+/* Hyp.cycle(S, table, hist, objects, t, noise, pose, sensor, src, dets, dcfg, mem | None, nscan, acfg, par, ucfg,
+ *           bcfg, bias | None, ccfg) -> (late, sightings, births, ended, bias | None)   or   an int
+ * One scan (Tracker.process): `objects` are the handles of all the tracker's objects, in its order. An object whose
+ * time is more than ccfg[0] (oosm_max_s) ahead of the scan's does not take part (`late` counts them). For the others
+ * the scan's info is made here from their rows of the table and of the state array: dt, what the car's own movement
+ * over it is not sure about (noise(the object's time, t) -> (along, heading), asked once per time), what the kind
+ * can do, vehicle / person, id, settled, and whether its moving hypotheses hold its height and angle offset against
+ * a camera's boxes (ccfg[1]: consider_moving; from ucfg[0] sightings on; not while a sensor that measures range has
+ * seen it within ccfg[2] seconds; ccfg[3]: the standing hypothesis too). dets: the detections as the tracker gets
+ * them (det_rows). The rest as Hyp.scan.
+ * Written into the table: of every object that took part and lives its primary row, the probabilities that it
+ * exists and that the primary's story is the true one, its leaves, whether it is in the best story, when a scan
+ * last covered its place and when it was last hidden; a new object's row and an empty trajectory.
+ * Returns the count of late objects, the sightings [(the object's place in `objects`, detection)], the births
+ * [(handle, detection)], the handles of objects that ended, the sensor's bias after the scan. An int > 0: the
+ * state array needs that many free rows first; an int < 0: the table and the trajectories need -int rows first
+ * (nothing was changed in either case). */
+static PyObject *hyp_cycle(PyObject *self, PyObject *args)
+{
+    Hyp *H = (Hyp *)self;
+    PyObject *oS, *oT, *oHi, *otr, *onoise, *opose, *osen, *odets, *odcfg, *omem, *oacfg, *opar, *oucfg, *obcfg, *obias,
+        *occfg;
+    double t, nscan;
+    int src;
+    if (!PyArg_ParseTuple(args, "OOOOdOOOiOOOdOOOOOO", &oS, &oT, &oHi, &otr, &t, &onoise, &opose, &osen, &src, &odets,
+                          &odcfg, &omem, &nscan, &oacfg, &opar, &oucfg, &obcfg, &obias, &occfg))
+        return NULL;
+    PyObject *res = NULL, *hits = NULL, *births = NULL, *bias_o = NULL;
+    View vS, vT, vH;
+    vS.held = vT.held = vH.held = 0;
+    Scan s;
+    memset(&s, 0, sizeof(s));
+    s.H = H;
+    s.t = t;
+    s.nscan = nscan;
+    s.src = src;
+    Py_ssize_t cap, na = 0, *th = NULL, *part = NULL, nm = 0, need = 0, trows, hrows, hcols, n = 0, late = 0;
+    double bias[5] = {0.0, 0.0, 0.0, 0.0, -1e18}, ccfg[4], *in = NULL;
+    int has_bias = obias != Py_None;
+    if (store_get(oS, &vS, &cap) < 0 || tab_get(oT, &vT, ROTW, &trows, NULL, "table") < 0 ||
+        tab_get(oHi, &vH, 0, &hrows, &hcols, "hist") < 0 || (th = idx_get(otr, 1 << 30, &na)) == NULL ||
+        sens_get(osen, &s.sen) < 0 || rnums_get(opose, 6, s.pose, "pose") < 0 || rnums_get(oacfg, RSCFG, s.acfg, "acfg") < 0 ||
+        rpar_get(opar, &s.par) < 0 || rnums_get(oucfg, 2, s.ucfg, "ucfg") < 0 || rnums_get(obcfg, RBCFG, s.bcfg, "bcfg") < 0 ||
+        (has_bias && rnums_get(obias, 5, bias, "bias") < 0) || rnums_get(occfg, 4, ccfg, "ccfg") < 0)
+        goto done;
+    if (!PyList_Check(odets)) {
+        PyErr_SetString(PyExc_TypeError, "Hyp.cycle: the detections must be a list");
+        goto done;
+    }
+    if (hcols < 6 || (hcols - 1) % 5 != 0) {
+        PyErr_SetString(PyExc_TypeError, "Hyp.cycle: the trajectories: a count and points of five numbers");
+        goto done;
+    }
+    Py_ssize_t nd = PyList_Size(odets);
+    s.A = (double *)vS.b.buf;
+    s.nd = nd;
+    if (omem != Py_None && (nm = batch_len(omem)) < 0)
+        goto done;
+    if (trows < H->ntr + nd || hrows < H->ntr + nd) {    /* every detection may start an object */
+        res = PyLong_FromSsize_t(-(Py_ssize_t)(H->ntr + nd));
+        goto done;
+    }
+    double *tab = (double *)vT.b.buf, *hist = (double *)vH.b.buf;
+    {
+        size_t n_ti = (size_t)na * HTI, n_d = (size_t)nd * RDET, n_kb = (size_t)nd * RKB;
+        in = (double *)PyMem_Malloc((n_ti + n_d + n_kb + (size_t)nm * 5 + 3 * (size_t)na + 1) * sizeof(double));
+        part = (Py_ssize_t *)PyMem_Malloc((size_t)(2 * na + 1) * sizeof(Py_ssize_t));
+        if (in == NULL || part == NULL) {
+            PyErr_NoMemory();
+            goto done;
+        }
+        double *ti = in, *D = ti + n_ti, *KB = D + n_d, *mem = KB + n_kb, *nt = mem + (size_t)nm * 5, *nv = nt + na;
+        Py_ssize_t *pos = part + na;
+        int nn = 0;
+        /* the objects that take part, and what the scan needs to know of each */
+        for (Py_ssize_t i = 0; i < na; i++) {
+            Py_ssize_t h = th[i];
+            if (h >= trows) {
+                PyErr_SetString(PyExc_IndexError, "Hyp.cycle: an object outside the table");
+                goto done;
+            }
+            const double *T = tab + h * ROTW;
+            Py_ssize_t slot = (Py_ssize_t)T[ROT_SLOT];
+            if (!(T[ROT_SLOT] >= 0.0) || slot >= cap) {
+                PyErr_SetString(PyExc_IndexError, "radar: a row outside the state array");
+                goto done;
+            }
+            const double *M = s.A + slot * RROW + RO_M;
+            double ot = M[M_T];
+            if (t < ot - ccfg[0]) {
+                late++;
+                continue;
+            }
+            int q = 0;
+            while (q < nn && nt[q] != ot)
+                q++;
+            if (q == nn) {
+                PyObject *r = PyObject_CallFunction(onoise, "dd", ot, t);
+                if (r == NULL)
+                    goto done;
+                int ok = PyTuple_Check(r) && PyArg_ParseTuple(r, "dd", &nv[2 * nn], &nv[2 * nn + 1]);
+                Py_DECREF(r);
+                if (!ok) {
+                    if (!PyErr_Occurred())
+                        PyErr_SetString(PyExc_TypeError, "Hyp.cycle: noise() must give two numbers");
+                    goto done;
+                }
+                nt[nn++] = ot;
+            }
+            double *o = ti + (size_t)n * HTI;
+            o[0] = t - ot;
+            o[1] = nv[2 * q];
+            o[2] = nv[2 * q + 1];
+            memcpy(o + 3, T + ROT_KIN, 4 * sizeof(double));
+            o[7] = T[ROT_LABEL];
+            o[8] = T[ROT_ID];
+            o[9] = (T[ROT_STATE] == 1.0 || T[ROT_STATE] == 2.0) ? 1.0 : 0.0;
+            if (ccfg[1] == 0.0 || (double)(long long)M[M_HITS] < s.ucfg[0] || t - T[ROT_RANGE] <= ccfg[2])
+                o[10] = 0.0;
+            else
+                o[10] = ccfg[3] != 0.0 ? 2.0 : 1.0;
+            part[n] = h;
+            pos[n] = i;
+            n++;
+        }
+        s.n = (int)n;
+        if (det_rows(odets, nd, odcfg, D, KB) < 0 || (nm && rows_get(omem, nm, 5, mem, "mem") < 0))
+            goto done;
+        int r = scan_core(H, &s, cap, part, n, ti, D, KB, nm, mem, has_bias, bias, &need);
+        if (r < 0)
+            goto done;
+        if (r == 1) {
+            res = PyLong_FromSsize_t(need);
+            goto done;
+        }
+        /* what the scan did to every object */
+        if ((hits = PyList_New(0)) == NULL || (births = PyList_New(0)) == NULL)
+            goto done;
+        for (Py_ssize_t k = 0; k < n; k++) {
+            HTrack *tr = &H->tr[part[k]];
+            if (!tr->alive)
+                continue;
+            double *T = tab + part[k] * ROTW;
+            const double *M = s.A + (Py_ssize_t)tr->primary * RROW + RO_M;
+            T[ROT_SLOT] = (double)tr->primary;
+            T[ROT_PE] = tr->pe;
+            T[ROT_PP] = tr->pp;
+            T[ROT_NLEAF] = (double)tr->nleaf;
+            T[ROT_INMAP] = tr->in_map ? 1.0 : 0.0;
+            if (M[M_COV] > 0.0)
+                T[ROT_COVER] = t;
+            if (M[M_OCC] == 1.0 || M[M_OCC] == 2.0)      /* hidden by an object or cut by the edge in this scan */
+                T[ROT_HIDDEN] = t;
+            int j = (int)M[M_DET];
+            if (j >= 0) {
+                T[ROT_COVER] = t;
+                PyObject *o = Py_BuildValue("(ni)", pos[k], j);
+                if (o == NULL || PyList_Append(hits, o) < 0) {
+                    Py_XDECREF(o);
+                    goto done;
+                }
+                Py_DECREF(o);
+            }
+        }
+        for (Py_ssize_t j = 0; j < nd; j++) {
+            int h = s.birth_h[j];
+            if (h < 0 || !H->tr[h].alive || H->tr[h].born != H->level)
+                continue;
+            HTrack *tr = &H->tr[h];
+            double *T = tab + (Py_ssize_t)h * ROTW;
+            memset(T, 0, ROTW * sizeof(double));
+            T[ROT_SLOT] = (double)tr->primary;
+            T[ROT_PE] = tr->pe;
+            T[ROT_PP] = tr->pp;
+            T[ROT_NLEAF] = 1.0;
+            T[ROT_INMAP] = tr->in_map ? 1.0 : 0.0;
+            T[ROT_COVER] = t;
+            T[ROT_HIDDEN] = -1e18;
+            T[ROT_HIST_T] = -1e18;
+            T[ROT_RANGE] = -1e18;
+            T[ROT_DP0] = s.A[(Py_ssize_t)tr->primary * RROW + RO_P + R_DP * RN + R_DP];
+            hist[(Py_ssize_t)h * hcols] = 0.0;
+            PyObject *o = Py_BuildValue("(in)", h, j);
+            if (o == NULL || PyList_Append(births, o) < 0) {
+                Py_XDECREF(o);
+                goto done;
+            }
+            Py_DECREF(o);
+        }
+        if (has_bias)
+            bias_o = Py_BuildValue("(ddddd)", bias[0], bias[1], bias[2], bias[3], bias[4]);
+        else {
+            bias_o = Py_None;
+            Py_INCREF(bias_o);
+        }
+        if (bias_o == NULL)
+            goto done;
+        res = Py_BuildValue("(nOOOO)", late, hits, births, s.dead, bias_o);
+    }
+done:
+    Py_XDECREF(hits);
+    Py_XDECREF(births);
+    Py_XDECREF(bias_o);
+    Py_XDECREF(s.dead);
+    ar_free(&s.ar);
+    PyMem_Free(th);
+    PyMem_Free(part);
+    PyMem_Free(in);
+    view_drop(&vS);
+    view_drop(&vT);
+    view_drop(&vH);
+    return res;
+}
+
+/* a point at the end of a trajectory of at most hn points (the oldest goes where it is full) */
+static void hist_push(double *Hh, Py_ssize_t hn, double t, double x, double y, double vx, double vy)
+{
+    Py_ssize_t n = (Py_ssize_t)Hh[0];
+    if (n >= hn) {
+        memmove(Hh + 1, Hh + 6, (size_t)(hn - 1) * 5 * sizeof(double));
+        n = hn - 1;
+    }
+    double *p = Hh + 1 + 5 * n;
+    p[0] = t;
+    p[1] = x;
+    p[2] = y;
+    p[3] = vx;
+    p[4] = vy;
+    Hh[0] = (double)(n + 1);
+}
+
+enum { RAFT_WINDOW, RAFT_INCONS, RAFT_INFLATE, RAFT_HIST_S, RAFT_NHZ, RAFT_HZ, RAFT_SMOOTH = RAFT_HZ + 4, RAFT_STEPS, RAFT_SMOOTH_S, RAFT_SHORT_S,
+       RAFT_LAG_S, RAFT_WHOLE_S, RAFT_N };
+
+/* Hyp.after(S, table, hist, sighted, kept, born, t, par, cfg) -> None
+ * What follows a scan's sightings once the tracker has done its own bookkeeping of them (Tracker.process).
+ * sighted: the handles of the objects that took a detection. Each one's expectations whose time has passed are
+ * compared with where it is now believed to have been then (how well its predictions hold: consistency, the
+ * error; one that keeps being elsewhere has the uncertainty of all its stories opened), and its place and velocity
+ * go to the end of its trajectory, which is kept cfg[RAFT_HIST_S] long.
+ * kept: those of them that still live. Each writes down where it expects to be at the horizons ahead, and its
+ * past is smoothed (smooth_core): the velocity a lag ago after every sighting, the whole trajectory as far as
+ * the smoother reaches once per cfg[RAFT_WHOLE_S].
+ * born: the objects this scan started: the first point of their trajectories.
+ * cfg: check_window_s, inconsistent, inflate, history_s, the number of horizons (at most 4) and the horizons,
+ * smooth (0: not), the smoother's steps, how far back the whole pass and the short pass reach, the lag, how often
+ * the whole pass runs. */
+static PyObject *hyp_after(PyObject *self, PyObject *args)
+{
+    Hyp *H = (Hyp *)self;
+    PyObject *oS, *oT, *oHi, *ohit, *okept, *oborn, *opar, *ocfg;
+    double t;
+    if (!PyArg_ParseTuple(args, "OOOOOOdOO", &oS, &oT, &oHi, &ohit, &okept, &oborn, &t, &opar, &ocfg))
+        return NULL;
+    PyObject *res = NULL;
+    View vS, vT, vH;
+    vS.held = vT.held = vH.held = 0;
+    Py_ssize_t cap, trows, hrows, hcols, nh = 0, nk = 0, nb = 0, *hit = NULL, *kept = NULL, *born = NULL;
+    double cfg[RAFT_N], *hb = NULL;
+    RPar par;
+    if (store_get(oS, &vS, &cap) < 0 || tab_get(oT, &vT, ROTW, &trows, NULL, "table") < 0 ||
+        tab_get(oHi, &vH, 0, &hrows, &hcols, "hist") < 0 || rpar_get(opar, &par) < 0 || rnums_get(ocfg, RAFT_N, cfg, "cfg") < 0)
+        goto done;
+    Py_ssize_t lim = trows < hrows ? trows : hrows;
+    if (lim > H->ntr)
+        lim = H->ntr;
+    if ((hit = idx_get(ohit, lim, &nh)) == NULL || (kept = idx_get(okept, lim, &nk)) == NULL ||
+        (born = idx_get(oborn, lim, &nb)) == NULL)
+        goto done;
+    int nhz = (int)cfg[RAFT_NHZ], steps = (int)cfg[RAFT_STEPS];
+    if (cap < H->cap || hcols < 6 || (hcols - 1) % 5 != 0 || nhz < 0 || nhz > 4 || steps < 0) {
+        PyErr_SetString(PyExc_ValueError, "Hyp.after: the arrays or the constants do not fit");
+        goto done;
+    }
+    Py_ssize_t hn = (hcols - 1) / 5;
+    double *A = (double *)vS.b.buf, *tab = (double *)vT.b.buf, *hist = (double *)vH.b.buf;
+    hb = (double *)PyMem_Malloc((size_t)(steps + 1) * 6 * sizeof(double));
+    if (hb == NULL) {
+        PyErr_NoMemory();
+        goto done;
+    }
+    for (Py_ssize_t i = 0; i < nh + nk + nb; i++) {
+        Py_ssize_t h = i < nh ? hit[i] : i < nh + nk ? kept[i - nh] : born[i - nh - nk];
+        double v = tab[h * ROTW + ROT_SLOT];
+        if (!(v >= 0.0) || (Py_ssize_t)v >= cap) {
+            PyErr_SetString(PyExc_IndexError, "radar: a row outside the state array");
+            goto done;
+        }
+    }
+    for (Py_ssize_t i = 0; i < nh; i++) {
+        Py_ssize_t h = hit[i];
+        double *T = tab + h * ROTW, *C = T + ROT_CHK, *Hh = hist + h * hcols;
+        double *row = A + (Py_ssize_t)T[ROT_SLOT] * RROW;
+        /* expectations whose time has passed against where the object is now believed to have been then */
+        int nc = (int)T[ROT_NCHK], keep = 0;
+        if (nc > ROT_MAXCHK)
+            nc = ROT_MAXCHK;
+        for (int k = 0; k < nc; k++) {
+            const double *c = C + 7 * k;
+            if (c[0] > t) {
+                if (keep != k)
+                    memmove(C + 7 * keep, c, 7 * sizeof(double));
+                keep++;
+                continue;
+            }
+            if (t - c[0] > cfg[RAFT_WINDOW])
+                continue;                                /* no update near that time: nothing to check it with */
+            double m2, e;
+            if (r_check(row, t - c[0], c[1], c[2], c + 3, &m2, &e) < 0)
+                continue;
+            if (T[ROT_NCHECKS] == 0.0) {
+                T[ROT_CONS] = m2;
+                T[ROT_PERR] = e;
+            } else {
+                T[ROT_CONS] = T[ROT_CONS] + 0.25 * (m2 - T[ROT_CONS]);
+                T[ROT_PERR] = T[ROT_PERR] + 0.25 * (e - T[ROT_PERR]);
+            }
+            T[ROT_NCHECKS] += 1.0;
+        }
+        if (keep > 8) {
+            memmove(C, C + 7 * (keep - 8), 8 * 7 * sizeof(double));
+            keep = 8;
+        }
+        T[ROT_NCHK] = (double)keep;
+        T[ROT_UNPRED] = 0.0;
+        if (T[ROT_NCHECKS] >= 4.0 && T[ROT_CONS] > cfg[RAFT_INCONS]) {
+            T[ROT_UNPRED] = 1.0;                          /* it keeps being somewhere else than predicted: believe less */
+            for (Py_ssize_t r = 0; r < H->cap; r++) {    /* every story of it */
+                if (H->owner[r] != (int32_t)h)
+                    continue;
+                double *q = A + r * RROW;
+                for (int k = 0; k < 3 * RNN; k++)
+                    q[RO_PS + k] *= cfg[RAFT_INFLATE];
+                for (int k = 0; k < RNN; k++)
+                    q[RO_PF + k] *= cfg[RAFT_INFLATE];
+                r_combine(q + RO_XS, q + RO_PS, q + RO_MU, q + RO_X, q + RO_P);
+            }
+            T[ROT_CONS] = 0.5 * (T[ROT_CONS] + 1.0);
+        }
+        /* its trajectory */
+        hist_push(Hh, hn, t, row[RO_X + R_PX], row[RO_X + R_PY], row[RO_X + R_VX], row[RO_X + R_VY]);
+        Py_ssize_t n = (Py_ssize_t)Hh[0], old = 0;
+        while (old < n && Hh[1 + 5 * old] < t - cfg[RAFT_HIST_S])
+            old++;
+        if (old) {
+            memmove(Hh + 1, Hh + 1 + 5 * old, (size_t)(n - old) * 5 * sizeof(double));
+            Hh[0] = (double)(n - old);
+        }
+    }
+    for (Py_ssize_t i = 0; i < nk; i++) {                /* written down now, checked when the time has come */
+        double *T = tab + kept[i] * ROTW;
+        const double *row = A + (Py_ssize_t)T[ROT_SLOT] * RROW;
+        double ot = row[RO_M + M_T];
+        for (int k = 0; k < nhz; k++) {
+            int nc = (int)T[ROT_NCHK];
+            if (nc >= ROT_MAXCHK)
+                break;
+            double *c = T + ROT_CHK + 7 * nc, tf = t + cfg[RAFT_HZ + k], dt = tf - ot;
+            c[0] = tf;
+            if (fabs(dt) < 1e-6) {
+                c[1] = row[RO_X + R_PX];
+                c[2] = row[RO_X + R_PY];
+                c[3] = row[RO_P];
+                c[4] = row[RO_P + 1];
+                c[5] = row[RO_P + RN];
+                c[6] = row[RO_P + RN + 1];
+            } else
+                r_peek_pos(row, dt, T + ROT_KIN, &par, c + 1);
+            T[ROT_NCHK] = (double)(nc + 1);
+        }
+    }
+    if (cfg[RAFT_SMOOTH] != 0.0)
+        for (Py_ssize_t i = 0; i < nk; i++) {
+            Py_ssize_t h = kept[i];
+            HTrack *tr = &H->tr[h];
+            if (!tr->alive) {
+                PyErr_SetString(PyExc_ValueError, "Hyp: an object that does not exist");
+                goto done;
+            }
+            double *T = tab + h * ROTW, *Hh = hist + h * hcols;
+            double ot = A[(Py_ssize_t)T[ROT_SLOT] * RROW + RO_M + M_T], lag[5], fl[5], pl;
+            /* back to the lag after every sighting; the whole trajectory, as far as the smoother reaches, once per
+             * cfg[RAFT_WHOLE_S] */
+            int whole = ot - T[ROT_HIST_T] >= cfg[RAFT_WHOLE_S], np = 0;
+            if (!smooth_core(H, A, tr, &par, steps, whole ? cfg[RAFT_SMOOTH_S] : cfg[RAFT_SHORT_S], cfg[RAFT_LAG_S],
+                             whole ? hb : NULL, &np, lag, fl, &pl))
+                continue;
+            memcpy(T + ROT_VS, lag, sizeof(lag));
+            memcpy(T + ROT_FS, fl, sizeof(fl));
+            T[ROT_PSLAG] = pl;
+            T[ROT_HASVS] = 1.0;
+            if (!whole)
+                continue;
+            T[ROT_HIST_T] = ot;
+            double t_old = hb[6 * (np - 1)] - 1e-6;      /* older than the smoother reaches: as it was */
+            Py_ssize_t n = (Py_ssize_t)Hh[0], w = 0;
+            for (Py_ssize_t k = 0; k < n; k++)
+                if (Hh[1 + 5 * k] < t_old) {
+                    if (w != k)
+                        memmove(Hh + 1 + 5 * w, Hh + 1 + 5 * k, 5 * sizeof(double));
+                    w++;
+                }
+            Hh[0] = (double)w;
+            for (int k = np - 1; k >= 0; k--)
+                hist_push(Hh, hn, hb[6 * k], hb[6 * k + 1], hb[6 * k + 2], hb[6 * k + 3], hb[6 * k + 4]);
+        }
+    for (Py_ssize_t i = 0; i < nb; i++) {
+        const double *row = A + (Py_ssize_t)tab[born[i] * ROTW + ROT_SLOT] * RROW;
+        hist_push(hist + born[i] * hcols, hn, t, row[RO_X + R_PX], row[RO_X + R_PY], 0.0, 0.0);
+    }
+    res = Py_None;
+    Py_INCREF(res);
+done:
+    PyMem_Free(hit);
+    PyMem_Free(kept);
+    PyMem_Free(born);
+    PyMem_Free(hb);
+    view_drop(&vS);
+    view_drop(&vT);
+    view_drop(&vH);
+    return res;
+}
+
 static PyMethodDef hyp_methods[] = {
     {"scan", hyp_scan, METH_VARARGS, "one scan: the hypotheses of every cluster, the objects' primaries"},
+    {"cycle", hyp_cycle, METH_VARARGS, "one scan of the tracker: its objects in, what the scan did to them out"},
+    {"after", hyp_after, METH_VARARGS, "after a scan's sightings: predictions checked and written down, trajectories, the smoothed past"},
     {"drop", hyp_drop, METH_VARARGS, "an object taken out"},
     {"rows", hyp_rows_of, METH_O, "every row of an object, the primary first"},
     {"smooth", hyp_smooth, METH_VARARGS, "the primary's story smoothed backwards (fixed lag)"},

@@ -30,8 +30,10 @@ How it is built (each part is a file):
 The arithmetic of all of it (the motion model, the measurement functions, a scan's association and update, the
 objects' upkeep and the message's objects) runs in the native core (chris_integrator/native, the `radar` part),
 its only implementation: this package does not import without it (docs/NATIVE.md says how to build it). The
-objects' numbers live in one array of the tracker (`tracker.State`), which the native calls read and write; the
-Python here is the objects' life, the message's assembly and the glue.
+objects' numbers live in the tracker's arrays (`tracker.State`: a row per node of an object's tree of hypotheses,
+a row per object of what a scan needs and says of it, its trajectory), which the native calls read and write: a
+scan is two native calls (`Hyp.cycle`, `Hyp.after`); the Python here is the objects' record (sensors, class vote,
+verdict), their life, the message's assembly and the glue.
 * `replay.py`   a recorded session through the component alone.
 
 The plug-in that wires it into the mixer is `chris_integrator/plugins/radar.py`.

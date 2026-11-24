@@ -196,18 +196,56 @@ OFF = {k[1:]: (a, b) for k, a, b, _ in _OFF}
  M_COV, M_OCCBY, M_SENSE, M_HOLD) = range(20)
 
 
-class State:
-    """The rows of the objects' numbers: an array (capacity, ROW). The native hypotheses (`Hyp`) say which rows are
-    in use; a State by itself (tests, tools) hands out rows in order."""
+# Beside the rows the tracker keeps a table of its objects, one row per handle (chris_native.c `ROT_*`): what a scan
+# needs to know of an object and what it says of it, so that a scan is one native call over all objects
+# (`Hyp.cycle`) and what follows its sightings another (`Hyp.after`). The primary row; the probabilities that it
+# exists and that the primary's story is the true one; its leaves; 1 if it is in the best story of its cluster; when
+# a scan's field last covered its place; when it was last hidden; how unknown its angle offset was at birth; its
+# id; its state (`_STATES`); what its kind can do (4); vehicle 1 / person -1 / not known 0; the last time a sensor
+# that measures range saw it; how its predictions held (consistency, error, the number of checks); 1 if it keeps
+# being elsewhere than predicted; when its trajectory was last smoothed as a whole; 1 once it has a smoothed
+# velocity, that velocity (vx, vy, 1 sigma x, y, how long ago), the free estimate's (vx, vy, 00, 01, 11) and the
+# smoothed probability of "it stands" at the lag; the predictions it has written down: their number and
+# (time, x, y, P00, P01, P10, P11) each.
+OT_MAXCHK = 12
+(OT_SLOT, OT_PE, OT_PP, OT_NLEAF, OT_INMAP, OT_COVER, OT_HIDDEN, OT_DP0, OT_ID, OT_STATE, OT_KIN) = range(11)
+(OT_LABEL, OT_RANGE, OT_CONS, OT_PERR, OT_NCHECKS, OT_UNPRED, OT_HIST_T, OT_HASVS, OT_VS) = range(OT_KIN + 4, OT_KIN + 13)
+OT_FS = OT_VS + 5
+OT_PSLAG = OT_FS + 5
+OT_NCHK = OT_PSLAG + 1
+OT_CHK = OT_NCHK + 1
+OTW = OT_CHK + 7 * OT_MAXCHK     # numbers per object
+_STATES = {"tentative": 0.0, "confirmed": 1.0, "coast": 2.0, "memory": 3.0}
+_MO = OFF["m"][0]
 
-    def __init__(self, cap=96):
+
+# of a primary row: the free estimate's velocity and its covariance, "it stands", the velocity (Tracker._groups)
+_GCOLS = [OFF["xf"][0] + VX, OFF["xf"][0] + VY, OFF["Pf"][0] + VX * N + VX, OFF["Pf"][0] + VX * N + VY,
+          OFF["Pf"][0] + VY * N + VY, OFF["mu"][0] + STAND, OFF["x"][0] + VX, OFF["x"][0] + VY]
+
+
+class State:
+    """The tracker's numbers: the rows (capacity, ROW), the objects' table (handles, OTW) and their trajectories
+    (handles, 1 + 5 x history_n: the count, then (t, x, y, vx, vy) per point, the oldest first). The native
+    hypotheses (`Hyp`) say which rows are in use; a State by itself (tests, tools) hands out rows in order."""
+
+    def __init__(self, cap=96, objects=64):
         self.a = np.zeros((cap, ROW))
         self.free = list(range(cap - 1, -1, -1))
+        self.tab = np.zeros((objects, OTW))
+        self.hist = np.zeros((objects, 1 + 5 * CFG["history_n"]))
 
     def grow(self, cap):
         a = np.zeros((cap, ROW))
         a[:len(self.a)] = self.a
         self.a = a
+
+    def grow_objects(self, n):
+        for k in ("tab", "hist"):
+            old = getattr(self, k)
+            new = np.zeros((n, old.shape[1]))
+            new[:len(old)] = old
+            setattr(self, k, new)
 
     def take(self, live=()):
         return self.free.pop()
@@ -216,83 +254,155 @@ class State:
         self.free.append(slot)
 
 
-def _view(name):
-    def get(self):
-        return getattr(self, "_" + name)
+def _view(a, b, sh):
+    """A part of the object's primary row, as an array that is the row's own memory."""
+    if len(sh) == 1:
+        def get(self):
+            s = self.store
+            return s.a[int(s.tab[self.h, OT_SLOT]), a:b]
+    else:
+        def get(self):
+            s = self.store
+            return s.a[int(s.tab[self.h, OT_SLOT]), a:b].reshape(sh)
 
     def put(self, v):
-        getattr(self, "_" + name)[...] = v
+        get(self)[...] = v
     return property(get, put)
 
 
 def _meta(k, kind=float):
+    k += _MO
+
     def get(self):
-        return kind(self._m[k])
+        s = self.store
+        return kind(s.a[int(s.tab[self.h, OT_SLOT]), k])
 
     def put(self, v):
-        self._m[k] = v
+        s = self.store
+        s.a[int(s.tab[self.h, OT_SLOT]), k] = v
+    return property(get, put)
+
+
+def _col(k, kind=float):
+    """A number of the object's row of the table."""
+    def get(self):
+        return kind(self.store.tab[self.h, k])
+
+    def put(self, v):
+        self.store.tab[self.h, k] = v
     return property(get, put)
 
 
 class Obj:
-    __slots__ = ("id", "h", "slot", "_xs", "_Ps", "_mu", "_xf", "_Pf", "_x", "_P", "_e", "_Pe", "_st", "_m", "t0", "state",
-                 "sources", "last_seen", "vote", "history", "checks", "consistency", "pred_err", "n_checks", "nis",
-                 "verdict", "coast_s", "velocity_seen", "merge_t", "flags", "last_cover", "dp0", "scores", "cls", "kin",
-                 "store", "pe", "pp", "nleaf", "in_map", "label_code", "hidden_t", "vs", "fs", "ps_lag", "grp", "grp_kind", "hist_t",
-                 "lhp")
-    xs, Ps, mu, xf, Pf, x, P, e, Pe, st, m = (_view(k) for k, _ in _LAY)
+    """An object: its handle in the native hypotheses, what the tracker remembers of it in Python (sensors, class
+    vote, verdict, group) and, as attributes, its numbers in the tracker's arrays (`State`): the parts of its
+    primary row and its row of the table."""
+    __slots__ = ("id", "h", "store", "t0", "_state", "sources", "last_seen", "vote", "nis", "verdict", "coast_s",
+                 "velocity_seen", "merge_t", "scores", "cls", "_kin", "grp", "grp_kind", "lhp")
+    xs, Ps, mu, xf, Pf, x, P, e, Pe, st, m = (_view(a, b, sh) for _, a, b, sh in _OFF)
     t = _meta(M_T)                   # the time its numbers are of
     logodds = _meta(M_L)             # that it exists, in the primary's story (`exist`: over all stories)
     hits = _meta(M_HITS, int)
     range_t = _meta(M_RANGE_T)       # the last time a detection said how far it is (not a bearing alone)
+    slot = _col(OT_SLOT, int)        # its primary row: its leaf in the best hypothesis of its cluster
+    pe = _col(OT_PE)                 # probability that it exists
+    pp = _col(OT_PP)                 # ... that the primary's story is the true one
+    nleaf = _col(OT_NLEAF, int)      # its hypotheses
+    in_map = _col(OT_INMAP, bool)    # it is in the best hypothesis of its cluster
+    last_cover = _col(OT_COVER)      # the last time a scan's field covered where the object is
+    hidden_t = _col(OT_HIDDEN)       # the last time a scan could not see it for another object or the field's edge
+    dp0 = _col(OT_DP0)               # how unknown its angle offset was at birth
+    label_code = _col(OT_LABEL)
+    n_checks = _col(OT_NCHECKS, int)
+    hist_t = _col(OT_HIST_T)         # when its trajectory was last smoothed as a whole
 
-    def __init__(self, oid, h, slot, t, src, coast_s, store):
+    def __init__(self, oid, h, t, src, coast_s, store):
         self.id = oid
-        self.h = h                   # its handle in the native hypotheses
-        self.slot = slot
-        self.bind(store)
+        self.h = h                   # its handle in the native hypotheses: its row of the table (written at its
+        self.store = store           # birth by Hyp.cycle)
+        store.tab[h, OT_ID] = oid
         self.t0 = t
         self.state = "tentative"
         self.sources = {src}
         self.last_seen = {src: t}
         self.vote = {}
-        self.history = deque(maxlen=CFG["history_n"])
-        self.checks = []
-        self.consistency = None
-        self.pred_err = None
-        self.n_checks = 0
         self.nis = {}
         self.verdict = "unknown"
         self.coast_s = coast_s
         self.velocity_seen = False
         self.merge_t = {}
-        self.flags = set()
-        self.last_cover = t          # the last time a scan's field covered where the object is
-        self.dp0 = float(self._P[M.DP, M.DP])   # how unknown its angle offset was at birth
         self.scores = []             # (sensor, score) of its boxes while it is not confirmed
         self.cls = None              # classvote.result of `vote` without its age (box.py), until the next vote
         self.kin = M._KIN4[None]     # what its kind can do (models._KIN4 of `label`), set with every vote
-        self.pe = self.pp = 0.0      # probability that it exists; that the primary's story is the true one
-        self.nleaf = 1               # its hypotheses
-        self.in_map = True           # it is in the best hypothesis of its cluster
         self.label_code = 0.0
-        self.hidden_t = -1e18        # the last time a scan could not see it for another object or the field's edge
-        self.vs = None               # its velocity a lag ago, smoothed: (vx, vy, 1 sigma x, y, how long ago), ground frame
-        self.fs = None               # the free estimate's smoothed velocity and its covariance (vx, vy, 00, 01, 11)
-        self.ps_lag = None           # the smoothed probability of "it stands" at the lag
-        self.hist_t = -1e18          # when its trajectory was last smoothed as a whole
         self.grp = None              # the group it is of (id), and the group's kind: row | queue | platoon
         self.grp_kind = None
         self.lhp = None              # the prior of its height (lh) its numbers hold: (mean, variance) (Tracker._size)
 
-    def bind(self, store, slot=None):
-        """Point the object's arrays at its (primary) row of the state array."""
-        self.store = store
-        if slot is not None:
-            self.slot = slot
-        row = store.a[self.slot]
-        for k, a, b, sh in _OFF:
-            setattr(self, k, row[a:b].reshape(sh))
+    @property
+    def state(self):
+        return self._state
+
+    @state.setter
+    def state(self, v):
+        if getattr(self, "_state", None) != v:
+            self._state = v
+            self.store.tab[self.h, OT_STATE] = _STATES[v]
+
+    @property
+    def kin(self):
+        return self._kin
+
+    @kin.setter
+    def kin(self, v):
+        self._kin = v
+        self.store.tab[self.h, OT_KIN:OT_KIN + 4] = v
+
+    @property
+    def consistency(self):
+        """How its earlier predictions held: about 1 when within their own stated uncertainty (None: none checked)."""
+        r = self.store.tab[self.h]
+        return float(r[OT_CONS]) if r[OT_NCHECKS] else None
+
+    @property
+    def pred_err(self):
+        r = self.store.tab[self.h]
+        return float(r[OT_PERR]) if r[OT_NCHECKS] else None
+
+    @property
+    def flags(self):
+        return {"unpredictable"} if self.store.tab[self.h, OT_UNPRED] else set()
+
+    @property
+    def checks(self):
+        """Where it expects to be, written down and not yet checked: [(time, x, y, [P00, P01, P10, P11])]."""
+        r = self.store.tab[self.h]
+        return [(c[0], c[1], c[2], c[3:]) for c in r[OT_CHK:OT_CHK + 7 * int(r[OT_NCHK])].reshape(-1, 7).tolist()]
+
+    @property
+    def history(self):
+        """Its trajectory on the ground: [(t, x, y, vx, vy)], the oldest first, smoothed as far as the smoother
+        reaches."""
+        r = self.store.hist[self.h]
+        return [tuple(p) for p in r[1:1 + 5 * int(r[0])].reshape(-1, 5).tolist()]
+
+    @property
+    def vs(self):
+        """Its velocity a lag ago, smoothed: (vx, vy, 1 sigma x, y, how long ago), ground frame; None before."""
+        r = self.store.tab[self.h]
+        return tuple(r[OT_VS:OT_VS + 5].tolist()) if r[OT_HASVS] else None
+
+    @property
+    def fs(self):
+        """The free estimate's smoothed velocity and its covariance (vx, vy, 00, 01, 11); None before."""
+        r = self.store.tab[self.h]
+        return tuple(r[OT_FS:OT_FS + 5].tolist()) if r[OT_HASVS] else None
+
+    @property
+    def ps_lag(self):
+        """The smoothed probability of "it stands" at the lag; None before."""
+        r = self.store.tab[self.h]
+        return float(r[OT_PSLAG]) if r[OT_HASVS] else None
 
     @property
     def exist(self):
@@ -342,12 +452,42 @@ class Tracker:
         self.bias_t = None
         self.t = None
         self.road_t = None
+        self._kinds = {}             # a detection's kind -> its code (sensors.kind_code), as far as asked
+        self._labs = {}              # a detection's class as given -> (vehicle / person / not known, models.kinb)
+        self._ranges = {}            # sensor id -> it measures range (a microwave radar, a position)
+        self._snap = None            # (the list of objects, `look` of them): see `looked`
+
+    def look(self, objs):
+        """Several objects' numbers at once, as lists (the upkeep and the message read every object once per
+        message): their primary rows, their rows of the table up to the predictions written down, and the start of
+        each primary row's record (`M_T` .. `M_RANGE_T`)."""
+        if not objs:
+            return [], [], []
+        s = self.store
+        tb = s.tab[[o.h for o in objs], :OT_NCHK]
+        slots = tb[:, OT_SLOT].astype(np.intp)
+        return slots.tolist(), tb.tolist(), s.a[slots, _MO:_MO + M_RANGE_T + 1].tolist()
+
+    def looked(self):
+        """`look` of all objects, in their order: what the upkeep read at its start where nothing has changed the
+        list of objects since (objects dropped by the upkeep's own rules are out of both), else read now."""
+        sn = self._snap
+        if sn is None or sn[0] is not self.objects or len(sn[1]) != len(self.objects):
+            sn = self._snap = (self.objects,) + self.look(self.objects)
+        return sn[1:]
 
     def peek(self, o, t):
         """Where the object is believed to be at time t, without changing it: (x, P, mu) (for tools)."""
         x, P, mu = np.empty((1, N)), np.empty((1, N, N)), np.empty((1, 3))
         _NR.radar_peek(self.store.a, [o.slot], [float(t) - o.t], [o.kin], M._native_par(self.mcfg), x, P, mu)
         return x[0], P[0], mu[0]
+
+    @staticmethod
+    def _shown(vx, vy, s00, s01, s11):
+        det = s00 * s11 - s01 * s01
+        if det <= 0.0:
+            return 0.0
+        return (s11 * vx * vx - 2.0 * s01 * vx * vy + s00 * vy * vy) / det
 
     @staticmethod
     def shown_moving(o):
@@ -390,13 +530,10 @@ class Tracker:
             h = self.score_hist[src] = [(wgt * ht / ht.sum()).tolist(), (wgt * hf / hf.sum()).tolist()]
         return h
 
-    def _score_odds(self, src, sc):
-        """Log odds a box of this score adds for "a real thing" (0 without a score). Per bin, kept until the
-        sensor's histograms change (`_score_learn`)."""
-        if sc is None:
-            return 0.0
+    def _bin_odds(self, src, b):
+        """Log odds a box whose score falls into bin b adds for "a real thing". Per bin, kept until the sensor's
+        histograms change (`_score_learn`). (A box without a score adds 0: Hyp.cycle.)"""
         c = self.cfg
-        b = min(int(sc * c["score_bins"]), c["score_bins"] - 1)
         tab = self.score_odds.get(src)
         if tab is None:
             tab = self.score_odds[src] = [None] * c["score_bins"]
@@ -406,6 +543,28 @@ class Tracker:
             r = math.log(((ht[b] + 0.5) / (_npsum(ht) + 0.5 * len(ht))) / ((hf[b] + 0.5) / (_npsum(hf) + 0.5 * len(hf))))
             v = tab[b] = c["score_gain"] * max(-c["score_max"], min(c["score_max"], r))
         return v
+
+    def _kind_code(self, kind):
+        v = self._kinds[kind] = kind_code(kind)
+        return v
+
+    def _lab_row(self, raw):
+        """What a detection's class says, as the native core reads it: (vehicle 1 / person -1 / not known 0) and
+        what the kind can do for an object started by it (models.kinb)."""
+        lab = classvote.norm_label(raw)
+        r = (0.0 if lab is None else (1.0 if lab in M.VEHICLES else -1.0),) + tuple(M.kinb(lab))
+        try:
+            if len(self._labs) < 256:
+                self._labs[raw] = r
+        except TypeError:                                # not a thing a dict takes as a key
+            pass
+        return r
+
+    def _range_seen(self, o):
+        """The last time a sensor that measures range saw the object, into its row of the table (`Hyp.cycle`: the
+        consider parameters)."""
+        rg = self._ranges
+        self.store.tab[o.h, OT_RANGE] = max((ts for s, ts in o.last_seen.items() if rg.get(s)), default=-1e18)
 
     def _score_learn(self, scores, real):
         c = self.cfg
@@ -430,15 +589,15 @@ class Tracker:
             # the camera's pitch error: its slow part (value, variance) and its fast part (value, variance, time)
             b = self.bias.setdefault(src, [0.0, sensor.bias_var, 0.0, 0.0, -1e18])
             sensor.bias, sensor.bias_var = b[0], b[1]
+        rg = sensor.kind in ("microwave_radar", "position")
+        if self._ranges.get(src) is not rg:
+            self._ranges[src] = rg
+            for o in self.objects:
+                self._range_seen(o)
         pose = self._pose(t)
         if pose is None:
             return
-        objs = []
-        for o in self.objects:
-            if t < o.t - c["oosm_max_s"]:
-                st["late"] += 1
-                continue
-            objs.append(o)
+        self._snap = None
         self.t = t if self.t is None else max(self.t, t)
         if getattr(sensor, "extraneous", None) is not None:
             sensor.extraneous = max(sensor.extraneous, self.new_rate.get(src, 0.0))
@@ -449,19 +608,10 @@ class Tracker:
             sensor.gm = (math.radians(cc["pitch_gm_stand_deg"] + f * (cc["pitch_gm_deg"] - cc["pitch_gm_stand_deg"])) ** 2,
                          cc["pitch_gm_tau_s"])
         if getattr(sensor, "extended", None):
-            dets = self._cells(sensor, pose, t, objs, dets)
+            dets = self._cells(sensor, pose, t, [o for o in self.objects if not t < o.t - c["oosm_max_s"]], dets)
             st["dets"] += len(dets)
-        D, KB = self._det_rows(src, dets)
-        # what the car's own movement over the interval is not sure about goes into where each object is
-        noise, info = {}, []
-        for o in objs:
-            ot = o.t
-            nz = noise.get(ot)
-            if nz is None:
-                nz = noise[ot] = self.ego.motion_noise(ot, t)
-            k = o.kin
-            info.append((float(t) - ot, nz[0], nz[1], k[0], k[1], k[2], k[3], o.label_code, o.id,
-                         1.0 if o.state in ("confirmed", "coast") else 0.0, self._consider(o, t)))
+        elif type(dets) is not list:
+            dets = list(dets)
         mem = self.unexplained.get(src)
         rows = None
         if mem:
@@ -474,36 +624,37 @@ class Tracker:
                 c["split_rel"])
         bcfg = (c["new_exist"], c["p_any_side"], c["side_m"], c["with_rel"], c["with_std"], self.mcfg["p_ca0"],
                 c["mu_floor"], max(0, c["max_objects"] - len(self.objects)))
-        args = ([o.h for o in objs], info, float(t), pose, sensor.native(), code, D, KB, rows,
-                float(len(self.scan_times.get(src) or ())), acfg, M._native_par(self.mcfg),
-                (c["mu_hold_hits"], c["mu_floor"]), bcfg, b)
-        res = self.hyp.scan(self.store.a, *args)
-        if isinstance(res, int):                         # the state array is too small for this scan: more rows
-            self.store.grow(max(2 * len(self.store.a), len(self.store.a) + res + 64))
-            for o in self.objects:
-                o.bind(self.store)
-            res = self.hyp.scan(self.store.a, *args)
-        out, births, dead, bias = res
+        # the scan in one native call (chris_native.c `Hyp.cycle`): the objects that are not too far ahead of its
+        # time take part (what the car's own movement over the interval is not sure about goes into where each is;
+        # whether its moving hypotheses hold its height and angle offset: the consider parameters, see `CFG`); the
+        # detections as the native core reads them; what the scan did to each object goes into its row of the table
+        store, par = self.store, M._native_par(self.mcfg)
+        objs = self.objects
+        args = ([o.h for o in objs], float(t), self.ego.motion_noise, pose, sensor.native(), code, dets,
+                (self._kinds, self._kind_code, self._labs, self._lab_row, lambda k: self._bin_odds(src, k), c["score_bins"]),
+                rows, float(len(self.scan_times.get(src) or ())), acfg, par, (c["mu_hold_hits"], c["mu_floor"]), bcfg, b,
+                (c["oosm_max_s"], 1.0 if c["consider_moving"] else 0.0, c["consider_range_s"],
+                 1.0 if c["consider_stand"] else 0.0))
+        while True:
+            res = self.hyp.cycle(store.a, store.tab, store.hist, *args)
+            if not isinstance(res, int):
+                break
+            if res < 0:                                  # the table is too small for the objects this scan may start
+                store.grow_objects(max(2 * len(store.tab), 16 - res))
+            else:                                        # the state array is too small for this scan: more rows
+                store.grow(max(2 * len(store.a), len(store.a) + res + 64))
+        late, hits, births, dead, bias = res
+        st["late"] += late
         if bias is not None:                             # the sensor's pitch error after the scan
             b[:] = bias
             sensor.bias, sensor.bias_var = bias[0], bias[1]
-        store = self.store
         hit = []
-        for o, (alive, prim, pd, cover, pe, pp, nleaf, in_map) in zip(objs, out):
-            if not alive:
-                continue
-            o.bind(store, prim)
-            o.pe, o.pp, o.nleaf, o.in_map = pe, pp, nleaf, bool(in_map)
-            if cover > 0.0:
-                o.last_cover = t
-            if o._m[M_OCC] in (1.0, 2.0):                # hidden by an object or cut by the edge in this scan
-                o.hidden_t = t
-            j = int(o._m[M_DET])
-            if j >= 0:
-                o.last_cover = t
-                self._after_update(o, dets[j], sensor, src, t)
-                hit.append(o)
-                st["assigned"] += 1
+        for i, j in hits:                                # (object, detection): the object took it in its primary's story
+            o = objs[i]
+            self._after_update(o, dets[j], sensor, src, t)
+            hit.append(o)
+        st["assigned"] += len(hit)
+        kept = hit
         if dead:
             gone = set(dead)
             for o in self.objects:
@@ -512,17 +663,7 @@ class Tracker:
                     if o.state == "tentative" and o.scores:
                         self._score_learn(o.scores, False)   # never confirmed and gone: its boxes were false ones
             self.objects = [o for o in self.objects if o.h not in gone]
-            hit = [o for o in hit if o.h not in gone]
-        if hit:                                          # written down now, checked when the time has come
-            hz = c["check_horizons"]
-            ahead = np.empty((len(hit) * len(hz), 6))    # where, and how well: (x, y, P00, P01, P10, P11)
-            _NR.radar_peek_pos(store.a, [o.slot for o in hit for _ in hz], [t + h - o.t for o in hit for h in hz],
-                               [o.kin for o in hit for _ in hz], M._native_par(self.mcfg), ahead)
-            for k, r in enumerate(ahead.tolist()):
-                hit[k // len(hz)].checks.append((t + hz[k % len(hz)], r[0], r[1], r[2:]))
-        if c["smooth"]:
-            for o in hit:
-                self._smooth(o)
+            kept = [o for o in hit if o.h not in gone]
         memq = self.unexplained.setdefault(src, deque())
         times = self.scan_times.setdefault(src, deque())
         times.append(t)
@@ -530,11 +671,12 @@ class Tracker:
             times.popleft()
         while memq and memq[0][0] < t - c["map_s"]:
             memq.popleft()
-        for h, j, prim, pe, pp, in_map in births:
+        for h, j in births:
             d = dets[j]
-            o = Obj(self.next_id, h, prim, t, src, sensor.coast_s, store)
+            o = Obj(self.next_id, h, t, src, sensor.coast_s, store)
             self.next_id += 1
-            o.pe, o.pp, o.in_map = pe, pp, bool(in_map)
+            if rg:
+                self._range_seen(o)
             sc = self._score(d)
             if sc is not None:
                 o.scores.append((src, sc))
@@ -542,7 +684,6 @@ class Tracker:
             kb = M.kinb(classvote.norm_label((d.get("attrs") or {}).get("class")))
             o.lhp = (math.log(kb[7]), kb[8] * kb[8])     # the height prior it was born with (chris_native.c r_birth)
             self._vote(o, d, src, t)
-            o.history.append((t, float(o._x[PX]), float(o._x[PY]), 0.0, 0.0))
             kb = (d.get("kind") or "").rstrip("s")
             if kb in ("rb", "rbh"):
                 # the map lives in the space of the ground angle, the bearing and the log height: a box with a
@@ -551,6 +692,20 @@ class Tracker:
             self.objects.append(o)
             self.by_h[h] = o
             st["started"] += 1
+        if hit or births:
+            # what follows the sightings, in one native call (chris_native.c `Hyp.after`): each sighted object's
+            # earlier predictions checked against where it turned out to be (one that keeps being elsewhere has
+            # its uncertainty opened) and its trajectory carried on; where it expects to be at the horizons ahead
+            # written down; its past smoothed (docs/RADAR.md, section 6: the velocity a lag ago after every
+            # sighting, the whole trajectory once per smooth_hist_s: it costs four times the short pass with a
+            # 17 Hz sensor); a new object's first point
+            hz = c["check_horizons"]
+            self.hyp.after(store.a, store.tab, store.hist, [o.h for o in hit], [o.h for o in kept], [h for h, _ in births],
+                           float(t), par,
+                           (c["check_window_s"], c["inconsistent"], c["inflate"], c["history_s"], len(hz)) + tuple(hz)
+                           + (0.0,) * (4 - len(hz))
+                           + (1.0 if c["smooth"] else 0.0, c["hyp_keep_steps"], c["smooth_s"], 1.5 * c["smooth_lag_s"],
+                              c["smooth_lag_s"], c["smooth_hist_s"]))
         r0 = self.new_rate.get(src, 0.0)
         self.new_rate[src] = r0 + c["new_rate_gain"] * (len(births) - r0)
 
@@ -564,51 +719,6 @@ class Tracker:
                                 sensor.native(), pose, margin) if returns else ()
         return [{"z": np.array([r, az, rr]), "R": np.array([sr * sr / n, sa * sa / n, sv * sv / n]), "attrs": {},
                  "cell": (float(n), sxx, sxy, syy)} for r, az, rr, n, sxx, sxy, syy in cells]
-
-    def _smooth(self, o):
-        """The object's past as its present story tells it, smoothed (Hyp.smooth: a backward pass over the story's
-        nodes): its trajectory (`history`) and its velocity a lag ago (`vs`), from the detections that came after
-        as well. The filtered state stays what is put out for now."""
-        c = self.cfg
-        # back to the lag after every sighting (the velocity that is judged and put out); the whole trajectory, as
-        # far as smooth_s, once per smooth_hist_s (it costs four times the short pass with a 17 Hz sensor)
-        whole = o.t - o.hist_t >= c["smooth_hist_s"]
-        r = self.hyp.smooth(self.store.a, o.h, M._native_par(self.mcfg), c["hyp_keep_steps"],
-                            c["smooth_s"] if whole else 1.5 * c["smooth_lag_s"], c["smooth_lag_s"])
-        if r is None:
-            return
-        hist, o.vs, o.fs, o.ps_lag = r
-        if not whole:
-            return
-        o.hist_t = o.t
-        t_old = hist[-1][0]
-        keep = [h for h in o.history if h[0] < t_old - 1e-6]     # older than the smoother reaches: as it was
-        o.history.clear()
-        o.history.extend(keep)
-        o.history.extend(h[:5] for h in reversed(hist))
-
-    def _det_rows(self, src, dets):
-        """The scan's detections as the native core reads them (chris_native.c `RDET`: kind, scale-rate baseline,
-        group (kind and baseline: what is predicted alike), vehicle (1) / person (-1) / not known (0), box width, z,
-        the variances (R's diagonal), what the detector's score adds to the log odds of a real thing, the whole
-        box's aspect) and what each detection's kind can do, for an object started by it (`RKB`)."""
-        rows, kb = [], []
-        kinds = {}
-        pad = (0.0, 0.0, 0.0, 0.0)
-        for j, d in enumerate(dets):
-            k = d.get("kind")
-            at = d.get("attrs") or {}
-            lab = classvote.norm_label(at.get("class"))
-            z, R = d["z"], d["R"]
-            z = z.tolist() if isinstance(z, np.ndarray) else list(z)
-            R = R.tolist() if isinstance(R, np.ndarray) else list(R)
-            rows.append([kind_code(k), float(d.get("sdt") or 0.0), kinds.setdefault((k, d.get("sdt")), len(kinds)),
-                         0 if lab is None else (1 if lab in M.VEHICLES else -1), float(d.get("w") or 0.0)]
-                        + z + list(pad[len(z):]) + R + list(pad[len(R):])
-                        + [self._score_odds(src, self._score(d)), float(at.get("aspect") or 0.0)]
-                        + list(d.get("cell") or (1.0, 0.0, 0.0, 0.0)) + [1.0 if d.get("wok") else 0.0])
-            kb.append(M.kinb(lab))
-        return np.array(rows, float).reshape(len(dets), 20), np.array(kb, float).reshape(len(dets), 12)
 
     def _vote(self, o, d, src, t):
         at = d.get("attrs") or {}
@@ -641,10 +751,9 @@ class Tracker:
 
     def _after_update(self, o, d, sensor, src, t):
         """What a detection does to an object besides its numbers (those, its existence and its sightings are the
-        native scan's): its record, the detector's score, its sensors, class vote, the checks of its predictions,
-        its trajectory."""
-        c = self.cfg
-        n = float(o._m[M_NIS])
+        native scan's; the checks of its predictions and its trajectory follow in `Hyp.after`): its record, the
+        detector's score, its sensors, class vote."""
+        n = float(self.store.a[o.slot, _MO + M_NIS])
         if n == n:
             o.nis[src] = n if o.nis.get(src) is None else o.nis[src] + 0.2 * (n - o.nis[src])
         sc = self._score(d)
@@ -655,43 +764,11 @@ class Tracker:
                 self._score_learn([(src, sc)], True)
         o.sources.add(src)
         o.last_seen[src] = t
+        if self._ranges[src]:
+            self._range_seen(o)
         o.coast_s = max(o.coast_s, sensor.coast_s) if len(o.sources) == 1 else min(o.coast_s, sensor.coast_s)
         o.velocity_seen = o.velocity_seen or sensor.velocity
         self._vote(o, d, src, t)
-        self._check(o, t)
-        o.history.append((t, float(o.x[PX]), float(o.x[PY]), float(o.x[VX]), float(o.x[VY])))
-        while o.history and o.history[0][0] < t - c["history_s"]:
-            o.history.popleft()
-
-    def _check(self, o, t):
-        """Expectations whose time has passed against where the object is now believed to have been then."""
-        c = self.cfg
-        keep = []
-        for (tf, px, py, Pp) in o.checks:
-            if tf > t:
-                keep.append((tf, px, py, Pp))
-                continue
-            if t - tf > c["check_window_s"]:
-                continue                                 # no update near that time: nothing to check it with
-            back = t - tf                                # the present estimate, taken back to that time
-            # half the squared distance in both uncertainties (+ 0.05 m2 each way) and the distance; None: singular
-            r = _NR.radar_check(self.store.a, o.slot, back, px, py, Pp)
-            if r is None:
-                continue
-            m2, e = r
-            o.n_checks += 1
-            o.consistency = m2 if o.consistency is None else o.consistency + 0.25 * (m2 - o.consistency)
-            o.pred_err = e if o.pred_err is None else o.pred_err + 0.25 * (e - o.pred_err)
-        o.checks = keep[-8:]
-        o.flags.discard("unpredictable")
-        if o.n_checks >= 4 and o.consistency is not None and o.consistency > c["inconsistent"]:
-            o.flags.add("unpredictable")                 # it keeps being somewhere else than predicted: believe less
-            rows = self.hyp.rows(o.h)                   # every story of it
-            a = self.store.a
-            a[rows, OFF["Ps"][0]:OFF["Ps"][1]] *= c["inflate"]
-            a[rows, OFF["Pf"][0]:OFF["Pf"][1]] *= c["inflate"]
-            _NR.radar_combine_rows(a, rows)
-            o.consistency = 0.5 * (o.consistency + 1.0)
 
     # ---- life ---------------------------------------------------------------------------------------------
     def manage(self, T):
@@ -701,23 +778,27 @@ class Tracker:
         # "out of view" is what scans say that came and did not cover the object's place; while no scan comes
         # at all (frames dropped, the detector shed by the load governor) nothing has left any field
         scan = T if self.t is None else min(T, self.t)
-        life = self._life(T, pose, scan)
-        for o, (p_st, finite, _, sd, rng) in zip(self.objects, life):
-            last = max(o.last_seen.values())
-            if o.exist < c["delete_exist"] or not finite:
+        self._snap = None
+        slots, tb, rec = self.looked()
+        lasts = [max(o.last_seen.values()) for o in self.objects]
+        life = self._life(T, pose, scan, slots, tb, rec, lasts)
+        sn = ([], [], [])                                # ... of the objects that stay
+        for o, (p_st, finite, _, sd, rng), s, r, m, last in zip(self.objects, life, slots, tb, rec, lasts):
+            exist, cover, hidden, hits = r[OT_PE], r[OT_COVER], r[OT_HIDDEN], int(m[M_HITS])
+            if exist < c["delete_exist"] or not finite:
                 continue
-            if scan - o.last_cover <= c["view_gap_s"]:
+            if scan - cover <= c["view_gap_s"]:
                 # a sensor is looking at where it should be: it lives by being seen
                 # (the time it was hidden behind another object does not count: nothing was to be seen)
-                hid = o.hidden_t > last
-                if T - max(last, o.hidden_t) > max(o.coast_s, c["seen_max_s"]):
+                hid = hidden > last
+                if T - max(last, hidden) > max(o.coast_s, c["seen_max_s"]):
                     continue
                 # (a member of a queue hidden by the queue itself is kept as long as a remembered object)
                 if hid and (T - last > (c["memory_s"] if o.grp_kind == "queue" else c["hidden_s"])
                             or (sd is not None and sd > c["hidden_std_m"])):
                     continue                             # hidden for too long: where it is is no longer known
                 if o.state == "tentative":
-                    if o.exist >= c["confirm_exist"] and o.hits >= c["confirm_hits"] and o.in_map:
+                    if exist >= c["confirm_exist"] and hits >= c["confirm_hits"] and r[OT_INMAP]:
                         o.state = "confirmed"
                         self.real_ids.add(o.id)
                         self._score_learn(o.scores, True)
@@ -727,20 +808,24 @@ class Tracker:
             else:
                 # out of every field: remembered while where it is remains worth knowing
                 if o.state == "tentative":
-                    if scan - o.last_cover > c["memory_tentative_s"]:
+                    if scan - cover > c["memory_tentative_s"]:
                         continue
                 else:
-                    if T - o.last_cover > c["memory_s"] or sd > c["memory_std_m"] or rng > c["memory_range_m"]:
+                    if T - cover > c["memory_s"] or sd > c["memory_std_m"] or rng > c["memory_range_m"]:
                         continue
                     o.state = "memory"
-            self._judge(o, T, p_st)
+            self._judge(o, T, p_st, hits)
             keep.append(o)
+            sn[0].append(s)
+            sn[1].append(r)
+            sn[2].append(m)
         kept = {o.id for o in keep}
         for o in self.objects:                           # never confirmed and gone: its boxes were false ones
             if o.id not in kept and o.state == "tentative" and o.scores:
                 self._score_learn(o.scores, False)
         gone = [o for o in self.objects if o.id not in kept]
         self.objects = keep
+        self._snap = (keep,) + sn
         for o in gone:
             self._drop(o)
         if len(self.real_ids) > 4096:
@@ -764,12 +849,23 @@ class Tracker:
             self.groups = {}
             return
         info = []
-        for o in objs:
-            sm = self.shown_moving(o)
-            stands = o.verdict == "stationary" or (o.verdict != "moving" and sm < c["group_still_m2"] and o.mu[STAND] > 0.3)
-            drives = o.verdict == "moving" and o.speed > c["group_move_mps"]
-            info.append((1.0 if stands else 2.0 if drives else 0.0, 1.0 if o.state in ("confirmed", "coast", "memory") else 0.0))
-        found = _NR.radar_groups(self.store.a, [o.slot for o in objs], info, pose,
+        slots, tb, _ = self.looked()
+        slots, tb = ([v for o, v in zip(self.objects, q) if o.state != "tentative"] for q in (slots, tb))
+        a = self.store.a
+        for o, s, r in zip(objs, slots, tb):
+            v = o.verdict
+            if v == "stationary":
+                kind = 1.0
+            elif v == "moving":                          # it drives: its speed
+                vx, vy = a[s, _GCOLS[6]:_GCOLS[7] + 1].tolist()
+                kind = 2.0 if math.hypot(vx, vy) > c["group_move_mps"] else 0.0
+            else:
+                # it stands as far as is known: its sightings by themselves show no speed (`shown_moving`: the free
+                # estimate a lag ago, smoothed, where there is one), and "it stands" is believed
+                sm = self._shown(*(r[OT_FS:OT_FS + 5] if r[OT_HASVS] else a[s, _GCOLS[:5]].tolist()))
+                kind = 1.0 if sm < c["group_still_m2"] and a[s, _GCOLS[5]] > 0.3 else 0.0
+            info.append((kind, 1.0 if o.state in ("confirmed", "coast", "memory") else 0.0))
+        found = _NR.radar_groups(self.store.a, slots, info, pose,
                                  (c["group_gap_stand_m"], c["group_gap_move_m"], c["group_dv"], c["group_line_m"],
                                   c["group_line_rel"], c["group_lane_m"], c["group_min"]))
         support = self.group_t is None or T - self.group_t >= c["group_s"]
@@ -861,17 +957,17 @@ class Tracker:
         for q in self.objects:                           # their primaries may have changed
             pass
 
-    def _life(self, T, pose, scan):
+    def _life(self, T, pose, scan, slots, tb, rec, lasts):
         """Per object: (p_still, its combined state finite, and for one out of every field (not tentative) where
         it will be at T: the probability that it stands, 1 sigma of its place (larger axis), its range; else
         None x 3)."""
         c = self.cfg
         objs = self.objects
         kin = [o.kin for o in objs]
-        return _NR.radar_life(self.store.a, [o.slot for o in objs], [k[3] for k in kin],
-                              [1.0 if o.state != "tentative" and (scan - o.last_cover > c["view_gap_s"] or o.hidden_t > max(o.last_seen.values()))
-                               else 0.0 for o in objs],
-                              [T - o.t for o in objs], kin, M._native_par(self.mcfg), pose[:2] if pose else None,
+        return _NR.radar_life(self.store.a, slots, [k[3] for k in kin],
+                              [1.0 if o.state != "tentative" and (scan - r[OT_COVER] > c["view_gap_s"] or r[OT_HIDDEN] > last)
+                               else 0.0 for o, r, last in zip(objs, tb, lasts)],
+                              [T - m[M_T] for m in rec], kin, M._native_par(self.mcfg), pose[:2] if pose else None,
                               self.mcfg["stand_drift"] ** 2)
 
     def _register(self, T):
@@ -918,14 +1014,16 @@ class Tracker:
                 return 0.0
         return 2.0 if c["consider_stand"] else 1.0
 
-    def _judge(self, o, T, p):
+    def _judge(self, o, T, p, hits=None):
         """"stationary" | "moving" | "unknown" from how much the standing hypothesis is believed, with hysteresis;
         no verdict before the object has been seen often and long enough for the hypotheses to differ."""
         c = self.cfg
+        if hits is None:
+            hits = o.hits
         if o.velocity_seen:
-            ripe = o.hits >= c["verdict_hits_velocity"] and T - o.t0 >= c["verdict_s_velocity"]
+            ripe = hits >= c["verdict_hits_velocity"] and T - o.t0 >= c["verdict_s_velocity"]
         else:
-            ripe = o.hits >= c["verdict_hits"] and T - o.t0 >= c["verdict_s"]
+            ripe = hits >= c["verdict_hits"] and T - o.t0 >= c["verdict_s"]
         v = o.verdict
         if v == "stationary" and p < c["release_p"]:
             v = "unknown"
@@ -955,11 +1053,13 @@ class Tracker:
         nearj, nearset = {}, set()
         e = self.ego.pose_at(T)
         here, poses = [], {}
-        for o in obs:
-            if o.t not in poses:
-                poses[o.t] = self.ego.pose_at(o.t)[:2]
-            here.append(poses[o.t])
-        for i, j, same in _NR.radar_merge(self.store.a, [o.slot for o in obs], [o.t for o in obs], [o.kin for o in obs],
+        slots, _, rec = self.looked()
+        ts = [m[M_T] for m in rec]
+        for ot in ts:
+            if ot not in poses:
+                poses[ot] = self.ego.pose_at(ot)[:2]
+            here.append(poses[ot])
+        for i, j, same in _NR.radar_merge(self.store.a, slots, ts, [o.kin for o in obs],
                                           M._native_par(self.mcfg), here, e[:2], (c["merge_m"], c["merge_rel"], c["merge_dv"], c["merge_d2"])):
             nearj.setdefault(i, []).append((j, same))
             nearset.add((i, j))
@@ -996,6 +1096,8 @@ class Tracker:
                 old.sources |= new.sources
                 for s, t in new.last_seen.items():
                     old.last_seen[s] = max(old.last_seen.get(s, -1e18), t)
+                self._range_seen(old)
+                self._snap = None
                 if old.state == "tentative" and new.state != "tentative":
                     old.state = new.state
                 dead.add(new.id)

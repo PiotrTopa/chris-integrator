@@ -593,7 +593,7 @@ def test_radar_golden():
             assert G.same(hyp, codec.dec(c["hyp_after"]), where + " hypotheses") is None
     need = ("Hyp.scan", "Hyp.drop", "radar_h", "radar_peek_pos", "radar_life", "radar_merge", "radar_frame", "radar_check",
             "radar_register", "radar_combine_rows", "radar_marginals", "radar_assign", "radar_kbest", "Hyp.smooth",
-            "radar_groups", "radar_group_support", "radar_cells")
+            "radar_groups", "radar_group_support", "radar_cells", "Hyp.cycle", "Hyp.after")
     assert all(seen.get(k, 0) >= 3 for k in need), seen
 
 

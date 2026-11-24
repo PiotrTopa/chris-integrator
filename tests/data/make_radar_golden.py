@@ -4,10 +4,12 @@
     python3 tests/data/make_radar_golden.py
 
 writes
-  tests/data/radar_golden.npz      calls of every native radar function (and of the hypotheses: Hyp.scan,
-                                   Hyp.drop) sampled on simulated drives, with their results
+  tests/data/radar_golden.npz      calls of every native radar function (and of the hypotheses: Hyp.cycle,
+                                   Hyp.after, Hyp.drop) sampled on simulated drives, with their results
                                    (tests/test_native.py::test_radar_golden replays them, to rounding: it also
-                                   runs where the phone's build is tested)
+                                   runs where the phone's build is tested). The cases of LEGACY functions, which
+                                   the tracker called before a scan became one native call (their arithmetic is
+                                   now inside Hyp.cycle and Hyp.after), are carried over from the file as it is
   tests/data/radar_digests.json    sha256 of the radar's messages on the simulated drives of
                                    tests/test_native.py::RADAR_DIGEST_RUNS (held byte for byte on x86-64)
   chris_integrator/native/_radar_selftest.py   a few results for the self-test on a target
@@ -25,7 +27,8 @@ HERE = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(HERE, "tests"))
 
-PER_FN = {"Hyp.scan": 16, "Hyp.drop": 6, "Hyp.smooth": 8, "radar_frame": 8}
+PER_FN = {"Hyp.cycle": 16, "Hyp.after": 10, "Hyp.drop": 6, "radar_frame": 8}
+LEGACY = ("Hyp.scan", "Hyp.smooth", "radar_check", "radar_peek_pos")
 DEFAULT_N = 6
 MAX_ROWS = 40                   # a case's state array has at most this many rows in use
 
@@ -64,6 +67,12 @@ class Trace:
         if slot is None:
             return fn(*args)
         codec = self.lib.Codec()
+
+        def wrap(v):                                     # a function among the arguments: what it is asked is recorded
+            if isinstance(v, tuple):
+                return tuple(wrap(x) for x in v)
+            return self.lib.Calls(v, codec) if callable(v) else v
+        args = tuple(wrap(a) for a in args)
         case = {"fn": name, "hyp": codec.enc(hyp.dump()) if hyp is not None else None, "args": codec.enc(list(args))}
         before = [a.copy() if isinstance(a, np.ndarray) else None for a in args]
         dicts = [json.dumps(codec.enc(a), sort_keys=True) if isinstance(a, dict) else None for a in args]
@@ -93,7 +102,7 @@ class HypTrace:
 
     def __getattr__(self, name):
         v = getattr(self._H, name)
-        if name in ("scan", "drop", "smooth"):
+        if name in ("scan", "drop", "smooth", "cycle", "after"):
             return lambda *a: self._tr.call("Hyp." + name, v, self._H, a)
         return v
 
@@ -216,6 +225,29 @@ def main():
             cases.append(ren(case))
             arrays.update({pre + k: a for k, a in arr.items()})
     path = os.path.join(HERE, "tests", "data", "radar_golden.npz")
+    if os.path.exists(path):                             # the cases of functions the tracker no longer calls
+        old_cases, old = lib.load(path)
+        for case in old_cases:
+            if case["fn"] not in LEGACY or case["fn"] in trace.kept:
+                continue
+            pre = "c%d_" % len(cases)
+
+            def carry(v):
+                if isinstance(v, list):
+                    return [carry(x) for x in v]
+                if isinstance(v, dict):
+                    r = {}
+                    for k, x in v.items():
+                        if k in ("array", "state", "rows"):
+                            r[k] = pre + x
+                            arrays[pre + x] = old.arrays[x]
+                            if k != "array":
+                                arrays[pre + x + "i"] = old.arrays[x + "i"]
+                        else:
+                            r[k] = carry(x)
+                    return r
+                return v
+            cases.append(carry(case))
     lib.save(path, cases, arrays)
     print("wrote %s: %d cases, %.0f kB" % (path, len(cases), os.path.getsize(path) / 1e3))
     print("  " + ", ".join("%s %d of %d" % (k, len(v), trace.seen[k]) for k, v in sorted(trace.kept.items())))
