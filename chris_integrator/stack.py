@@ -176,7 +176,12 @@ def build(cfg=None, config_dir=None, datadir=None, clock=None, mapper="auto", ex
     if lead:
         est_cfg["lead"] = dict(lead, **(est_cfg.get("lead") or {}))
     view_cfg = conf("view")
-    boxes = [RideWatch(), RoadUsers(conf("road_users") or None), Estimator(est_cfg)]
+    disable = set(wiring.get("disable") or ())
+    replace = wiring.get("replace") or {}
+    # range-sensor scans are tracked once: by the radar box where it runs (the estimator then takes the car's own
+    # velocity from them and nothing else), by the estimator's object layer where it does not
+    boxes = [RideWatch(), RoadUsers(conf("road_users") or None),
+             Estimator(est_cfg, radar_objects="radar" in disable or "radar" in replace)]
     boxes.append(Radar(conf("radar") or None))        # the objects around the car (chris_integrator/radar)
     boxes.append(Decide(conf("decide") or None))      # how threatening each object is; the alerts (chris_integrator/decide)
     if external_map:
@@ -191,8 +196,6 @@ def build(cfg=None, config_dir=None, datadir=None, clock=None, mapper="auto", ex
               EgoLight(conf("lights")), SignContext(), View(view_cfg or None),
               Rules(dict(conf("rules"), rules=rules)), Fused(dict(conf("fused"), rules=rules))]
     boxes.append(Predict(conf("predict") or None))  # the radar's objects' futures (chris_integrator/predict)
-    disable = set(wiring.get("disable") or ())
-    replace = wiring.get("replace") or {}
     for b in boxes:
         if b.name in replace:
             b = _make(replace[b.name])

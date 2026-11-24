@@ -12,6 +12,8 @@ What it gives the integrator:
 
 Any number of radars: one `RadarSource` per sensor id with its `Mount`. `{"kind": "radar", "id": "*"}` in the
 configuration registers one per sensor id as its scans arrive (mount from the message, else at the camera).
+`"objects": false` keeps the car's own velocity and the calibration states and gives the object layer no
+detections: where the radar box (chris_integrator/radar) runs, it is the one tracker of these scans.
 """
 import math
 import random
@@ -182,6 +184,8 @@ class RadarSource(Source):
     sigma = (0.25, math.radians(0.5), 0.15)      # range m, azimuth rad, range rate m/s
     roadside_m = 5.0             # stationary detections further than this from the car's axis start no tracks
     ego_motion = True
+    objects = True               # False: the scans give the car's own velocity only, no detections for the object
+                                 # layer (the radar box, chris_integrator/radar, tracks them: `{"objects": false}`)
 
     def __init__(self, sensor, mount=None, **kw):
         self.id = sensor
@@ -277,6 +281,8 @@ class RadarSource(Source):
         return out
 
     def scan(self, msg, ctx):
+        if not self.objects:
+            return None
         p = self._parse(msg, ctx)
         if p is None:
             return None
@@ -317,9 +323,10 @@ class RadarAuto(Source):
     stale_s = 1e9
     info = "registers radars as they appear"
 
-    def __init__(self, defaults=None, **kw):
+    def __init__(self, defaults=None, objects=True, **kw):
         super().__init__(**kw)
         self.defaults = defaults or {}
+        self.objects = bool(objects)
         self.known = set()
 
     def measure(self, msg, ctx):
@@ -333,7 +340,9 @@ class RadarAuto(Source):
         if any(s.id == sid for s in ctx.integ.specs):
             return []
         m = msg.get("mount") or self.defaults.get(sid) or {}
-        ctx.integ.register(RadarSource(sid, _mount(m)))
+        src = RadarSource(sid, _mount(m))
+        src.objects = self.objects
+        ctx.integ.register(src)
         return []
 
 
@@ -343,9 +352,9 @@ def _mount(m):
 
 def _factory(spec):
     if spec.get("id", "*") == "*":
-        return RadarAuto(spec.get("mounts"))
+        return RadarAuto(spec.get("mounts"), spec.get("objects", True))
     src = RadarSource(spec["id"], _mount(spec.get("mount") or {}))
-    for k in ("fov", "max_range", "roadside_m", "ego_motion", "rank"):
+    for k in ("fov", "max_range", "roadside_m", "ego_motion", "rank", "objects"):
         if k in spec:
             setattr(src, k, spec[k])
     return src
