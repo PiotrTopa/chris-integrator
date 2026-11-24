@@ -2194,8 +2194,19 @@ static void ego_modes(PCtx *c, PPath *tmp)
             ss = cfg[PC_idm_s0_m];
         a_idm = p_clip(a * (1.0 - p_sq(ss / g)), -cfg[PC_brake_max], 0.3);
     }
-    double x, y, th, kap;
-    pp_eval(&c->base, 0.0, &x, &y, &th, &kap);
+    /* the yaw rate the road asks for here: the path's mean curvature over the next max(5 m, v x 1 s), from the
+     * turn of its chords (positions at 0, half, all of it). Not the curvature at s = 0: the path there joins the
+     * arc behind the car (5 m steps) to the given points (decimetres apart), and the half heading step at the join
+     * read over a short segment made 3-4 times the road's curvature, so every steady bend took the car off its path
+     * (p_path at its 0.05 floor, curve_parked R 110 m, 2026-11-24) */
+    double kap;
+    {
+        double s1 = e[PE_V] > 5.0 ? e[PE_V] : 5.0, xa, ya, xb, yb, xc, yc, th, k;
+        pp_eval(&c->base, 0.0, &xa, &ya, &th, &k);
+        pp_eval(&c->base, 0.5 * s1, &xb, &yb, &th, &k);
+        pp_eval(&c->base, s1, &xc, &yc, &th, &k);
+        kap = wrap_pi(atan2(yc - yb, xc - xb) - atan2(yb - ya, xb - xa)) / (0.5 * s1);
+    }
     double l_yaw = exp(p_logn(e[PE_W] - kap * e[PE_V], 0.0, 0.05, 0.05));
     double p_path = have_path ? cfg[PC_ego_path_p] * l_yaw / (cfg[PC_ego_path_p] * l_yaw + 1.0 - cfg[PC_ego_path_p]) : 0.0;
     if (p_path < 0.05 && have_path)

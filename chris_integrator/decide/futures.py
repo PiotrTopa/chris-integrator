@@ -91,6 +91,9 @@ def extent(o):
     L, sL = _vs(o, "len")
     W, sW = _vs(o, "wid")
     h, sh = _vs(o, "hdg")
+    es = o.get("ext_std")                   # the radar's 1 sigma of len, wid, hdg (docs/TOPICS.md): the heading's
+    if sh is None and h is not None and isinstance(es, (list, tuple)) and len(es) >= 3 and _fin(es[2]):
+        sh = float(es[2])                   # (len, wid keep the class's spread: the box's length is a view's)
     src = "radar" if (L is not None and W is not None) else "class"
     L = L if L is not None and 0.1 <= L <= 40.0 else L0
     W = W if W is not None and 0.1 <= W <= 5.0 else W0
@@ -140,6 +143,24 @@ def heading_from_motion(o):
     return sp >= max(2.0, 2.0 * sv)
 
 
+def travel_heading(o):
+    """(heading, 1 sigma) of the radar's direction of travel (where heading_from_motion): the velocity's spread
+    across it over the speed."""
+    sd = o.get("std") or ()
+    sv = max(float(sd[2]), float(sd[3])) if len(sd) >= 4 and _fin(sd[2]) and _fin(sd[3]) else 0.0
+    sp = o.get("speed_mps") if _fin(o.get("speed_mps")) else math.hypot(float(o.get("vx_mps") or 0.0),
+                                                                        float(o.get("vy_mps") or 0.0))
+    return float(o["heading_rad"]), math.atan2(sv, max(sp, 1e-6))
+
+
+def heading_resolved(sh, resolved):
+    """The radar's heading of the box is a measurement of the object's heading: its stated 1 sigma at most
+    `resolved` (or not stated). A box fitted to a vehicle seen whole states its heading within about 0.1 rad; one
+    fitted to a partial view (side-on beside the car, cut by the field's edge) states 0.2-0.8 rad and is often a
+    quarter turn off (a car parked along the road drawn across it)."""
+    return not (math.isfinite(sh) and sh > resolved)
+
+
 def road_axis(h, sh, road, snap, sd):
     """(heading, sd) of a standing object: the road's axis at its place (either direction, whichever is nearer the
     stated heading) when the stated heading is within `snap` of it or not known; else as stated."""
@@ -163,6 +184,14 @@ def in_path_weight(o, lane, floor):
     return min(1.0, max(floor, float(vals.get("ego", 0.0)) + float(vals.get("cross", 0.0))))
 
 
+def along_lane_p(lane):
+    """The prediction's probability that the object is in a lane along the road (the car's, beside it, oncoming); 0
+    without lanes."""
+    if not isinstance(lane, dict):
+        return 0.0
+    return float(sum(lane.get(k, 0.0) for k in ("ego", "left", "right", "onc") if _fin(lane.get(k, 0.0))))
+
+
 def mode_stands(x, y, move_m):
     """A mode whose place moves less than move_m over the horizon."""
     return float(np.max(np.hypot(np.asarray(x) - x[0], np.asarray(y) - y[0]))) < move_m
@@ -180,6 +209,7 @@ class FrameFutures:
         self.lane = {}                    # object id -> the prediction's lane probabilities
         self.intent = {}
         self.road_hdg = {}                # object id -> the path's direction at its place (an unknown heading)
+        self.along = set()                # ids the adapter judged to drive along the path or against it (cv_path)
 
 
 def _grid(top):
@@ -467,6 +497,8 @@ def build(radar_msg, cfg, path=None, companion=None):
             modes = cv_futures(o, t, cfg, path)
             F.degraded["objects"] += 1
             src = "cv"
+            if any(m[0].endswith("_path") for m in modes):
+                F.along.add(o.get("id"))
         else:
             src = "contract"
         if path is not None:

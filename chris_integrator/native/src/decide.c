@@ -49,7 +49,7 @@
 enum {
     DC_FRONT, DC_REAR, DC_HALFW, DC_V0, DC_A0, DC_ALONG, DC_ALAT, DC_TREACT, DC_TAUB, DC_TAUS, DC_DT, DC_NMAX,
     DC_KSIG, DC_MLONG, DC_MLAT, DC_METHOD, DC_NSAMP, DC_PRUNE, DC_SDEL, DC_SDET, DC_NDIRS, DC_AFAC, DC_TOLA,
-    DC_TOLT, DC_REF, DC_OTHERS, DC_PMIN, DC_HMAX, DC_HEXT, DC_ECAPL, DC_ECAPT, DC_ICAPL, DC_ICAPT, DC_NC
+    DC_TOLT, DC_REF, DC_OTHERS, DC_PMIN, DC_HMAX, DC_HEXT, DC_ECAPL, DC_ECAPT, DC_ICAPL, DC_ICAPT, DC_TMHIT, DC_NC
 };
 
 /* pair fields */
@@ -417,8 +417,9 @@ static void dk_path_at(const DkEgo *e, double s, double *x, double *y, double *t
     *th = h0 + f * dh;
 }
 
-/* the object's rectangle at step i, inflated by k sigma along its axes (+ margins), with the car's covariance */
-static void dk_obj_rect(const double *cfg, const DkObj *o, int i, double esxx, double esxy, double esyy, int infl,
+/* the object's rectangle at step i, inflated by k sigma along its axes (+ margins), with the car's covariance; the
+ * inflation (spread and margins together) scaled by infl in [0, 1] (0: the rectangle as it is) */
+static void dk_obj_rect(const double *cfg, const DkObj *o, int i, double esxx, double esxy, double esyy, double infl,
                         DkRect *r)
 {
     r->cx = o->cx[i];
@@ -427,7 +428,7 @@ static void dk_obj_rect(const double *cfg, const DkObj *o, int i, double esxx, d
     r->s = o->s[i];
     r->hl = o->hl;
     r->hw = o->hw;
-    if (infl) {
+    if (infl > 0.0) {
         double sxx = o->sxx[i] + esxx, sxy = o->sxy[i] + esxy, syy = o->syy[i] + esyy;
         double c = r->c, s = r->s;
         double va = c * c * sxx + 2.0 * c * s * sxy + s * s * syy;
@@ -436,8 +437,8 @@ static void dk_obj_rect(const double *cfg, const DkObj *o, int i, double esxx, d
         double ia = k * sqrt(va > 0.0 ? va + 0.25 * o->sdl * o->sdl : 0.25 * o->sdl * o->sdl);
         double ic = k * sqrt(vc > 0.0 ? vc + 0.25 * o->sdw * o->sdw : 0.25 * o->sdw * o->sdw);
         /* bounded: a poorly ranged object's spread is the collision probability's matter, not a wall */
-        r->hl += (ia < cfg[DC_ICAPL] ? ia : cfg[DC_ICAPL]) + cfg[DC_MLONG];
-        r->hw += (ic < cfg[DC_ICAPT] ? ic : cfg[DC_ICAPT]) + cfg[DC_MLAT];
+        r->hl += infl * ((ia < cfg[DC_ICAPL] ? ia : cfg[DC_ICAPL]) + cfg[DC_MLONG]);
+        r->hw += infl * ((ic < cfg[DC_ICAPT] ? ic : cfg[DC_ICAPT]) + cfg[DC_MLAT]);
     }
 }
 
@@ -456,12 +457,38 @@ typedef struct {
 } DkCtx;
 
 /* the judged object mode's footprint per step, inflated by k sigma of its own spread (the threat numbers and the
- * collision course: what the car must keep clear of; the car's own spread enters the collision probability only) */
+ * collision course: what the car must keep clear of; the car's own spread enters the collision probability only).
+ *
+ * A margin larger than the gap the car has now (a car parked beside the path, passed 0.4 m off its side with a
+ * spread of 1 m) cannot be kept by any demand and says nothing about a collision to come: the inflation is scaled
+ * down (the same share over the whole horizon) until the inflated footprint is clear of the car now; none where the
+ * footprint as it is touches the car now. */
 static void dk_pair_prep(DkCtx *C, int j, int k)
 {
-    (void)j;                                   /* the car executes the demand: its own spread is not added here */
+    const DkEgo *e = &C->eg[j];
+    DkRect er, r;
+    dk_ego_rect(C->cfg, e->x[0], e->y[0], e->th[0], &er);
+    double f = 1.0;
+    dk_obj_rect(C->cfg, &C->ob[k], 0, 0.0, 0.0, 0.0, 1.0, &r);
+    if (dk_sep(&er, &r) < 0.0) {
+        dk_obj_rect(C->cfg, &C->ob[k], 0, 0.0, 0.0, 0.0, 0.0, &r);
+        if (dk_sep(&er, &r) < 0.0)
+            f = 0.0;
+        else {                                  /* the largest share that keeps it clear now */
+            double lo = 0.0, hi = 1.0;
+            for (int q = 0; q < 12; q++) {
+                double m = 0.5 * (lo + hi);
+                dk_obj_rect(C->cfg, &C->ob[k], 0, 0.0, 0.0, 0.0, m, &r);
+                if (dk_sep(&er, &r) < 0.0)
+                    hi = m;
+                else
+                    lo = m;
+            }
+            f = lo;
+        }
+    }
     for (int i = 0; i < C->g.n; i++)
-        dk_obj_rect(C->cfg, &C->ob[k], i, 0.0, 0.0, 0.0, 1, &C->tgt[i]);
+        dk_obj_rect(C->cfg, &C->ob[k], i, 0.0, 0.0, 0.0, f, &C->tgt[i]);
 }
 
 /* simulate the car on ego mode j: its own motion until ts, then a constant demand (along: deceleration a_long
@@ -664,7 +691,7 @@ static double dk_pc(const DkCtx *C, int j, int k, double *t_contact)
             if (!live[i])
                 continue;
             DkRect orr;
-            dk_obj_rect(cfg, o, i, 0.0, 0.0, 0.0, 0, &orr);
+            dk_obj_rect(cfg, o, i, 0.0, 0.0, 0.0, 0.0, &orr);
             double esxx, esxy, esyy;
             dk_ego_cov(cfg, i * dt, e->th[i], &esxx, &esxy, &esyy);
             double c = orr.c, s = orr.s, a2 = 0.25 * o->sdl * o->sdl, b2 = 0.25 * o->sdw * o->sdw;
@@ -747,7 +774,7 @@ static double dk_first_contact(const DkCtx *C, int j, int k, int infl, double *s
         if (infl)
             orr = C->tgt[i];
         else
-            dk_obj_rect(C->cfg, &C->ob[k], i, 0.0, 0.0, 0.0, 0, &orr);
+            dk_obj_rect(C->cfg, &C->ob[k], i, 0.0, 0.0, 0.0, 0.0, &orr);
         double sp = dk_sep(&er, &orr);
         if (sp < best)
             best = sp;
@@ -1013,7 +1040,7 @@ static PyObject *n_decide_eval(PyObject *self, PyObject *args)
                 r->s = 0.0;
                 continue;
             }
-            dk_obj_rect(cfg, &ob[top[m]], i, 0.0, 0.0, 0.0, 0, r);
+            dk_obj_rect(cfg, &ob[top[m]], i, 0.0, 0.0, 0.0, 0.0, r);
             r->hl += cfg[DC_MLONG];
             r->hw += cfg[DC_MLAT];
         }
@@ -1116,13 +1143,21 @@ static PyObject *n_decide_eval(PyObject *self, PyObject *args)
                     if (best < tn)
                         tn = best;
                     pp[DP_TN] = tn;
-                    double tb = dk_latest(&C, j, k, along, 0.0, tmax);
-                    double tl = dk_latest(&C, j, k, 0.0, alat, tmax), tr = dk_latest(&C, j, k, 0.0, -alat, tmax);
-                    double ts = tl > tr ? tl : tr;
-                    pp[DP_TTB] = tb < 0.0 ? 0.0 : tb;
-                    pp[DP_TTS] = ts < 0.0 ? 0.0 : ts;
-                    double latest = tb > ts ? tb : ts;
-                    pp[DP_TM] = (latest < 0.0 ? 0.0 : latest) - cfg[DC_TREACT];
+                    /* the time margin: the time left to start the last action that avoids the collision with its
+                     * margin (the inflated footprint, as the threat numbers). It needs a collision to have a time:
+                     * where the mean futures miss (cfg DC_TMHIT; only the margin is breached) there is none, and
+                     * the pair's level is its threat number's (and its probability's mass) */
+                    if (cfg[DC_TMHIT] > 0.5 && isnan(pp[DP_TTC])) {
+                        pp[DP_TTB] = pp[DP_TTS] = pp[DP_TM] = NAN;
+                    } else {
+                        double tb = dk_latest(&C, j, k, along, 0.0, tmax);
+                        double tl = dk_latest(&C, j, k, 0.0, alat, tmax), tr = dk_latest(&C, j, k, 0.0, -alat, tmax);
+                        double ts = tl > tr ? tl : tr;
+                        pp[DP_TTB] = tb < 0.0 ? 0.0 : tb;
+                        pp[DP_TTS] = ts < 0.0 ? 0.0 : ts;
+                        double latest = tb > ts ? tb : ts;
+                        pp[DP_TM] = (latest < 0.0 ? 0.0 : latest) - cfg[DC_TREACT];
+                    }
                 }
                 int le = dk_level(thr, set, 0, pp[DP_COURSE], pp[DP_TN], isnan(pp[DP_TM]) ? INFINITY : pp[DP_TM]);
                 int lx = dk_level(thr, set, 1, pp[DP_COURSE], pp[DP_TN], isnan(pp[DP_TM]) ? INFINITY : pp[DP_TM]);
