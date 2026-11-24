@@ -7,9 +7,7 @@ writes
   tests/data/radar_golden.npz      calls of every native radar function (and of the hypotheses: Hyp.cycle,
                                    Hyp.after, Hyp.drop) sampled on simulated drives, with their results
                                    (tests/test_native.py::test_radar_golden replays them, to rounding: it also
-                                   runs where the phone's build is tested). The cases of LEGACY functions, which
-                                   the tracker called before a scan became one native call (their arithmetic is
-                                   now inside Hyp.cycle and Hyp.after), are carried over from the file as it is
+                                   runs where the phone's build is tested)
   tests/data/radar_digests.json    sha256 of the radar's messages on the simulated drives of
                                    tests/test_native.py::RADAR_DIGEST_RUNS (held byte for byte on x86-64)
   chris_integrator/native/_radar_selftest.py   a few results for the self-test on a target
@@ -27,8 +25,7 @@ HERE = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(HERE, "tests"))
 
-PER_FN = {"Hyp.cycle": 16, "Hyp.after": 10, "Hyp.drop": 6, "radar_frame": 8}
-LEGACY = ("Hyp.scan", "Hyp.smooth", "radar_check", "radar_peek_pos")
+PER_FN = {"Hyp.cycle": 16, "Hyp.after": 10, "Hyp.drop": 6, "Hyp.history": 6, "radar_frame": 8}
 DEFAULT_N = 6
 MAX_ROWS = 40                   # a case's state array has at most this many rows in use
 
@@ -102,7 +99,7 @@ class HypTrace:
 
     def __getattr__(self, name):
         v = getattr(self._H, name)
-        if name in ("scan", "drop", "smooth", "cycle", "after"):
+        if name in ("drop", "cycle", "after", "history"):
             return lambda *a: self._tr.call("Hyp." + name, v, self._H, a)
         return v
 
@@ -125,6 +122,19 @@ def drives(trace):
             radar_score.run(name, seed=1, cfg={"tracker": {"hyp_keep_steps": 8}})
         radar_score.run("occlusion", seed=1, radar="point", cfg={"tracker": {"hyp_keep_steps": 8}})
         radar_score.run("platoon", seed=1, radar="extended", cfg={"tracker": {"hyp_keep_steps": 8}})
+        frame = box.Radar.frame
+
+        def asked(self, ts):                             # the trajectories are asked for now and then (Hyp.history)
+            m = frame(self, ts)
+            if m is not None and m["seq"] % 9 == 0:
+                for o in self.tracker.objects:
+                    o.history
+            return m
+        box.Radar.frame = asked
+        try:
+            radar_score.run("slow_lead", seed=1, cfg={"tracker": {"hyp_keep_steps": 8}})
+        finally:
+            box.Radar.frame = frame
     finally:
         models.NR, tracker._NR, box._NR, sensors._NR = saved[:4]
         tracker.CFG.clear()
@@ -178,9 +188,9 @@ def selftest(C):
         S = row[None].copy()
         C.radar_combine_rows(S, [0])
         dt, label = (0.2, 0.05, 1.0)[it], ("car", "human", None)[it]
-        out = np.empty((1, 6))
-        C.radar_peek_pos(S, [0], [dt], [R._KIN4.get(label) or R._KIN4[None]], R._native_par(R.CFG), out)
-        ev.append((S[0, :363].tolist(), dt, label, out[0].tolist()))
+        x, P, mu = np.empty((1, 8)), np.empty((1, 8, 8)), np.empty((1, 3))
+        C.radar_peek(S, [0], [dt], [R._KIN4.get(label) or R._KIN4[None]], R._native_par(R.CFG), x, P, mu)
+        ev.append((S[0, :363].tolist(), dt, label, [float(v) for v in (x[0, 0], x[0, 1], P[0, 0, 0], P[0, 0, 1], P[0, 1, 0], P[0, 1, 1])]))
     sens = ([0.0, 1.3, 6.882437470997847, 0.004, 1.0, -0.6, 0.55, 8.0, 80.0, 0.55, 0.4, 14.0, 2.0, 0.1, 1.25, 0.2, 1.15,
              0.1665698348469775, 0.49970950454093244, 0.575, 1.5, 3.0, 0.7, 0.5] + [0.0] * 8,
             [1.0, 2.0, 0.3, 0.05, 0.9, 160.0, 0.9, 1e-4] + [0.0] * 24, [2.0, 1.0, 70.0, 0.85, 1e-4] + [0.0] * 27)
@@ -225,29 +235,6 @@ def main():
             cases.append(ren(case))
             arrays.update({pre + k: a for k, a in arr.items()})
     path = os.path.join(HERE, "tests", "data", "radar_golden.npz")
-    if os.path.exists(path):                             # the cases of functions the tracker no longer calls
-        old_cases, old = lib.load(path)
-        for case in old_cases:
-            if case["fn"] not in LEGACY or case["fn"] in trace.kept:
-                continue
-            pre = "c%d_" % len(cases)
-
-            def carry(v):
-                if isinstance(v, list):
-                    return [carry(x) for x in v]
-                if isinstance(v, dict):
-                    r = {}
-                    for k, x in v.items():
-                        if k in ("array", "state", "rows"):
-                            r[k] = pre + x
-                            arrays[pre + x] = old.arrays[x]
-                            if k != "array":
-                                arrays[pre + x + "i"] = old.arrays[x + "i"]
-                        else:
-                            r[k] = carry(x)
-                    return r
-                return v
-            cases.append(carry(case))
     lib.save(path, cases, arrays)
     print("wrote %s: %d cases, %.0f kB" % (path, len(cases), os.path.getsize(path) / 1e3))
     print("  " + ", ".join("%s %d of %d" % (k, len(v), trace.seen[k]) for k, v in sorted(trace.kept.items())))
