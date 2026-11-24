@@ -257,8 +257,10 @@ class RoadGeometryTracker:
         src = "vehicle" if from_vehicle(sp.get("sources")) else "vision"
         return v, src, (-yr["value"] if yr.get("valid") else 0.0)
 
-    def _measure(self, road):
-        """-> (x[n], y[6,n], std[6,n], prob[6], ok[6]) from a road message, or None when it carries no lines."""
+    def _measure(self, road, reuse=False):
+        """-> (x[n], y[6,n], std[6,n], prob[6], ok[6]) from a road message, or None when it carries no lines.
+        reuse (on_road only): the arrays are the tracker's frame buffers, overwritten by the next frame; else new
+        ones (a caller may keep them)."""
         c = self.cfg
         ll = road.get("lane_lines") or []
         re = road.get("road_edges") or []
@@ -282,10 +284,12 @@ class RoadGeometryTracker:
         n = len(x)
         srcs = [ll[i] if i < N_LANE and i < len(ll) else re[i - N_LANE] if i >= N_LANE and i - N_LANE < len(re) else None
                 for i in range(N_LINES)]
-        # the frame's arrays: the same ones every frame while n stays (the native function writes every element;
-        # nothing keeps them past the frame: rows taken into a track are copied)
+        # the frame's arrays: for on_road the same ones every frame while n stays (the native function writes
+        # every element; nothing keeps them past the frame: rows taken into a track are copied), else new ones
         b = self._mbuf
-        if b is None or b[0] != n:
+        if not reuse:
+            b = (n, (np.empty((N_LINES, n)), np.empty((N_LINES, n)), np.empty(N_LINES), np.empty(N_LINES, bool)))
+        elif b is None or b[0] != n:
             b = self._mbuf = (n, (np.empty((N_LINES, n)), np.empty((N_LINES, n)), np.empty(N_LINES),
                                   np.empty(N_LINES, bool)),
                               (np.empty((N_LINES, n)), np.empty((N_LINES, n)), np.empty(n, bool), np.empty(N_LINES),
@@ -306,7 +310,7 @@ class RoadGeometryTracker:
         if not _fin(ts):
             return None
         es = ego if ego is not None else self._local.at(road)
-        z = self._measure(road)
+        z = self._measure(road, True)
         if z is None:
             return None
         x, zy, zs, prob, ok = z
