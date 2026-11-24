@@ -449,7 +449,7 @@ class RulesInEffect:
         return out
 
     def _key(self):
-        val, kind, tid = self.speed.limit_key()        # (= current()'s value, source kind and track id)
+        val, kind, tid, _ = self.speed.limit_key()        # (= current()'s value, source kind and track id)
         return (val, kind, tid, self.speed.area["type"], self.speed.zone["type"],
                 self.speed.road_class["type"], tuple(sorted((rid, r["info"]["track_id"], r["confirmations"]) for rid, r in self.active.items())),
                 tuple(r["info"]["track_id"] for r in self.recent), tuple(w["info"]["track_id"] for w in self.ahead),

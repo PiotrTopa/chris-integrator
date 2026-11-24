@@ -511,13 +511,15 @@ class SpeedLimit:
         return val, src, round(conf, 3), None
 
     def limit_key(self):
-        """(value, source kind, source track_id) of `current()`, without building its source, confidence and
-        expiry: what a change key needs (RulesInEffect._key, every message). Must follow `current()`."""
+        """(value, source kind, source track_id, source rule) of `current()`, without building its source,
+        confidence and expiry: what the change keys need (`_update_output`, RulesInEffect._key: every message).
+        Must follow `current()`."""
         lim = self.limit
         if lim:
-            return lim["value_kmh"], "sign", lim["info"].get("track_id")
-        val = self.default_limit()[0]
-        return val, "default" if val is not None else "unknown", None
+            info = lim["info"]
+            return lim["value_kmh"], "sign", info.get("track_id"), info.get("rule")
+        val, rule, _ = self.default_limit()
+        return val, "default" if val is not None else "unknown", None, rule
 
     def pending(self):
         out = []
@@ -535,9 +537,8 @@ class SpeedLimit:
         return out
 
     def _update_output(self):
-        val, src, conf, _ = self.current()
-        key = (val, src.get("kind"), src.get("track_id"), src.get("rule"), self.area["type"],
-               self.zone["type"], self.road_class["type"])
+        val, kind, tid, rule = self.limit_key()        # (= current()'s value and source fields)
+        key = (val, kind, tid, rule, self.area["type"], self.zone["type"], self.road_class["type"])
         if key != self._last_key:
             if self._last_key is None or val != self._last_key[0]:
                 self._since = {"ts_mono_ns": self.now_ns, "ts_real_ns": self.now_real_ns, "odo": self.odo}
