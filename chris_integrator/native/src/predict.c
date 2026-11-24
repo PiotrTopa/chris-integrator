@@ -588,8 +588,9 @@ static void roll_out(const PRoll *r, const double *cfg, const double *times, int
         if (v > 1.0) {
             for (int j = 0; j < 4; j++) {
                 double la = (j == 0 ? 0.0 : j == 1 ? 0.6 : j == 2 ? 1.5 : 3.0) * v + (j == 0 ? 0.0 : 2.0);
-                double qx, qy, qth, qk;
-                pp_eval(p, s + r->dir * la, &qx, &qy, &qth, &qk);
+                double qx, qy, qth, qk = pk;              /* (at the place itself: the curvature just read) */
+                if (!(la == 0.0))
+                    pp_eval(p, s + r->dir * la, &qx, &qy, &qth, &qk);
                 double ak = fabs(qk);
                 if (ak > 1e-3) {
                     double vc = sqrt(r->a_lat / ak);
