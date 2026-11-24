@@ -28,8 +28,11 @@ from .vehicle import scale_reg
 AXLE = 1.5                       # the car frame's origin (reference camera) is this far ahead of the rear axle
 
 
+_PI, _TWO_PI = math.pi, 2.0 * math.pi
+
+
 def _wrap(a):
-    return (a + math.pi) % (2.0 * math.pi) - math.pi
+    return (a + _PI) % _TWO_PI - _PI
 
 
 class RadarModel(SensorModel):
@@ -62,7 +65,8 @@ class RadarModel(SensorModel):
 
     def residual(self, z, zp):
         d = z - zp
-        d[1] = _wrap(d[1])
+        # (in a Python float: the same IEEE sum and remainder as numpy's scalar arithmetic, without its overhead)
+        d[1] = (float(d[1]) + _PI) % _TWO_PI - _PI
         return d
 
     def initiate(self, det, ego):
@@ -111,8 +115,10 @@ def ego_velocity(az, rr, rng, tol=0.35, iters=24):
         return None
     A = -np.column_stack([np.cos(az), np.sin(az)])
     # all candidate pairs at once
-    ii = np.array([rng.randrange(n) for _ in range(iters)])
-    jj = np.array([rng.randrange(n) for _ in range(iters)])
+    # (`_randbelow(n)` is what `randrange(n)` returns for n > 0, without its argument checks: the same stream)
+    rb = rng._randbelow
+    ii = np.array([rb(n) for _ in range(iters)])
+    jj = np.array([rb(n) for _ in range(iters)])
     a, b, c, d = A[ii, 0], A[ii, 1], A[jj, 0], A[jj, 1]
     det = a * d - b * c
     ok = np.abs(det) > 0.02
