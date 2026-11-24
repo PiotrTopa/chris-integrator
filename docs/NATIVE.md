@@ -178,6 +178,26 @@ spare slots of the road row carry the street's count (`PR_ROWL`, `PR_ROWR`). The
 `ego_path_p` 0.8 the code computes what it computed before. The native version is unchanged (11): no function's
 arguments or results changed shape.
 
+Since 2026-11-24 (lane SPREAD) an object's row of `predict_pack` / `predict_frame` has a 28th number (`PO_RHO`: the
+radar's `std_rho`, NaN where not given; the widths are the native core's own, `predict_names()`), the last four
+slots of an object's kept state are in use (`PS_DANCH`, `PS_TON`, `PS_DPREV`, `PS_TCH`: where a pedestrian stood,
+for how long it has been away from there, its offset when that last changed and how long ago), and
+`predict_cfg()` has `std_rho`, `ped_gap`, `ped_gap_s_m`, `ped_onset` (with `ped_onset_m`, `_span_m`, `_range`,
+`_tau_s`, `_v_min`, `_v_max`), `ped_carry`, `ped_cov`. With `std_rho` 0 or no `std_rho` in the message, `ped_gap`
+1, `ped_onset` 0, `ped_carry` 0 and `ped_cov` 0 the code computes what it computed before (the goldens and digests
+recorded before held with them so); `ped_onset` and `ped_carry` are 1 by default since, and
+`tests/data/predict_golden.json` and `decide_port_golden.json.gz` were recorded anew for that (a crossing
+pedestrian's intent by 0.005; 60 of 511 `radar_fut` messages, one `decide` message by 0.003 of a collision
+probability, no level, no stage; and once more for the alerts' `unsaid_needs_object`: `suppressed` of 21 `decide`
+messages). `decide_frame` reads further
+constants where its array reaches them (`DX_HOLD`..: an array of the earlier length is taken as "off") and writes
+`hold` into a record where the knob is on; `decide_gaps(objects, v, path, cfg)` is new (what is hidden between
+standing vehicles; the plug-in asks for it only with `gaps` on and only where the native core has it). The native
+version is unchanged (12): the row's width is the native core's own word (Python reshapes by `predict_names()`'s
+width and reads no column beyond the 25th), the further constants are optional, the new function is asked for only
+where it exists: this Python runs with a version-12 binary built before the change, and the binary with the Python
+before it.
+
 ### Inputs the C code takes, and what it does with others
 
 * Arrays: float64 (index arrays: the platform's 64-bit integer), C-contiguous. The Python around a call makes

@@ -1073,6 +1073,149 @@ Why the alert said parked cars on bends, measured on the simulator (docs/TOPICS.
   assumes a spread along the line of sight; a correlation in the radar message (`std_rho`, the correlation of
   the x and y errors, or `std_los`: 1 sigma along and across the line of sight) would replace it.
 
+### 17.2 The needle as the radar states it, waiting for the range, pedestrians at parked cars (lane SPREAD, 2026-11-24)
+
+Numbers: `tools/alert_truth.py` (the said episodes against the simulator's truth; six streets and two pedestrian
+controls x seeds 1-6 x day and night, thirteen scripted conflicts x seeds 1-3 x day and night; paired over the same
+runs, +- the bootstrap's spread over seeds), the plain and the realistic (`DETIN`) stream; the tracker's knobs
+`ctx_prior` + `std_rho` + `path_normal` ("C"), `size_learn` ("S"), both ("CS").
+
+**The radar's own needle (`std_rho`).** With the radar's `std_rho` the place's covariance is complete, and the
+predictor reads the needle along its own long axis instead of rebuilding one along the line of sight from `std`
+(native `std_rho`, 1; the futures of a place start with that covariance too: a standing car's one place was an
+upright box; a pedestrian's and a cyclist's futures keep the spread they had). The rebuilt needle was a faithful
+one. With the field read (and the two pedestrian defaults below) the false episodes of the six streets go 58 ->
+55 (-3 +- 2.5) and 71 -> 74 (+3 +- 2.6) with C on the plain and the realistic stream, 67 -> 68 (+1 +- 2.6) and
+77 -> 79 (+2 +- 1.9) with CS; of the two controls 6 -> 7, 9 -> 10, 5 -> 7, 8 -> 10 (+- 1.0-1.3: a parked car,
+the standing pedestrian's lane read along its needle); the conflicts with a vehicle: none lost, one gained and four
+earlier on the realistic stream (a car half in the lane 1.08 -> 2.44 s before), one later in each of three sets
+(3.42 -> 3.25 s, 2.82 -> 2.74 s, 2.64 -> 2.32 s). Nothing either way. Things behind the car take three places of
+their needle, not nine, and no second place (the rebuilt needle left most of them out by its fit): the predictor
+alone costs 5 % fewer instructions on dense streets with the field read. With the knob 0 and the field present
+every run is what it was; without the field every run of the standard sets is what it was (54 and 81 false, the
+vehicle conflicts 32 and 36 of 48 at the same frames).
+
+**Can the decision wait for the range?** A standing car of two places (17.1) is at ONE of them, and the car learns
+which as it closes: the range's spread shrinks with the range. `place_hold` (off) puts that as a rule: the two
+places, d apart on the ground, are told apart (two spreads between them, the spread 9 % of the range: what the
+tracker states of a clean track at 15-40 m) once the car is within d / 0.18 of their middle: in t_res. The driver
+must act when braking at 3 m/s^2 after the reaction time still stops short of the place in the way: in t_act.
+While t_res <= t_act the object's entry level is held at information. Measured: **it holds nothing.** With
+comfortable braking not one run of 1056 (four tracker settings, two streams) changes, and that is arithmetic, not
+chance: caution begins when full braking has a time margin of 1.5 s, comfortable braking is due when
+1.5 s - v (1 / (2 x 3) - 1 / (2 x 7.3)) of that is gone: 0.2 s at 13 m/s, nothing from 15 m/s, 0.7 s at 8 m/s. The
+false episodes of roadside cars are first said 0.8-3.5 s before the place in the way would be reached (median
+1.9 s): by then acting cannot wait for anything. With emergency braking as the bound (`place_hold_decel` 7) the
+hold takes 4-5 false episodes of 54-83 (-5 +- 2.2, -4 +- 2.2, -4 +- 1.7, 0) and says two true warnings later in
+each realistic set (a car half in the lane 2.10 -> 1.08 s before, a stopped car in a bend 2.74 -> 2.15 s): not a
+trade to make. On the recorded drive (8 m/s) it held one of the two episodes for 1.1 s; it was then said one stage
+higher.
+
+What the arrays say instead (the two-place episodes of the base runs): the two places are 6-20 m apart, two to
+four of the 9 % spreads: by the tracker's own figure for a clean track they are told apart already, and the
+episode is said because the track is NOT that track: its range is off by one of its stated sigmas, which is a
+fifth of the range (a car 25 m away read 5-9 m short), its extent is another car's (a parked car 1.8 m wide
+tracked 2.4 m wide and 9.6 m long: two cars' boxes; its road-side face 0.05 m from the car's side instead of
+0.8 m), or its place has just hopped. Of the 54 / 81 false episodes of the six streets (plain / realistic, no
+tracker knob) 39 / 60 are on a parked car and 22 / 33 on one given two places; when first said the place in the
+way is 2.1 / 1.6 s ahead (median; a tenth under 0.6 s, a tenth over 3.1 s), the two places 7.9 / 6.9 m apart, the
+track's range off by 0.6 / 0.8 of its stated spread; by cause: place jump 26 / 25, the track's mean in the lane
+7 / 14, moving futures of a parked car 5 / 14, the stated spread alone 1 / 9. 27 / 55 go on to imminent: the range
+does not resolve as the car closes (the simulator's detector boxes a near car 2-3 times under 25 m). Nothing
+in prediction or decision tells these from a car that is where its track says: that is the tracker's range and
+association.
+
+**An alert said without an object.** Of the said episodes 2-7 a set had no object when they were first said: a
+stage suppressed since its entry (on a bend the driver's own steering "steers away"; braking; a crawl), or only
+ever at information, whose object then left the list: without a record the suppression rules have nothing to
+judge, and the held stage was said until its minimum hold ran out. `unsaid_needs_object` (alerts, on): an alert
+not said since it left none is not said without its object (`suppressed: "object_gone"`). Paired, the eight sets:
+false episodes 54 -> 53, 81 -> 79 (no tracker knob), 55 -> 54, 74 -> 74 (C), 69 -> 66, 77 -> 76 (S), 68 -> 64,
+79 -> 79 (CS): -12 of 557, none up; every conflict warning at the frame it had; the recorded drives as they were.
+
+**The car half in the lane** (`half_in_lane_13`; the obstacle's truth beside its track, six seeds, `alert_truth.py
+run --trace`). By day on the plain stream, from 3 to 2 s before contact the track's centre stands 1.08 m further
+from the lane than the car (its body clear of the car's swept strip in 88 % of the frames; from 2 to 1 s 0.54 m and
+61 %), its width is right to 0.03 m, and its range is 4.3 m long (0.65 of the stated spread): on the bend a range
+read long IS a place further out. On the straight (`half_in_lane_straight_13`) the centre is right to 0.02-0.14 m
+and the body is in the strip in 80-90 % of the frames. So the decision uses the footprint and its width as they
+are (`lane_step`: "in the way" is the body reaching the strip, half the car's width plus half the object's); what
+it is given is a needle of which a fifth to a third lies in the way (`p_place` 0.30-0.37), honest for a range
+0.65 sigma long, and indistinguishable from a roadside car read short. The bias (+2.5 to +4.3 m at 20-40 m: the
+height prior's 1.6 m against 1.5 m) is the tracker's: with `ctx_prior` + `size_learn` the lead of that run is back
+at 2.64 s on the plain stream (the half-in-lane runs' mean lead 1.29 -> 1.82 s), while on the realistic stream
+`ctx_prior` loses three of eight half-in-lane warnings (the car's "it stands beside the road" comes sooner, and
+on the straight its body, 0.3 m further out in the track than in truth, is at the strip's very edge: P(in the way)
+0.4-0.5, and the alert's evidence rule waits). Entering by time once the time margin is gone
+(`entry_evidence_tm_s` 0, off) brings two half-in-lane warnings back, 0.46 and 0.66 s before contact, and 15 +- 3.8
+false episodes with them (59 -> 74; 22 -> 34 in the conflict runs): the evidence rule earns its keep.
+
+**A pedestrian at parked cars.** `ped_between_parked_13` and three more (`PED_SCENARIOS`: in plain view on a
+straight road, hidden between two vans until 1.2 s before, a child running), with two controls (the same pedestrian
+not stepping out). Counted honestly (the alert's primary is the pedestrian's own track, not a parked van's on the
+same line of sight) the pedestrian was warned of in 6 of 48 runs on the plain stream (0.4-1.1 s before) and 3 of 48
+on the realistic one, never in plain view by day, never the child, never from between the vans on the realistic
+stream. Why, from the arrays (six seeds):
+
+| | first confirmed (median, s before contact) | never tracked | the step is taken | track's place behind the pedestrian at -1.0 / -0.5 s | tracker speed > 0.7 m/s |
+|---|---|---|---|---|---|
+| between parked cars, day (plain / realistic) | 2.1 / 2.7 | 0 / 0 of 6 | 1.86 s before | 0.7 / 1.3 m, 1.1 / 0.5 m | in 4 of 6, 0.8-0.9 s after the step |
+| ... night | 2.1 / 1.5 | 1 / 3 | | 0.3 / 0.3 m, 0.5 m | 4 / 3 of 6 |
+| in plain view, day | 1.9 / 2.8 | 0 / 0 | 1.5 s before | 0.5 / 1.0 m, 0.7 / 1.2 m | 3 / 0 of 6 |
+| ... night | 1.3 / 3.1 | 5 / 5 | | | 0 / 1 |
+| hidden between vans | 0.9 / - | 5 / 6 (day), 6 / 6 (night) | 2.36 s before | | |
+| a child, day | 2.7 / 1.7 | 1 / 1 | 1.18 s before | | 0 / 0 |
+
+A pedestrian in plain view from 100 m is confirmed 27-37 m away; after the step the track's place stays where it
+stood (the standing hypothesis holds it: 0.5-1.3 m behind within a second, its stated spread 0.2 m) and no box
+comes in the last second; at night it is mostly never tracked. A warning that needs the pedestrian to have moved
+can lead by 1.5-1.9 s at the very most. That is the tracker's (confirmation of pedestrians, the place following a
+step, night). What prediction and decision do with what they get:
+
+* `ped_carry` (native, 1): **a defect.** "In another lane the change that got it there is over" is a vehicle's
+  rule; applied to a pedestrian it turned four fifths of "about to step out" into "walks along" at the moment the
+  pedestrian entered the car's lane, and half of the rest into the priors: the crossing futures of a pedestrian
+  the tracker saw walking out fell from 0.72 to 0.19 as it crossed the lane's edge and took 0.3 s to come back
+  (the arrays of the base runs: `walk` 0.66-0.89 with the pedestrian 0.5-0.75 s from contact). Now the step out
+  goes on as the crossing it is.
+* `ped_onset` (native, 1): the first step read from the track's place (0.3 m from where it stood, against the
+  spread a CHANGE of its offset has) before the tracker's velocity shows it; not a step: the track's place
+  settling as the car closes (a standing pedestrian's track came 1.6 m towards the road over 4 s at night: the
+  place it stood at follows 0.3 m/s), a correction faster than anyone runs, anything away from the road. On a
+  place that follows the pedestrian the crossing futures hold 0.5 0.6 s after the step and 0.9 after 0.8 s where
+  they held 0.07.
+* `ped_cov` (native, 0): the crossing futures start with the place's own spread, not a round one of the same size
+  (a pedestrian 2.9 m beside the lane's middle, range known to 2.8 m, stood "in the lane" with a fifth of it).
+  One more warning and two earlier ones on the plain stream; the futures' likelihood at 1 s a little worse
+  (`predict_eval`: 2.74 -> 2.92): not on by default.
+* `ped_gap` (native, 1 = off; tried at 6): a pedestrian standing in the line of the parked vehicles next to one of
+  them (not behind them on the pavement) is that many times likelier about to step out: `start_cross` 0.06 ->
+  0.2-0.5 while it stands. That reaches information, not caution: no said episode of any run changes.
+* `entry_hold_vru_s` (alerts, off): a pedestrian's own entry holds (0.1, 0.1, 0, 0): 0.09 s earlier, two more of
+  48 warned on the plain stream, one more false episode in the 24 control runs of each stream: not taken.
+
+With `ped_carry` and `ped_onset` (the defaults since): `tools/predict_eval.py`: a crossing is recognised 1.28 /
+1.82 / 1.55 s after its start where it was 1.69 / 1.91 / 1.63 s (by night 1.55 -> 1.31 s), its mean probability
+0.74 / 0.70 / 0.77 -> 0.83 / 0.72 / 0.80, a pedestrian who waits or stands as before, every vehicle manoeuvre's
+line as it was. The pedestrian scenarios (48 runs a stream): plain 6 -> 7 warned (two gained, 0.47 and 0.71 s
+before; one earlier, 0.39 -> 0.73 s; one lost: 0.66 s before, its mass 0.21-0.26 against the minimum 0.20 for four
+frames, now 0.20-0.25), realistic 3 -> 3 with two earlier (0.35 -> 0.86 s, 0.69 -> 0.95 s); the streets' and the
+controls' episodes unchanged in every run; the recorded drives as they were. With `ped_cov` and `ped_gap` as well:
+plain 6 -> 9, none lost. The warnings stay under a second: what is missing is the track.
+
+
+**What is hidden** (`decide.json` `gaps`, off; alert `hidden_gap`, at most caution; native `decide_gaps`). Behind
+the far end of a vehicle standing beside the car's way someone is not seen until past its road-side face, g metres
+from the strip the car sweeps: g / v_ped seconds before being in the way. The car can still stop for that only
+below v_stop = 2 a (g / v_ped - t_react); a gap is in reach while the car could neither stop before it nor be past
+it in time. With the parked rows of the simulator (faces 0.8-1.4 m from the car's side) and a pedestrian at
+1.5 m/s, a driver reacting in 1 s, braking at 6 m/s^2: v_stop is 0: at such a distance from parked cars no speed is
+one to stop from, and the alert says so for 27-54 % of the pedestrian scenarios' time (first 6.5 s before their
+collisions, median; before the pedestrian hidden between vans 6.9 s, never under 2.7 s; in the controls as much)
+and once on the two recorded drives; on the streets: `parked_street` 67-74 % of the time, `curve_parked` 59-64 %,
+`oncoming` 42-50 %, a junction 4-5 %, nothing where nothing is parked. As a caution it is a statement about the
+street, not about a moment; it does not hold the stack's pace.
+
 ## 18. Learnt values across drives (lane DECIDE, 2026-11-23)
 
 `chris_integrator/learnt.py` (the store) and `chris_integrator/learners.py` (the learners' adapters and the plug-in

@@ -641,6 +641,41 @@ constants, each a switch):
   counts up to 0.3).
 * `ego_path_p` 0.95 (was 0.8): the car's straight-on future (`ctra`) held a fifth of the weight in every frame
   and ran through the bends' roadside cars; it still takes over where the yaw rate leaves the path.
+* `std_rho` (1; lane SPREAD): where the radar object carries `std_rho` (the radar box's `std_rho: true`) the
+  place's covariance is [[sx^2, rho sx sy], [rho sx sy, sy^2]] and the needle is its long axis, whatever its
+  direction: read at the same three or nine places along that axis, the two places' futures along it, and the
+  futures of a single place start with that covariance (a standing car's one place was an upright box:
+  `rxy` 0). 0: the field is not read (the needle rebuilt from `std` and the bearing, as before). Without the
+  field nothing changes.
+
+**A pedestrian stepping out** (lane SPREAD 2026-11-24; native constants):
+
+* `ped_carry` (1; 0: as before): a pedestrian's manoeuvres are carried over the edge of a lane. A vehicle that
+  is in another lane has finished the change that got it there; the same rule took "about to step out" from a
+  pedestrian at the moment it entered the car's lane (four fifths of it became `walk`, half of the rest the
+  priors: the crossing futures of a pedestrian the tracker saw walking out fell from 0.72 to 0.19 as it crossed
+  the lane's edge and took 0.3 s to come back). Now `start_cross` goes on as `crossing` once the pedestrian is in
+  the road.
+
+* `ped_gap` (1 = no difference): a pedestrian standing near the road's edge in the line of the vehicles parked
+  there (a standing vehicle on its side ends within `ped_gap_s_m` 6 m of it along the road, and its offset lies
+  within that vehicle's body's, 0.3 m beyond its far face at most: not behind the row on the pavement) is that
+  many times likelier about to step out (`start_cross`).
+* `ped_onset` (1; 0: off): the first step is read from the place, before the tracker's velocity shows it. The
+  offset at which it stood is kept (it follows the offset within `ped_onset_tau_s` 0.7 s while that stays within
+  `ped_onset_m` 0.3 m of it: a track's place settling at 0.3 m/s as the car closes is followed, a walk is not);
+  once the offset has come `ped_onset_m` towards the road, the likelihood ratio of "a step out begun within the
+  last second" (anywhere up to `ped_onset_span_m` 1.5 m) against "it stands" (the spread a change of the offset
+  has: across the line of sight twice, and `ped_onset_range` 1.0 of what a correction of the range would move it
+  across the road; 0.1 m at least) lowers the share of "it stands" and weighs the crossing futures against
+  walking along; the `start_cross` future then starts walking now (at `ped_v` while the tracker's speed is still
+  0). Not a step: a change of the place faster than `ped_onset_v_max` 4 m/s between two changes (the track's
+  correction: the place it stood at goes with it), one that half a second on has not come on at
+  `ped_onset_v_min` 0.6 m/s, and anything away from the road. After 4 s away the place it has reached is where
+  it stands. With the place following the pedestrian every 0.05 s the crossing futures hold 0.5 0.6 s after
+  the step and 0.9 after 0.8 s, where they held 0.07 while the tracker said "it stands".
+* `ped_cov` (0): a pedestrian's crossing futures (`start_cross`, `crossing`) start with the place's own
+  covariance turned into the walking direction, not a round one of the same size.
 
 Manoeuvres (`m`, keys of `intent`): vehicles `keep`, `follow` (behind the one ahead, by the car-following law),
 `lc_left` / `lc_right`, `cut_in` (a lane change into the car's lane ahead of the car), `cut_out` (out of it),
@@ -913,7 +948,7 @@ none renamed or removed. Per object:
 ```jsonc
 "x_m": 31.2, "y_m": 0.3,          // as before: the object's NEAR FACE (the point of it nearest the car)
 "ctr": [33.4, 0.3],               // its centre (car frame)
-"std_rho": 0.93,                  // optional (radar `std_rho: true`; off by default): the correlation of the x and y
+"std_rho": 0.93,                  // optional (radar `std_rho: true`; off by default; read by the predictor): the correlation of the x and y
                                   // errors of the place (car axes); with `std`[0], `std`[1] the place's covariance
                                   // [[sx^2, rho sx sy], [rho sx sy, sy^2]]: a camera's place is a needle along the
                                   // line of sight. With radar `path_normal: true` `path_offset_m`, `on_path`,
@@ -1030,6 +1065,60 @@ acceleration >= 1.5 m/s^2 towards a side whose required demand it covers), speed
 pedestrians and cyclists), the sensors' newest sample older than 1 s. Every change is an event (`events`), kept
 in the plug-in's health (`shadow_log`, the last 20) and written to the log (`alert obstacle_ahead (shadow): raise
 stage warning object 17 [WARNING VEHICLE 2.6s]`).
+
+A standing vehicle of two places (`p_place`), the hold (`decide.json` `{"threat": {"place_hold": true}}`, off): the
+record carries `"hold": {"act_s", "res_s", "held"}`: `res_s` until the range tells the two places apart (they are
+told apart, `place_hold_sigma` 2 spreads of `place_hold_range_rel` 0.09 of the range between them, once the car is
+within their distance / 0.18 of their middle), `act_s` until braking at `place_hold_decel` (3 m/s^2) after the
+reaction time must begin to stop short of the place in the way (null: no contact with it within the horizon);
+`held`: `res_s <= act_s` and the place in the way carries the level: `level` is then at most `place_hold_level`
+(1), `level_exit` and `mass` are as computed. Not for an object with `p_place` from `place_hold_p` (0.9) on, nor
+where a future in which the object moves carries the level. Measured (docs/DESIGN.md 17.2): it holds none of the
+simulator's false episodes with comfortable braking; off.
+
+What is hidden (`decide.json` `{"gaps": true}`, off; `"gap": {"ped_mps": 1.5, "react_s": 1.0, "decel_mps2": 6.0,
+"clear_max_m": 2.0, "clear_min_m": 0.1, "gap_min_m": 0.6, "seen_m": 1.5, "margin_mps": 1.0}`): with it on the
+message carries
+
+```
+"gap": null | {"level": 2, "level_exit": 2,          // 2: a gap in reach and the car faster than v_stop + margin_mps;
+                                                      //   1: a gap within twice the stopping distance, faster than v_stop
+               "side": "right", "s_m": 14.5,          // the gap reported (in reach, the least v_stop): the far end of a
+               "clear_m": 1.12,                       //   vehicle standing beside the car's way, along the plan from the
+               "v_stop_mps": 0.0,                     //   camera; its road-side face to the car's swept strip; the speed
+               "t_reach_s": 0.95,                     //   from which the car could still stop: 2 a (clear / v_ped - t_react)
+               "gaps": 3, "in_reach": 2}              // gaps counted; of them in reach
+```
+
+and the alerts a third one, `hidden_gap` (`source: "gap"`; shadow by default as the others): information or
+caution, never more (entry after 0.5 s, held at least 1 / 2 s, left 1 s after the last gap; `reason`: the gap
+record with `v_mps`; `text` `CAUTION GAP RIGHT 0 km/h`: the speed to stop from). A gap is the far end of a standing
+vehicle (radar verdict or p_stationary >= 0.5) whose road-side face is `clear_min_m`..`clear_max_m` from the strip
+the car's body sweeps along the plan, with no other standing vehicle of its side beginning within `gap_min_m`
+beyond it and no pedestrian or cyclist tracked within `seen_m` of it (someone seen is the prediction's matter). It
+is in reach while the car's front is further from it than a pedestrian's time to the strip (v x clear / v_ped) and
+nearer than the stopping distance (v t_react + v^2 / 2a). The alert does not hold the stack's pace (`pace.json`):
+the low rate judges it.
+
+`{"alerts": {"obstacle_ahead": {"entry_hold_vru_s": [0.1, 0.1, 0.0, 0.0]}}}`: a pedestrian's or cyclist's own entry
+holds (null, the default: `entry_hold_s`).
+
+`{"alerts": {"obstacle_ahead": {"entry_evidence_tm_s": 0.0}}}` (null, the default): the evidence rule applies only
+while the object's time margin `tm_s` is above this; at or below it a place in doubt enters by time (acting cannot
+wait for the evidence). Measured with 0: two half-in-lane warnings gained, 15 +- 3.8 false episodes more: off.
+
+`unsaid_needs_object` (true; false: as before): an alert that has not been said since it left none (below `show_from`, or
+suppressed all along) and whose object is no longer a candidate is not said for the rest of its holds:
+`suppressed: "object_gone"`. Without a record the suppression rules have nothing to judge: on a bend the driver's
+own steering suppressed a stage, the object left the list, and the held stage was then said without an object
+(`object: null`) until its minimum hold ran out: 2-7 of the said episodes of a set of the simulator's streets. An
+alert that was said keeps its holds as before, object or not.
+
+`tools/alert_truth.py run | sum | cmp`: the said episodes of the simulator's streets against the truth (true /
+arguable / false, the false ones by cause), the lead time on a scripted conflict's obstacle (the first said frame
+whose primary is the obstacle's own track), and the paired difference of two result sets with its bootstrap
+spread. Use this, not a count of every said episode of a scenario without a scripted collision: that count calls a
+slow lead the car closes on, and a pedestrian walking into the lane, false.
 
 `tools/decide_replay.py CAPTURE | --scenario NAME`: what each alert would have done on a recorded drive or
 simulated scenarios: episodes, stages, lead time before the object's closest approach, false-alert candidates.
