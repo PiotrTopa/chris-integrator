@@ -34,13 +34,15 @@ def tracks_message(layer, es, ts, valid=True, reason=None):
     out = []
     for tr in layer.tracks:
         seen = {s: round(max(0.0, T - t), 3) for s, t in tr.last_seen.items()}
+        # (the state and the variances converted once per track: the same numbers as indexing them one by one)
+        xl, dg = tr.x.tolist(), tr.P.diagonal().tolist()
         out.append({
             "id": tr.id, "state": tr.state, "exist": round(tr.exist, 3),
-            "x_m": round(float(tr.x[X]), 2), "y_m": round(float(tr.x[Y]), 2),
-            "vx_mps": round(float(tr.x[VX]), 2), "vy_mps": round(float(tr.x[VY]), 2),
-            "ax_mps2": round(float(tr.x[AX]), 2),
-            "std": [round(_std(tr.P, i), 2) for i in range(5)],
-            "v_rel_mps": round(float(tr.x[VX]) - layer._ve, 2),
+            "x_m": round(float(xl[X]), 2), "y_m": round(float(xl[Y]), 2),
+            "vx_mps": round(float(xl[VX]), 2), "vy_mps": round(float(xl[VY]), 2),
+            "ax_mps2": round(float(xl[AX]), 2),
+            "std": [round(math.sqrt(max(float(dg[i]), 0.0)), 2) for i in range(5)],
+            "v_rel_mps": round(float(xl[VX]) - layer._ve, 2),
             "age_s": round(T - tr.t0, 2), "meas_age_s": round(min(seen.values()), 3) if seen else None,
             "sources": sorted(tr.sources), "seen": seen, "hits": tr.hits,
             "flags": sorted(tr.flags | ({"standing"} if tr.standing else set())
