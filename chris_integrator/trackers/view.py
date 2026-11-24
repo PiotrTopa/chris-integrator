@@ -205,6 +205,10 @@ class _Static:
         self.leaving = False
 
 
+_LANE_IDS = ("lane:0", "lane:1", "lane:2", "lane:3")      # the line ids of `view` ("lane:%d", "edge:%d")
+_EDGE_IDS = ("edge:0", "edge:1")
+
+
 class _Line:
     def __init__(self, ys, ts):
         self.a = list(ys)                       # first stage
@@ -239,6 +243,9 @@ class ViewBuilder:
         if not hasattr(self, "ext_scale"):     # kept across a reset of the channel: it describes the camera
             self.ext_scale, self.scale_ts = None, None
         self.seen = {}                         # id -> first-seen ts (age across fade-out / back in)
+        self._mv = (0.0, 0.0)                  # (speed, yaw rate) of the frame being built (_motion)
+        self._gains_key = self._gains = None   # _lines: the smoothing gains of the last dt
+        self._xs_of = None                     # _lines: the xs of _xs_n / _xs_rising
         self.road = RoadView(self.road_cfg)    # the road part (roadview.py)
 
     # ---- inputs ------------------------------------------------------------------------------------------
@@ -538,6 +545,7 @@ class ViewBuilder:
         dt = 0.0 if self.ts is None else (ts - self.ts) / NS
         self.ts = ts
         v, r, src = self._motion(ts)
+        self._mv = (v, r)
         fade = dt / c["fade_s"] if c["fade_s"] > 0 else 1.0
         objects = []
         lo = self._lead(lead, ts, dt, fade)
@@ -630,15 +638,24 @@ class ViewBuilder:
         out = []
         src = []
         if isinstance(lanes, dict) and isinstance(lanes.get("x"), list):
-            for kind, key, names in (("lane_line", "lines", 4), ("road_edge", "edges", 2)):
-                for i, ln in enumerate((lanes.get(key) or [])[:names]):
-                    src.append(("%s:%d" % ("lane" if kind == "lane_line" else "edge", i), kind, ln))
-        gains = [1.0 - math.exp(-dt / (c["line_tau_s"] + c["line_tau_rel"] * x)) if dt > 0 and c["line_tau_s"] > 0 else 1.0
-                 for x in xs]
-        mv, mr, _ = self._motion(ts)
+            for kind, key, ids in (("lane_line", "lines", _LANE_IDS), ("road_edge", "edges", _EDGE_IDS)):
+                for lid, ln in zip(ids, (lanes.get(key) or [])[:len(ids)]):
+                    src.append((lid, kind, ln))
+        # the gains are a function of dt and the configuration only: the last frame's list again when they are
+        # the same (frames come at a steady rate; the list is only read)
+        gkey = (dt, c["line_tau_s"], c["line_tau_rel"], xs)
+        if gkey == self._gains_key:
+            gains = self._gains
+        else:
+            gains = [1.0 - math.exp(-dt / (c["line_tau_s"] + c["line_tau_rel"] * x)) if dt > 0 and c["line_tau_s"] > 0
+                     else 1.0 for x in xs]
+            self._gains_key, self._gains = gkey, gains
+        mv, mr = self._mv                                       # (on_frame's _motion of this frame)
         seen = set()
-        nx = len(xs)
-        xs_rising = all(a <= b for a, b in zip(xs, xs[1:]))     # then "x <= reach" holds for a leading run of points
+        if xs is not self._xs_of:
+            # then "x <= reach" holds for a leading run of points
+            self._xs_of, self._xs_n, self._xs_rising = xs, len(xs), all(a <= b for a, b in zip(xs, xs[1:]))
+        nx, xs_rising = self._xs_n, self._xs_rising
         flat, todo = [], []
         for lid, kind, ln in src:
             seen.add(lid)
