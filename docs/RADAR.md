@@ -22,7 +22,7 @@ back.
 * Objects that compete for detections (now, or within the scans still open) form a **cluster**. A cluster holds
   **global hypotheses**: one leaf of every object of the cluster (or none: in that story the object does not
   exist, its first detection was another object's), no detection used twice, with a probability.
-* **A scan** (`Hyp.cycle`, its core also as `Hyp.scan`): every leaf is stepped to the scan's time; each leaf is compared with each detection
+* **A scan** (`Hyp.cycle`): every leaf is stepped to the scan's time; each leaf is compared with each detection
   (gate, then the likelihood ratio against "something else"); objects that share a gated detection are joined
   into one cluster; for every global hypothesis of a cluster the K best assignments are enumerated in order
   (Murty's ranked assignment; a hypothesis is given a share of K by its weight) and the best of all kept; a
@@ -321,7 +321,7 @@ seconds. Two mechanisms, both in the measurement model, neither in the hypothese
    **Change:** the pitch's fast part is a Gauss-Markov process (`pitch_gm_deg` 0.5 while driving, 0.1 standing,
    `pitch_gm_tau_s` 1 s) kept per camera beside the slow bias: what the last scan's common angle (`h_common`)
    found of it is carried to the next scan with its memory, taken out of the scan's ground angles, and what it no
-   longer says is their variance (`Hyp.scan`; `Tracker.bias[src]` is now `[slow, variance, fast, variance, time]`).
+   longer says is their variance (`Hyp.cycle`; `Tracker.bias[src]` is now `[slow, variance, fast, variance, time]`).
    A scan with enough settled objects still measures its own common angle and takes it out, as before.
 2. **A bearing linearised over a place that is not known (4.1 s).** A new object's moving hypotheses carry a
    velocity prior of 12 to 15 m/s along the car's heading; a second later that is tens of metres of place, and
@@ -403,7 +403,7 @@ the square of the range) or a class / appearance term over several scans.
 The filtered state is the estimate from the detections up to now; it is what the message carries as the present.
 The past can be known better: the chain of nodes from an object's primary back is one story's history, each node
 holding the motion hypotheses after its scan and the step that led into it (switching matrix, dt, what the car's
-own movement added). The smoother (in `Hyp.after`; by itself `Hyp.smooth`) runs a backward pass over it after every sighting back to the lag, and once per `smooth_hist_s`
+own movement added). The smoother (in `Hyp.after`) runs a backward pass over it after every sighting back to the lag; an object's trajectory (`Obj.history`, read by tools and tests, not by the message) is smoothed when it is asked for (`Hyp.history`), and was until then once per `smooth_hist_s`
 (0.5 s; 0: every sighting) as far back as `smooth_s` (2 s) for the trajectory: per motion hypothesis a Rauch-Tung-Striebel step (the gain from a Cholesky factor of the predicted
 covariance), with the hypotheses mixed backwards (the smoother of the interacting multiple model filter: each
 hypothesis of a node receives the child's smoothed hypotheses in proportion to what it handed them), and a plain

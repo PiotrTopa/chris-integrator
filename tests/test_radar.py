@@ -930,5 +930,31 @@ class ParkedCars(unittest.TestCase):
         self.assertGreater(sum(a for a, _ in white_only), 5.0)             # the defect, reproduced (12 seeds: 30 s)
 
 
+class PrimaryAfterDrop(unittest.TestCase):
+    def test_an_objects_numbers_are_its_primarys_after_another_object_is_taken_out(self):
+        """An object that is dropped (or merged into another) settles its cluster anew, and a cluster-mate's primary
+        may then be another of its leaves. The object's numbers must be that leaf's from then on (Hyp.sync in
+        Tracker._drop), not the former primary's until its next scan: on this drive 16 object-messages read a row
+        that was no longer the primary's."""
+        from chris_integrator.radar import box
+        from chris_integrator.sim import radar_score
+        frame, seen = box.Radar.frame, {"objects": 0, "stale": 0, "drops": 0}
+
+        def checked(rd, ts):
+            m = frame(rd, ts)
+            tr = rd.tracker
+            for o in tr.objects:
+                seen["objects"] += 1
+                seen["stale"] += tr.hyp.rows(o.h)[0] != o.slot
+            return m
+        box.Radar.frame = checked
+        try:
+            radar_score.run("parked_street", seed=1)
+        finally:
+            box.Radar.frame = frame
+        self.assertGreater(seen["objects"], 10000)
+        self.assertEqual(seen["stale"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()

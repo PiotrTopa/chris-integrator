@@ -572,7 +572,7 @@ needs_radar = pytest.mark.skipif(N.radar is None, reason="the native core is not
 
 @needs_radar
 def test_radar_golden():
-    """Calls of the native radar functions and of the hypotheses (Hyp.scan, Hyp.drop) recorded on simulated drives
+    """Calls of the native radar functions and of the hypotheses (Hyp.cycle, Hyp.after, Hyp.drop) recorded on simulated drives
     (tests/data/radar_golden.npz, tests/data/make_radar_golden.py), made again: the same results, the same rows
     written, the same hypotheses afterwards; ints, texts and truth values the same, numbers to rounding."""
     import radar_golden_lib as G
@@ -591,9 +591,9 @@ def test_radar_golden():
                 assert G.same(args[int(i)], codec.dec(a), where + " argument %s" % i) is None
         if c["hyp_after"] is not None:
             assert G.same(hyp, codec.dec(c["hyp_after"]), where + " hypotheses") is None
-    need = ("Hyp.scan", "Hyp.drop", "radar_h", "radar_peek_pos", "radar_life", "radar_merge", "radar_frame", "radar_check",
-            "radar_register", "radar_combine_rows", "radar_marginals", "radar_assign", "radar_kbest", "Hyp.smooth",
-            "radar_groups", "radar_group_support", "radar_cells", "Hyp.cycle", "Hyp.after")
+    need = ("Hyp.cycle", "Hyp.after", "Hyp.history", "Hyp.drop", "radar_h", "radar_life", "radar_merge", "radar_frame",
+            "radar_register", "radar_combine_rows", "radar_marginals", "radar_assign", "radar_kbest",
+            "radar_groups", "radar_group_support", "radar_cells")
     assert all(seen.get(k, 0) >= 3 for k in need), seen
 
 
@@ -648,10 +648,27 @@ def test_radar_messages_digests():
     assert _radar_digests() == RADAR_DIGESTS
 
 
+def _cycle_one(H, st, h, row, t, kin, veh, sen, dets, acfg, pose):
+    """One scan (Hyp.cycle, as the tracker calls it) for the one object h whose primary row is `row`: it is
+    confirmed, no object may be started, its hypotheses learn everything (no consider parameters). The primary row
+    after it."""
+    from chris_integrator.radar import models as M, tracker as T
+    tr = T.Tracker(None)                                 # (its tables of kinds and labels)
+    st.tab[h, T.OT_SLOT], st.tab[h, T.OT_ID], st.tab[h, T.OT_STATE], st.tab[h, T.OT_LABEL] = row, 1.0, 1.0, veh
+    st.tab[h, T.OT_KIN:T.OT_KIN + 4] = kin
+    st.tab[h, T.OT_RANGE] = -1e18
+    res = H.cycle(st.a, st.tab, st.hist, [h], t, lambda t0, t1: (0.0, 0.0), pose, sen, 1, dets,
+                  (tr._kinds, tr._kind_code, tr._labs, tr._lab_row, lambda b: 0.0, 10), None, 0.0, acfg,
+                  M._native_par(M.CFG), (2.0, 0.01), (0.2, 0.5, 2.5, 0.3, 3.0, 0.15, 0.01, 0.0), None, (1e9, 0.0, 2.0, 0.0))
+    late, hits, births, dead, bias = res
+    assert late == 0 and not births and not dead and H.rows(h)[0] == int(st.tab[h, T.OT_SLOT])
+    return int(st.tab[h, T.OT_SLOT])
+
+
 @needs_radar
 def test_radar_single_hypothesis_functions():
     """models.predict / still / transition (one hypothesis, for tests and tools) give what the tracker's rows get:
-    the free estimate's step in a scan (Hyp.scan with no detections) is models.predict of the steady hypothesis."""
+    the free estimate's step in a scan (Hyp.cycle with no detections) is models.predict of the steady hypothesis."""
     from chris_integrator.radar import models as M, tracker as T
     from chris_integrator.radar.sensors import MicrowaveRadar
     g = np.random.default_rng(41)
@@ -669,12 +686,10 @@ def test_radar_single_hypothesis_functions():
         kin = M._KIN4.get(label) or M._KIN4[None]
         h, r0 = H.start(st.a, row, kin, 0.0, 1.0)
         dt = float(g.choice([0.05, 0.4, 2.0]))
-        out, births, dead, bias = H.scan(st.a, [h], [(dt, 0.0, 0.0) + tuple(kin) + (0.0, 1.0, 1.0, 0.0)], dt,
-                                         (0.0, 0.0, 0.0, 0.0, 0.0, 0.0), sen, 1, np.zeros((0, 20)), None, None, 0.0,
-                                         (9.0, 13.8, 16.3, 18.5, 0.25, 0.9, 3.0, 0.01, 0.03, 0.4, 1.0, 3.0, 0.8, 1.0, 0.25, 0.65, 0.03, 0.3, 0.12),
-                                         M._native_par(M.CFG), (2.0, 0.01), (0.2, 0.5, 2.5, 0.3, 3.0, 0.15, 0.01, 0.0), None)
-        r1 = out[0][1]
-        assert out[0][0] and r1 != r0 and H.chain(h) == [r1, r0]
+        r1 = _cycle_one(H, st, h, r0, dt, kin, 0.0, sen, [],
+                        (9.0, 13.8, 16.3, 18.5, 0.25, 0.9, 3.0, 0.01, 0.03, 0.4, 1.0, 3.0, 0.8, 1.0, 0.25, 0.65, 0.03, 0.3, 0.12),
+                        (0.0, 0.0, 0.0, 0.0, 0.0, 0.0))
+        assert r1 != r0 and H.chain(h) == [r1, r0]
         xf, Pf = M.predict(M.CV, x, P, dt, label)
         assert np.array_equal(st.a[r1, 219:227], xf) and np.array_equal(st.a[r1, 227:291], Pf.ravel())
     T3 = M.transition(0.2, (0.3, 0.1))
@@ -745,18 +760,15 @@ def test_radar_update_keeps_the_covariance_symmetric_and_positive():
             rng = math.hypot(xc[0], xc[1])
             if it % 2:
                 sen = mw
-                D = [2.0, 0.0, 0.0, 0.0, 0.0, math.hypot(xc[0] - 2.0, xc[1]), math.atan2(xc[1], xc[0] - 2.0), -10.0, 0.0]
-                Rv = [10.0 ** g.uniform(-8, -1), 10.0 ** g.uniform(-11, -4), 10.0 ** g.uniform(-8, -1), 0.0]
+                d = {"z": [math.hypot(xc[0] - 2.0, xc[1]), math.atan2(xc[1], xc[0] - 2.0), -10.0],
+                     "R": [10.0 ** g.uniform(-8, -1), 10.0 ** g.uniform(-11, -4), 10.0 ** g.uniform(-8, -1)], "attrs": {}}
             else:
                 sen = cam
-                D = [2.0, 0.0, 0.0, 1.0, 0.05, math.atan2(1.22, rng), math.atan2(xc[1], xc[0]),
-                     cam.logf + xc[7] - math.log(max(xc[0], 0.5)), 0.0]
-                Rv = [10.0 ** g.uniform(-11, -5), 10.0 ** g.uniform(-11, -5), 10.0 ** g.uniform(-9, -2), 0.0]
-            out, _, _, _ = H.scan(st.a, [h], [(0.0, 0.0, 0.0) + tuple(kin) + (1.0, 1.0, 1.0, 0.0)], 0.0, pose, sen.native(), 1,
-                                  np.array([D + Rv + [0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0]]), None, None, 0.0, acfg,
-                                  M._native_par(M.CFG), (2.0, 0.01), (0.2, 0.5, 2.5, 0.3, 3.0, 0.15, 0.01, 0.0), None)
-            assert out[0][0]
-            r = out[0][1]
+                d = {"kind": "rbh", "z": [math.atan2(1.22, rng), math.atan2(xc[1], xc[0]),
+                                          cam.logf + xc[7] - math.log(max(xc[0], 0.5))],
+                     "R": [10.0 ** g.uniform(-11, -5), 10.0 ** g.uniform(-11, -5), 10.0 ** g.uniform(-9, -2)],
+                     "w": 0.05, "attrs": {"class": "car"}}
+            r = _cycle_one(H, st, h, r, 0.0, kin, 1.0, sen.native(), [d], acfg, pose)
             taken += st.a[r, T.OFF["m"][0] + T.M_DET] >= 0.0
             for lo, n in ((24, 3), (227, 1), (299, 1)):
                 for k in range(n):

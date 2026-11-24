@@ -6037,52 +6037,6 @@ static void r_peek_pos(const double *row, double dt, const double *K, const RPar
     memcpy(out + 2, P, sizeof(P));
 }
 
-/* radar_peek_pos(S, rows, dt, kin, par, out (B, 6)) -> None: where each object's place will be after its dt
- * (Tracker.peek_many, the place only: x, y, P00, P01, P10, P11); |dt| < 1e-6: its row as it is */
-static PyObject *n_radar_peek_pos(PyObject *self, PyObject *args)
-{
-    PyObject *oS, *orows, *odt, *okin, *opar, *oo;
-    if (!PyArg_ParseTuple(args, "OOOOOO", &oS, &orows, &odt, &okin, &opar, &oo))
-        return NULL;
-    PyObject *res = NULL;
-    View vS, vo;
-    vS.held = vo.held = 0;
-    Py_ssize_t cap, B = 0, *rows = NULL;
-    double *dk = NULL, *out;
-    RPar par;
-    if (store_get(oS, &vS, &cap) < 0 || (rows = idx_get(orows, cap, &B)) == NULL || rpar_get(opar, &par) < 0)
-        goto done;
-    dk = (double *)PyMem_Malloc((size_t)(B ? B : 1) * 5 * sizeof(double));
-    if (dk == NULL) {
-        PyErr_NoMemory();
-        goto done;
-    }
-    if (rows_get(odt, B, 1, dk, "dt") < 0 || rows_get(okin, B, 4, dk + B, "kin") < 0 ||
-        out_get(oo, &vo, B * 6, 0, &out, "out") < 0)
-        goto done;
-    for (Py_ssize_t b = 0; b < B; b++) {
-        const double *row = (const double *)vS.b.buf + rows[b] * RROW;
-        double *o = out + 6 * b;
-        if (fabs(dk[b]) < 1e-6) {
-            o[0] = row[RO_X + R_PX];
-            o[1] = row[RO_X + R_PY];
-            o[2] = row[RO_P];
-            o[3] = row[RO_P + 1];
-            o[4] = row[RO_P + RN];
-            o[5] = row[RO_P + RN + 1];
-        } else
-            r_peek_pos(row, dk[b], dk + B + 4 * b, &par, o);
-    }
-    res = Py_None;
-    Py_INCREF(res);
-done:
-    PyMem_Free(rows);
-    PyMem_Free(dk);
-    view_drop(&vS);
-    view_drop(&vo);
-    return res;
-}
-
 /* radar_peek(S, rows, dt, kin, par, x_out, P_out, mu_out) -> None. Tracker.peek_many: where each object is
  * believed to be after its dt (an object whose |dt| < 1e-6: its row as it is), nothing committed */
 static PyObject *n_radar_peek(PyObject *self, PyObject *args)
@@ -7154,41 +7108,6 @@ static int r_check(const double *row, double back, double px, double py, const d
     return 0;
 }
 
-/* radar_check(S, row, back, px, py, Pp) -> (m2, e) | None. Tracker._check for one expectation: the object's
- * present estimate taken back by `back` seconds against where it said it would be then (px, py; Pp: the 2 x 2
- * covariance it gave): half the squared distance in both uncertainties (+ 0.05 m2 each way), and the distance.
- * None: the sum is singular. */
-static PyObject *n_radar_check(PyObject *self, PyObject *args)
-{
-    PyObject *oS, *oPp;
-    Py_ssize_t slot;
-    double back, px, py, Pp[4];
-    if (!PyArg_ParseTuple(args, "OndddO", &oS, &slot, &back, &px, &py, &oPp))
-        return NULL;
-    View vS;
-    Py_ssize_t cap;
-    if (store_get(oS, &vS, &cap) < 0)
-        return NULL;
-    PyObject *res = NULL;
-    if (slot < 0 || slot >= cap) {
-        PyErr_SetString(PyExc_IndexError, "radar: a row outside the state array");
-        goto done;
-    }
-    if (rnums_get(oPp, 4, Pp, "Pp") < 0)
-        goto done;
-    {
-        double m2, e;
-        if (r_check((const double *)vS.b.buf + slot * RROW, back, px, py, Pp, &m2, &e) < 0) {
-            res = Py_None;
-            Py_INCREF(res);
-        } else
-            res = Py_BuildValue("(dd)", m2, e);
-    }
-done:
-    view_drop(&vS);
-    return res;
-}
-
 /* radar_register(S, ripe, dp_var, rows, a) -> (m, sum of weights) | None. Tracker._register for one sensor:
  * what the ripe objects agree on in their angle offsets (weights 1 / (P[dp, dp] + dp_var); from three on the
  * middle one by weight, else the weighted mean), and that times `a` taken out of the offset of every object
@@ -7342,6 +7261,10 @@ typedef struct {
     double prune_ln, keep_s;
     /* counters since the start */
     long long c_scans, c_leaves, c_children, c_hyps, c_murty, c_births, c_pruned;
+    /* the smoother's kept gains (r_rts): per row and hypothesis (3 + the free estimate), made when first needed */
+    double *sc;
+    Py_ssize_t sc_cap;
+    double sc_par[RNPAR];
 } Hyp;
 
 static PyObject *HypType;
@@ -7368,6 +7291,9 @@ static void hyp_release(Hyp *H)
     PyMem_Free(H->nchild);
     PyMem_Free(H->owner);
     PyMem_Free(H->freel);
+    PyMem_Free(H->sc);
+    H->sc = NULL;
+    H->sc_cap = 0;
     H->tr = NULL;
     H->cl = NULL;
     H->parent = H->nchild = H->owner = H->freel = NULL;
@@ -9723,7 +9649,7 @@ static int h_generate(Scan *s, int ci)
     return 0;
 }
 
-/* One scan: the core of Hyp.scan and Hyp.cycle. sc: its time, sensor, pose, constants, the state array (A) and the
+/* One scan: the core of Hyp.cycle. sc: its time, sensor, pose, constants, the state array (A) and the
  * numbers of objects (n) and detections (nd), set by the caller; th: the objects' handles; ti_in (n, HTI), D_in
  * (nd, RDET), KB_in (nd, RKB) | NULL, mem_in (nm, 5); bias: the sensor's five numbers where it has them (changed in
  * place). 0: done (sc->dead: the handles that ended, a list; sc->birth_h: per detection the object it started; the
@@ -9736,7 +9662,7 @@ static int scan_core(Hyp *H, Scan *sc, Py_ssize_t cap, const Py_ssize_t *th, Py_
     double t = sc->t;
     int nd = (int)sc->nd;
     if (cap < H->cap) {
-        PyErr_SetString(PyExc_ValueError, "Hyp.scan: the state array is smaller than the rows in use");
+        PyErr_SetString(PyExc_ValueError, "Hyp.cycle: the state array is smaller than the rows in use");
         return -1;
     }
     if (hyp_rows(H, cap) < 0)
@@ -9746,12 +9672,12 @@ static int scan_core(Hyp *H, Scan *sc, Py_ssize_t cap, const Py_ssize_t *th, Py_
         Py_ssize_t L = 0;
         for (Py_ssize_t k = 0; k < n; k++) {
             if (th[k] >= H->ntr || !H->tr[th[k]].alive) {
-                PyErr_SetString(PyExc_ValueError, "Hyp.scan: an object that does not exist");
+                PyErr_SetString(PyExc_ValueError, "Hyp.cycle: an object that does not exist");
                 return -1;
             }
             for (Py_ssize_t k2 = 0; k2 < k; k2++)
                 if (th[k2] == th[k]) {
-                    PyErr_SetString(PyExc_ValueError, "Hyp.scan: an object named twice");
+                    PyErr_SetString(PyExc_ValueError, "Hyp.cycle: an object named twice");
                     return -1;
                 }
             L += H->tr[th[k]].nleaf;
@@ -10012,125 +9938,6 @@ static int scan_core(Hyp *H, Scan *sc, Py_ssize_t cap, const Py_ssize_t *th, Py_
                 h_trim(H, sc->A, &H->tr[th[k]], t);
     }
     return 0;
-}
-
-/* Hyp.scan(S, objects, info, t, pose, sensor, src, dets, kinds | None, mem | None, nscan, acfg, par, ucfg, bcfg,
- *          bias | None) -> (objects' results, births, ended, bias | None)   or   rows needed (an int)
- *   objects: the handles that take part (not too far ahead of the scan's time); info: (n, HTI) per object;
- *   pose: the car's (X, Y, psi, vx, vy, w) at t; src: the sensor's number; dets: (nd, RDET); kinds: (nd, RKB) what
- *   each detection's kind can do (None: this scan starts no objects); mem: (nm, 5) the map's entries; bias: the
- *   sensor's slow angle error [value, variance] where it has one.
- * Returns per object (alive, primary row, p_detect, coverage, p_exists, p_primary, leaves, in the best story),
- * the objects started [(handle, detection, primary row)], the handles of objects that ended, and the sensor's
- * bias after the scan's common angle was taken (None: not taken). An int: the state array needs that many free
- * rows before the scan can run (nothing was changed). */
-static PyObject *hyp_scan(PyObject *self, PyObject *args)
-{
-    Hyp *H = (Hyp *)self;
-    PyObject *oS, *otr, *oti, *opose, *osen, *oD, *oKB, *omem, *oacfg, *opar, *oucfg, *obcfg, *obias;
-    double t, nscan;
-    int src;
-    if (!PyArg_ParseTuple(args, "OOOdOOiOOOdOOOOO", &oS, &otr, &oti, &t, &opose, &osen, &src, &oD, &oKB, &omem, &nscan,
-                          &oacfg, &opar, &oucfg, &obcfg, &obias))
-        return NULL;
-    PyObject *res = NULL, *out = NULL, *bias_o = NULL, *births = NULL;
-    View vS;
-    vS.held = 0;
-    Scan s;
-    memset(&s, 0, sizeof(s));
-    s.H = H;
-    s.t = t;
-    s.nscan = nscan;
-    s.src = src;
-    Py_ssize_t cap, n = 0, *th = NULL, nm = 0, need = 0;
-    double bias[5] = {0.0, 0.0, 0.0, 0.0, -1e18}, *in = NULL;
-    int has_bias = obias != Py_None;
-    if (store_get(oS, &vS, &cap) < 0 || (th = idx_get(otr, 1 << 30, &n)) == NULL || sens_get(osen, &s.sen) < 0 ||
-        rnums_get(opose, 6, s.pose, "pose") < 0 || rnums_get(oacfg, RSCFG, s.acfg, "acfg") < 0 ||
-        rpar_get(opar, &s.par) < 0 || rnums_get(oucfg, 2, s.ucfg, "ucfg") < 0 || rnums_get(obcfg, RBCFG, s.bcfg, "bcfg") < 0 ||
-        (has_bias && rnums_get(obias, 5, bias, "bias") < 0))
-        goto done;
-    s.A = (double *)vS.b.buf;
-    s.n = (int)n;
-    s.nd = batch_len(oD);
-    if (s.nd < 0)
-        goto done;
-    if (omem != Py_None && (nm = batch_len(omem)) < 0)
-        goto done;
-    int nd = (int)s.nd;
-    {
-        /* the objects' info, the detections, their kinds and the map's entries, as numbers */
-        size_t n_ti = (size_t)n * HTI, n_d = (size_t)nd * RDET, n_kb = (size_t)nd * RKB;
-        in = (double *)PyMem_Malloc((n_ti + n_d + n_kb + (size_t)nm * 5 + 1) * sizeof(double));
-        if (in == NULL) {
-            PyErr_NoMemory();
-            goto done;
-        }
-        double *ti = in, *D = ti + n_ti, *KB = D + n_d, *mem = KB + n_kb;
-        if ((n && rows_get(oti, n, HTI, ti, "info") < 0) || (nd && rows_get(oD, nd, RDET, D, "dets") < 0) ||
-            (nd && oKB != Py_None && rows_get(oKB, nd, RKB, KB, "kinds") < 0) || (nm && rows_get(omem, nm, 5, mem, "mem") < 0))
-            goto done;
-        int r = scan_core(H, &s, cap, th, n, ti, D, oKB == Py_None ? NULL : KB, nm, mem, has_bias, bias, &need);
-        if (r < 0)
-            goto done;
-        if (r == 1) {
-            res = PyLong_FromSsize_t(need);
-            goto done;
-        }
-    }
-    {
-        if ((births = PyList_New(0)) == NULL)
-            goto done;
-        /* 5. what the tracker needs back */
-        out = PyList_New(n);
-        if (out == NULL)
-            goto done;
-        for (Py_ssize_t k = 0; k < n; k++) {
-            HTrack *tr = &H->tr[th[k]];
-            PyObject *o;
-            if (!tr->alive)
-                o = Py_BuildValue("(Oiddddii)", Py_False, -1, 0.0, 0.0, 0.0, 0.0, 0, 0);
-            else {
-                const double *M = s.A + (Py_ssize_t)tr->primary * RROW + RO_M;
-                o = Py_BuildValue("(Oiddddii)", Py_True, (int)tr->primary, M[M_PD], M[M_COV], tr->pe, tr->pp, tr->nleaf,
-                                  tr->in_map);
-            }
-            if (o == NULL)
-                goto done;
-            PyList_SetItem(out, k, o);
-        }
-        for (int j = 0; j < nd; j++) {
-            int h = s.birth_h[j];
-            if (h < 0 || !H->tr[h].alive || H->tr[h].born != H->level)
-                continue;
-            HTrack *tr = &H->tr[h];
-            PyObject *o = Py_BuildValue("(iiiddi)", h, j, (int)tr->primary, tr->pe, tr->pp, tr->in_map);
-            if (o == NULL || PyList_Append(births, o) < 0) {
-                Py_XDECREF(o);
-                goto done;
-            }
-            Py_DECREF(o);
-        }
-        if (has_bias)
-            bias_o = Py_BuildValue("(ddddd)", bias[0], bias[1], bias[2], bias[3], bias[4]);
-        else {
-            bias_o = Py_None;
-            Py_INCREF(bias_o);
-        }
-        if (bias_o == NULL)
-            goto done;
-        res = PyTuple_Pack(4, out, births, s.dead, bias_o);
-    }
-done:
-    Py_XDECREF(out);
-    Py_XDECREF(bias_o);
-    Py_XDECREF(s.dead);
-    Py_XDECREF(births);
-    ar_free(&s.ar);
-    PyMem_Free(th);
-    PyMem_Free(in);
-    view_drop(&vS);
-    return res;
 }
 
 /* an object's handle checked */
@@ -10631,13 +10438,12 @@ static int r_chol8(const double *A, double *L)
     return 0;
 }
 
-/* One step back over a prediction: from the filtered (x, P) at a node and the smoothed (xs, Ps) at its child, the
- * smoothed (x, P) at the node (in place). model, dt, kin, par: the step; e: what the car's own movement added to
- * the place at the child (e00, e01, e11). */
-static void r_rts(int model, double *x, double *P, const double *xs, const double *Ps, double dt, const double *kin,
-                  const RPar *par, const double *e)
+/* The gain of one step back over a prediction (r_rts): the prediction (xp, Pp) of the filtered (x, P) over dt with
+ * what the car's own movement added (e), and G = P F^T Pp^-1. 0: the prediction is not positive. */
+static int r_rts_gain(int model, const double *x, const double *P, double dt, const double *kin, const RPar *par,
+                      const double *e, double *xp, double *Pp, double *G)
 {
-    double xp[RN], Pp[RNN], F[RNN], C[RNN], L[RNN], G[RNN];
+    double F[RNN], C[RNN], L[RNN];
     r_predict(model, x, P, dt, kin[0], kin[1], kin[2], par, xp, Pp);
     Pp[0] += e[0];
     Pp[1] += e[1];
@@ -10670,7 +10476,7 @@ static void r_rts(int model, double *x, double *P, const double *xs, const doubl
                 C[i * RN + j] = acc;
             }
     if (r_chol8(Pp, L) < 0)
-        return;                                          /* (a prediction that is not positive: the node stays filtered) */
+        return 0;                                        /* (a prediction that is not positive: the node stays filtered) */
     for (int i = 0; i < RN; i++) {                       /* G = C Pp^-1: each row solved against L L^T */
         double y[RN];
         for (int j = 0; j < RN; j++) {
@@ -10686,6 +10492,51 @@ static void r_rts(int model, double *x, double *P, const double *xs, const doubl
             G[i * RN + j] = acc / L[j * RN + j];
         }
     }
+    return 1;
+}
+
+/* What r_rts_gain gave for a step is kept with the step's child row, per hypothesis (and the free estimate): the
+ * inputs it was computed from (x, P, dt, e, kin) and the results. A later pass over the same story finds most steps
+ * unchanged (a sighting adds one node at the front); where the kept inputs are the same bits, the kept results are
+ * what the computation would give again. Nothing has to be told when rows are rewritten (the height prior, the
+ * sensor's registration, the opened uncertainty, a group's support, the heading prior, a row taken anew): the inputs
+ * then differ and the gain is computed. The angle offset and the height (x[dp], x[lh]) are left out of what is
+ * compared: the prediction carries each of them over as it is (r_predict: its coefficient is 1, its noise is in P)
+ * and nothing else of the prediction, its covariance or the gain reads them, so the kept results hold with the
+ * present two values put in. (The sensor's registration moves every row's angle offset at every message: with them
+ * compared, nothing kept of a camera's objects would ever be used.) The model's constants are kept once (Hyp.sc_par): other constants, nothing
+ * kept is used. */
+#define RSC_IN (RN + RNN + 1 + 3 + 3)
+#define RSC_W (RSC_IN + 1 + RN + RNN + RNN)
+
+/* One step back over a prediction: from the filtered (x, P) at a node and the smoothed (xs, Ps) at its child, the
+ * smoothed (x, P) at the node (in place). model, dt, kin, par: the step; e: what the car's own movement added to
+ * the place at the child (e00, e01, e11). keep: RSC_W numbers kept with the step (NULL: nothing is kept). */
+static void r_rts(int model, double *x, double *P, const double *xs, const double *Ps, double dt, const double *kin,
+                  const RPar *par, const double *e, double *keep)
+{
+    double in[RSC_IN], loc[1 + RN + RNN + RNN], *out = loc;
+    if (keep) {
+        memcpy(in, x, RN * sizeof(double));
+        in[R_DP] = in[R_LH] = 0.0;                       /* (not inputs of the gain: see above) */
+        memcpy(in + RN, P, RNN * sizeof(double));
+        in[RN + RNN] = dt;
+        memcpy(in + RN + RNN + 1, e, 3 * sizeof(double));
+        memcpy(in + RN + RNN + 4, kin, 3 * sizeof(double));
+        out = keep + RSC_IN;
+        if (out[0] == 0.0 || memcmp(keep, in, sizeof(in)) != 0) {
+            out[0] = 0.0;                                /* (not valid while it is written) */
+            int ok = r_rts_gain(model, x, P, dt, kin, par, e, out + 1, out + 1 + RN, out + 1 + RN + RNN);
+            memcpy(keep, in, sizeof(in));
+            out[0] = ok ? 1.0 : 2.0;
+        }
+        out[1 + R_DP] = x[R_DP];                         /* the prediction of the angle offset and of the height: */
+        out[1 + R_LH] = x[R_LH];                         /* themselves */
+    } else
+        out[0] = r_rts_gain(model, x, P, dt, kin, par, e, out + 1, out + 1 + RN, out + 1 + RN + RNN) ? 1.0 : 2.0;
+    if (out[0] != 1.0)
+        return;
+    const double *xp = out + 1, *Pp = xp + RN, *G = Pp + RNN;
     double dx[RN], D[RNN], GD[RNN];
     for (int i = 0; i < RN; i++)
         dx[i] = xs[i] - xp[i];
@@ -10718,7 +10569,7 @@ static void r_rts(int model, double *x, double *P, const double *xs, const doubl
 }
 
 /* The primary's story of object t smoothed backwards over at most max_steps nodes and max_s seconds (the core of
- * Hyp.smooth and Hyp.after). 0: the story has one node (nothing given). 1: hist (NULL: not wanted; room for
+ * Hyp.after and Hyp.history). 0: the story has one node (nothing given). 1: hist (NULL: not wanted; room for
  * max_steps + 1 rows of 6): (t, x, y, vx, vy, p_stand) at every node, the newest first, *nh_out rows; lag_out[5],
  * fl_out[5], *pl_out: the smoothed velocity, the free estimate's and the probability of "it stands" at the lag. */
 static int smooth_core(Hyp *H, const double *A, HTrack *t, const RPar *par, int max_steps, double max_s, double lag_s,
@@ -10727,6 +10578,15 @@ static int smooth_core(Hyp *H, const double *A, HTrack *t, const RPar *par, int 
     int32_t c = t->primary;
     if (c < 0 || H->parent[c] < 0)
         return 0;
+    /* the kept gains: for the rows there are now (more rows, or other constants of the model: started anew; no
+     * memory for them: the pass computes every gain) */
+    if (H->sc == NULL || H->sc_cap != H->cap || memcmp(H->sc_par, par, sizeof(H->sc_par)) != 0) {
+        PyMem_Free(H->sc);
+        H->sc = (double *)PyMem_Calloc((size_t)H->cap * 4 * RSC_W, sizeof(double));
+        H->sc_cap = H->sc ? H->cap : 0;
+        memcpy(H->sc_par, par, sizeof(H->sc_par));
+    }
+    double *sc = H->sc;
     {
         const double *row = A + (Py_ssize_t)c * RROW;
         double xs[3 * RN], Ps[3 * RNN], mu[3], xf[RN], Pf[RNN], t0 = row[RO_M + M_T];
@@ -10784,7 +10644,7 @@ static int smooth_core(Hyp *H, const double *A, HTrack *t, const RPar *par, int 
                             acc += b[i] * (Ps[i * RNN + r * RN + q] + (xs[i * RN + r] - xb[r]) * (xs[i * RN + q] - xb[q]));
                         Pb[r * RN + q] = Pb[q * RN + r] = acc / d[j];
                     }
-                r_rts(j, xn + j * RN, Pn + j * RNN, xb, Pb, dt, kin, par, e);
+                r_rts(j, xn + j * RN, Pn + j * RNN, xb, Pb, dt, kin, par, e, sc ? sc + (4 * (size_t)c + j) * RSC_W : NULL);
                 if (j == R_STAND)
                     for (int k = R_VX; k <= R_AY; k++)
                         xn[j * RN + k] = 0.0;
@@ -10803,7 +10663,7 @@ static int smooth_core(Hyp *H, const double *A, HTrack *t, const RPar *par, int 
             double xfn[RN], Pfn[RNN];
             memcpy(xfn, rp + RO_XF, sizeof(xfn));
             memcpy(Pfn, rp + RO_PF, sizeof(Pfn));
-            r_rts(R_CV, xfn, Pfn, xf, Pf, dt, kin, par, e);
+            r_rts(R_CV, xfn, Pfn, xf, Pf, dt, kin, par, e, sc ? sc + (4 * (size_t)c + 3) * RSC_W : NULL);
             memcpy(xs, xn, sizeof(xs));
             memcpy(Ps, Pn, sizeof(Ps));
             memcpy(mu, mn, sizeof(mu));
@@ -10845,70 +10705,6 @@ static int smooth_core(Hyp *H, const double *A, HTrack *t, const RPar *par, int 
         *nh_out = nh;
     }
     return 1;
-}
-
-/* Hyp.smooth(S, handle, par, max_steps, max_s, lag_s) ->
- *     ([(t, x, y, vx, vy, p_stand)], (vx, vy, svx, svy, age), (fvx, fvy, f00, f01, f11), p_stand at the lag) | None
- * The primary's story smoothed backwards over at most max_steps nodes and max_s seconds: the smoothed place and
- * velocity (ground frame) and probability of "it stands" at every node, the newest first (the first is the
- * filtered state itself); the smoothed velocity with its 1 sigma at the first node at least lag_s back (or the
- * oldest reached) and that node's age; the free estimate's smoothed velocity and its covariance there. Nothing
- * is written into the rows. None: the story has one node. */
-static PyObject *hyp_smooth(PyObject *self, PyObject *args)
-{
-    Hyp *H = (Hyp *)self;
-    PyObject *oS, *opar;
-    long h;
-    int max_steps;
-    double max_s, lag_s;
-    if (!PyArg_ParseTuple(args, "OlOidd", &oS, &h, &opar, &max_steps, &max_s, &lag_s))
-        return NULL;
-    HTrack *t = h_get(H, h);
-    if (t == NULL)
-        return NULL;
-    View vS;
-    Py_ssize_t cap;
-    RPar par;
-    if (store_get(oS, &vS, &cap) < 0)
-        return NULL;
-    PyObject *res = NULL, *hist = NULL;
-    double *hb = NULL;
-    if (rpar_get(opar, &par) < 0 || cap < H->cap) {
-        if (!PyErr_Occurred())
-            PyErr_SetString(PyExc_ValueError, "Hyp.smooth: a state array that is too small");
-        goto done;
-    }
-    {
-        double lag[5], fl[5], pl;
-        int nh = 0;
-        hb = (double *)PyMem_Malloc((size_t)((max_steps > 0 ? max_steps : 0) + 1) * 6 * sizeof(double));
-        if (hb == NULL) {
-            PyErr_NoMemory();
-            goto done;
-        }
-        if (!smooth_core(H, (const double *)vS.b.buf, t, &par, max_steps, max_s, lag_s, hb, &nh, lag, fl, &pl)) {
-            res = Py_None;
-            Py_INCREF(res);
-            goto done;
-        }
-        hist = PyList_New(nh);
-        if (hist == NULL)
-            goto done;
-        for (int k = 0; k < nh; k++) {
-            const double *o = hb + 6 * k;
-            PyObject *v = Py_BuildValue("(dddddd)", o[0], o[1], o[2], o[3], o[4], o[5]);
-            if (v == NULL)
-                goto done;
-            PyList_SetItem(hist, k, v);
-        }
-        res = Py_BuildValue("(O(ddddd)(ddddd)d)", hist, lag[0], lag[1], lag[2], lag[3], lag[4], fl[0], fl[1], fl[2], fl[3],
-                            fl[4], pl);
-    }
-done:
-    Py_XDECREF(hist);
-    PyMem_Free(hb);
-    view_drop(&vS);
-    return res;
 }
 
 /* ====================================================================================================
@@ -11239,7 +11035,9 @@ done:
  * can do, vehicle / person, id, settled, and whether its moving hypotheses hold its height and angle offset against
  * a camera's boxes (ccfg[1]: consider_moving; from ucfg[0] sightings on; not while a sensor that measures range has
  * seen it within ccfg[2] seconds; ccfg[3]: the standing hypothesis too). dets: the detections as the tracker gets
- * them (det_rows). The rest as Hyp.scan.
+ * them (det_rows). pose: the car's (X, Y, psi, vx, vy, w) at t; src: the sensor's number; mem: (nm, 5) the entries
+ * of the map of unexplained detections; nscan: the scans the map's memory holds; bias: the sensor's angle error
+ * [slow value, variance, fast value, variance, time] where it has one.
  * Written into the table: of every object that took part and lives its primary row, the probabilities that it
  * exists and that the primary's story is the true one, its leaves, whether it is in the best story, when a scan
  * last covered its place and when it was last hidden; a new object's row and an empty trajectory.
@@ -11488,7 +11286,7 @@ static PyObject *hyp_after(PyObject *self, PyObject *args)
     View vS, vT, vH;
     vS.held = vT.held = vH.held = 0;
     Py_ssize_t cap, trows, hrows, hcols, nh = 0, nk = 0, nb = 0, *hit = NULL, *kept = NULL, *born = NULL;
-    double cfg[RAFT_N], *hb = NULL;
+    double cfg[RAFT_N];
     RPar par;
     if (store_get(oS, &vS, &cap) < 0 || tab_get(oT, &vT, ROTW, &trows, NULL, "table") < 0 ||
         tab_get(oHi, &vH, 0, &hrows, &hcols, "hist") < 0 || rpar_get(opar, &par) < 0 || rnums_get(ocfg, RAFT_N, cfg, "cfg") < 0)
@@ -11506,11 +11304,6 @@ static PyObject *hyp_after(PyObject *self, PyObject *args)
     }
     Py_ssize_t hn = (hcols - 1) / 5;
     double *A = (double *)vS.b.buf, *tab = (double *)vT.b.buf, *hist = (double *)vH.b.buf;
-    hb = (double *)PyMem_Malloc((size_t)(steps + 1) * 6 * sizeof(double));
-    if (hb == NULL) {
-        PyErr_NoMemory();
-        goto done;
-    }
     for (Py_ssize_t i = 0; i < nh + nk + nb; i++) {
         Py_ssize_t h = i < nh ? hit[i] : i < nh + nk ? kept[i - nh] : born[i - nh - nk];
         double v = tab[h * ROTW + ROT_SLOT];
@@ -11609,32 +11402,21 @@ static PyObject *hyp_after(PyObject *self, PyObject *args)
                 PyErr_SetString(PyExc_ValueError, "Hyp: an object that does not exist");
                 goto done;
             }
-            double *T = tab + h * ROTW, *Hh = hist + h * hcols;
+            double *T = tab + h * ROTW;
             double ot = A[(Py_ssize_t)T[ROT_SLOT] * RROW + RO_M + M_T], lag[5], fl[5], pl;
-            /* back to the lag after every sighting; the whole trajectory, as far as the smoother reaches, once per
-             * cfg[RAFT_WHOLE_S] */
+            /* back to the lag: the first node at least the lag back within cfg[RAFT_SHORT_S], and once per
+             * cfg[RAFT_WHOLE_S] within cfg[RAFT_SMOOTH_S] (sightings far apart: the nearer reach finds none). The
+             * trajectory itself is smoothed when it is asked for (Hyp.history). */
             int whole = ot - T[ROT_HIST_T] >= cfg[RAFT_WHOLE_S], np = 0;
-            if (!smooth_core(H, A, tr, &par, steps, whole ? cfg[RAFT_SMOOTH_S] : cfg[RAFT_SHORT_S], cfg[RAFT_LAG_S],
-                             whole ? hb : NULL, &np, lag, fl, &pl))
+            if (!smooth_core(H, A, tr, &par, steps, whole ? cfg[RAFT_SMOOTH_S] : cfg[RAFT_SHORT_S], cfg[RAFT_LAG_S], NULL,
+                             &np, lag, fl, &pl))
                 continue;
             memcpy(T + ROT_VS, lag, sizeof(lag));
             memcpy(T + ROT_FS, fl, sizeof(fl));
             T[ROT_PSLAG] = pl;
             T[ROT_HASVS] = 1.0;
-            if (!whole)
-                continue;
-            T[ROT_HIST_T] = ot;
-            double t_old = hb[6 * (np - 1)] - 1e-6;      /* older than the smoother reaches: as it was */
-            Py_ssize_t n = (Py_ssize_t)Hh[0], w = 0;
-            for (Py_ssize_t k = 0; k < n; k++)
-                if (Hh[1 + 5 * k] < t_old) {
-                    if (w != k)
-                        memmove(Hh + 1 + 5 * w, Hh + 1 + 5 * k, 5 * sizeof(double));
-                    w++;
-                }
-            Hh[0] = (double)w;
-            for (int k = np - 1; k >= 0; k--)
-                hist_push(Hh, hn, hb[6 * k], hb[6 * k + 1], hb[6 * k + 2], hb[6 * k + 3], hb[6 * k + 4]);
+            if (whole)
+                T[ROT_HIST_T] = ot;
         }
     for (Py_ssize_t i = 0; i < nb; i++) {
         const double *row = A + (Py_ssize_t)tab[born[i] * ROTW + ROT_SLOT] * RROW;
@@ -11646,20 +11428,123 @@ done:
     PyMem_Free(hit);
     PyMem_Free(kept);
     PyMem_Free(born);
-    PyMem_Free(hb);
     view_drop(&vS);
     view_drop(&vT);
     view_drop(&vH);
     return res;
 }
 
+/* Hyp.history(S, hist, handle, par, max_steps, max_s) -> [(t, x, y, vx, vy)], the oldest first
+ * An object's trajectory on the ground, as it is asked for: the points written at its sightings (hist: the filtered
+ * place and velocity of each), and in their place, as far back as the smoother reaches from the primary now
+ * (smooth_core: at most max_steps nodes and max_s seconds), the smoothed place and velocity of every node of the
+ * primary's story. Nothing is written. An object that has ended, or whose story has one node: the points as written. */
+static PyObject *hyp_history(PyObject *self, PyObject *args)
+{
+    Hyp *H = (Hyp *)self;
+    PyObject *oS, *oHi, *opar, *res = NULL;
+    Py_ssize_t h;
+    int max_steps;
+    double max_s;
+    if (!PyArg_ParseTuple(args, "OOnOid", &oS, &oHi, &h, &opar, &max_steps, &max_s))
+        return NULL;
+    View vS, vH;
+    vS.held = vH.held = 0;
+    Py_ssize_t cap, hrows, hcols;
+    RPar par;
+    double *hb = NULL;
+    if (store_get(oS, &vS, &cap) < 0 || tab_get(oHi, &vH, 0, &hrows, &hcols, "hist") < 0 || rpar_get(opar, &par) < 0)
+        goto done;
+    if (h < 0 || h >= hrows || hcols < 6 || (hcols - 1) % 5 != 0 || max_steps < 0 || cap < H->cap) {
+        PyErr_SetString(PyExc_ValueError, "Hyp.history: the arrays or the object do not fit");
+        goto done;
+    }
+    {
+        const double *Hh = (const double *)vH.b.buf + h * hcols;
+        Py_ssize_t n = (Py_ssize_t)Hh[0], hn = (hcols - 1) / 5;
+        double lag[5], fl[5], pl, t_old = INFINITY;
+        int np = 0;
+        hb = (double *)PyMem_Malloc((size_t)(max_steps + 1) * 6 * sizeof(double));
+        if (hb == NULL) {
+            PyErr_NoMemory();
+            goto done;
+        }
+        if (h < H->ntr && H->tr[h].alive &&
+            smooth_core(H, (const double *)vS.b.buf, &H->tr[h], &par, max_steps, max_s, INFINITY, hb, &np, lag, fl, &pl))
+            t_old = hb[6 * (np - 1)] - 1e-6;             /* older than the smoother reaches: as it was written */
+        else
+            np = 0;
+        if ((res = PyList_New(0)) == NULL)
+            goto done;
+        Py_ssize_t keep = 0;
+        for (Py_ssize_t k = 0; k < n; k++)
+            keep += Hh[1 + 5 * k] < t_old;
+        Py_ssize_t skip = keep + np > hn ? keep + np - hn : 0;   /* (at most hn points: the oldest go) */
+        for (Py_ssize_t k = 0; k < n + np; k++) {
+            const double *p = k < n ? Hh + 1 + 5 * k : hb + 6 * (np - 1 - (k - n));
+            if (k < n && !(p[0] < t_old))
+                continue;
+            if (skip > 0) {
+                skip--;
+                continue;
+            }
+            PyObject *o = Py_BuildValue("(ddddd)", p[0], p[1], p[2], p[3], p[4]);
+            if (o == NULL || PyList_Append(res, o) < 0) {
+                Py_XDECREF(o);
+                Py_CLEAR(res);
+                goto done;
+            }
+            Py_DECREF(o);
+        }
+    }
+done:
+    PyMem_Free(hb);
+    view_drop(&vS);
+    view_drop(&vH);
+    return res;
+}
+
+/* Hyp.sync(table, objects) -> None: what the hypotheses say of each object now, into its row of the table: its
+ * primary row, the probabilities that it exists and that the primary's story is the true one, its leaves, whether it
+ * is in the best story. A scan writes these for the objects that took part; an object taken out (Hyp.drop) settles
+ * its cluster anew, which may name another leaf of a cluster-mate its primary: then the table follows. */
+static PyObject *hyp_sync(PyObject *self, PyObject *args)
+{
+    Hyp *H = (Hyp *)self;
+    PyObject *oT, *otr, *res = NULL;
+    if (!PyArg_ParseTuple(args, "OO", &oT, &otr))
+        return NULL;
+    View vT;
+    vT.held = 0;
+    Py_ssize_t trows, n = 0, *th = NULL;
+    if (tab_get(oT, &vT, ROTW, &trows, NULL, "table") < 0 || (th = idx_get(otr, trows, &n)) == NULL)
+        goto done;
+    for (Py_ssize_t k = 0; k < n; k++) {
+        if (th[k] >= H->ntr || !H->tr[th[k]].alive)
+            continue;
+        const HTrack *tr = &H->tr[th[k]];
+        double *T = (double *)vT.b.buf + th[k] * ROTW;
+        T[ROT_SLOT] = (double)tr->primary;
+        T[ROT_PE] = tr->pe;
+        T[ROT_PP] = tr->pp;
+        T[ROT_NLEAF] = (double)tr->nleaf;
+        T[ROT_INMAP] = tr->in_map ? 1.0 : 0.0;
+    }
+    res = Py_None;
+    Py_INCREF(res);
+done:
+    PyMem_Free(th);
+    view_drop(&vT);
+    return res;
+}
+
 static PyMethodDef hyp_methods[] = {
-    {"scan", hyp_scan, METH_VARARGS, "one scan: the hypotheses of every cluster, the objects' primaries"},
+    {"sync", hyp_sync, METH_VARARGS, "the objects' primaries and probabilities as the hypotheses hold them, into the table"},
+    {"history", hyp_history, METH_VARARGS, "an object's trajectory, smoothed as far as the smoother reaches"},
     {"cycle", hyp_cycle, METH_VARARGS, "one scan of the tracker: its objects in, what the scan did to them out"},
     {"after", hyp_after, METH_VARARGS, "after a scan's sightings: predictions checked and written down, trajectories, the smoothed past"},
     {"drop", hyp_drop, METH_VARARGS, "an object taken out"},
     {"rows", hyp_rows_of, METH_O, "every row of an object, the primary first"},
-    {"smooth", hyp_smooth, METH_VARARGS, "the primary's story smoothed backwards (fixed lag)"},
     {"chain", hyp_chain, METH_O, "the primary's rows from now back"},
     {"leaves", hyp_leaves, METH_O, "an object's hypotheses and their probabilities"},
     {"start", hyp_start, METH_VARARGS, "an object put in from outside"},
@@ -12220,7 +12105,6 @@ static PyMethodDef methods[] = {
     {"geom_centre", n_geom_centre, METH_VARARGS, "the road geometry's centre line lists (RoadGeometryFusion._centre)"},
     {"geom_reach", n_geom_reach, METH_VARARGS, "how far the camera's centre line reaches (RoadGeometryFusion._reach)"},
     {"radar_peek", n_radar_peek, METH_VARARGS, "Tracker.peek: where objects will be (x, P, mu), into given arrays"},
-    {"radar_peek_pos", n_radar_peek_pos, METH_VARARGS, "Tracker.peek_many, the place only (x, y and its covariance)"},
     {"radar_h", n_radar_h, METH_VARARGS, "a sensor's measurement function (sensors.py h) into given arrays"},
     {"radar_combine_rows", n_radar_combine_rows, METH_VARARGS, "the objects' combinations from their hypotheses, in their rows"},
     {"radar_predict1", n_radar_predict1, METH_VARARGS, "one hypothesis forward by dt (models.predict)"},
@@ -12238,7 +12122,6 @@ static PyMethodDef methods[] = {
     {"radar_frame", n_radar_frame, METH_VARARGS, "the output's per-object numbers (box.py Radar.frame)"},
     {"radar_life", n_radar_life, METH_VARARGS, "Tracker.manage's numbers: stillness, finiteness, out-of-view place"},
     {"radar_merge", n_radar_merge, METH_VARARGS, "Tracker._merge's geometry: the near pairs and their test"},
-    {"radar_check", n_radar_check, METH_VARARGS, "Tracker._check for one expectation"},
     {"radar_register", n_radar_register, METH_VARARGS, "Tracker._register for one sensor: the shared offset, taken out"},
     PREDICT_METHODS
     EGOMOTION_METHODS

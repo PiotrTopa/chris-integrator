@@ -72,10 +72,10 @@ def selftest(n=20000, seed=1):
     for row, dt, label, ref in RADAR_EVOLVE:
         S = np.zeros((1, _n.RADAR_ROW))                           # a row of the state array: the motion part recorded
         S[0, :len(row)] = row
-        out = np.empty((1, 6))
-        _n.radar_peek_pos(S, [0], [dt], [R._KIN4.get(label) or R._KIN4[None]], R._native_par(R.CFG), out)
-        if not close(out[0], ref):
-            bad.append("radar_peek_pos differs from the reference's motion model")
+        x, P, mu = np.empty((1, 8)), np.empty((1, 8, 8)), np.empty((1, 3))    # the place after dt and its covariance
+        _n.radar_peek(S, [0], [dt], [R._KIN4.get(label) or R._KIN4[None]], R._native_par(R.CFG), x, P, mu)
+        if not close([x[0, 0], x[0, 1], P[0, 0, 0], P[0, 0, 1], P[0, 1, 0], P[0, 1, 1]], ref):
+            bad.append("radar_peek differs from the reference's motion model")
             break
     for sen, kind, sdt, x, pose, zr, Hr in RADAR_H:
         z, H = np.empty(4), np.empty((4, 8))

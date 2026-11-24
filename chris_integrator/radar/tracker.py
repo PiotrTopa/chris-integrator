@@ -75,9 +75,10 @@ CFG = dict(
     hyp_n_scan=5, hyp_k_best=32, hyp_max_leaves=12, hyp_prune_ln=math.log(1e4), hyp_max_cluster=16,
     hyp_keep_steps=40, hyp_keep_s=2.0,   # each story's history kept this far back (the smoother's reach)
     rows=1024,                   # of the state array at the start (it grows as needed)
-    # the past, smoothed (docs/RADAR.md, section 6): a backward pass over each story after every sighting, as far
-    # back as smooth_s (the whole trajectory once per smooth_hist_s; 0: at every sighting); the velocity that is
-    # put out as `vs` and judged is the one smooth_lag_s ago
+    # the past, smoothed (docs/RADAR.md, section 6): a backward pass over each story after every sighting, back to
+    # the lag: the velocity that is put out as `vs` and judged is the one smooth_lag_s ago (the first node that far
+    # back within 1.5 lags; once per smooth_hist_s the pass looks as far as smooth_s for it). An object's trajectory
+    # (`Obj.history`) is smoothed as far back as smooth_s when it is asked for
     smooth=True, smooth_s=2.0, smooth_lag_s=0.5, smooth_hist_s=0.5,
     # structure (docs/RADAR.md, section 7): rows of standing things, queues, platoons. The free room between two
     # members (standing / driving), how alike two drivers' velocities are, how straight the line is (m + share
@@ -233,6 +234,7 @@ class State:
         self.a = np.zeros((cap, ROW))
         self.free = list(range(cap - 1, -1, -1))
         self.tab = np.zeros((objects, OTW))
+        self.tracker = None              # the tracker whose numbers these are (an object's trajectory asks its smoother)
         self.hist = np.zeros((objects, 1 + 5 * CFG["history_n"]))
 
     def grow(self, cap):
@@ -382,9 +384,14 @@ class Obj:
     @property
     def history(self):
         """Its trajectory on the ground: [(t, x, y, vx, vy)], the oldest first, smoothed as far as the smoother
-        reaches."""
-        r = self.store.hist[self.h]
-        return [tuple(p) for p in r[1:1 + 5 * int(r[0])].reshape(-1, 5).tolist()]
+        reaches (docs/RADAR.md, section 6). The smoothing is done when this is asked (Hyp.history: a backward pass
+        over the primary's story as far as smooth_s); nothing in the stack reads it per message."""
+        s = self.store
+        tr = s.tracker
+        if tr is None:
+            r = s.hist[self.h]
+            return [tuple(p) for p in r[1:1 + 5 * int(r[0])].reshape(-1, 5).tolist()]
+        return tr.hyp.history(s.a, s.hist, self.h, M._native_par(tr.mcfg), tr.cfg["hyp_keep_steps"], tr.cfg["smooth_s"])
 
     @property
     def vs(self):
@@ -433,6 +440,7 @@ class Tracker:
         c = self.cfg
         self.objects = []
         self.store = State(c["rows"])    # the objects' numbers: a row per node of their trees
+        self.store.tracker = self
         self.hyp = _NR.Hyp(c["rows"], c["hyp_n_scan"], c["hyp_k_best"], c["hyp_max_leaves"], c["hyp_prune_ln"],
                            c["hyp_keep_steps"], c["hyp_keep_s"], c["hyp_max_cluster"])
         self.by_h = {}               # handle -> object
@@ -456,6 +464,7 @@ class Tracker:
         self._labs = {}              # a detection's class as given -> (vehicle / person / not known, models.kinb)
         self._ranges = {}            # sensor id -> it measures range (a microwave radar, a position)
         self._snap = None            # (the list of objects, `look` of them): see `looked`
+        self._memrows = {}           # sensor id -> the map's entries of confirmed objects as the native core reads them
 
     def look(self, objs):
         """Several objects' numbers at once, as lists (the upkeep and the message read every object once per
@@ -617,11 +626,11 @@ class Tracker:
             st["dets"] += len(dets)
         elif type(dets) is not list:
             dets = list(dets)
-        mem = self.unexplained.get(src)
-        rows = None
-        if mem:
-            real = self.real_ids
-            rows = [(len(zz), zz[0], zz[1], zz[2] if len(zz) > 2 else 0.0, oid) for (_, _, zz, oid) in mem if oid in real] or None
+        rows = self._memrows.get(src, False)             # the map's entries as rows, made anew when the map changed
+        if rows is False:
+            mem, real = self.unexplained.get(src), self.real_ids
+            rows = self._memrows[src] = [(len(zz), zz[0], zz[1], zz[2] if len(zz) > 2 else 0.0, oid)
+                                         for (_, _, zz, oid) in mem or () if oid in real] or None
         g, bw = c["gate"], c["map_bw"]
         acfg = (g.get(1, 16.0), g.get(2, 16.0), g.get(3, 16.0), g.get(4, 16.0), c["feat_sigma"], c["feat_same"],
                 c["feat_span"], bw[0], bw[1], bw[2], c["feat_max_s"], c["common_min"], c["common_pair"],
@@ -676,6 +685,7 @@ class Tracker:
             times.popleft()
         while memq and memq[0][0] < t - c["map_s"]:
             memq.popleft()
+            self._memrows.pop(src, None)
         for h, j in births:
             d = dets[j]
             o = Obj(self.next_id, h, t, src, sensor.coast_s, store)
@@ -694,6 +704,7 @@ class Tracker:
                 # the map lives in the space of the ground angle, the bearing and the log height: a box with a
                 # scale-rate row enters without it, a box cut at the bottom (its rows are another space) not at all
                 memq.append((t, kb, np.asarray(d["z"], float)[:len(kb)], o.id))
+                self._memrows.pop(src, None)
             self.objects.append(o)
             self.by_h[h] = o
             st["started"] += 1
@@ -701,9 +712,8 @@ class Tracker:
             # what follows the sightings, in one native call (chris_native.c `Hyp.after`): each sighted object's
             # earlier predictions checked against where it turned out to be (one that keeps being elsewhere has
             # its uncertainty opened) and its trajectory carried on; where it expects to be at the horizons ahead
-            # written down; its past smoothed (docs/RADAR.md, section 6: the velocity a lag ago after every
-            # sighting, the whole trajectory once per smooth_hist_s: it costs four times the short pass with a
-            # 17 Hz sensor); a new object's first point
+            # written down; its past smoothed back to the lag (docs/RADAR.md, section 6: the velocity a lag ago);
+            # a new object's first point
             hz = c["check_horizons"]
             self.hyp.after(store.a, store.tab, store.hist, [o.h for o in hit], [o.h for o in kept], [h for h, _ in births],
                            float(t), par,
@@ -806,6 +816,7 @@ class Tracker:
                     if exist >= c["confirm_exist"] and hits >= c["confirm_hits"] and r[OT_INMAP]:
                         o.state = "confirmed"
                         self.real_ids.add(o.id)
+                        self._memrows.clear()
                         self._score_learn(o.scores, True)
                         o.scores = []
                 else:
@@ -835,6 +846,7 @@ class Tracker:
             self._drop(o)
         if len(self.real_ids) > 4096:
             self.real_ids = {o.id for o in keep if o.state != "tentative"}
+            self._memrows.clear()
         self._merge(T)
         self._register(T)
         self._groups(T, pose)
@@ -959,8 +971,10 @@ class Tracker:
                 if q.h in dead:
                     self.by_h.pop(q.h, None)
             self.objects = [q for q in self.objects if q.h not in dead]
-        for q in self.objects:                           # their primaries may have changed
-            pass
+        # the cluster it was of is settled anew: another leaf of a cluster-mate may be its primary now, and what the
+        # hypotheses say of its existence has changed; the objects' rows of the table follow
+        self.hyp.sync(self.store.tab, [q.h for q in self.objects])
+        self._snap = None
 
     def _life(self, T, pose, scan, slots, tb, rec, lasts):
         """Per object: (p_still, its combined state finite, and for one out of every field (not tentative) where
