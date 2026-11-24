@@ -1021,8 +1021,8 @@ runs, 63 of them warned in the last 8 s; the time of the last said episode befor
 warning one frame later (0.07 s), the rest at the same frames; with levels only and `hold_s` 0.3, one warning of 63
 was lost (and another gained, one 1 s earlier): the looser signs are not the default. `fixed`: 19 of 63 later by more
 than 0.06 s, up to 0.27 s. On the detector's realistic stream (`DETIN`, 36 runs and 48 collision runs at 20 frames a
-second) only the looser signs were run: no run differs (56 / 54 false episodes, 15 and 13 warnings at the same
-frames); `fixed`: 14 of 28 warnings later, by up to 0.21 s.
+second): as configured with 128 draws, the 15 and 13 warnings at the same frames, false episodes 56 -> 54 / 54 -> 54;
+the looser signs: no run differs; `fixed`: 14 of 28 warnings later, by up to 0.21 s.
 The simulator's own 13 frames a second (the older road model) are not thinned by any mode: nothing saved, nothing
 changed. Cost (`tools/cost_bench.py`, user instructions of the whole replay): the recorded night drive -1.6 %
 (`fixed` -2.4 %); of `predict` + `decide` there that is a fifth. With `fixed` the same warnings come later and a
