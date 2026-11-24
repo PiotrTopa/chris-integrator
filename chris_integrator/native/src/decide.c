@@ -758,7 +758,31 @@ static double dk_pc(const DkCtx *C, int j, int k, double *t_contact)
     int any = 0;
     static double L11[DK_MAXSIM], L21[DK_MAXSIM], L22[DK_MAXSIM], DD[DK_MAXSIM];
     static unsigned char live[DK_MAXSIM];
+    /* Most steps of most pairs are far beyond the prune, and that is seen without a square root: the largest
+     * spread of a step is at most max(sxx, syy) + |sxy| (lmax below: tr + dd, dd <= |sxx - syy| / 2 + |sxy|), so
+     * with umax the largest of that over the horizon a step whose centres are further apart than the two circles
+     * and prune_sigma sqrt(umax) is not live, whatever its own spread (a margin of 1e-9 against the rounding). */
+    static double D2[DK_MAXSIM];
+    double umax = 0.0;
     for (int i = 0; i < n; i++) {
+        double sxx = o->sxx[i] + e->exx[i], sxy = o->sxy[i] + e->exy[i], syy = o->syy[i] + e->eyy[i];
+        double u = (sxx > syy ? sxx : syy) + fabs(sxy);
+        if (!(u <= umax))
+            umax = u > umax ? u : INFINITY;      /* (not a number: every step is looked at) */
+        double dx = o->cx[i] - ER[i].cx, dy = o->cy[i] - ER[i].cy;
+        D2[i] = dx * dx + dy * dy;
+    }
+    double far2 = -1.0;                          /* beyond this squared distance a step is not live; < 0: no bound */
+    if (cfg[DC_PRUNE] >= 0.0 && cfg[DC_PRUNE] < INFINITY) {
+        double far = (Ro0 + Re + cfg[DC_PRUNE] * sqrt(umax)) * (1.0 + 1e-9);
+        if (far >= 0.0 && far < INFINITY)
+            far2 = far * far * (1.0 + 1e-9);
+    }
+    for (int i = 0; i < n; i++) {
+        if (far2 >= 0.0 && D2[i] > far2) {
+            live[i] = 0;
+            continue;
+        }
         double sxx = o->sxx[i] + e->exx[i], sxy = o->sxy[i] + e->exy[i], syy = o->syy[i] + e->eyy[i];
         double tr = 0.5 * (sxx + syy), dd = sqrt(0.25 * (sxx - syy) * (sxx - syy) + sxy * sxy);
         double lmax = tr + dd;
