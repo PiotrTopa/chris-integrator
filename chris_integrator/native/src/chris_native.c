@@ -7988,7 +7988,7 @@ static inline double clamp_dp(double v)          /* min(0.05, max(-0.05, v)) as 
 }
 
 static int r_take_parts(double *x, double *P, const RSens *sen, int kind, double sdt, const double *pose, const double *z,
-                        const double *Rf, const double *e, double rel, double *like)
+                        const double *Rf, const double *e, double rel, int cons, double *like)
 {
     double xk[RSPLIT * RN], Pk[RNN], Pq[RSPLIT][RNN], lq[RSPLIT], tot = 0.0;
     int np = r_split(x, P, pose[0], pose[1], rel, xk, Pk);
@@ -8009,6 +8009,9 @@ static int r_take_parts(double *x, double *P, const RSens *sen, int kind, double
         tot += lq[q];
         memcpy(Pq[q], Pk, sizeof(Pk));
         r_gain(Pk, H, m, Si, K);
+        if (cons)                                        /* the size and the angle offset as consider parameters */
+            for (int c = 0; c < m; c++)
+                K[R_LH * m + c] = K[R_DP * m + c] = 0.0;
         r_take(xk + q * RN, Pq[q], K, H, Rf, nu, m, 1.0);
     }
     *like = tot;
@@ -8046,7 +8049,7 @@ static int r_take_parts(double *x, double *P, const RSens *sen, int kind, double
  * object's normalised innovation before the update; *dl: what the fit adds to the log odds that the object
  * exists. -1: an innovation covariance is singular (nothing changed). */
 static int r_update_full(double *row, const RSens *sen, const double *pose, const double *d, double hold, double floor_,
-                         double rel, double *nis, double *dl)
+                         double rel, int cons, double *nis, double *dl)
 {
     double *mu = row + RO_MU;
     int kind = (int)d[D_KIND];
@@ -8059,14 +8062,15 @@ static int r_update_full(double *row, const RSens *sen, const double *pose, cons
         return -1;
     for (int j = 0; j < 3; j++) {
         double *x = row + RO_XS + j * RN, *P = row + RO_PS + j * RNN;
-        if (r_take_parts(x, P, sen, kind, sdt, pose, d + D_Z, Rf, row + RO_E, rel, &like[j]) < 0)
+        if (r_take_parts(x, P, sen, kind, sdt, pose, d + D_Z, Rf, row + RO_E, rel,
+                         cons && sen->type == SEN_CAMERA && (j != R_STAND || cons >= 2), &like[j]) < 0)
             like[j] = 0.0;
         if (j == R_STAND)
             for (int k = R_VX; k <= R_AY; k++)
                 x[k] = 0.0;
         x[R_DP] = clamp_dp(x[R_DP]);
     }
-    if (r_take_parts(row + RO_XF, row + RO_PF, sen, kind, sdt, pose, d + D_Z, Rf, row + RO_E, rel, &lf) == 0)
+    if (r_take_parts(row + RO_XF, row + RO_PF, sen, kind, sdt, pose, d + D_Z, Rf, row + RO_E, rel, 0, &lf) == 0)
         row[RO_XF + R_DP] = clamp_dp(row[RO_XF + R_DP]);
     double tot = (mu[0] * like[0] + mu[1] * like[1]) + mu[2] * like[2];
     double w[3] = {mu[0] * like[0], mu[1] * like[1], mu[2] * like[2]};
@@ -8646,8 +8650,9 @@ static void r_cell_centre(const double *row, const RSens *sen, const double *pos
 }
 
 /* ---- one scan ---- */
-#define HTI 10                   /* a participating object: dt, sa, sp (the car's movement over dt: along, heading),
-                                    kin[4], vehicle (-1, 0, 1), id, settled (confirmed or coast: 1) */
+#define HTI 11                   /* a participating object: dt, sa, sp (the car's movement over dt: along, heading),
+                                    kin[4], vehicle (-1, 0, 1), id, settled (confirmed or coast: 1), consider (1: its
+                                    moving hypotheses hold its size and angle offset against a camera's boxes) */
 
 /* a leaf one scan on: a new row under it with its numbers at the scan's time (the story "not reported"), the
  * step written down for the smoother. -1: no free row. */
@@ -9410,7 +9415,8 @@ static int32_t h_detchild(Scan *s, int a, int j)
     int base = (int)d[D_KIND] & 7;
     memcpy(dc, d, sizeof(dc));
     r_cell_centre(row, &s->sen, s->pose, dc);
-    if (r_update_full(row, &s->sen, s->pose, dc, s->ucfg[0], s->ucfg[1], s->acfg[18], &nis, &dl) == 0)
+    if (r_update_full(row, &s->sen, s->pose, dc, s->ucfg[0], s->ucfg[1], s->acfg[18],
+                      (int)s->ti[(size_t)s->lk[a] * HTI + 10], &nis, &dl) == 0)
         r_extent_update(row, &s->sen, d, s->pose, s->ti + (size_t)s->lk[a] * HTI + 3);
     M[M_L] = pymax(-12.0, pymin(12.0, M[M_L] + dl + d[D_SCORE]));
     M[M_HITS] += 1.0;

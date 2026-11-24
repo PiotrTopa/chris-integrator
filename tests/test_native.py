@@ -669,7 +669,7 @@ def test_radar_single_hypothesis_functions():
         kin = M._KIN4.get(label) or M._KIN4[None]
         h, r0 = H.start(st.a, row, kin, 0.0, 1.0)
         dt = float(g.choice([0.05, 0.4, 2.0]))
-        out, births, dead, bias = H.scan(st.a, [h], [(dt, 0.0, 0.0) + tuple(kin) + (0.0, 1.0, 1.0)], dt,
+        out, births, dead, bias = H.scan(st.a, [h], [(dt, 0.0, 0.0) + tuple(kin) + (0.0, 1.0, 1.0, 0.0)], dt,
                                          (0.0, 0.0, 0.0, 0.0, 0.0, 0.0), sen, 1, np.zeros((0, 20)), None, None, 0.0,
                                          (9.0, 13.8, 16.3, 18.5, 0.25, 0.9, 3.0, 0.01, 0.03, 0.4, 1.0, 3.0, 0.8, 1.0, 0.25, 0.65, 0.03, 0.3, 0.12),
                                          M._native_par(M.CFG), (2.0, 0.01), (0.2, 0.5, 2.5, 0.3, 3.0, 0.15, 0.01, 0.0), None)
@@ -752,7 +752,7 @@ def test_radar_update_keeps_the_covariance_symmetric_and_positive():
                 D = [2.0, 0.0, 0.0, 1.0, 0.05, math.atan2(1.22, rng), math.atan2(xc[1], xc[0]),
                      cam.logf + xc[7] - math.log(max(xc[0], 0.5)), 0.0]
                 Rv = [10.0 ** g.uniform(-11, -5), 10.0 ** g.uniform(-11, -5), 10.0 ** g.uniform(-9, -2), 0.0]
-            out, _, _, _ = H.scan(st.a, [h], [(0.0, 0.0, 0.0) + tuple(kin) + (1.0, 1.0, 1.0)], 0.0, pose, sen.native(), 1,
+            out, _, _, _ = H.scan(st.a, [h], [(0.0, 0.0, 0.0) + tuple(kin) + (1.0, 1.0, 1.0, 0.0)], 0.0, pose, sen.native(), 1,
                                   np.array([D + Rv + [0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0]]), None, None, 0.0, acfg,
                                   M._native_par(M.CFG), (2.0, 0.01), (0.2, 0.5, 2.5, 0.3, 3.0, 0.15, 0.01, 0.0), None)
             assert out[0][0]

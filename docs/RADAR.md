@@ -158,6 +158,54 @@ pulled the object's place and blew up its covariance (found on the hidden-car te
 that the object does so *from where it is now*: the share the floor adds is given the other hypotheses' state (for
 "it stands": their place, no speed) (`r_update_full`).
 
+**A moving story does not learn the object's height and angle offset from a camera (2026-11-24).** A camera
+gives a moving object's range only through two unknowns of the object's own: its height (`lh`, read through the box
+height) and its ground-angle offset (`dp`, read through the bottom edge). Their priors are the only absolute
+information: the boxes relate the two to the range, and while the object drives its range is a free path between the
+boxes (the motion hypotheses' process noise), so the boxes cannot tell them apart from it. An extended Kalman filter
+that learns them there anyway is a biased estimator of them (the gain's own dependence on the parameters is
+ignored: Ljung 1979), and the bias went one way: a car driving with the traffic at 20-30 m was put 4-10 m too far
+with a stated spread of 2.5-3 m. Shown on the simulator with every error source of its own switched off (no pitch
+error, no road grade, no bottom-edge bias, cars of exactly the prior's 1.6 m, the pitch bias held at zero): the
+boxes by themselves were right (ground range +1 to +3 %, box-height range 0 to +2 %, residuals at the truth
+-0.16..+0.1 sigma), yet the tracker's centre was +3.1 m off on average (adjacent and platoon, 10-40 m), and a plain
+single-model EKF over the same detections, started AT the truth, drifted the same way (height 1.60 -> 1.83 m, offset
+0 -> +0.3 deg, range +2.6 m). The drift grows with the velocity process noise (cv_noise 0.05 / 0.35 / 2: -1.7 / +5.7
+/ +9.6 m) and is not a matter of linearisation (iterated EKF: -8 m, the other way; unscented: +6 m). With height and
+offset as consider parameters (Schmidt: their variance in the covariance and in every innovation, their values
+held) the same EKF was right to +0.03..+0.9 m with 1 / 2 sigma coverage 0.85-0.98 / 0.93-1.0. The drifting offsets
+also taught the camera's pitch bias the wrong sign (learnt +0.3..+0.4 deg against a true -0.33 deg) through the
+objects that "ripened" on it.
+
+Change: `Tracker._consider` (per object, `info` column 10 of the scan): the moving hypotheses take a camera's
+detection with the gain on `lh` and `dp` held at zero (Joseph form: the covariance stays the filter's exact one for
+that gain; native `r_take_parts`, `cons`) from the sighting on at which the hypotheses are weighed
+(`mu_hold_hits`), unless a sensor that measures range (a microwave radar, a position) has seen the object within
+`consider_range_s` (2 s): then the range pins them and they are learnt. The standing hypothesis learns them as
+before (its rigid motion lets the car's own passing measure the range: parallax), and so does the free estimate.
+
+Measured (tools/radar_trace.py, seeds 1-3 day + 1 night, confirmed, moving cars of 10-40 m, the centre against the
+truth's centre; before -> after): along error mean / p50 / p90, share within 1 / 2 sigma:
+
+| | before | after |
+|---|---|---|
+| platoon | +6.7 / 6.4 / 13.5 m, 0.33 / 0.65 | +2.0 / 2.7 / 6.4 m, 0.86 / 1.00 |
+| adjacent | +3.6 / 3.4 / 9.4 m, 0.35 / 0.61 | +2.4 / 2.9 / 6.0 m, 0.58 / 0.95 |
+| crossing_pair | +6.7 / 7.2 / 18.1 m, 0.44 / 0.78 | +4.0 / 3.9 / 12.0 m, 0.84 / 0.99 |
+| queue | +0.6 / 1.7 / 6.5 m, 0.57 / 0.86 | -0.2 / 1.5 / 4.3 m, 0.74 / 0.94 |
+
+What remains of the cars' bias is honest: the car prior's 1.6 m against the simulator's 1.5 m (+7 %: KITTI's cars
+are 1.53 +- 0.14 m, today's fleet with its SUVs and the vans a detector calls car is taller; the prior was left) and
+the camera's pitch where nothing passed teaches it (seeds 2-3: +0.4 deg not learnt, read far), both inside the stated
+spread. What it costs: a vehicle whose range changes a lot no longer refines its height from its own boxes: the
+overtaken truck of `adjacent` (3.4 m, prior from the class vote 2.6 m) at 40-80 m along p50 11 -> 16 m (within
+2 sigma 0.58 -> 0.80), at 80-150 m 28 -> 32 m (0.47 -> 0.66). The variant with the standing hypothesis held too
+(`consider_stand`) cures `slow_lead` (a slow car ahead read as a standing thing 1.5 times as far and as tall: the same
+scale ambiguity; moving 10-40 m mean +4.4 -> +1.4 m, p90 11.3 -> 4.7 m) but takes the parallax-pinned learning from
+parked cars (three behaviour tests fail: a parked car passed with a biased range, the row, the pitching camera); not
+taken. A moving vehicle whose range changes by more than a factor (1.5, 2.5) learning again was measured and
+dropped (the drift comes back first).
+
 ## 3. What a sensor can see: occlusion, the edge of the field
 
 An object that is not reported loses existence by `ln(1 - pd)` per scan. `pd` is no longer a constant inside

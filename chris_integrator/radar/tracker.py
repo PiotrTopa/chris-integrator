@@ -120,6 +120,12 @@ CFG = dict(
     memory_tentative_s=1.0,      # an object never confirmed is not worth remembering
     mu_hold_hits=2,              # the hypotheses are weighed from this many sightings on (velocity initialised)
     mu_floor=0.01,               # no hypothesis is ever ruled out for good
+    # a moving hypothesis does not learn the object's height (lh) and angle offset (dp) from a camera's boxes: they
+    # are consider parameters there (their uncertainty in the covariance, their values held; docs/RADAR.md, section
+    # 2), from the sighting on at which the hypotheses are weighed (mu_hold_hits), unless a sensor that measures range
+    # has seen the object within consider_range_s. consider_stand: the standing hypothesis too (measured, not taken:
+    # docs/RADAR.md, section 2)
+    consider_moving=True, consider_range_s=2.0, consider_stand=False,
     common_min=3, common_pair=0.8,   # the scan's common pitch: from at least this many settled objects, each paired this surely
     bias_ripe=0.5,               # an object speaks about the sensor's bias once its own angle offset is known
                                  # this much better (share of the variance it was born with)
@@ -455,7 +461,7 @@ class Tracker:
                 nz = noise[ot] = self.ego.motion_noise(ot, t)
             k = o.kin
             info.append((float(t) - ot, nz[0], nz[1], k[0], k[1], k[2], k[3], o.label_code, o.id,
-                         1.0 if o.state in ("confirmed", "coast") else 0.0))
+                         1.0 if o.state in ("confirmed", "coast") else 0.0, self._consider(o, t)))
         mem = self.unexplained.get(src)
         rows = None
         if mem:
@@ -894,6 +900,23 @@ class Tracker:
                                        [r for o in self.objects if src in o.sources for r in self.hyp.rows(o.h)], a)
             b[0] += a * m
             b[1] = max((1.0 - a) * b[1] + a / ws, math.radians(cc["bias_floor_deg"]) ** 2)
+
+    def _consider(self, o, t):
+        """1 (2: and its standing hypothesis) if the object's moving hypotheses take a camera's boxes with its height
+        and angle offset held (consider parameters), 0 if not. The box height and the bottom edge's angle tell the
+        range only through those two, and while the object moves (its range a free path between the boxes) the two
+        cannot be told apart from it: an extended Kalman filter that learns them there drifts (a car driving with the
+        traffic at 25 m was put 4-10 m too far on boxes that by themselves were right to 2 %; docs/RADAR.md, section
+        2). Held from the sighting on at which the hypotheses are weighed (`mu_hold_hits`). A sensor that measures
+        the range (a microwave radar, a position) pins them: then they are learnt."""
+        c = self.cfg
+        if not c["consider_moving"] or o.hits < c["mu_hold_hits"]:
+            return 0.0
+        for src, ts in o.last_seen.items():
+            sen = self.sensors.get(src)
+            if sen is not None and sen[0].kind in ("microwave_radar", "position") and t - ts <= c["consider_range_s"]:
+                return 0.0
+        return 2.0 if c["consider_stand"] else 1.0
 
     def _judge(self, o, T, p):
         """"stationary" | "moving" | "unknown" from how much the standing hypothesis is believed, with hysteresis;

@@ -861,7 +861,9 @@ class PastAndStructure(unittest.TestCase):
         row = {"p%d" % k: (14.0 + 6.5 * k, -4.0, 1.8, 1.5, "car", 0.0) for k in range(5)}
         res = {}
         for name, cfg in (("with", {}), ("without", {"group_support": False})):
-            rd, m = self.scene(row, v_ego=0.0, T=5.0, cfg=cfg)
+            # (6 s: the fifth car is 65 % hidden behind the fourth, its existence grows at the occlusion floor; its
+            # object is grouped from 4.5-5.5 s on, as the scene's chance has it)
+            rd, m = self.scene(row, v_ego=0.0, T=6.0, cfg=cfg)
             objs = [o for o in rd.tracker.objects if o.grp is not None]
             self.assertEqual(len(objs), 5, name)
             res[name] = (sum(float(o.mu[0]) for o in objs) / 5, max(abs(float(o.xs[0][1]) + 4.0 - 0.0) for o in objs),
