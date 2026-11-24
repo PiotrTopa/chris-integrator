@@ -164,14 +164,16 @@ CFG = dict(
     in_reid=False, reid_s=6.0, reid_lr=4.0, reid_gate=16.0,
     # the lamp pair (`lamps`). Its colour: which end faces the camera (the heading, to lamp_colour_deg and no
     # better; a new object with white lamps comes the other way if it drives). Its separation: a ruler on the object
-    # (lamp centres lamp_sep_ratio of the vehicle's width apart, unknown to lamp_sep_rel in the logarithm); a pair
-    # under lamp_min_px apart is not used (the detector picks other blobs there)
+    # (lamp centres lamp_sep_ratio of the vehicle's width apart, unknown to lamp_sep_rel in the logarithm), read
+    # against the box height as a measurement of the object's height, and its change from pair to pair as a scale
+    # rate; a pair under lamp_min_px apart is not used (the detector picks other blobs there)
     in_lamp_colour=False, lamp_colour_deg=40.0, in_lamp_size=False, lamp_sep_ratio=0.67, lamp_sep_rel=0.2, lamp_min_px=10.0,
-    # the box width of a vehicle seen along its axis as a ruler (the width never taken as known better than width_rel)
+    # the box width of a vehicle seen along its axis as a ruler: read against the box height it measures the
+    # object's height (a vehicle's width follows from its height to width_rel)
     in_width=False, width_rel=0.10,
     # the rulers: with ruler_eps their number is not the object's; "anywhere" spans ruler_span (logarithm); each
-    # ruler's prior is used ruler_uses times at most (a half, a quarter ... of its information)
-    ruler_eps=0.1, ruler_span=3.0, ruler_uses=5,
+    # ruler is used ruler_uses times, each use with a share 1 / ruler_uses of what its prior knows
+    ruler_eps=0.1, ruler_span=3.0, ruler_uses=8,
     # the road's vertical curvature, 1 sigma (1/m; crest and sag radii of built roads are 2-10 km: 1 / 3000), in each
     # object's own ground-angle offset. 0: the road ahead is the plane under the car
     grade_k=0.0,

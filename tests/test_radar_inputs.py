@@ -360,17 +360,19 @@ class Lamps(unittest.TestCase):
 
     def test_the_lamp_pair_is_a_ruler_whose_prior_is_used_once(self):
         """A car 50 m ahead at our speed in the dark, its box height jittering by a fifth: the pair's separation
-        says how far it is to what a car's lamp separation is known (once), and from then on how the distance
-        changes."""
+        against the box height says how tall the car is, to what a car's lamp separation is known and no better
+        however many pairs come; and from pair to pair how the distance changes."""
         res = {}
         for name, cfg in (("off", {}), ("on", {"in_lamp_size": True})):
             rng = random.Random(3)
-            rd, out = run(cfg, lambda s, k: [box(50.0, 0.3, 1.8, 1.5 * (1 + rng.gauss(0, 0.2)), lamps=lamps(50.0))], T_s=6.0)
-            xs = [m["objects"][0]["x_m"] for s, m in out[20:] if m["objects"]]
-            res[name] = (max(xs) - min(xs), out[20][1]["objects"][0]["std"][0], rd.tracker.hyp.xrow(rd.tracker.objects[0].slot))
+            rd, out = run(cfg, lambda s, k: [box(50.0, 0.3, 1.8, 1.5 * (1 + rng.gauss(0, 0.2)), lamps=lamps(50.0))], T_s=12.0)
+            xs = [m["objects"][0]["x_m"] for s, m in out[20:120] if m["objects"]]
+            o = rd.tracker.objects[0]
+            res[name] = (max(xs) - min(xs), math.sqrt(o.P[M.LH, M.LH]), rd.tracker.hyp.xrow(o.slot))
         self.assertLess(res["on"][0], 0.75 * res["off"][0])                   # the range wanders less
-        self.assertLess(res["on"][1], 0.9 * res["off"][1])                    # and is better known from the start
-        self.assertLessEqual(res["on"][2][4], T.CFG["ruler_uses"])            # the prior: so many shares, no more
+        self.assertLess(res["on"][1], 0.9 * res["off"][1])                    # the height is better known
+        self.assertGreater(res["on"][1], 0.12)                                # ... but not better than the prior allows
+        self.assertEqual(res["on"][2][4], T.CFG["ruler_uses"])                # the prior: so many shares, no more
         self.assertGreater(res["on"][2][10], 0.0)                             # the last pair is remembered
 
     def test_a_pair_on_the_wrong_blobs_is_not_taken(self):
@@ -385,17 +387,21 @@ class Lamps(unittest.TestCase):
 
 
 class Rulers(unittest.TestCase):
-    def test_the_width_of_a_car_seen_from_behind_says_how_far_it_is(self):
-        """A car straight ahead at our speed: its box width against a car's width (1.8 m to a tenth) is a second
-        range beside the box height (1.6 m to a fifth)."""
+    def test_the_width_of_a_car_seen_from_behind_says_how_tall_and_so_how_far_it_is(self):
+        """A car straight ahead at our speed, 1.7 m tall where a car is taken as 1.6 m: by its box height alone it
+        reads 6 % near for as long as it is followed. Its box is 1.8 m wide at that height: the ratio of the two,
+        whatever the range, says how tall it is, and the range follows and stays."""
         res = {}
         for name, cfg in (("off", {}), ("on", {"in_width": True})):
-            rd, out = run(cfg, lambda s, k: [box(45.0, 0.2, 1.8, 1.7)], T_s=3.0)           # a tall car: the height reads near
-            o = out[-1][1]["objects"][0]
-            res[name] = (o["x_m"], o["std"][0], rd.tracker.hyp.xrow(rd.tracker.objects[0].slot))
-        self.assertLess(abs(res["on"][0] - 45.0), abs(res["off"][0] - 45.0))
-        self.assertLessEqual(res["on"][2][5], T.CFG["ruler_uses"])
-        self.assertGreater(res["on"][2][5], 0.0)
+            rd, out = run(cfg, lambda s, k: [box(45.0, 0.2, 1.8, 1.7)], T_s=8.0)
+            o = rd.tracker.objects[0]
+            res[name] = (out[-1][1]["objects"][0]["x_m"], math.exp(o.x[M.LH]), math.sqrt(o.P[M.LH, M.LH]), rd.tracker.hyp.xrow(o.slot))
+        self.assertGreater(abs(res["off"][0] - 45.0), 2.0)
+        self.assertLess(abs(res["on"][0] - 45.0), 0.7)                        # ... also seconds after the last use
+        self.assertLess(abs(res["on"][1] - 1.7), 0.03)
+        self.assertLess(res["on"][2], 0.75 * res["off"][2])
+        self.assertGreater(res["on"][2], 0.09)                                # a width is known to a tenth, no better
+        self.assertEqual(res["on"][3][5], T.CFG["ruler_uses"])
 
     def test_a_side_view_is_no_ruler(self):
         rd, out = run({"in_width": True}, lambda s, k: [box(30.0, 6.0 - 3.0 * s, 4.5, 1.5)], T_s=2.0, v=0.0)
@@ -472,6 +478,49 @@ class Hypotheses(unittest.TestCase):
         for _, m in out:
             for o in m["objects"]:
                 self.assertTrue(all(math.isfinite(v) for v in (o["x_m"], o["y_m"], o["vx_mps"], o["exist"], *o["std"])))
+
+
+class Golden(unittest.TestCase):
+    """The radar with every further input taken, on the detector simulator emitting them, held to what was recorded
+    (tests/data/make_radar_golden.py --detin)."""
+    DATA = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+
+    def test_recorded_scans_give_what_they_gave(self):
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import radar_golden_lib as G
+        cases, codec = G.load(os.path.join(self.DATA, "radar_golden_detin.npz"))
+        seen = {}
+        for n, c in enumerate(cases):
+            seen[c["fn"]] = seen.get(c["fn"], 0) + 1
+            ret, args, hyp = G.replay(C, c, codec)
+            where = "case %d %s" % (n, c["fn"])
+            self.assertIsNone(G.same(ret, codec.dec(c["ret"]), where + " result"))
+            for i, a in c["post"].items():
+                if isinstance(a, dict) and "rows" in a:
+                    rows = codec.arrays[a["rows"] + "i"]
+                    self.assertIsNone(G.same(args[int(i)][rows], codec.arrays[a["rows"]], where + " rows"))
+                else:
+                    self.assertIsNone(G.same(args[int(i)], codec.dec(a), where + " argument %s" % i))
+            if c["hyp_after"] is not None:
+                self.assertIsNone(G.same(hyp, codec.dec(c["hyp_after"]), where + " hypotheses"))
+        self.assertGreaterEqual(seen.get("Hyp.cycle", 0), 16)
+        # the recorded scans do use what they are there for: an xcfg, low boxes, vectors, lamp pairs, hidden edges
+        cyc = [codec.dec(c["args"]) for c in cases if c["fn"] == "Hyp.cycle"]
+        self.assertTrue(all(len(a) == 20 for a in cyc))
+        dets = [d for a in cyc for d in a[9]]
+        self.assertTrue(any(d.get("emb") for d in dets))
+        self.assertTrue(any(d["x"][2] for d in dets if "x" in d))             # a low box
+        self.assertTrue(any(d["x"][3] for d in dets if "x" in d))             # a lamp pair
+        self.assertTrue(any(d["x"][0] for d in dets if "x" in d))             # a hidden edge
+        self.assertTrue(any("x" in codec.dec(c["hyp"]) for c in cases if c["fn"] == "Hyp.cycle"))
+
+    @unittest.skipIf(os.uname().machine != "x86_64", "the digests are of the development machine's arithmetic")
+    def test_the_messages_on_simulated_drives_are_what_they_were(self):
+        sys.path.insert(0, self.DATA)
+        import make_radar_golden as MG
+        with open(os.path.join(self.DATA, "radar_digests_detin.json")) as f:
+            want = json.load(f)
+        self.assertEqual(MG.detin_digests(), want)
 
 
 if __name__ == "__main__":

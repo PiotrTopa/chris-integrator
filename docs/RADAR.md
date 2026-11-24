@@ -538,31 +538,51 @@ kind without a table, two kinds: the factor is 1.
   wrong now and then), and the heading along the line of sight to `lamp_colour_deg` and no better however often
   (like the road's axis). For a birth with white lamps: both moving stories start from the car's speed reversed
   (an oncoming vehicle; "it stands" keeps its share).
-* **Separation: a ruler** (`x_aux_rows`). `ln(sep / f) = ln(S |cos a|) - ln depth`, S the lamp separation
-  (`lamp_sep_ratio` of the leaf's width; unknown to `lamp_sep_rel`). **Against the proposal**, which makes S a
-  state like the object's height, S is not a state here; its prior is used as what it is, one piece of information:
-  the k-th use of the ruler takes the prior's variance times 2^(k+1) (a half, a quarter, ... of its information;
-  `ruler_uses` times at most), so that all uses together never count the prior more than once. What the pair says
-  beyond its prior is how the range CHANGES from one pair to the next, and that needs no constant: the separation
-  against the leaf's last one is a scale rate over the time between them, a row like the detector's own (not taken
-  where the box's scale rate already comes from the lamp pair: `scale_src`). The two together are the exact
-  decomposition of "a size with an unknown constant" (y_k = u_k + c + e_k is equivalent to y_0 with the prior of c,
-  and the differences y_k - y_{k-1}); what is given up against a state for S is the memory of S across a gap of
-  more than 1.2 s between pairs. What is gained: no ninth state, no double counting of a prior, and a wrong pair
-  (one in ten is found on other blobs) costs two rows, not a corrupted constant.
-* Both rows are taken as mixtures: with `ruler_eps` the number is not the object's and says nothing; taken only
-  where it is likelier the object's than not. They are scalar rows processed after the box's other rows (in the
-  update: per motion hypothesis, with the size and the angle offset held where they are held; in the pairing: on the
-  leaf as a whole, as the likelihood of the extra rows given the others).
+* **Separation: a ruler** (`in_lamp_size`, `x_aux_rows`): see "Rulers" below.
 
-### The width of an axial view (`in_width`)
-The same ruler with the box width: `ln w = ln(L |sin a| + W |cos a|) - ln depth` for a vehicle whose both sides
-are in the picture and uncovered. The silhouette's mean and variance are taken over what is not known of the heading
-(the folded normal: at the axis the silhouette has a kink, the length comes in with the first power of the
-heading's spread), of the width (never taken as known better than `width_rel`: the leaf learnt its width from these
-same boxes) and of the length. Not used where the silhouette is not known to a third, nor where the length is the
-larger part of it. **Against the proposal** ("a car 1.8 m, 10 %: half the height prior's 20 %"): that holds only
-where the heading is known to a few degrees; a car whose heading is known to 0.1 rad has a silhouette known to 15 %.
+### Rulers: the box width of an axial view (`in_width`), the lamp pair's separation (`in_lamp_size`)
+A ruler is a size of the object that the detection does not know, seen from the object's distance: a vehicle's
+width (known to a tenth), its lamp separation (to a fifth). The proposal takes each as a range row with a constant
+of the object's own, "like the height". **Against the proposal**, neither is a row on the range here, and neither
+gets a state:
+
+* **Two sizes seen from one distance measure their ratio, whatever the distance.** The box height against the box
+  width, or against the lamp separation, is a measurement of the object's height state `lh` itself, free of the
+  range:
+
+      ln(h_px / w_px) = lh - ln(W(lh) s)        s = (L |sin a| + W |cos a|) / W, a: the heading against the line of sight
+      ln(h_px / sep)  = lh - ln(lamp_sep_ratio W(lh) |cos a|)
+
+  with `W(h) = 1.8 + 0.35 (h - 1.5)` m the width of a vehicle of that height (cars 1.8 x 1.5, vans 2.0-2.1 x 2.5,
+  lorries and buses 2.5 x 3.4: widths vary far less than heights across everything the detector calls a vehicle,
+  which makes the width a ruler without knowing the class). What the height then says of the range it says in every
+  later box, through the box-height row and the filter's own knowledge of how the two hang together: the ruler's
+  information stays with the object as its height does. (The first build had the rulers as rows on the range; their
+  information was gone with the next seconds' process noise: a car 1.7 m tall, taken as 1.6 m, read 6 % near again
+  two seconds after the ruler's last use. As a measurement of the height it reads right for as long as it is
+  followed: `tests/test_radar_inputs.py::Rulers`.) Every motion hypothesis takes the row, also the moving ones that
+  hold the height against the box's own rows (section 2): there is no range in it, so the drift that made the height
+  a consider parameter there cannot arise from it.
+* **The constant is not counted once per box.** A width's own deviation from `W(h)` is the same in every box. Each
+  of `ruler_uses` uses takes that variance (`width_rel`^2, `lamp_sep_rel`^2) times `ruler_uses`, with the box's own
+  noise beside it (which does average): all uses together hold the prior's information once.
+* **Where it applies.** The width: a vehicle whose both sides, top and bottom are in the picture and uncovered,
+  seen along its axis: the length's share of the silhouette under 0.4 of the width's (within 8 degrees for a car:
+  what the detector calls a car is 3.5 to 6 m long, and at a larger angle that is what the box width would
+  measure), the silhouette at the heading believed known to a third (its spread over what is not known of the
+  heading by the folded normal: at the axis the silhouette has a kink). **Against the proposal** ("a car 1.8 m,
+  10 %: half the height prior's 20 %", for any view "within 20 deg of the line of sight"): at 20 degrees a car's
+  silhouette is 3.2 m, not 1.8 m, and what is known of it is what is known of the heading and the length. The lamp
+  pair: within about 50 degrees of the axis, a box whose top and bottom are its own.
+* **How the range changes needs no constant**: the lamp separation against the leaf's last pair (the heading against
+  the line of sight taken out) is a scale rate over the time between them, a row like the detector's own, to the
+  lamp centroids' fraction of a pixel; not taken where the box's scale rate already comes from the lamp pair
+  (`scale_src`), nor across more than 1.2 s.
+* All these rows are mixtures: with `ruler_eps` the number is not the object's (one lamp pair in ten is found on
+  other blobs; a box edge on a neighbour) and says nothing; taken only where it is likelier the object's than not.
+  They are scalar rows processed after the box's other rows: in the update per motion hypothesis; in the pairing on
+  the leaf as a whole, as the likelihood of the extra rows given the others (a van's box on a car's track: the
+  wrong aspect).
 
 ### The road's vertical curvature (`grade_k`)
 With a vertical curvature k the ground at distance x lies k x^2 / 2 off the plane under the car, and the ground

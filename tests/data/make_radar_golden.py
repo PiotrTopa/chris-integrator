@@ -1,9 +1,15 @@
 #!/usr/bin/env python3
 """Records the radar's frozen results anew, after a deliberate change of its behaviour:
 
-    python3 tests/data/make_radar_golden.py
+    python3 tests/data/make_radar_golden.py            the radar as it is by default
+    python3 tests/data/make_radar_golden.py --detin    the radar with the detector's further inputs taken
+                                                       (docs/RADAR.md, section 8), on the detector simulator
+                                                       emitting them: tests/data/radar_golden_detin.npz (calls of
+                                                       Hyp.cycle and Hyp.after with an xcfg, the hypotheses with
+                                                       their rows' memory), tests/data/radar_digests_detin.json
+                                                       (tests/test_radar_inputs.py replays and holds them)
 
-writes
+The first writes
   tests/data/radar_golden.npz      calls of every native radar function (and of the hypotheses: Hyp.cycle,
                                    Hyp.after, Hyp.drop) sampled on simulated drives, with their results
                                    (tests/test_native.py::test_radar_golden replays them, to rounding: it also
@@ -141,6 +147,79 @@ def drives(trace):
         tracker.CFG.update(saved[4])
 
 
+# the radar with every one of the detector's further inputs taken, as the --detin records are made and replayed
+DETIN_KNOBS = dict(in_flags=True, in_box_occl=True, in_low=True, in_app=True, in_reid=True, in_lamp_colour=True,
+                   in_lamp_size=True, in_width=True, in_scale=True, grade_k=1.0 / 3000.0)
+DETIN_SCALE = {False: {"px": 0.08, "rel": 0.002, "p": 0.78, "min_dt": 0.2, "max_dt": 1.0, "max_std": 0.06},
+               True: {"px": 0.45, "rel": 0.004, "p": 0.6, "min_dt": 0.2, "max_dt": 1.0, "max_std": 0.06}}
+DETIN_RUNS = (("occlusion", 1, False), ("parked_street", 1, True), ("platoon", 2, True), ("oncoming", 1, True))
+
+
+def detin_run(name, seed, night, keep_steps=None):
+    """One simulated drive with the detector's further inputs emitted and taken (sim.radar_score.run)."""
+    from chris_integrator.sim import radar_score, roaduser_sim as rs
+    tr = dict(DETIN_KNOBS)
+    if keep_steps:
+        tr["hyp_keep_steps"] = keep_steps
+    return radar_score.run(name, seed=seed, night=night, cfg={"tracker": tr},
+                           det_params=dict(rs.DETIN, scale_rate=DETIN_SCALE[night]))
+
+
+def detin_digests():
+    """sha256 of the radar's messages on DETIN_RUNS (the objects of every frame, as radar_score keeps them)."""
+    import hashlib
+    out = {}
+    for name, seed, night in DETIN_RUNS:
+        r = detin_run(name, seed, night)
+        out["%s:%d:%d" % (name, seed, night)] = hashlib.sha256(
+            json.dumps([f["objects"] for f in r["frames"]], sort_keys=True).encode()).hexdigest()
+    return out
+
+
+def drives_detin(trace):
+    from chris_integrator.radar import box, models, sensors, tracker
+    saved = (models.NR, tracker._NR, box._NR, sensors._NR)
+    models.NR = tracker._NR = box._NR = sensors._NR = trace
+    try:
+        for name, seed, night in DETIN_RUNS:
+            detin_run(name, seed, night, keep_steps=8)
+    finally:
+        models.NR, tracker._NR, box._NR, sensors._NR = saved
+
+
+def main_detin():
+    import radar_golden_lib as lib
+    from chris_integrator.native import radar as C
+    global PER_FN, DEFAULT_N
+    PER_FN, DEFAULT_N = {"Hyp.cycle": 24, "Hyp.after": 6}, 0
+    trace = Trace(C, lib)
+    drives_detin(trace)
+    cases, arrays = [], {}
+    for name in ("Hyp.cycle", "Hyp.after"):
+        for item in trace.kept.get(name, ()):
+            if item is None:
+                continue
+            case, arr = item
+            pre = "c%d_" % len(cases)
+
+            def ren(v):
+                if isinstance(v, list):
+                    return [ren(x) for x in v]
+                if isinstance(v, dict):
+                    return {k: (pre + x if k in ("array", "state", "rows") else ren(x)) for k, x in v.items()}
+                return v
+            cases.append(ren(case))
+            arrays.update({pre + k: a for k, a in arr.items()})
+    path = os.path.join(HERE, "tests", "data", "radar_golden_detin.npz")
+    lib.save(path, cases, arrays)
+    print("wrote %s: %d cases, %.0f kB" % (path, len(cases), os.path.getsize(path) / 1e3))
+    path = os.path.join(HERE, "tests", "data", "radar_digests_detin.json")
+    with open(path, "w") as f:
+        json.dump(detin_digests(), f, indent=1, sort_keys=True)
+        f.write("\n")
+    print("wrote", path)
+
+
 def extra(trace):
     """Functions the drives do not call (tools and tests do): on random inputs."""
     from chris_integrator.radar import tracker as T
@@ -249,4 +328,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    if "--detin" in sys.argv[1:]:
+        main_detin()
+    else:
+        main()

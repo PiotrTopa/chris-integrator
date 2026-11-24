@@ -7834,8 +7834,9 @@ static void x_folded(double m, double s, double *mean, double *var)
     *var = pymax(m * m + s * s - e * e, 0.0);
 }
 
-/* An extra row of a detection: a size of the object's image (as an angle, logarithm) that is the object's own size
- * over its distance: z = c - ln(depth of the near face). c: the logarithm of the size as this leaf believes it. */
+/* An extra row of a detection (x_aux_rows). which 0, 1: a size of the object's image against the box height, a
+ * measurement of the object's height state: z = lh - ln(c W(lh)) (W(h): a vehicle's width by its height). which 2:
+ * the lamp separation's change since the leaf's last pair, a scale rate over sdt. */
 typedef struct {
     double z, c, R, near, sdt, span;
     int which;                       /* 0: the lamp pair's separation, 1: the box width, 2: the separation's change */
@@ -7853,28 +7854,45 @@ typedef struct {
     double cover_obj, pe, psen, klo, incov;
 } XBox;
 
-/* The extra rows detection d gives this leaf (row; xr: its memory), at most two. Both are rulers: a size of the
- * object that the detection does not know, seen from its distance.
+/* A vehicle's width by its height (m): cars 1.8 x 1.5, vans 2.0-2.1 x 2.5, lorries and buses 2.5 x 3.4. Widths vary
+ * far less than heights across everything the detector calls a vehicle, and by under a tenth among vehicles of one
+ * height: which is what makes a width a ruler without knowing the class. *dw: dW / dh. */
+static double x_width_of(double h, double *dw)
+{
+    double hh = pymin(pymax(h, 1.0), 4.2);
+    *dw = (h > 1.0 && h < 4.2) ? 0.35 : 0.0;
+    return 1.8 + 0.35 * (hh - 1.5);
+}
+
+/* The extra rows detection d gives this leaf (row; xr: its memory), at most three. Rulers: a size of the object
+ * that the detection does not know, seen from the object's distance.
  *
- * The object's own constant (its lamp separation, its width) is not a state. Its prior is used as what it is, one
- * piece of information, and not once per scan: the k-th use of a ruler takes the constant's variance times
- * 2^(k+1) (a half, a quarter, an eighth ... of the prior's information: all uses together never more than the
- * prior holds), XC_AUX_USES times at most. What a ruler says beyond its prior is how the range CHANGES from one
- * box to the next, and that needs no constant: the lamp pair's separation against the leaf's last one is a scale
- * rate over the time between them (a row like the detector's own; not taken where the box's scale rate already
- * comes from the lamp pair). Together: the first sighting says how far, to what the prior knows of the size; from
- * then on the pair says how the distance changes, to the pixel.
+ * Seen from one distance, two sizes of an object measure their RATIO, whatever the distance: the box height against
+ * the box width, or against the lamp pair's separation. The object's height is a state (lh, with its prior by the
+ * kind); the width of a vehicle of that height is known to a tenth, its lamp separation to a fifth. So the ratio is
+ * a measurement of the height state itself, free of the range:
  *
- *   the lamp pair   ln(sep / f) = ln(S |cos a|) - ln depth: S the lamp separation, a share of the leaf's width
- *                   (XC_LSEP_RATIO; unknown to XC_LSEP_REL in the logarithm), a the leaf's heading against the
- *                   line of sight (a pair is seen within about 50 degrees of the axis)
- *   the box width   ln(w) = ln(L |sin a| + W |cos a|) - ln depth for a vehicle whose both sides are in the picture
- *                   and uncovered: the silhouette's mean and variance over what is not known of the heading (the
- *                   folded normal: at the axis the silhouette has a kink, and the length comes in with the first
- *                   power of the heading's spread), of the width (never taken as better known than XC_WID_REL: the
- *                   leaf learnt its width from these same boxes) and of the length. Not used where the silhouette
- *                   is not known to a third, nor where the length is the larger part of it (a view from the side:
- *                   what the detector calls a car is 3.5 to 8 m long). */
+ *   the box width   ln(h_px / w_px) = lh - ln(W(lh) s),  s = (L |sin a| + W |cos a|) / W the silhouette over the
+ *                   width at the heading believed (a: the heading against the line of sight), for a vehicle whose
+ *                   both sides and top and bottom are in the picture and uncovered, seen along its axis (the
+ *                   length's share under 0.4 of the width's: within 8 degrees for a car; what the detector calls a
+ *                   car is 3.5 to 6 m long, and at a larger angle that is what the box width would measure; the
+ *                   silhouette known to a third)
+ *   the lamp pair   ln(h_px / sep) = lh - ln(XC_LSEP_RATIO W(lh) |cos a|), within about 50 degrees of the axis
+ *
+ * and what the height then says of the range it says in every later box, through the box-height row and what the
+ * filter knows of how the two hang together: the ruler's information stays with the object as its height does.
+ * (As a row on the range the same information is gone with the next seconds' process noise.) Taken by every motion
+ * hypothesis, also the moving ones that hold the height against the box's own rows: this row has no range in it.
+ *
+ * The width's (the separation's) own spread about W(h) is a constant of the object, the same in every box: it is
+ * not counted once per box. Each of XC_AUX_USES uses takes that variance times XC_AUX_USES (all uses together: the
+ * prior's information once), with the box's own noise beside it, which does average over the uses.
+ *
+ * What a ruler says beyond that is how the range CHANGES from one box to the next, and that needs no constant: the
+ * lamp pair's separation against the leaf's last one is a scale rate over the time between them (a row like the
+ * detector's own, to the lamp centroids' fraction of a pixel; not taken where the box's scale rate already comes
+ * from the lamp pair). */
 static int x_aux_rows(const RXc *xc, const RSens *sen, const double *row, const double *xr, const double *d,
                       const double *pose, XAux *out)
 {
@@ -7882,15 +7900,17 @@ static int x_aux_rows(const RXc *xc, const RSens *sen, const double *row, const 
     const double *c = xc->c;
     if (sen->type != SEN_CAMERA || d[D_LOW] != 0.0 || !(d[D_VEH] > 0.0))
         return 0;
+    int whole = ((int)d[D_KIND] & 7) == K_RBH;           /* top and bottom its own: the box height is a row */
     int pair = c[XC_LSIZE] != 0.0 && d[D_LAMPC] > 0.0 && d[D_LSEPR] > 0.0;
-    int lamp = pair && xr[X_NLAMP] < c[XC_AUX_USES];
-    int wid = c[XC_WID] != 0.0 && d[D_WOK] > 0.0 && d[D_W] > 0.0 && xr[X_NWID] < c[XC_AUX_USES];
+    int lamp = pair && whole && xr[X_NLAMP] < c[XC_AUX_USES];
+    int wid = c[XC_WID] != 0.0 && whole && d[D_WOK] > 0.0 && d[D_W] > 0.0 && xr[X_NWID] < c[XC_AUX_USES];
     if (!pair && !wid)
         return 0;
     const double *x = row + RO_X, *e = row + RO_E, *Pe = row + RO_PE;
     double dx = x[R_PX] - pose[0], dy = x[R_PY] - pose[1], rc = pymax(hypot(dx, dy), 0.5), los = atan2(dy, dx);
     double near = pymax(rc - r_half_depth(e, los, NULL), 0.5) / rc;
     double a = e[XE_HDG] - los, ca = cos(a), sa = sin(a), va = pymin(pymax(Pe[8], 0.0), 0.5);
+    double uses = pymax(c[XC_AUX_USES], 1.0);
     if (pair && fabs(ca) >= 0.6 && xr[X_LSR] > 0.0 && xc->t - xr[X_LST] > 0.05 && xc->t - xr[X_LST] <= 1.2 &&
         !(((int)d[D_KIND] & K_SCALE) && d[D_SSRC] >= 1.0)) {
         XAux *o = &out[n++];
@@ -7909,54 +7929,55 @@ static int x_aux_rows(const RXc *xc, const RSens *sen, const double *row, const 
         o->near = near;
         o->span = c[XC_AUX_SPAN];
         o->sdt = 0.0;
-        o->z = d[D_LSEP];
-        o->c = log(pymax(c[XC_LSEP_RATIO] * e[XE_WID], 0.2)) + log(fabs(ca));
-        o->R = d[D_LSEPR] + (sa * sa) / (ca * ca) * va + c[XC_LSEP_REL] * c[XC_LSEP_REL] * ldexp(1.0, (int)xr[X_NLAMP] + 1);
+        o->z = d[D_Z + 2] - (d[D_LSEP] + sen->logf);
+        o->c = c[XC_LSEP_RATIO] * fabs(ca);
+        o->R = d[D_R + 2] + d[D_LSEPR] + (sa * sa) / (ca * ca) * va + c[XC_LSEP_REL] * c[XC_LSEP_REL] * uses;
     }
     if (wid) {
         double ms, vs, mc, vc, sg = sqrt(va);
         x_folded(sa, fabs(ca) * sg, &ms, &vs);
         x_folded(ca, fabs(sa) * sg, &mc, &vc);
-        double L = e[XE_LEN], W = e[XE_WID], sil = L * ms + W * mc;
-        double vw = pymax(Pe[4], c[XC_WID_REL] * c[XC_WID_REL] * W * W);
-        double var = L * L * vs + W * W * vc + ms * ms * pymax(Pe[0], 0.0) + mc * mc * vw;
-        if (sil > 0.2 && var < 0.1225 * sil * sil && L * ms < W * mc) {
+        /* the silhouette AT the heading believed (for a vehicle straight ahead the heading is the line of sight far
+         * better than its stated spread says, and the mean over that spread would read every such vehicle a fifth
+         * too far); what is not known of the heading is the row's variance: the spread of the folded silhouette and
+         * its mean's distance from the value used; what is not known of the length likewise */
+        double L = e[XE_LEN], W = pymax(e[XE_WID], 0.3), sil = L * fabs(sa) + W * fabs(ca), dm = L * ms + W * mc - sil;
+        double var = L * L * vs + W * W * vc + dm * dm + ms * ms * pymax(Pe[0], 0.0);
+        if (sil > 0.2 && var < 0.1225 * sil * sil && L * fabs(sa) < 0.4 * W * fabs(ca)) {
             XAux *o = &out[n++];
             double px = 3.0 / (exp(sen->logf) * d[D_W]);
             o->which = 1;
             o->near = near;
             o->span = c[XC_AUX_SPAN];
             o->sdt = 0.0;
-            o->z = log(d[D_W]);
-            o->c = log(sil);
-            o->R = 0.06 * 0.06 + px * px + var / (sil * sil) * ldexp(1.0, (int)xr[X_NWID] + 1);
+            o->z = d[D_Z + 2] - (log(d[D_W]) + sen->logf);
+            o->c = sil / W;
+            o->R = d[D_R + 2] + 0.06 * 0.06 + px * px + var / (sil * sil) + c[XC_WID_REL] * c[XC_WID_REL] * uses;
         }
     }
     return n;
 }
 
-/* (x, P) takes the extra rows one after the other (they are scalar, their noises independent of the box's other
- * rows: after those rows this is the joint update). Each as a mixture: with XC_AUX_EPS the number is not the
+/* (x, P) takes the extra rows one after the other (they are scalar, their noises taken as independent of the box's
+ * other rows: after those rows this is the joint update). Each as a mixture: with XC_AUX_EPS the number is not the
  * object's (the pair found on other blobs, a box edge on a neighbour) and says nothing; taken only where it is
- * likelier the object's than not. cons: the size and the angle offset are held (consider parameters). Returns the
- * rows' likelihood against "a number anywhere in XC_AUX_SPAN"; *used: a bit per row taken. */
+ * likelier the object's than not. cons: the size and the angle offset are held against rows that have the range in
+ * them (the scale rate; the rulers measure the height itself and are always taken). Returns the rows' likelihood
+ * against "a number anywhere in the row's span"; *used: a bit per row taken. */
 static double x_aux_take(const RXc *xc, double *x, double *P, const double *pose, const XAux *aux, int n, int cons,
                          int *used)
 {
-    double fac = 1.0, cph = cos(pose[2]), sph = sin(pose[2]), eps = xc->c[XC_AUX_EPS];
+    double fac = 1.0, eps = xc->c[XC_AUX_EPS];
     for (int q = 0; q < n; q++) {
         const XAux *o = &aux[q];
-        double dx = x[R_PX] - pose[0], dy = x[R_PY] - pose[1];
-        double dax = cph * dx + sph * dy, depth = pymax(dax * o->near, 0.5), span = o->span;
+        double span = o->span;
         double H[4 * RN] = {0}, PH[RN], S = o->R, nu;
         if (o->which == 2)                               /* the image's growth over the time since the last pair */
             nu = o->z - r_scale_row(x, pose, o->sdt, H, o->near);
         else {
-            nu = o->z - (o->c - log(depth));
-            if (dax * o->near > 0.5) {
-                H[R_PX] = -cph * o->near / depth;
-                H[R_PY] = -sph * o->near / depth;
-            }
+            double dw, h = exp(x[R_LH]), w = x_width_of(h, &dw);
+            nu = o->z - (x[R_LH] - log(o->c * w));
+            H[R_LH] = 1.0 - dw * h / w;
         }
         for (int i = 0; i < RN; i++) {
             double acc = 0.0;
@@ -7975,7 +7996,7 @@ static double x_aux_take(const RXc *xc, double *x, double *P, const double *pose
         double K[RN];
         for (int i = 0; i < RN; i++)
             K[i] = PH[i] / S;
-        if (cons)
+        if (cons && o->which == 2)
             K[R_LH] = K[R_DP] = 0.0;
         r_take(x, P, K, H, &o->R, &nu, 1, 1.0);
         if (used)
