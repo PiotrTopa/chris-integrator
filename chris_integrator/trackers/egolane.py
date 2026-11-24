@@ -95,6 +95,7 @@ def _norm(p):
     return [v / s for v in p]
 
 
+_NB = {}                        # size -> per k: (the neighbours k - 1, k + 1 within 0..size-1, their count)
 _WIN = {}                       # (lo, hi) -> (a copy of the last xs, the indices of its points within lo..hi)
 
 
@@ -265,11 +266,15 @@ class EgoLaneEstimator:
         if dt > 0 and size > 1:
             e = min(0.3, c["diffuse_per_s"] * dt)
             q = [0.0] * size
+            nbs = _NB.get(size)
+            if nbs is None:                     # the neighbours of every k and their count (a function of size)
+                nbs = _NB[size] = tuple((nb, len(nb)) for nb in
+                                        (tuple(j for j in (k - 1, k + 1) if 0 <= j < size) for k in range(size)))
             for k, v in enumerate(self.p):
                 q[k] += v * (1.0 - e)
-                nb = [j for j in (k - 1, k + 1) if 0 <= j < size]
+                nb, n_nb = nbs[k]
                 for j in nb:
-                    q[j] += v * e / len(nb)
+                    q[j] += v * e / n_nb
             self.p = q
         xs = lanes.get("x") or []
         lines = lanes.get("lines") or [{}] * 4
