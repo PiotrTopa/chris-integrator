@@ -663,7 +663,8 @@ static int dk_clear(const DkCtx *C, int j, int k, double ts, double a_long, doub
                 dk_path_at(e, s, &px, &py, &pth, &hint);
                 x = px - nn * sin(pth);
                 y = py + nn * cos(pth);
-                th = pth + atan2(nd, v > 0.5 ? v : 0.5);
+                /* (no sideways speed: atan2 of a zero over a positive number is that zero) */
+                th = pth + (nd == 0.0 ? nd : atan2(nd, v > 0.5 ? v : 0.5));
                 still = (v == 0.0 && nd == 0.0);
                 dk_ego_rect(cfg, x, y, th, &er);
             }
@@ -1104,12 +1105,13 @@ static void dk_obj_sample(const DkSamp *S, DkObj *o, int to)
         double h;
         if (i == 0)
             h = isfinite(hd[6]) ? hd[6] : (isfinite(hm) ? hm : h0);
-        else {
-            h = isfinite(hm) ? hm : hprev;
+        else if (isfinite(hm)) {
+            h = hm;
             double dh = remainder(h - hprev, 2.0 * M_PI);
             if (fabs(dh) > 0.5 * M_PI)
                 h = remainder(h + M_PI, 2.0 * M_PI);
-        }
+        } else
+            h = hprev;                           /* held (no half turn to take: it differs from itself by nothing) */
         if (i == 0 || h != hprev || signbit(h) != signbit(hprev)) {      /* a held heading keeps its cos, sin */
             c = cos(h);
             s = sin(h);
