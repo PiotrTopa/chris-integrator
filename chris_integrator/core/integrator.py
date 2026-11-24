@@ -1,5 +1,6 @@
 """The integrator: source registry, ego estimator, monitors and fault isolation, object layer, outputs
 (docs/DESIGN.md). No I/O and no wall clock: times come from the messages (`ts_mono_ns`)."""
+import bisect
 import collections
 import math
 
@@ -10,6 +11,7 @@ from ..native import core as _C
 from .ekf import Filter, Row, wrap_pi
 from .fdi import Diagnostics
 from .monitors import NisMonitor, Pair, SelfCheck, Series
+from . import output                       # (imported here once, not per ego state: it imports nothing of this module)
 from .registry import NS, Ctx, Meas, lin
 
 API = 3
@@ -323,7 +325,6 @@ class Integrator:
     def yaw_between(self, t0, t1):
         """The heading change (rad) from t0 to t1 as the yaw sensors measured it, or None (a gap in between, or
         outside what is remembered: about a minute)."""
-        import bisect
         ts = getattr(self, "_yaw_t", None)
         if not ts or t0 < ts[0] - 0.2 or max(t0, t1) > ts[-1] + 0.5:
             return None
@@ -334,17 +335,17 @@ class Integrator:
     def dist_between(self, t0, t1):
         """The distance over ground (m, signed: backwards is negative) the car drove from t0 to t1 as its speed
         sensors measured it, or None (a gap in between, or outside what is remembered)."""
-        import bisect
         ts = getattr(self, "_yaw_t", None)
         if not ts or t0 < ts[0] - 0.2 or max(t0, t1) > ts[-1] + 0.5:
             return None
+        yc, n, br = self._yaw_c, len(ts), bisect.bisect_right
         out = []
         for t in (t0, t1):
-            k = max(bisect.bisect_right(ts, t) - 1, 0)
-            a = self._yaw_c[k]
+            k = max(br(ts, t) - 1, 0)
+            a = yc[k]
             d = a[2]
-            if k + 1 < len(ts) and self._yaw_c[k + 1][1] == a[1] and ts[k + 1] > ts[k]:      # between two notes of one stretch
-                d += (self._yaw_c[k + 1][2] - a[2]) * min(max((t - ts[k]) / (ts[k + 1] - ts[k]), 0.0), 1.0)
+            if k + 1 < n and yc[k + 1][1] == a[1] and ts[k + 1] > ts[k]:      # between two notes of one stretch
+                d += (yc[k + 1][2] - a[2]) * min(max((t - ts[k]) / (ts[k + 1] - ts[k]), 0.0), 1.0)
             out.append((d, a[1]))
         return None if out[0][1] != out[1][1] else out[1][0] - out[0][0]
 
@@ -1124,7 +1125,6 @@ class Integrator:
 
     # ---- output --------------------------------------------------------------------------------------
     def state(self, ts_mono_ns, ts_real_ns=None):
-        from . import output
         if self.now is not None:
             ex = False
             for p in self.pairs.values():
