@@ -866,8 +866,10 @@ static double motion_scale_bound(const double *cfg, const double *o, double v_eg
     double rho = r > 1.0 ? sr / r : 0.0;
     if (rho < cfg[PC_motion_scale_rel])
         rho = cfg[PC_motion_scale_rel];
-    if (rho > 0.5)
-        rho = 0.5;
+    /* (a range known no better than that still does not make a car that keeps the car's own speed a standing one:
+     * real drive 20261122-202233 at 327 s, a car 14 m ahead at the car's speed, its range known to 9 m) */
+    if (rho > 0.3)
+        rho = 0.3;
     double svx = o[PO_SVX] == o[PO_SVX] ? o[PO_SVX] : 1.0, svy = o[PO_SVY] == o[PO_SVY] ? o[PO_SVY] : 1.0;
     /* (the scale's share alone, with a metre a second of the filter's own: a velocity that is merely poorly known
      * (a lead just born, 18 +- 9 m/s) is not thereby one a standing thing would show) */
@@ -1209,7 +1211,9 @@ static void lane_step(PCtx *c, PObj *q, double dt, double *lane_out)
         const double cross = PRIOR[PL_CROSS] * em[PL_CROSS];
         /* "in the car's way": its body reaches into the strip the car's body sweeps along its lane (a car parked
          * half in the lane is in the way though its lane is the parking strip's) */
-        const double reach = 0.5 * (cfg[PC_ego_wid] + q->wid) + 0.15, mid = 0.3 * c->ed0;
+        /* (the bodies themselves, no margin: a parked car 0.1 m clear of the strip is not "surely in the way"; real
+         * drive 20261122-202233 at 331 s) */
+        const double reach = 0.5 * (cfg[PC_ego_wid] + q->wid), mid = 0.3 * c->ed0;
         for (int k = 0; k < los; k++) {
             double step = k == 0 ? dk[1] - dk[0] : k == los - 1 ? dk[k] - dk[k - 1] : 0.5 * (dk[k + 1] - dk[k - 1]);
             double rs = sqrt(vc + 0.0225 + step * step / 12.0);
@@ -1227,20 +1231,23 @@ static void lane_step(PCtx *c, PObj *q, double dt, double *lane_out)
         }
         const double hA = sa + sb > 0.0 ? sa / (sa + sb) : 0.0, pmin = cfg[PC_lane_hyp_min];
         /* Two places only for what (probably) stands, and only where they are apart in range: a moving vehicle's
-         * futures are its lane's, and a place open across the line of sight alone (a car at the lane's edge) is one
-         * place whose spread says it. Those, and a vehicle as good as surely in the way, keep their futures as they
-         * are, with their weight (hyp 2: no lanes' weight on top). */
+         * futures are its lane's, and a place open across the line of sight alone (a car at the lane's edge, a car
+         * parked half in the lane) is one place whose spread says it: those stay as they were, weighed by the lanes
+         * in the decision unless the radar's own corridor test puts them in the path. (Weighing them by "its body
+         * reaches the strip" instead said a parked car on a real drive, 20261122-202233 at 331 s, whose track stood
+         * a metre nearer the plan's line than the car was passed.) */
         const int stands = q->pstat >= cfg[PC_lane_hyp_stand];
         if (sa > 0.0 && sb > 0.0) {
             ma /= sa;
             mb /= sb;
         }
-        const int apart = sa > 0.0 && sb > 0.0 && fabs(ma - mb) >= (0.5 * q->los_sr > 1.0 ? 0.5 * q->los_sr : 1.0);
-        if (hA >= pmin && (1.0 - hA < pmin || (stands && !apart))) {
-            q->hyp = 2;
-            q->hyp_p[0] = 1.0;
-            q->hyp_p[1] = 0.0;
-        } else if (stands && apart && hA >= pmin) {
+        /* apart in range: the ranges that belong to the one place are mostly not those of the other (a car in the lane
+         * on a bend has the other place on both sides of it: the means coincide, the stretches do not) */
+        double ov = 0.0;
+        for (int k = 0; k < los && sa > 0.0 && sb > 0.0; k++)
+            ov += a[k] / sa < b[k] / sb ? a[k] / sa : b[k] / sb;
+        const int apart = sa > 0.0 && sb > 0.0 && ov < 0.5 && los == P_LOS;
+        if (stands && apart && hA >= pmin) {
             for (int k = 0; k < los; k++) {
                 va += a[k] * p_sq(rk[k] - ma);
                 vb += b[k] * p_sq(rk[k] - mb);

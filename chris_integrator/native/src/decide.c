@@ -2619,8 +2619,10 @@ static PyObject *n_decide_frame(PyObject *self, PyObject *args)
         q->nm = 0;
         q->cv = 1;
         q->along = 0;
-        q->lane_res = state == 3;                 /* the futures' weights are the lanes' already (predict: lane_hyp) */
-        q->p_place = state == 3 ? hrows[3 * q->row + 2] - 3.0 : 1.0;      /* ... and the share of the place in the car's way */
+        /* state 3 + p: futures of two places (predict: lane_hyp), their weights final; p, the probability of the
+         * place in the car's way, is what the record carries as p_place */
+        q->lane_res = state == 3;
+        q->p_place = q->lane_res ? hrows[3 * q->row + 2] - 3.0 : 1.0;
         if (grid != NULL && (state == 1 || state == 3)) {         /* futures.contract_modes */
             int first = (int)hrows[3 * q->row], cnt = (int)hrows[3 * q->row + 1];
             int two = q->nsd >= 2 && q->sdfin[0] && q->sdfin[1];
@@ -2739,7 +2741,8 @@ static PyObject *n_decide_frame(PyObject *self, PyObject *args)
         else if (PP != NULL && tc[DX_AXIS_STANDING] > 0.5 && q->stands && !q->hfm)
             df_road_axis(&h, &sh, rh, tc[DX_AXIS_SNAP], tc[DX_AXIS_STD]);
         double w_stand = 1.0;
-        if (tc[DX_LANE_WEIGHT] > 0.5 && !(q->in_path || q->threat || !ln.has) && !(ln.sum < 0.5) && !(q->lane_res && !q->cv)) {
+        const int res = q->cv ? 0 : q->lane_res;
+        if (tc[DX_LANE_WEIGHT] > 0.5 && !(q->in_path || q->threat || !ln.has) && !(ln.sum < 0.5) && !res) {
             double a = ln.ego + ln.cross, b = DF_MAX(tc[DX_LANE_FLOOR], a);
             w_stand = DF_MIN(1.0, b);
         }
@@ -2760,7 +2763,13 @@ static PyObject *n_decide_frame(PyObject *self, PyObject *args)
             double *row = MD + (size_t)(q->first + i) * wM;
             const double *X = row + 2, *Y = X + N;
             double f = 1.0;
-            if (w_stand < 1.0) {                  /* futures.mode_stands */
+            /* of two places, the one beside the car's way ("parked") weighs what a standing future beside the lane
+             * always weighed: the floor, against every future of the car. "In the way" is said of the car's lane; a
+             * car leaving it at walking pace (its turn carried on: real drive 20261122-203305, 90 s) is not thereby
+             * about to hit the row it is parking into */
+            const double w_mode = res == 1 && tc[DX_LANE_WEIGHT] > 0.5 &&
+                                  PyUnicode_CompareWithASCIIString(mname[q->first + i], "parked") == 0 ? tc[DX_LANE_FLOOR] : w_stand;
+            if (w_mode < 1.0) {                   /* futures.mode_stands */
                 double far = hypot(X[0] - X[0], Y[0] - Y[0]);
                 for (int j = 1; j < N; j++) {
                     double d = hypot(X[j] - X[0], Y[j] - Y[0]);
@@ -2768,7 +2777,7 @@ static PyObject *n_decide_frame(PyObject *self, PyObject *args)
                         far = d;
                 }
                 if (far < tc[DX_STAND_MOVE])
-                    f = w_stand;
+                    f = w_mode;
             }
             row[0] = pn[2 * (q->first + i)] * f;
             row[1] = pn[2 * (q->first + i) + 1] * f;

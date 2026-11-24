@@ -93,12 +93,15 @@ def test_a_poorly_ranged_car_on_a_bend_has_two_places():
 
 
 def test_well_ranged_cars_keep_one_place():
-    _, pred = run([car(1, 55.0, -2.9, 0.6), car(2, 55.0, 0.0, 0.6)])
-    i, j = pred.index(1), pred.index(2)
-    assert float(pred._modes[i, 0, 1]) < 0.06 and pred.lane[i][5] > 0.6        # beside the road: parked (what is left: "across the road")
-    assert [n for n, _, _ in futs(pred, 1)][0] == "parked"
-    assert float(pred._modes[j, 0, 1]) > 0.97 and pred.lane[j][0] > 0.6        # in the lane: surely in the way
-    assert "parked" not in [n for n, _, _ in futs(pred, 2)]
+    # no doubt about the range: the futures and their weights are as they always were (the decision weighs the
+    # standing ones by the lanes), whether beside the road, in the lane or half in it
+    _, pred = run([car(1, 55.0, -2.9, 0.6), car(2, 55.0, 0.0, 0.6), car(3, 30.0, -1.45, 0.5)])
+    for oid in (1, 2, 3):
+        assert float(pred._modes[pred.index(oid), 0, 1]) == 0.0
+    assert pred.lane[pred.index(1)][5] > 0.6 and [n for n, _, _ in futs(pred, 1)][0] == "parked"
+    assert pred.lane[pred.index(2)][0] > 0.6 and "parked" not in [n for n, _, _ in futs(pred, 2)]
+    h = pred.handoff()
+    assert all(float(r[2]) == 1.0 for r in h.arrays()[2])
 
 
 def test_a_stopped_car_in_the_lane_keeps_most_of_its_weight_at_the_same_doubt():
@@ -107,9 +110,11 @@ def test_a_stopped_car_in_the_lane_keeps_most_of_its_weight_at_the_same_doubt():
     assert p_lane > 0.5 > p_side and p_lane > p_side + 0.2, (p_side, p_lane)
 
 
-def test_a_car_half_in_the_lane_is_in_the_way_whatever_its_lane():
-    _, pred = run([car(1, 30.0, -1.45, 0.5)])
-    assert float(pred._modes[pred.index(1), 0, 1]) > 0.9
+def test_a_moving_vehicle_keeps_its_lanes_futures():
+    x, y = centre(55.0, 0.0)
+    sx, sy = needle(x, y, 9.0)
+    _, pred = run([K.obj(1, x, y, 12.0, 6.0, ps=0.02, std=(sx, sy, 0.8, 0.4))])
+    assert float(pred._modes[0, 0, 1]) == 0.0 and "parked" not in [n for n, _, _ in futs(pred, 1)]
 
 
 def test_the_place_is_not_counted_again_frame_after_frame():
@@ -174,6 +179,10 @@ def test_the_decision_takes_two_place_futures_at_their_weight():
     assert abs(res.modes[0, 0] - 1.0) < 1e-9                   # its weight is the prediction's: not weighed again
     assert "p_place" not in plain.records[0] and res.records[0]["p_place"] == 0.4
     assert res.records[0]["p_coll"] > 0.9 > 0.2 > plain.records[0]["p_coll"]
+    m = _frame(0.4)                                            # of the two places, the one beside the way keeps the floor
+    m["objects"][0]["fut"][0]["m"] = "parked"
+    beside = tm.explain(m)
+    assert abs(beside.modes[0, 0] - tm.cfg["lane_weight_floor"]) < 1e-9 and beside.records[0]["p_coll"] < 0.1
 
 
 if __name__ == "__main__":

@@ -166,6 +166,18 @@ no second copy of a default. Its results were never a Python program's: the gold
 (`python3 -m chris_integrator.native._predict_selftest record`) are recorded from the C code after a deliberate
 change, and what the code must DO is held by `tests/test_predict.py` and judged by `tools/predict_eval.py`.
 
+Since 2026-11-24 (lane CURVES) the predictor's row 0 of `modes` carries, beside the number of futures, the
+probability of the place in the car's way for an object given futures of two places (`modes[i, 0, 1]`, 0: one
+place); `predict_handoff` hands it on as state 3 + p in the rows' third column, `predict_message` as the object's
+`lane_res`; `decide_frame` then takes such an object's futures at their weight (the future named `parked`, the
+place beside the way, at the lanes' floor), starts a prepended "now" at the future's own first place, and writes
+`p_place` into the record. One spare slot of an object's kept state is in use (`PS_MOVED`: seen to move); two
+spare slots of the road row carry the street's count (`PR_ROWL`, `PR_ROWR`). The constants are in `predict_cfg()`
+(`lane_los`, `lane_mem`, `lane_hyp`, `lane_hyp_min`, `lane_hyp_stand`, `ego_kap_back`, `motion_scale`,
+`motion_scale_rel`, `motion_scale_v`); with `lane_los` 0, `lane_mem` 1, `lane_hyp` 0, `motion_scale` 0 and
+`ego_path_p` 0.8 the code computes what it computed before. The native version is unchanged (11): no function's
+arguments or results changed shape.
+
 ### Inputs the C code takes, and what it does with others
 
 * Arrays: float64 (index arrays: the platform's 64-bit integer), C-contiguous. The Python around a call makes
