@@ -58,7 +58,7 @@ def run(name, seed=1, night=False, radar=None, cfg=None, hz_out=20.0, det_params
     Returns {name, seed, night, radar, hz_out, events, groups, frames: [{t (s from start), dt, objects, actors,
     occ, radar_fov, ego_w, ego_al (the car's true yaw rate and yaw acceleration)}], first_det, wall_s, duration_s}."""
     t_wall = time.time()
-    w = rs.scenario(name, seed=seed, night=night)
+    w = rs.scenario(name, seed=seed, night=night, world=(det_params or {}).get("world"))
     det = rs.DetectorSim(seed=1000 + seed, night=night, params=det_params)
     sensors = [VehicleSim(seed=11 + 97 * seed, **(vehicle_kw or {})), VisionSim(seed=21 + 97 * seed, leads=False), det]
     integ = None
@@ -611,8 +611,11 @@ def main(argv=None):
     ap.add_argument("--vehicle", default=None, help="sim.VehicleSim parameters as JSON (gyro_bias, gyro_lag, stamp_lag, ...)")
     ap.add_argument("--estimator", default=None, help="the estimator's configuration as JSON (with --ego estimator)")
     ap.add_argument("--phantom", action="store_true", help="the velocity given to standing actors")
+    ap.add_argument("--det", default=None, help="DetectorSim parameters as JSON; 'detin' (or 'detin_reid') = the detection-"
+                    "inputs preset roaduser_sim.DETIN (DETIN_REID)")
     a = ap.parse_args(argv)
     r = run(a.name, seed=a.seed, night=a.night, radar=a.radar, hz_out=a.hz, ego=a.ego,
+            det_params=rs.det_params_arg(a.det) if a.det else None,
             vehicle_kw=json.loads(a.vehicle) if a.vehicle else None, integ_cfg=json.loads(a.estimator) if a.estimator else None)
     s = score(r)
     print_table(s)

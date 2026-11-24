@@ -106,6 +106,152 @@ Edges touching the roi get the clip letters l, t, r, b.
 Known realism gap: the dense parked-row scenarios produce 3 to 7 boxes per message at night. The real city
 drives averaged 0.37, so the simulator still sees far more parked cars than the real night detector.
 
+## Detection inputs (lane detin): the detector's optional outputs
+
+The detector (roadsense-signs `signd`, branch `detin`) can publish more per box: frame-edge and occlusion
+flags, a low-score list, an appearance vector, the lamp pair at night, and lamp-based scale rates. The contract
+is in roadsense `docs/ARCHITECTURE.md` (the `lights` message), the consumer's design in roadsense
+`docs/lanes/detin-consumption-design.md`. `DetectorSim` emits all of them. Each one is a parameter of `DET_DAY`
+/ `DET_NIGHT` and is off by default. **With every option off the messages and `det.log` are bit-identical to the
+simulator without them** (`tests/test_sim_detin.py` holds seven runs to digests recorded before the change).
+
+How to switch them on:
+
+* `DetectorSim(seed, night, params=dict(rs.DETIN))` turns everything on at the recommended values (the
+  detector's documented set: floor 0.10, flags, `yuv3x3`, lamps). `rs.DETIN_REID` is the same with
+  `reid32+yuv3x3`. `scale_corr` only acts together with a `scale_rate` dict (`SCALE_DAY` / `SCALE_NIGHT` in
+  `tools/visual_radar_eval.py`).
+* The environment variable `CHRIS_SIM_DET` holds a JSON object, or `detin` / `detin_reid`; `{"detin": true, ...}`
+  starts from the preset and then overrides. It is merged into the parameters after the day/night dict and
+  before `params`, so explicit parameters win. Whole-stack tools that build `DetectorSim(seed, night)`
+  themselves pick it up without code changes.
+* `python3 -m chris_integrator.sim.radar_score NAME --det detin` (or `--det '{...}'`).
+
+**Paired runs.** The base detector runs draw for draw on its own generator (`random.Random(seed)`), on the full
+truth boxes and the old occlusion rule, whatever the options. Every new thing comes from a second generator
+(`seed * 31 + 7`; roadside occluders `seed * 31 + 9`). That covers the low list, flags, vectors, lamps, scale
+chains, and the draws for an actor that the base dropped but the new rules report. So the miss chains, the false
+positives and the boxes of actors the new rules leave alone are the same with the options on. With `low`,
+`flags`, `emb` or `lamps` alone, the first list is the base one box for box (only keys are added).
+
+Outcomes do differ where `visible_boxes` has to change them:
+
+* a covered actor gets a smaller box, a lower score mean and a lower detection probability;
+* cover is the union of everything nearer, hidden actors included. The old rule summed the overlaps of
+  reported-size boxes, so a different set of actors passes `occl_cover`;
+* an actor the base dropped (old rule, or the region test on the full box) but whose visible part passes gets
+  second-stream draws;
+* such an actor's persistent bottom offset is a second-stream draw until the base draws its own;
+* the base scale value is dropped from boxes covered more than `scale_occ_max`.
+
+With `scale_corr` every scale value is the new model's; the base draws are still consumed.
+
+### What each option models (M = measured in the documents above, A = assumed)
+
+| option | what is emitted | numbers |
+|---|---|---|
+| `visible_boxes` (+ `roadside`) | The box of the visible part of the actor's silhouette. The silhouette is a body cuboid plus an inset cabin for cars (A) and one cuboid for vans and trucks; it is rasterised on a 24×24 grid over the truth box and cut by the silhouettes of everything nearer (true range) and by the 1280×720 frame. Covered ≥ `occl_cover` (0.6): not reported, as before. Between 0.15 and 0.6 the detection probability falls linearly to ×0.5 (A). Edge noise, `clip` and the region test then apply to the visible box. `ROADSIDE`: posts 25, tree trunks 15, kerbside railings/hedges 6 per km and side, 4.0-5.2 m from the lane centre (A). | A; "no flag ≠ whole" comes from occluders not boxed in the pass, from roadside occluders and from the silhouettes |
+| `flags` | `trunc` on every box; `occ`, `occ_by`, `occ_edges` only when covered. Computed from the EMITTED boxes by signd `detin.cc`'s rule, ported 1:1 (`ru_nearer`, `flag_one` on a 16×16 grid, `trunc_of`; ties count both ways). Low boxes are flagged against the first list. | M (rule) |
+| `low` (floor) | `road_users_low`. A visible actor missed by the first list is in it with p 0.68 (day) / 0.75 (night) inside a miss run (M), 0.4 when missed by the size/off-axis/cover draw (M, BDD100K), 0.3 when covered 0.6-0.85 (A), and 0.5 × a ramp between 0.5 and 0.8 × h_min below the first list's size limit (A). Score uniform in (floor, class threshold] (signd thresholds 0.35-0.50). Edges 1.5 × the px terms + 10 % (M). Class wrong 5 % (M). Clutter on nothing: 0.65 a pass by day, 0.35 at night; 30 % of it recurs at one image place for 1-2 s (rates M × the BDD share of 0.57 of low boxes on no label; recurrence A). Beside or on part of a first-list actor box: 0.15 / 0.2 per box (A within the rides' 0.04-0.45). Then signd's NMS 0.5 against the first list and better low boxes, and the cap of 20. | as marked |
+| `emb` | `emb` (hex of int8) on boxes ≥ 8 px a side in both lists, and `emb_kind`. Per key (actor, persistent false box, roadside item, clutter) there is a latent and an Ornstein-Uhlenbeck drift that grows with the time since the key's last observation, plus white noise per observation. A per-object volatility and a per-observation scale are both log-normal; by day a share of "frozen" objects barely changes (the table's near-zero same-object pairs). The nine Y cells carry the scene level, 0 by day and -1.5 at night (A); it does not change distances. A covered box is blended towards its main occluder's look in proportion to its covered share (A). `reid32+yuv3x3`: the 32 learnt numbers around a common direction, L2-normalised, sharing the scale draws; at most 16 vectors a pass. | fitted to `detin-emb-distances.json` (M), table below |
+| `lamps` | Night only, vehicles whose rear or front is within 40° of the line of sight (A). `lit` (moving or standing in traffic) p 0.65 (M 0.61-0.73); parked (unlit) p 0.05, colour red/unknown (A). The two lamp points are projected: S = 0.67 W e^N(0,0.12) apart (A), at 0.6 H (A). Noise hypot(0.35 px, 2 %), 0.8 px under 10 px (M). Wrong blobs 10 %, sep × 0.6-0.9 (M). Colour unknown 13 %, wrong 3 % (M). `sep_std` is the detector's hypot(0.35, 2 %) whatever the size. The detector's own checks apply: centroids inside the box, 0.3-0.98 of its width apart, about its middle unless a side is cut. | as marked |
+| `scale_corr` | Per actor and pass a noisy log size: a chain of increments, each with that pass's own alignment error, its variance in proportion to the step so that a 0.6 s baseline has the base model's std (A). The value is this pass against the oldest sample of the window (the patch alignment), so successive values share the increments of their overlap. The stated std is the value's own 1-sigma. At night with `lamps`: the WLS line through ln sep over ≥ 3 passes in the window (≥ 10 px, one colour, no step above 0.25), std × 1.5 (M), 10 % of the samples off by 3 sigma (A, the heavier tail). Combined with the patch value as signd does: `scale_src` "both" / "lamps". With `low`, low boxes continue the chains and carry values. | as marked |
+
+Truth for scoring, per message (only with an option on):
+
+* `det.log_low`: (t, view, [(actor id | `fp:clutter` | `fp:clutter_fixed` | `fp:beside:<id>`, cls, box, clip)]).
+* `det.log_x`: {t, view, seen (actors whose visible part is in the view's region), first / low: per box {id,
+  cover, cover_box, hidden (truth edges covered), out (truth edges beyond the frame), by (main occluder: actor id
+  or `rs:...`), h (truth box height), scale_true (the noise-free value of the emitted scale rate), sep_true (the
+  true lamp separation), why (low: run / draw / small / occl / clutter / clutter_fixed / beside)}}.
+
+**World option `dims_spread`** (`scenario(name, seed, night, world={"dims_spread": True})`, or the `"world"` key of
+`CHRIS_SIM_DET`; part of `DETIN`; `radar_score.run` passes `det_params["world"]` to `scenario()`). Each actor's (L,
+W, H) is multiplied by exp(N(0, sigma)), drawn from a generator of its own seeded from the scenario seed and the
+actor id. Cars use sigma 0.08 / 0.04 / 0.06, vans and trucks half that, pedestrians and riders 0.05 on the height
+(A: the European fleet, small cars to SUVs). Explicit `dims=` are spread the same way. Off: the worlds are
+unchanged. The lamp separation follows the spread width.
+
+### Appearance fit (`EMB_MODEL`)
+
+Quantiles 5 / 25 / 50 / 75 / 95 % of the contract's distance, simulated with `EmbGen` against the table
+(`detin-emb-distances.json`; "other" = the mean of its three other-object rows):
+
+| case | simulated | table |
+|---|---|---|
+| day yuv3x3, same 1 s | 0.06 0.30 0.56 0.92 1.61 | 0.07 0.33 0.54 0.87 1.65 |
+| day yuv3x3, same 2 s | 0.07 0.33 0.63 1.02 1.77 | 0.08 0.41 0.66 1.02 1.83 |
+| day yuv3x3, same 4 s | 0.08 0.39 0.74 1.19 2.04 | 0.08 0.50 0.80 1.20 2.00 |
+| day yuv3x3, other | 1.13 1.76 2.42 3.31 4.87 | 1.18 1.85 2.56 3.49 4.80 |
+| day reid32+yuv3x3, same 1 s | 0.05 0.33 0.49 0.71 1.12 | 0.06 0.32 0.47 0.66 1.13 |
+| day reid32+yuv3x3, same 2 s | 0.05 0.36 0.53 0.75 1.16 | 0.06 0.39 0.56 0.77 1.26 |
+| day reid32+yuv3x3, same 4 s | 0.05 0.40 0.59 0.81 1.23 | 0.06 0.45 0.66 0.89 1.40 |
+| day reid32+yuv3x3, other | 0.87 1.27 1.58 1.94 2.76 | 1.03 1.45 1.81 2.23 2.82 |
+| night yuv3x3, same 1 s | 0.36 0.63 0.88 1.26 2.78 | 0.41 0.59 0.82 1.33 2.57 |
+| night yuv3x3, same 2 s | 0.45 0.76 1.05 1.50 2.90 | 0.48 0.68 0.98 1.53 3.52 |
+| night yuv3x3, same 4 s | 0.51 0.88 1.20 1.70 3.22 | 0.58 0.88 1.14 1.72 3.37 |
+| night yuv3x3, other | 0.77 1.31 1.90 3.03 6.92 | 0.78 1.29 1.93 3.38 6.80 |
+| night reid32+yuv3x3, same 1 s | 0.30 0.46 0.61 0.90 2.17 | 0.34 0.46 0.61 0.93 1.56 |
+| night reid32+yuv3x3, same 2 s | 0.37 0.56 0.73 1.02 2.23 | 0.37 0.51 0.70 1.03 2.06 |
+| night reid32+yuv3x3, same 4 s | 0.43 0.63 0.82 1.14 2.28 | 0.43 0.60 0.79 1.12 2.20 |
+| night reid32+yuv3x3, other | 0.63 0.95 1.27 1.83 3.79 | 0.68 0.93 1.25 2.00 3.60 |
+
+The worst spots: by day the learnt kind's other-object distances are 10-15 % short, and at night the learnt
+kind's same-object 95 % point at 1 s is 2.2 against 1.6. The fit was made by Nelder-Mead on log-quantile errors
+with a vectorised copy of the generator (scratch, not in the repo); `tests/test_sim_detin.py` checks the
+simulator's own generator against the table. Caveat from the source: the tables come from full-frame crops at
+10 fps; the unit's own views show larger distances.
+
+### Emitted streams with `DETIN` on
+
+`SCALE_DAY` / `SCALE_NIGHT` scale rates, seeds 1-3 per row; shares are of first-list boxes. Columns:
+
+* truly covered: truth cover > 0;
+* covered, no flag: of the truly covered, those without `occ`. M: 26-28 % on BDD100K, where every vehicle in
+  front is a box and the camera sees the whole frame;
+* no flag, covered: of the unflagged, those truly covered. M: 40 %;
+* gap passes: as the rides define them (boxed before and after within 1.5 s and seen in the pass's region).
+  M: 68-100 %.
+
+| scenario | | first / msg | low / msg | occ > 0 | with occ_edges | truly covered | covered, no flag | no flag, covered | truth edge hidden or cut | lamps on vehicle boxes | scale coverage (lamps / both) | gap passes with a low box |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| parked_street | day | 5.08 | 4.98 | 0.33 | 0.32 | 0.62 | 0.57 | 0.53 | 0.76 | - | 0.39 (0 / 0) | 381/771 |
+| parked_street | night | 2.39 | 6.10 | 0.17 | 0.17 | 0.65 | 0.78 | 0.61 | 0.73 | 0.01 | 0.32 (0 / 0) | 356/612 |
+| curve_parked | day | 5.57 | 4.98 | 0.38 | 0.37 | 0.72 | 0.53 | 0.62 | 0.76 | - | 0.50 (0 / 0) | 445/1006 |
+| curve_parked | night | 2.20 | 6.72 | 0.22 | 0.21 | 0.71 | 0.73 | 0.67 | 0.75 | 0.01 | 0.41 (0 / 0) | 321/513 |
+| platoon | day | 1.79 | 1.62 | 0.30 | 0.29 | 0.47 | 0.38 | 0.26 | 0.47 | - | 0.72 (0 / 0) | 106/192 |
+| platoon | night | 0.97 | 1.82 | 0.15 | 0.14 | 0.41 | 0.64 | 0.30 | 0.41 | 0.52 | 0.60 (16 / 15) | 143/218 |
+| occlusion | day | 1.47 | 1.23 | 0.17 | 0.16 | 0.20 | 0.44 | 0.11 | 0.24 | - | 0.49 (0 / 0) | 77/160 |
+| occlusion | night | 0.66 | 1.32 | 0.09 | 0.08 | 0.25 | 0.78 | 0.22 | 0.27 | 0.43 | 0.42 (10 / 15) | 87/147 |
+| queue | day | 2.02 | 1.73 | 0.15 | 0.15 | 0.32 | 0.62 | 0.23 | 0.27 | - | 0.54 (0 / 0) | 110/194 |
+| queue | night | 0.88 | 2.08 | 0.11 | 0.11 | 0.23 | 0.63 | 0.17 | 0.21 | 0.55 | 0.40 (26 / 9) | 126/190 |
+| oncoming | day | 2.66 | 2.54 | 0.26 | 0.26 | 0.48 | 0.54 | 0.34 | 0.57 | - | 0.45 (0 / 0) | 205/429 |
+| oncoming | night | 1.22 | 3.04 | 0.13 | 0.13 | 0.49 | 0.76 | 0.43 | 0.56 | 0.10 | 0.31 (1 / 0) | 151/264 |
+
+Reading it:
+
+* The low list is far busier than on the rides (0.4-1.2 a pass). This is the simulator's known excess of
+  visible actors: 2-6 first-list boxes a pass against 0.2-0.5. Clutter alone is at the documented rate.
+* Covered boxes go unflagged more often than on BDD100K, by night most of all: the occluder is often missed in
+  that pass (night p_miss 0.45, off-axis 0.5).
+* The gap share with a low box is 0.43-0.66, below the rides' 0.68-1.0. Here a gap also counts passes in which
+  the actor is lost to the size / off-axis draw (low p 0.4) or covered beyond 0.6 (low p 0.3).
+* Lamps on parked vehicles are rare by design: unlit, p 0.05.
+
+### Ground: the scenarios' vertical curvature
+
+All scenarios use World's grade profile `grade_amp * sin(s / 180 m)` with `grade_amp` 0.03 (no scenario sets
+it). Its vertical curvature is `grade_amp / 180 * cos(s / 180)`. Over the driven arcs plus 150 m ahead, |k_v|
+has p50 1.2e-4 /m, p90 1.6e-4 /m and max 1.67e-4 /m (R 6000 m); no point exceeds the consumer's assumed
+1/3000 m. Stronger crests and sags: the spec key `grade_amp` is honoured by `ScenarioWorld`.
+
+    spec = rs.SCENARIOS["platoon"](seed, night)
+    spec["grade_amp"] = 0.06
+    w = rs.ScenarioWorld(spec, seed=seed, name="platoon", night=night)
+
+That gives k_v up to 1/3000 m, but with grades of ±6 % (0.09: 1/2000 m at ±9 %). The 1.13 km wavelength is fixed
+in `world.py`, so realistic grades with tighter crests would need a shorter wavelength there.
+
 ## Metrics (per scenario × day/night; JSON has everything, the table a summary)
 
 Matching is CLEAR-MOT style. A correspondence from the previous frame is kept while it stays inside the
