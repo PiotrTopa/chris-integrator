@@ -7,7 +7,14 @@ tools/visual_radar_eval.py; this one feeds the `Radar` box directly, as radar/re
     print_table(s)
 
     python3 -m chris_integrator.sim.radar_score NAME [--seed N] [--night] [--radar point|extended] [--hz 20]
-                                                     [--json OUT]
+                                                     [--json OUT] [--ego feed|estimator] [--vehicle JSON]
+                                                     [--estimator JSON] [--phantom]
+
+`--ego estimator`: the car's own motion goes through the estimator (core.Integrator, its configuration `--estimator`)
+and the radar gets its `ego_state` per road frame, as in the stack, instead of the feed's raw `ego`. `--vehicle`:
+parameters of the simulated vehicle feed (sim.VehicleSim: gyro_bias, gyro_lag, stamp_lag, speed_floor, ...).
+`--phantom`: the velocity the radar gives to standing actors (`phantom()`): what an error of the car's own motion
+shows as (docs/EGO_MOTION.md).
 
 Inputs fed: the detector's calibration (`on_calib`), the car's own motion (sim.VehicleSim `ego` -> `on_ego`),
 the camera class detector (roaduser_sim.DetectorSim `lights` -> core.roadusers.from_lights -> `on_road_users`),
@@ -43,14 +50,21 @@ PRE_S = 0.5                      # an interval counts as "tracked before" if the
 
 
 # ---- one run ------------------------------------------------------------------------------------------------
-def run(name, seed=1, night=False, radar=None, cfg=None, hz_out=20.0, det_params=None, radar_kw=None):
+def run(name, seed=1, night=False, radar=None, cfg=None, hz_out=20.0, det_params=None, radar_kw=None, ego="feed",
+        vehicle_kw=None, integ_cfg=None):
     """A scenario through the Radar component alone. radar: None (camera boxes only), "point" or "extended".
+    ego: "feed" (the feed's raw `ego` into the radar) or "estimator" (through core.Integrator, configuration
+    `integ_cfg`: the radar gets `ego_state` per road frame, as in the stack). vehicle_kw: sim.VehicleSim parameters.
     Returns {name, seed, night, radar, hz_out, events, groups, frames: [{t (s from start), dt, objects, actors,
-    occ, radar_fov}], first_det, wall_s, duration_s}."""
+    occ, radar_fov, ego_w, ego_al (the car's true yaw rate and yaw acceleration)}], first_det, wall_s, duration_s}."""
     t_wall = time.time()
     w = rs.scenario(name, seed=seed, night=night)
     det = rs.DetectorSim(seed=1000 + seed, night=night, params=det_params)
-    sensors = [VehicleSim(seed=11 + 97 * seed), VisionSim(seed=21 + 97 * seed, leads=False), det]
+    sensors = [VehicleSim(seed=11 + 97 * seed, **(vehicle_kw or {})), VisionSim(seed=21 + 97 * seed, leads=False), det]
+    integ = None
+    if ego == "estimator":
+        from ..core.integrator import Integrator
+        integ = Integrator(dict(integ_cfg or {}), objects=False)
     rsim = None
     if radar:
         rsim = attach(w, radar, **(radar_kw or {}))
@@ -76,7 +90,9 @@ def run(name, seed=1, night=False, radar=None, cfg=None, hz_out=20.0, det_params
                 az = (math.atan2(a["y"] - my, a["x"] - mx) - myaw + math.pi) % (2 * math.pi) - math.pi
                 fov[a["id"]] = 1.0 < r <= rsim.max_range and abs(az) <= math.radians(rsim.fov_deg)
         objs = [{k: o[k] for k in KEEP if k in o} for o in out.get("objects") or ()]
-        frames.append({"t": T - w.t0, "objects": objs, "actors": acts, "occ": occ, "radar_fov": fov})
+        w0, w1 = w.truth_at(T - 0.1)["w"], w.truth_at(T + 0.1)["w"]
+        frames.append({"t": T - w.t0, "objects": objs, "actors": acts, "occ": occ, "radar_fov": fov,
+                       "ego_w": w.truth_at(T)["w"], "ego_al": (w1 - w0) / 0.2})
 
     for t_arr, m in w.messages(sensors):
         while t_next <= t_arr:
@@ -87,7 +103,10 @@ def run(name, seed=1, night=False, radar=None, cfg=None, hz_out=20.0, det_params
             calib = det.calib_msg(m["ts_mono_ns"])
             rd.on_calib(calib)
         if typ == "ego":
-            rd.on_ego(m)
+            if integ is None:
+                rd.on_ego(m)
+            else:
+                integ.on_message(m)
         elif typ == "lights":
             ru = from_lights(m, calib, "cam", pcfg)
             if ru is not None:
@@ -95,6 +114,10 @@ def run(name, seed=1, night=False, radar=None, cfg=None, hz_out=20.0, det_params
         elif typ == "objects":
             rd.on_objects(m)
         elif typ == "road":
+            if integ is not None:
+                es = integ.on_road(m)
+                if es is not None:
+                    rd.on_ego_state(es)
             rd.on_road(m)
     while t_next <= w.t0 + w.T:
         emit(t_next)
@@ -173,6 +196,35 @@ def match(outs, actors, prev=None):
         if C[r, c] <= 1.0:
             out[idx[r]] = (acts[c],) + E[(r, c)]
     return out
+
+
+# ---- the velocity given to what stands ------------------------------------------------------------------------
+def phantom(r, min_turn=0.05, min_al=0.05):
+    """The velocity over ground the radar gives to standing actors (confirmed objects matched to them; the truth
+    is zero): what an error of the car's own motion shows as. Per condition {n, lat_rms, lat_p90, lon_rms, lon_p90}
+    (m/s; lateral and along the car's axis): `all`, `turning` (the car's yaw rate beyond min_turn rad/s),
+    `changing` (its yaw acceleration beyond min_al rad/s2: turning in or out, where a time offset of the yaw rate
+    shows), `straight`."""
+    prev, rows = None, []
+    for f in r["frames"]:
+        outs = _outs(f)
+        m = match(outs, f["actors"], prev)
+        prev = {outs[i]["oid"]: a["id"] for i, (a, _, _) in m.items()}
+        for i, (a, _, _) in m.items():
+            o = outs[i]
+            if a["moving"] or o["state"] != "confirmed" or o["vx"] is None or o["vy"] is None:
+                continue
+            rows.append((abs(f["ego_w"]), abs(f["ego_al"]), o["vx"], o["vy"]))
+
+    def stat(sel):
+        v = [x for x in rows if sel(x)]
+        if not v:
+            return {"n": 0, "lat_rms": None, "lat_p90": None, "lon_rms": None, "lon_p90": None}
+        lat, lon = sorted(abs(x[3]) for x in v), sorted(abs(x[2]) for x in v)
+        return {"n": len(v), "lat_rms": round(math.sqrt(sum(x * x for x in lat) / len(v)), 3), "lat_p90": round(lat[int(0.9 * len(v))], 3),
+                "lon_rms": round(math.sqrt(sum(x * x for x in lon) / len(v)), 3), "lon_p90": round(lon[int(0.9 * len(v))], 3)}
+    return {"all": stat(lambda x: True), "turning": stat(lambda x: x[0] > min_turn), "changing": stat(lambda x: x[1] > min_al),
+            "straight": stat(lambda x: x[0] <= 0.01)}
 
 
 # ---- scoring ------------------------------------------------------------------------------------------------
@@ -554,9 +606,22 @@ def main(argv=None):
     ap.add_argument("--radar", default=None, choices=("point", "extended"), help="add a microwave radar")
     ap.add_argument("--hz", type=float, default=20.0, help="output frames per second")
     ap.add_argument("--json", default=None, help="write the score here")
+    ap.add_argument("--ego", default="feed", choices=("feed", "estimator"), help="the car's own motion: the feed's raw `ego`, "
+                    "or through the estimator (`ego_state`, as in the stack)")
+    ap.add_argument("--vehicle", default=None, help="sim.VehicleSim parameters as JSON (gyro_bias, gyro_lag, stamp_lag, ...)")
+    ap.add_argument("--estimator", default=None, help="the estimator's configuration as JSON (with --ego estimator)")
+    ap.add_argument("--phantom", action="store_true", help="the velocity given to standing actors")
     a = ap.parse_args(argv)
-    s = score(run(a.name, seed=a.seed, night=a.night, radar=a.radar, hz_out=a.hz))
+    r = run(a.name, seed=a.seed, night=a.night, radar=a.radar, hz_out=a.hz, ego=a.ego,
+            vehicle_kw=json.loads(a.vehicle) if a.vehicle else None, integ_cfg=json.loads(a.estimator) if a.estimator else None)
+    s = score(r)
     print_table(s)
+    if a.phantom:
+        ph = phantom(r)
+        s["phantom"] = ph
+        for k, v in ph.items():
+            print("phantom velocity of standing actors, %-9s n %5d  lateral rms %s p90 %s  along rms %s p90 %s m/s" % (
+                k, v["n"], _f(v["lat_rms"]), _f(v["lat_p90"]), _f(v["lon_rms"]), _f(v["lon_p90"])))
     if a.json:
         with open(a.json, "w") as fh:
             json.dump(s, fh, indent=1, default=str)
