@@ -799,3 +799,225 @@ seconds a standing actor was called stationary / moving 649 / 89 -> 819 / 80 and
 dense simulated capture 2.41-2.52 ms at the base, 2.11-2.52 ms with the knobs off, 2.40-2.57 ms with all five on;
 recorded capture 0.24 / 0.22-0.25 / 0.15-0.27 ms: nothing beyond the runs' own scatter. With the knobs off every
 stream of both captures is identical to the base's (`cost_bench.py diff`).
+
+## 10. One car, one object in a row; the detector's miss runs; the pose head (2026-11-24)
+
+Nine knobs of `radar.tracker`, all **off by default** in the code of this section's commit (with them off every scan
+and every message is what it was: the goldens and digests of tests/test_native.py, tests/test_radar_inputs.py and
+tests/test_radar_parked.py stand as recorded; a detection's row grew by eight numbers and the hypotheses got a second
+row memory, `Hyp.Y`, and a table, `Hyp.pdl`, both made only when a scan asks). Recorded with them on:
+`tests/data/make_radar_golden.py --rows` (tests/test_radar_rows.py). `Hyp.debug(1)` keeps a scan's pairing numbers
+for tools (the log ratio of every leaf and detection, ln r, ln(1 - r pd), the densities).
+
+### What the arrays said of the wrong-car updates
+Every update of `curve_parked` + `parked_street`, seeds 1-3, day and night (5941 updates on the plain stream, 4288 on
+the realistic one), with the scan's own pairing numbers and the hypothesis tree after it:
+
+* **The right story was nearly always "missed, and this box is a car that has no object yet"** (plain: 665 of 714
+  wrong-car updates; an object of the box's own car that was more than a tentative alternative existed in 49). In a
+  quarter of them the object's own car was boxed in the same scan as well.
+* **The pairing did not refuse them, and could not at that range.** The log odds of "took it" against "missed + something
+  else" were 3.4 in the median for a wrong-car box against 5.0 for a right one (quartiles 2.0-5.1 against 3.2-6.6):
+  no bar between the two separates them. Under "it stands" a neighbour's box fits with 1.5 per row (a right one 0.5):
+  the neighbour stands 6.5 m further along the line of sight, which is 1.5 sigma of the standing hypothesis' own range
+  (0.17 of the range), about 1 degree of bearing at 30 m against a box centre taken to 0.11 of its width (0.5
+  degree), and a fifth of box height against 0.1. The gate is in measurement space with the object's own covariance
+  already; what is missing is information, not a metric.
+* **Who hops is who has not settled.** The share of updates that are wrong-car by the object's "it stands" before
+  the update: under 0.3: 35 %; 0.3-0.5 (the birth prior): 14 %; 0.5-0.8: 10 %; 0.8-0.95: 7 %; above: 2 %. Two
+  thirds of all wrong-car updates happen below 0.5. An object that was called moving by one such update goes on
+  eating the row's boxes at a third of its updates.
+* **The alternative was there and lost.** After the scan the story "missed" still held a median 0.10 of the weight
+  (present in 93 %), a birth from the box in 75 %; five scans on, one wrong-car reading in nine had been taken back.
+  The two stories become alike: in one the object jumped to the neighbour and a new object sits on its car, in the
+  other the reverse; from then on both explain every box equally. What tells them apart is only the price of the jump
+  when it was made. Deeper trees do not help (`hyp_n_scan` 8, `hyp_k_best` 128, `hyp_max_leaves` 24: wrong-car updates
+  9.9 % against 9.1 % at the defaults, with the knobs below on).
+* **A new object could not hold its own car's second box.** It exists with 0.2 and its three stories are wide; and
+  where its box was near the view's smallest, the camera's model gave it a tenth of the usual chance of a box (below).
+
+### `row_ctx`: the place of every box as a row (tracker `_row_ctx`, native `XC_ROWB`, `r_birth`)
+Before a scan pairs anything, every vehicle box with a ground point is given q = n_s / (n_s + n_m + `ctx_n`): the
+vehicles already judged at its distance beside the road's path (the count of `ctx_prior`, of the box's own place).
+* `row_birth` (2.5): "something else" is exp(`row_birth` q) times denser at the box. The density of new objects was
+  one number over the whole field; beside a row the next box along IS another car.
+* `ctx_exist` (0.6): an object born there exists with `new_exist` + (`ctx_exist` - `new_exist`) q.
+* `ctx_vel` (2 m/s): its moving stories start from (1 - q) x the traffic's speed, and as narrow as `ctx_vel` where q
+  is 1: if a car in a row moves at all it starts from rest. "The same car, driving with us" was what explained the
+  next car of the row (section 5).
+The density alone does nothing (it lowers right and wrong pairings alike: 11.6 % against 11.2 % on one drive); with
+`ctx_prior` (which makes the pairing read the box mostly through "it stands") the three together take the wrong-car
+updates from 10.9 % to 9.6 %.
+
+### `det_chain`, `pd_learn`, `exist_shared`: a detector that misses in runs, and what a view can see
+Traced on the night runs of the true-conflict scenarios (a stopped car in the lane; 30 runs): the first box at
+39 m, the second at 33 m, the third at 26 m (median), confirmed at 20 m, in 16 runs never; several of those had four
+to six boxes of the car in a row. What happened there:
+* the camera's two views alternate; the object is born in one, the next scan is the other's. The model of what a
+  view can box is a ramp from "the smallest box this view has shown" (a tenth of the usual chance) to twice that
+  (all of it). Most of a view's boxes ARE near its smallest (wide view at night: smallest 35 px, the boxes 35-45
+  px), so the model gave the object's next box a chance of 0.06, and the best story was "a new object" at every
+  box: three objects on one car, each existing in a part of the stories, none confirmed;
+* the misses themselves were not the limit: the object's misses between the boxes cost 0.05-0.2 each (the same
+  model said it could hardly be seen).
+
+`pd_learn`: the chance of a box is learnt per view and box height (three bins to the octave) from the settled
+objects' own boxes and misses there, held to the sensor's model with the weight of `pd_learn_n0` scans (native
+`Hyp.pdl`, `r_p_detect`). `det_chain`: per leaf and view a two-state chain, "the detector has it" (a box with
+probability `det_chain_d`) or "has lost it", whose long-run share is the sensor's model and which forgets within
+`det_chain_tau_s`; the chance of a box, the price of a miss and the pairing read it (native `x_chain`): an object
+boxed in this view a moment ago is expected again, a run of misses costs its first miss and little more.
+`exist_shared`: an object's existence counts the stories in which ANOTHER object took its last box (the same
+detection of the same scan) with that object's existence (native `h_settle`): the stories of a young object disagree
+on whose its boxes were, every one of them has a thing there. (A rival that shares the box is then put out with the
+same `exist`; it is still tentative: `confirm_hits`.)
+
+`low_runs_only` (the low-score list only for an object the first list had within `low_run_s`) and `low_exist_only`
+(a low box takes the miss back and leaves the object's numbers to its motion) are built and measured: on the
+realistic stream at night they confirm nothing sooner (never confirmed 15 of 30 against 11 without the low list) and
+keep objects alive on the low boxes of other cars. Not recommended. Lamp pairs as existence evidence: not built.
+
+### The pose head (`in_pose_gn`, `in_pose_gc`, `in_pose_yaw`; contract pose1)
+The tracker's half of roadsense `docs/lanes/detin-consumption-design.md` section 9. `core/roadusers.from_lights`
+passes `pose` and `pose_kind` on; a pose is read where `pose_kind` is `pose1`, the box is of a vehicle class and
+`kind[0]` >= `pose_kind_min` (radar/box.py).
+* **`gn`, the near-face ground point**, is the ground-angle row. On a whole box ONE row: `gn` where its sigma is
+  smaller than the bottom edge's and it is seen (`pose_min_seen`), else the bottom edge (the same pixels). On a box
+  whose bottom is hidden (cut by the view or the frame, under a nearer box) it is the row that box lacked: the
+  detection is "ground angle + bearing" where it was a bearing only, the size rows stay off, the sigma times
+  `pose_gn_occ` (1.5) under a nearer box, and the Gaussian is cut at the visible bottom (the contact lies no higher:
+  `radar_trunc_low`, the moments of the one-sided normal). Successive rows of one leaf share their error for about a
+  second: the variance times `pose_corr_s` over the time since the leaf's previous one (`x_det_leaf`, `Hyp.Y`).
+* **`gc`, the footprint centre's column**, is the bearing row, with its own sigma, also where a side of the box is
+  hidden (the flags' side shift is then not applied). Not to be combined with `sil_bearing` (that predicts the
+  silhouette's middle for every box of the scan).
+* **The heading** (`x_pose_yaw`): the end by votes (ln(p / flip) bounded by `pose_vote_max`, half within
+  `pose_vote_half_s` of the previous vote; the front is turned at `pose_vote_turn` against it unless the motion has
+  shown it), the axis as a row on the extent's heading folded into a half turn (sigma max(yaw_std,
+  `pose_yaw_floor_deg`), the same memory of errors, Huber's weight at `pose_yaw_huber` sigma), not for a leaf that
+  drives. A new object's heading is the head's; seen from the front, its "drives with the traffic" story comes the
+  other way. In the dark (the tracker's own reading of the vectors' luma) a lamp pair's colour on the box votes
+  with the full bound, the head with `pose_vote_dark`, and its axis is taken only with p >= `pose_axis_dark_p`.
+* Not built: `gl` / `gr`, `dim` as a class vote, `occ` as a flag, the head's `kind` as a class hint, the width
+  ruler's test read from `yaw` (it reads the extent's heading, which the head now sets).
+
+The simulator emits the head's fields with its measured error statistics behind `pose` (preset `detin_pose`:
+`sim/roaduser_sim.py` `POSE`, `PoseGen`; tests/test_sim_pose.py).
+
+### Measured (2026-11-24; paired: the same seeds and runs for every row)
+Knob sets: **rows** = `ctx_prior` + `row_ctx` + `det_chain` + `pd_learn`; **+shared** = rows + `exist_shared`;
+**+sil** = +shared + `sil_bearing`; on the realistic stream (`detin`) each with `in_app`; **+pose** = +shared +
+`in_app` + the three pose knobs on the stream with the pose head (`detin_pose`).
+
+The tracker's own arrays (the lane's scratch tools on tools/radar_trace.py; `curve_parked` + `parked_street`, seeds
+1-3, day and night: 10 minutes of driving per row; standing actors):
+
+| | updates with another car's box | of settled objects | standing track-frames of objects fed by several cars | jumps over 3 m (at such an update) | called moving / stationary | `p_stationary` < 0.5 | range spread / range, bias at 15-30 m, within 1 / 2 sigma | birth -> `stationary` med / p90 (never) |
+|---|---|---|---|---|---|---|---|---|
+| plain, base | 12.0 % | 9.7 % | 0.43 | 78 (47) | 0.146 / 0.53 | 0.248 | 0.172, +10.6 %, 0.67 / 0.93 | 1.72 / 3.05 s (31) |
+| plain, rows | 9.4 % | 7.5 % | 0.33 | 50 (26) | 0.085 / 0.75 | 0.128 | 0.166, +9.1 %, 0.70 / 0.95 | 1.30 / 2.50 s (24) |
+| plain, +shared | 9.2 % | 8.2 % | 0.32 | 62 (35) | 0.078 / 0.75 | 0.123 | 0.164, +8.8 %, 0.71 / 0.95 | 1.27 / 2.47 s (24) |
+| plain, +sil (the first build of `exist_shared`) | 7.2 % | 5.7 % | 0.26 | 58 (31) | 0.061 / 0.78 | 0.103 | 0.157, +6.9 %, 0.71 / 0.95 | 1.26 / 2.50 s (24) |
+| detin, base | 8.6 % | 6.7 % | 0.29 | 35 (16) | 0.115 / 0.54 | 0.220 | 0.176, +4.9 %, 0.69 / 0.92 | 1.92 / 3.06 s (39) |
+| detin, +shared (first build) | 4.9 % | 2.9 % | 0.17 | 37 (15) | 0.060 / 0.72 | 0.118 | 0.172, +2.2 %, 0.72 / 0.95 | 1.32 / 2.85 s (28) |
+| detin_pose, +pose (first build) | 4.0 % | 2.6 % | 0.15 | 37 (10) | 0.053 / 0.74 | 0.103 | 0.172, +5.6 %, 0.73 / 0.96 | 1.22 / 2.69 s (26) |
+
+("First build": `exist_shared` before it was held to the best story's object and away from settled rivals; the
+tracker's calibration differs little between the builds, the id switches do: below.) Moving actors of the six traffic
+scenarios (36 runs per stream), plain base -> rows: called stationary 0.047 -> 0.051, called moving 0.886 -> 0.869,
+birth -> `moving` 1.94 -> 1.93 s, range within 2 sigma at 15-30 m 0.95 -> 0.95; realistic base -> +shared -> +pose:
+called stationary 0.054 -> 0.048 -> 0.051. The place across the line of sight within 2 sigma (standing, realistic
+stream): 0.85 -> 0.84 -> 0.91 with the pose head's centre.
+
+`sim.radar_score`, all 18 scenarios x seeds 1-3 x day and night (108 runs per row); the paired difference of the id
+switches against the base with its 1 sigma over the runs:
+
+| | id switches (paired) | in moving traffic | held / confirmed share | moving actors called moving / stationary (s) | standing called stationary / moving (s) | along p50 moving / standing (m) | heading p50 (rad) |
+|---|---|---|---|---|---|---|---|
+| plain, base | 503 | 205 | 0.267 / 0.095 | 712 / 33 | 819 / 129 | 3.48 / 2.78 | 0.084 |
+| plain, rows | 440 (-63 +- 28) | 189 (-16 +- 19) | 0.269 / 0.096 | 727 / 31 | 994 / 91 | 3.37 / 2.59 | 0.079 |
+| plain, +shared | 518 | 228 | | | | | |
+| plain, +shared, first build | 560 (+57 +- 33) | 248 (+43 +- 22) | 0.279 / 0.100 | 732 / 32 | 1059 / 83 | 3.43 / 2.59 | 0.082 |
+| plain, +sil, first build | 485 (-18 +- 39) | 206 | 0.276 / 0.098 | 716 / 35 | 1081 / 71 | 3.57 / 2.53 | 0.074 |
+| detin, base | 306 | 138 | 0.246 / 0.083 | 700 / 41 | 622 / 72 | 3.63 / 2.60 | 0.081 |
+| detin, rows | 296 | 135 | | | | | |
+| detin, +shared | 350 | 151 | | | | | |
+| detin_pose, +pose, first build | 281 (-25 +- 29) | 122 (-16 +- 16) | 0.275 / 0.093 | 810 / 37 | 844 / 21 | 3.31 / 2.34 | 0.054 |
+
+Night, the obstacle of the ten true-conflict scenarios (seeds 1-3: 30 runs by day, 30 at night; the range at which an
+object on it is first seen confirmed by the next scan, mean with "never" as 0; confirmed objects whose boxes were
+never an actor's):
+
+| plain | day: confirmed, never, mean | night: confirmed, never, mean | clutter confirmed |
+|---|---|---|---|
+| base | 34.5 m, 2, 33.9 m | 20.0 m, 16, 10.3 m | 1 of 354 |
+| rows | 35.4 m, 3, 33.6 m | 20.9 m, 15, 11.8 m | 1 of 354 |
+| +shared | 35.2 m, 2, 34.9 m | 22.1 m, 11, 14.9 m | 1 of 377 |
+
+(The boxes themselves: by day the first three at 54 / 47 / 43 m, at night at 39 / 33 / 26 m; in 10 night runs the car
+is boxed three times or fewer before the collision.) `confirm_hits` 2 on top changes nothing.
+
+Through the stack (shadow mode; the lane's scratch tools `diag.py`, `honest.py`: every said `obstacle_ahead` episode
+against the truth; the six false-episode scenarios and `stopped_brake_14`, seeds 1-6, day and night, predicted
+futures: 78 runs; then the ten true-conflict scenarios, seeds 1-3, day and night: 27 + 27 runs):
+
+| | false episodes (day / night), paired difference | arguable / true | causes: jump / mean in lane / spread / moving futures | true conflicts warned by day, mean lead | at night, mean lead |
+|---|---|---|---|---|---|
+| plain, base | 54 (21 / 33) | 7 / 9 | 26 / 7 / 1 / 5 | 23 of 27, 1.79 s | 12 of 27, 1.17 s |
+| plain, rows | 64 (30 / 34), +10 +- 8 | 6 / 8 | | 24, 1.85 s | 11, 1.27 s |
+| plain, +shared | 66 (32 / 34), +12 +- 9 | 6 / 7 | 22 / 14 / 5 / 5 (first build) | 24, 1.87 s | 14, 1.27 s |
+| plain, +sil, first build | 75 (39 / 36), +21 +- 10 | 6 / 6 | 22 / 19 / 8 / 6 | 24, 2.04 s | 13, 1.53 s |
+| plain, +shared + `size_learn`, first build | 71, +17 +- 9 | | | | |
+| detin, base | 83 (37 / 46) | 4 / 7 | 25 / 14 / 9 / 14 | 23, 1.98 s | 14, 1.45 s |
+| detin, rows | 77 (37 / 40), -6 +- 8.5 | 3 / 7 | | 21, 2.11 s | 13, 1.37 s |
+| detin, +shared | 83 (39 / 44), 0 +- 9 | 5 / 6 | 31 / 18 / 5 / 8 (first build) | 23, 2.15 s | 14, 1.38 s |
+| detin_pose, +pose, first build | 69 (34 / 35), -14 +- 7 | 4 / 9 | 21 / 20 / 5 / 4 | 23, 2.20 s | 15, 1.44 s |
+
+Real drives (docs/RADAR_TRUTH.md, `tools/radar_truth_eval.py --no-gate`; the recordings carry no pose, flags or
+vectors): base: wrong verdict 3.1 of 94.0 judged s, real things never followed 8, `in_path` unreviewed 4.73 s; +shared
+(first build): 2.7 of 93.3 s, 9, 4.94 s; with `sil_bearing`: 1.1 of 92.2 s, 9, 4.90 s. One knob at a time on
+`ctx_prior`: `row_ctx` as the base; `det_chain` 3.5 of 93.7 s, 8; `pd_learn` 1.9 of 90.9 s, 9, 4.42 s;
+`exist_shared` 3.1 of 92.4 s, 10.
+
+What it says:
+* **The tracker says more of the truth about a parked row**: a quarter fewer wrong-car updates on today's stream, a
+  third fewer jumps, parked cars called moving in 8.5 % of their frames against 14.6 %, known to stand in 75 %
+  against 53 %, half a second sooner, with fewer id switches and no loss on moving traffic. With the appearance
+  ratio on the realistic stream the wrong-car updates halve (8.6 -> 4.9 %), with the pose head they fall to 4.0 %
+  (of settled objects: 6.7 -> 2.6 %), and the moving traffic gains (810 s called moving against 700 s, heading
+  0.054 against 0.081 rad).
+* **What separates the cars of a row is the bearing, not the range**: `sil_bearing` on the plain stream (12.0 ->
+  7.2 % with the rest) and the pose head's centre on the realistic one do what no prior does. The range stays what
+  the boxes hold (0.16-0.17 of the range).
+* **The false warnings do not follow on today's stream** (+10 +- 8 on plain; -6 +- 8.5 on the realistic one; with the
+  pose head -14 +- 7). The jumps fall (26 -> 22); what rises is a car now known to stand, sooner and further out, on
+  the outside of a bend, whose honest range error puts its mean in the lane (`curve_parked` 22 -> 30-35: "mean in
+  lane" 7 -> 14, "spread" 1 -> 5). That is the decision layer reading a needle along the line of sight as a place in
+  the lane; `std_rho` and `path_normal` change nothing there today (the decision layer does not read them: identical
+  episodes). `sil_bearing` and `size_learn` make it worse on the plain stream (+21 +- 10, +17 +- 9).
+* **Night**: `exist_shared` is what confirms (never confirmed 16 -> 11 of 30 night runs, warned 12 -> 14 of 27) and
+  it costs identities in moving traffic (id switches 189 -> 228 against the set without it). The detector's own
+  boxes are the larger part of the night gap: by day the third box comes at 43 m, at night at 26 m.
+
+Proposed as defaults: **rows** (`ctx_prior`, `row_ctx`, `det_chain`, `pd_learn`); `exist_shared` where night
+confirmation matters more than identities in traffic; with the detector's options on `in_app`, and with the pose head
+`in_pose_gn`, `in_pose_gc`, `in_pose_yaw`. Not `sil_bearing`, `size_learn` (the alerts), not the low list.
+
+**The defaults were not switched.** With the four knobs on by default, 14 tests of the suite fail that pass with
+them off, and they are not all recordings: `tests/test_decide.py::Simulated::
+test_traffic_beside_and_against_the_car_does_not_warn` (`row_ctx`: an oncoming car's warning mass 0.07 where it must
+be 0), `tests/test_radar.py::PastAndStructure::test_a_row_holds_its_members_in_line_and_standing_but_not_one_that_
+pulls_out` (`row_ctx`, and `det_chain` + `pd_learn`), `...::Seeing::test_without_the_visibility_model_the_hidden_
+object_is_lost` and `tests/test_road_users.py::RoadUsersInTheStack::test_the_pedestrian_is_a_display_object_not_a_
+track` (`det_chain` + `pd_learn`), `...::ParkedCars::test_a_pitching_camera_does_not_make_parked_cars_drive` (all
+four together). `ctx_prior` alone fails three, all of them tests that compare "default" with "knob on" or pin a
+default's digest (`test_radar_parked.py::StandPrior`, `test_radar_smooth_knobs.py`). Each of the behaviour tests is
+a finding to be looked at before a default changes; none was loosened.
+
+Cost (`tools/cost_bench.py`, the radar per road frame, three interleaved runs on a shared machine): dense simulated
+capture: base 2.18-2.40 ms, this code with the knobs off 2.38-2.40 ms, with the four "rows" knobs on 2.36-2.43 ms;
+recorded capture 0.15-0.22 / 0.10-0.21 / 0.13-0.22 ms: nothing beyond the runs' own scatter (the row context is one
+vectorised pass over the scan's boxes and the judged objects; the chain and the learnt table are a few numbers per
+leaf). With the knobs off every stream of both captures is identical to the base's (`cost_bench.py diff`). The pose
+knobs and `in_app` were not costed through the stack: the captures carry neither. Deeper trees were measured and not
+taken (no gain), so nothing was added to the hypotheses' own cost.
