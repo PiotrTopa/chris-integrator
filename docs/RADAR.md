@@ -216,6 +216,17 @@ whole of what both sensors measure.
   takes its direction of travel as a measurement of its heading, as good as the velocity's direction is known;
   the first time, that also says which end is the front. A leaf that stands gets no such measurement and next to
   no process noise: its heading is held.
+* **The road's axis** (`Tracker.road_prior`, native `radar_heading_prior`, once per `road_prior_s`): a standing
+  vehicle within `road_prior_off_m` of the road model's path, whose motion has not shown its front and whose
+  rectangle no extended sensor measures, takes the path's direction at its place as a prior of its heading. The
+  box width measures |sin a|, not on which side of the line of sight the vehicle points: the heading and its mirror
+  about the line of sight explain the boxes alike, and the one within `road_prior_mirror` of the axis is taken.
+  Then the axis as a measurement, to `road_prior_std` and no better however often it is asked (the heading's
+  variance brought down to that at most), where the heading is within `road_prior_snap` of it (a car parked across
+  the road keeps its own). Born along the car's own heading, a car parked on a bend kept it or drifted to the mirror
+  (curve_parked, seed 1: heading error median 0.42 rad; with the prior 0.10). The decision layer's own snap to the
+  axis (`road_axis_standing`) is still needed: without it the cv futures' false alerts rose from 55 to 64 over 18
+  runs.
 * **A camera box** (`r_extent_update`): a box with both sides in the picture measures the silhouette
   `(L |sin a| + W |cos a|) / range` (a: heading against the line of sight), with the range's own uncertainty in
   its variance.

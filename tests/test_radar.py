@@ -731,6 +731,59 @@ class Sizes(unittest.TestCase):
         self.assertGreater(o["x_m"], 42.0)
 
 
+class RoadAxis(unittest.TestCase):
+    def test_the_road_decides_which_side_of_the_line_of_sight_a_standing_car_points(self):
+        """radar_heading_prior on one row: a car parked along a bend (the road's axis 0.34 rad), seen at 0.07 rad,
+        held by its box widths at the mirror heading -0.21 (2 x 0.07 - 0.35: the same |sin a|) is turned to the
+        mirror nearer the axis and pulled to the axis to 0.1 rad at most; a car parked across the road (1.3 rad) is
+        left as it is; one whose motion has shown its front is not touched."""
+        from chris_integrator.radar import tracker as TK
+        (e0, e1), (p0, p1) = TK.OFF["e"], TK.OFF["Pe"]
+        m0 = TK.OFF["m"][0]
+        a = np.zeros((3, TK.ROW))
+        for k, h in enumerate((-0.21, 1.3, -0.21)):
+            a[k, e0:e1] = (4.5, 1.8, h)
+            a[k, p0:p1] = np.diag([0.5, 0.05, 0.002]).ravel()
+            a[k, p0 + 2] = a[k, p0 + 6] = 0.01                  # length and heading correlated
+        a[2, m0 + TK.M_SENSE] = 1.0
+        n = M.NR.radar_heading_prior(a, [0, 1, 2], 0.34, 0.07, 0.1, 0.7, 0.25)
+        self.assertEqual(n, 1)
+        self.assertLess(abs(a[0, e0 + 2] - 0.34), 0.03)
+        self.assertLess(a[0, p0 + 8], 0.0101)
+        self.assertLess(a[0, p0 + 2], 0.0)                      # the reflection turned the correlation's sign
+        self.assertEqual(a[1, e0 + 2], 1.3)
+        self.assertEqual(a[2, e0 + 2], -0.21)
+
+    def test_a_car_parked_on_a_bend_takes_the_roads_axis(self):
+        """The car drives round a bend (R 110 m) past a car parked along it, the road model's path given: the
+        parked car's heading is the road's there, not the car's own when it was first seen."""
+        rd = Radar()
+        R, v = 110.0, 13.0
+        th = 70.0 / R                                            # the parked car 70 m along the bend, 3 m outside
+        px, py = (R + 3.0) * math.sin(th), R - (R + 3.0) * math.cos(th)
+        best = None
+        for i in range(60):
+            t = 20 + i * 0.05
+            rd.on_ego({"ts_mono_ns": int(t * NS), "speed_mps": v, "yaw_rate_rps": v / R})
+            s0 = v * (t - 20)
+            a0 = s0 / R
+            ex, ey, eh = R * math.sin(a0), R - R * math.cos(a0), a0
+            xs = [float(k) for k in range(0, 100, 5)]
+            # the path in the car frame: the circle ahead of the car (the road model's y is right)
+            pl = {"x": [R * math.sin(k / R) for k in xs], "y": [-(R - R * math.cos(k / R)) for k in xs]}
+            rd.on_road({"ts_mono_ns": int(t * NS), "plan": pl})
+            c, s = math.cos(eh), math.sin(eh)
+            dx, dy = px - ex, py - ey
+            x, y = c * dx + s * dy, -s * dx + c * dy
+            if i % 4 == 0 and x > 8:
+                rd.on_road_users(cam_boxes(t, {"p": (x - 2.0, y, 2.4, 1.5, "car")}))
+            m = rd.frame(int(t * NS))
+            if m and m["objects"]:
+                best = (m["objects"][0], eh)
+        o, eh = best
+        self.assertLess(abs(((o["hdg"] - (th - eh)) + math.pi / 2) % math.pi - math.pi / 2), 0.15)
+
+
 class PastAndStructure(unittest.TestCase):
     def test_the_past_is_smoothed_and_the_present_is_not_delayed(self):
         """A car ahead brakes from 14 to 6 m/s (microwave radar, noisy range rate). The smoothed velocity `vs` is of

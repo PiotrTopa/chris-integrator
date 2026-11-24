@@ -336,6 +336,12 @@ class Radar:
         self._drain(T)
         tr = self.tracker
         tr.manage(T)
+        path = self.path
+        if path is not None and tr.cfg["road_prior"]:   # the road model's path on the ground, for the heading prior
+            pp = self.ego.pose_at(self.path_t)
+            if pp is not None:
+                cp, sp = math.cos(pp[2]), math.sin(pp[2])
+                tr.road_prior(T, (pp[0] + cp * path[0] - sp * path[1], pp[1] + sp * path[0] + cp * path[1]))
         X, Y, psi = self.ego.pose_at(T)
         es = self.ego.state_at(T)
         v_ego, w_ego = es[3], es[4]
@@ -349,7 +355,6 @@ class Radar:
         # keeps following the road as the car does; and the message's dict of it
         hz = (0.0,) + tuple(c["predict_s"])
         kin = [o.kin for o in shown]
-        path = self.path
         out = _NR.radar_frame(tr.store.a, [o.slot for o in shown], [[T + h - o.t for h in hz] for o in shown], kin,
                               M._native_par(tr.mcfg), (X, Y, psi), (v_ego, w_ego), self._ncfg(), tuple(c["predict_s"]),
                               path[0] if path is not None else None, path[1] if path is not None else None,

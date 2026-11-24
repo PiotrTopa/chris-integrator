@@ -11184,6 +11184,65 @@ done:
     return res;
 }
 
+/* radar_heading_prior(S, rows, axis, los, sigma, snap, mirror) -> number of rows changed
+ * The road's axis at a standing vehicle's place as a prior of its heading (tracker.py `road_prior`), in every row
+ * of it whose motion has not shown which end is the front. A camera's box width measures |sin a| (a: the heading
+ * against the line of sight `los`), not on which side of it the vehicle points: the heading and its mirror about
+ * the line of sight (2 los - heading) explain the boxes alike, and the road decides between them: when the mirror
+ * lies within `mirror` of the axis (modulo a half turn) and nearer it than the heading, the vehicle is turned to it
+ * (the reflection changes the sign of the heading's covariances; a car parked at an angle to the road, whose two
+ * readings are both off the axis, is not turned). Then the
+ * axis as a measurement of the heading, within `snap` of it (a car parked across the road keeps its own), to
+ * `sigma` and no better however often it is asked: the heading's variance is brought down to sigma^2 at most. */
+static PyObject *n_radar_heading_prior(PyObject *self, PyObject *args)
+{
+    PyObject *oS, *orows;
+    double axis, los, sigma, snap, mirror;
+    if (!PyArg_ParseTuple(args, "OOddddd", &oS, &orows, &axis, &los, &sigma, &snap, &mirror))
+        return NULL;
+    View vS;
+    vS.held = 0;
+    Py_ssize_t cap, n = 0, *rows = NULL;
+    PyObject *res = NULL;
+    long changed = 0;
+    if (store_get(oS, &vS, &cap) < 0 || (rows = idx_get(orows, cap, &n)) == NULL)
+        goto done;
+    double R = sigma * sigma;
+    for (Py_ssize_t k = 0; k < n; k++) {
+        double *row = (double *)vS.b.buf + rows[k] * RROW, *e = row + RO_E, *Pe = row + RO_PE;
+        /* not where the motion has shown the front, nor where a sensor that returns the parts of a thing (an
+         * extended radar's cells) measures the rectangle's orientation itself */
+        if (row[RO_M + M_SENSE] != 0.0 || row[RO_M + M_HOLD] >= 2.0)
+            continue;
+        double h = e[E_HDG], hm = 2.0 * los - h;
+        double d = wrap_pi(2.0 * (axis - h)) / 2.0, dm = wrap_pi(2.0 * (axis - hm)) / 2.0;
+        int did = 0;
+        if (fabs(dm) + 0.05 < fabs(d) && fabs(dm) <= mirror) {
+            e[E_HDG] = wrap_pi(hm);
+            Pe[2] = -Pe[2];
+            Pe[6] = -Pe[6];
+            Pe[5] = -Pe[5];
+            Pe[7] = -Pe[7];
+            d = dm;
+            did = 1;
+        }
+        if (fabs(d) <= snap && Pe[8] > 1.0001 * R) {
+            double H[3] = {0.0, 0.0, 1.0}, Rr = Pe[8] * R / (Pe[8] - R);
+            r_extent_take(e, Pe, H, d, Rr, INFINITY);
+            did = 1;
+        }
+        if (did) {
+            r_extent_bounds(e);
+            changed++;
+        }
+    }
+    res = PyLong_FromLong(changed);
+done:
+    PyMem_Free(rows);
+    view_drop(&vS);
+    return res;
+}
+
 /* radar_kbest(cost (n, m), k) -> [(cost, [column of each row])]: the k cheapest assignments of n rows to m >= n
  * columns in order (the hypotheses' ranked assignment, for tests and tools); a pair that may not be: >= 1e17 */
 static PyObject *n_radar_kbest(PyObject *self, PyObject *args)
@@ -11273,6 +11332,7 @@ static PyMethodDef methods[] = {
     {"radar_groups", n_radar_groups, METH_VARARGS, "rows, queues and platoons among the objects"},
     {"radar_group_support", n_radar_group_support, METH_VARARGS, "what a standing row says about one member"},
     {"radar_lh_prior", n_radar_lh_prior, METH_VARARGS, "an object's height prior exchanged in all its rows"},
+    {"radar_heading_prior", n_radar_heading_prior, METH_VARARGS, "the road's axis as a standing vehicle's heading prior"},
     {"radar_kbest", n_radar_kbest, METH_VARARGS, "the k cheapest assignments in order (Murty)"},
     {"radar_frame", n_radar_frame, METH_VARARGS, "the output's per-object numbers (box.py Radar.frame)"},
     {"radar_life", n_radar_life, METH_VARARGS, "Tracker.manage's numbers: stillness, finiteness, out-of-view place"},

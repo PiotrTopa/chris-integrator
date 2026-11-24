@@ -87,6 +87,12 @@ CFG = dict(
     # what a row or a queue says about a member, once per group_s: it stands on the others' line to group_sigma_m,
     # and "it stands" is group_gain times likelier
     group_support=True, group_s=0.5, group_sigma_m=0.8, group_gain=2.0,
+    # the road's axis as a standing vehicle's heading prior (`road_prior`, docs/RADAR.md, section 4): once per
+    # road_prior_s, for a vehicle within road_prior_off_m of the road model's path (and no further than
+    # road_prior_beyond_m past its end), to road_prior_std, where its heading is within road_prior_snap of the axis
+    # (road_prior_mirror: the heading's mirror about the line of sight is taken when it lies this near the axis)
+    road_prior=True, road_prior_s=1.0, road_prior_std=0.1, road_prior_snap=0.7, road_prior_mirror=0.25,
+    road_prior_off_m=12.0, road_prior_beyond_m=10.0,
     # what a sensor can see: an object behind another one, or cut by the edge of the field, is not expected to be
     # reported (docs/RADAR.md, section 3). occlusion False: every object in the field counts as in the open. The
     # chance of a report falls from `occl_from` of the silhouette hidden to its lowest at `occl_full`
@@ -329,6 +335,7 @@ class Tracker:
         self.score_odds = {}         # sensor id -> the log odds of each bin, as far as asked since the last change
         self.bias_t = None
         self.t = None
+        self.road_t = None
 
     def peek(self, o, t):
         """Where the object is believed to be at time t, without changing it: (x, P, mu) (for tools)."""
@@ -793,6 +800,48 @@ class Tracker:
         if support:
             self.group_t = T
         self.groups = groups
+
+    def road_prior(self, T, path):
+        """The road's axis at each standing vehicle's place as a prior of its heading (radar_heading_prior), once
+        per `road_prior_s`. path: the road model's path as a polyline on the ground (xs, ys), or None. A camera's
+        box width cannot tell on which side of the line of sight a vehicle points, and a standing one gets no
+        heading from its motion: born along the car's own heading, a car parked on a bend kept it, or drifted to
+        the mirror heading, 0.2-0.55 rad off (curve_parked; docs/RADAR.md, section 4)."""
+        c = self.cfg
+        if not c["road_prior"] or path is None or (self.road_t is not None and T - self.road_t < c["road_prior_s"]):
+            return
+        self.road_t = T
+        px, py = np.asarray(path[0], float), np.asarray(path[1], float)
+        if len(px) < 2:
+            return
+        objs = [o for o in self.objects if (o.label is None or o.label in M.VEHICLES) and o.verdict != "moving"
+                and float(o.mu[STAND]) >= 0.5]
+        if not objs:
+            return
+        ax, ay = px[:-1], py[:-1]
+        ex, ey = px[1:] - ax, py[1:] - ay
+        L2 = np.maximum(ex * ex + ey * ey, 1e-12)
+        ox = np.array([float(o.x[PX]) for o in objs])[:, None]
+        oy = np.array([float(o.x[PY]) for o in objs])[:, None]
+        f = ((ox - ax) * ex + (oy - ay) * ey) / L2
+        lo = np.zeros_like(f)
+        hi = np.ones_like(f)
+        lo[:, 0] = -np.inf                               # the end segments reach on beyond the polyline
+        hi[:, -1] = np.inf
+        fc = np.clip(f, lo, hi)
+        d2 = (ox - (ax + fc * ex)) ** 2 + (oy - (ay + fc * ey)) ** 2
+        k = np.argmin(d2, axis=1)
+        idx = np.arange(len(objs))
+        beyond = (fc[idx, k] - 1.0) * np.sqrt(L2[k])        # past the end of the last segment (m)
+        for o, kk, dd, bb in zip(objs, k.tolist(), d2[idx, k].tolist(), beyond.tolist()):
+            if dd > c["road_prior_off_m"] ** 2 or (kk == len(ex) - 1 and bb > c["road_prior_beyond_m"]):
+                continue
+            pose = self.ego.pose_at(o.t)
+            if pose is None:
+                continue
+            los = math.atan2(float(o.x[PY]) - pose[1], float(o.x[PX]) - pose[0])
+            _NR.radar_heading_prior(self.store.a, self.hyp.rows(o.h), math.atan2(ey[kk], ex[kk]), los,
+                                    c["road_prior_std"], c["road_prior_snap"], c["road_prior_mirror"])
 
     def _drop(self, o):
         """The object taken out of the hypotheses (it is no longer in `objects`); what ends with it ends too."""
