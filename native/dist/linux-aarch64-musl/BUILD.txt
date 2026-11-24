@@ -3,8 +3,10 @@ image: alpine:edge (linux/arm64)
 compiler: cc (Alpine 15.2.0) 15.2.0
 python headers: Python 3.14.10
 numpy in the test run: 2.5.5
-source sha256: 0ac72319296920c18e315159fa71392ae70ee1731ab5fa4103b43bf25dd5e6d1
+source sha256: 27b92f7467e74fa37c98358cd01d740f4966a80871d291281648312f7675a064
 source sha256 (predict.c, included): 16e63d8debeb81eee03e07a603a6885ef87a3ebd1a88efe7d3b89eefcb252e99
 source sha256 (decide.c, included): 9cb973eb593b61e0273ffff318158f521b3f75326ee9c26c457730b3696cddac
 source sha256 (egomotion.c, included): c5de6f5efb11b3dddd5b1ae69b7d7bd8730f45bc58fc4660e746c7d7aeadb7f5
-binary sha256: 5b7b3c378b9350a03af2689f0c7752cd90e3a847ae8236e492ac538bb1e422be
+binary sha256: e1302613f55b04d86edc7f3800f13da70941437e8ba8c4fb22b01e06511860c7
+.....................s...                                                [100%]
+24 passed, 1 skipped in 369.96s (0:06:09)
