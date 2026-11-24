@@ -57,7 +57,7 @@ import bisect
 import math
 
 from ..native import core as _C, round, round_list
-from ..contract import LocalEgo, validity
+from ..contract import LocalEgo, from_vehicle, validity
 from .roadview import RoadView
 
 NS = 1e9
@@ -431,7 +431,7 @@ class ViewBuilder:
         if es is None:
             return 0.0, 0.0, "none"
         sp, yr = es.get("speed") or {}, es.get("yaw_rate") or {}
-        src = "vehicle" if any(x.startswith("vehicle.") for x in sp.get("sources") or ()) else \
+        src = "vehicle" if from_vehicle(sp.get("sources")) else \
             "vision" if sp.get("valid") else "none"
         return (sp["value"] if sp.get("valid") else 0.0), (-yr["value"] if yr.get("valid") else 0.0), src
 

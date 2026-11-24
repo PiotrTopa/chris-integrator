@@ -12,7 +12,7 @@ import os
 import re
 
 from ..native import round                  # builtins.round (its results; the native core)
-from ..contract import LocalEgo
+from ..contract import LocalEgo, from_vehicle
 
 RULES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rules")
 LIVE_TRACK_TIMEOUT_S = 2.0
@@ -174,7 +174,7 @@ class SpeedLimit:
         sp, yr = (es or {}).get("speed") or {}, (es or {}).get("yaw_rate") or {}
         v = max(0.0, abs(sp["value"])) if sp.get("valid") else None
         self.ego_source = None if v is None else \
-            "vehicle" if any(x.startswith("vehicle.") for x in sp.get("sources") or ()) else "vision"
+            "vehicle" if from_vehicle(sp.get("sources")) else "vision"
         yaw_rate = -yr["value"] if yr.get("valid") else 0.0          # positive right, as the heading always was
         if self._last_road_ns is not None and ts > self._last_road_ns and v is not None:
             dt = min((ts - self._last_road_ns) / NS, self.cfg["max_dt_s"])

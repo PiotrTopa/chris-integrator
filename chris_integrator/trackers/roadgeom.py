@@ -43,7 +43,7 @@ import numpy as np
 
 from ..native import round                  # builtins.round (its results; the native core)
 from ..native import core as _C
-from ..contract import LocalEgo, signal
+from ..contract import LocalEgo, from_vehicle, signal
 
 NS = 1e9
 
@@ -258,7 +258,7 @@ class RoadGeometryFusion:
             yr = es.get("yaw_rate") or {}
             if yr.get("valid"):
                 yaw_r = -yr["value"]
-                motion = "vehicle" if any(x.startswith("vehicle.") for x in yr.get("sources") or ()) else "vision"
+                motion = "vehicle" if from_vehicle(yr.get("sources")) else "vision"
             sig = signal(es, "turn_signal", c["intent_max_age_s"])
             if sig in ("left", "right"):
                 turn = sig

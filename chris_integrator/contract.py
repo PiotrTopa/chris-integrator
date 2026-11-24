@@ -37,6 +37,15 @@ def validity(es, depends=("vision",), need=("speed",)):
     return True, None, inputs
 
 
+def from_vehicle(sources):
+    """any(x.startswith("vehicle.") for x in sources or ()): a quantity made from the vehicle's own input (the
+    loop without the generator: four calls a road frame)."""
+    for x in sources or ():
+        if x.startswith("vehicle."):
+            return True
+    return False
+
+
 def signal(es, name, max_age_s):
     s = ((es or {}).get("signals") or {}).get(name)
     if not s or s.get("age_s") is None or s["age_s"] > max_age_s:

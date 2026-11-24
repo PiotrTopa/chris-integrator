@@ -45,7 +45,7 @@ import numpy as np
 
 from ..native import round                  # builtins.round (its results; the native core)
 from ..native import core as _C
-from ..contract import LocalEgo, validity
+from ..contract import LocalEgo, from_vehicle, validity
 
 NS = 1e9
 N_LANE, N_EDGE = 4, 2
@@ -236,7 +236,7 @@ class RoadGeometryTracker:
         """(speed, source, yaw rate positive right) of the frame from the integrator's `ego_state`."""
         sp, yr = es.get("speed") or {}, es.get("yaw_rate") or {}
         v = abs(sp["value"]) if sp.get("valid") else 0.0
-        src = "vehicle" if any(x.startswith("vehicle.") for x in sp.get("sources") or ()) else "vision"
+        src = "vehicle" if from_vehicle(sp.get("sources")) else "vision"
         return v, src, (-yr["value"] if yr.get("valid") else 0.0)
 
     def _measure(self, road):
