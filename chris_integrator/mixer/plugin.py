@@ -3,7 +3,7 @@
 A plug-in declares
 
     name        unique in a mixer
-    inputs      `In(stream, trigger=..., optional=..., feedback=..., same_frame=...)`
+    inputs      `In(stream, trigger=..., optional=..., feedback=..., native=...)`
     outputs     `Out(stream, kind=..., time=..., public=..., doc=...)`
     DEFAULT_CFG its configuration with defaults (`<config dir>/<name>.json` overrides per key)
 
@@ -11,6 +11,12 @@ and implements `on_input(stream, msg, ctx)`: called once for every message of a 
 mixer's order. Inside it reads other inputs with `ctx.get(stream)` (the newest message of that stream; with
 `frame=True` only when it belongs to the same camera frame as the message being handled) and publishes with
 `ctx.emit(stream, msg)`. It may touch nothing else: a stream it did not declare raises.
+
+In-process objects. A producer in this process may publish its result as it holds it (arrays) with
+`ctx.emit_lazy(stream, obj, make, ts)`: the message is made by `make()` only when someone reads it. A consumer
+that declared the input `native=True` gets `obj` in place of the message (in `on_input` and from `ctx.get`) and
+must take both: the object when the producer runs beside it, the message (a dict) when it comes from a recording
+or another process. Everyone else sees the message.
 
 Time. `ctx.now` (s), `ctx.mono_ns`, `ctx.real_ns` are the bus clock (the host's clocks in a running stack,
 the messages' time in a replay). A message a plug-in emits for a camera frame carries that frame's
@@ -33,10 +39,11 @@ handshake line carries exactly these declarations). A plug-in is tested alone by
 
 
 class In:
-    __slots__ = ("name", "trigger", "optional", "feedback", "doc")
+    __slots__ = ("name", "trigger", "optional", "feedback", "doc", "native")
 
-    def __init__(self, name, trigger=False, optional=False, feedback=False, doc=""):
+    def __init__(self, name, trigger=False, optional=False, feedback=False, doc="", native=False):
         self.name, self.trigger, self.optional, self.feedback, self.doc = name, trigger, optional, feedback, doc
+        self.native = native               # takes the producer's in-process object where there is one (see above)
 
     def as_dict(self):
         return {"name": self.name, "trigger": self.trigger, "optional": self.optional, "feedback": self.feedback}

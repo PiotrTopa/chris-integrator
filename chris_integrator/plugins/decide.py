@@ -3,7 +3,8 @@
 In: `radar` (trigger: one decision per radar message), `radar_fut` (the prediction layer's companion message,
 when it publishes one; trigger), `road` (the plan: the car's own path while no `ego_fut` is given), `ego_state`
 (the car's acceleration and yaw rate: is the driver braking or steering away), `vehicle` (brake pedal), `env`
-(the road condition: wet, snow). Out: `decide` (docs/TOPICS.md): per judged object its threat measures and level
+(the road condition: wet, snow). `radar_fut` is taken as the predictor's own object (arrays) when it runs in this
+process, as the message otherwise (a recording, another process): the same numbers either way. Out: `decide` (docs/TOPICS.md): per judged object its threat measures and level
 with the reasoning, and every alert's stage, mode and reasons.
 
 Futures (cfg `futures`): "auto" the contract's fields in `radar` or `radar_fut`, else the degraded adapter per
@@ -22,9 +23,14 @@ def _fin(v):
     return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
 
 
+def _stamp(m):
+    """`ts_mono_ns` of a `radar_fut`: the message, or the predictor's own object (in process)."""
+    return m.get("ts_mono_ns") if m.__class__ is dict else m.ts_mono_ns
+
+
 class Decide(Plugin):
     name = "decide"
-    inputs = (In("radar", trigger=True), In("radar_fut", trigger=True, optional=True),
+    inputs = (In("radar", trigger=True), In("radar_fut", trigger=True, optional=True, native=True),
               In("road", optional=True), In("ego_state", optional=True), In("vehicle", optional=True),
               In("env", optional=True))
     outputs = (Out("decide", "decision", "frame",
@@ -61,7 +67,7 @@ class Decide(Plugin):
     def on_input(self, stream, msg, ctx):
         if stream == "radar_fut":
             self._comp_t = ctx.now
-            if self._pending is not None and self._pending.get("ts_mono_ns") == msg.get("ts_mono_ns"):
+            if self._pending is not None and self._pending.get("ts_mono_ns") == _stamp(msg):
                 radar, self._pending = self._pending, None
                 self._decide(radar, msg, ctx)
             return
@@ -71,7 +77,7 @@ class Decide(Plugin):
         if self.cfg["futures"] == "auto" and "fut" not in msg and self._comp_t is not None \
                 and ctx.now - self._comp_t <= self.cfg["companion_wait_s"] + 1.0:
             comp = ctx.get("radar_fut")
-            if comp is not None and comp.get("ts_mono_ns") == msg.get("ts_mono_ns"):
+            if comp is not None and _stamp(comp) == msg.get("ts_mono_ns"):
                 self._decide(msg, comp, ctx)
             else:
                 self._pending = msg                   # its futures follow
@@ -91,10 +97,12 @@ class Decide(Plugin):
         objs_in = radar.get("objects") or ()
         path = FU.plan_path(ctx.get("road"), ts, self.fcfg["plan_max_age_s"]) if objs_in else None
         if c["futures"] == "cv":
-            radar = {k: v for k, v in radar.items() if k not in ("fut", "ego_fut")}
-            radar["objects"] = [{k: v for k, v in o.items() if k != "fut"} for o in radar.get("objects") or ()]
-            comp = None
-        F = FU.build(radar, self.fcfg, path, comp)
+            H = FU.from_message(radar, None, cv=True)
+        elif comp is not None and comp.__class__ is not dict:
+            H = comp.handoff()                        # the predictor in this process: its arrays, no message
+        else:
+            H = FU.from_message(radar, comp)
+        F = FU.build(radar, self.fcfg, path, H)
         road = TH.road_from_env(ctx.get("env")) if self.model.cfg["road_from_env"] else None
         res, info = self.model.evaluate(F, radar.get("ego") or {}, road)
         recs, out_objs = [], []

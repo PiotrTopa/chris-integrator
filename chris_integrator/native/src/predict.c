@@ -3219,9 +3219,164 @@ done:
     return res;
 }
 
+/* predict_handoff(traj (n, P_KMAX, nt, 6), modes (n, 5, P_KMAX), lane (n, 7), ego_out (P_EMODES, 2),
+ *                 ego_traj (P_EMODES, nt, 3), ego_n, names, decimals, ids)
+ *   -> (modes, names, rows, lanes, ego | None, ego_names, sel, ego_v_bad)
+ * The prediction as the decision layer takes it in process (chris_integrator/decide/futures.py `Futures`), with the
+ * numbers the `radar_fut` message would carry (predict_futs, Prediction.ego_fut, lane_dict: rint(v * 10^d) / 10^d,
+ * probabilities and lanes to three decimals), so a decision is the same from the arrays and from the message:
+ *   modes   bytes of float64 rows (2 + 5 nt): p0, p, x[nt], y[nt], sx[nt], sy[nt], rxy[nt], of the objects whose
+ *           futures are whole (every number finite), in the objects' order
+ *   names   their manoeuvre names
+ *   rows    bytes of float64 (n, 3): first mode, modes, state (1: futures as the contract says; 2: not)
+ *   lanes   bytes of float64 (n, 7)
+ *   ego     bytes of float64 rows (1 + 3 nt): p, x, y, v of the car's futures; None without one, or where a place
+ *           is not finite
+ *   sel     {object id: row}
+ *   ego_v_bad  1 where a speed of the car's futures is not finite (the caller derives it from the places) */
+static PyObject *n_predict_handoff(PyObject *self, PyObject *args)
+{
+    PyObject *ot, *om, *ol, *oeo, *oet, *names, *ids, *res = NULL;
+    PyObject *bm = NULL, *lnames = NULL, *br = NULL, *bl = NULL, *be = NULL, *enames = NULL, *sel = NULL;
+    int dec, ego_n;
+    View vt, vm, vl, veo, vet;
+    Py_ssize_t rt, n, nl, neo, ret;
+    vt.held = vm.held = vl.held = veo.held = vet.held = 0;
+    if (!PyArg_ParseTuple(args, "OOOOOiO!iO!", &ot, &om, &ol, &oeo, &oet, &ego_n, &PyTuple_Type, &names, &dec,
+                          &PyList_Type, &ids))
+        return NULL;
+    if (pview(ot, &vt, 0, 6, &rt, "traj") < 0 || pview(om, &vm, 0, 5 * P_KMAX, &n, "modes") < 0 ||
+        pview(ol, &vl, 0, 7, &nl, "lane") < 0 || pview(oeo, &veo, 0, 2, &neo, "ego_out") < 0 ||
+        pview(oet, &vet, 0, 3, &ret, "ego_traj") < 0)
+        goto done;
+    if (dec < 0 || dec > 9 || (n > 0 && (rt % (n * P_KMAX) != 0 || rt / (n * P_KMAX) < 1)) || nl != n ||
+        PyList_Size(ids) != n || ego_n < 0 || ego_n > neo || (neo > 0 && ret % neo != 0)) {
+        PyErr_SetString(PyExc_ValueError, "predict_handoff: array sizes do not fit together");
+        goto done;
+    }
+    Py_ssize_t nt = n > 0 ? rt / (n * P_KMAX) : (neo > 0 ? ret / neo : 0), nn = PyTuple_Size(names);
+    if (ego_n > 0 && ret / neo != nt) {
+        PyErr_SetString(PyExc_ValueError, "predict_handoff: the car's futures and the objects' differ in length");
+        goto done;
+    }
+    const double *t = (const double *)vt.b.buf, *M = (const double *)vm.b.buf, *LN = (const double *)vl.b.buf;
+    const double *EO = (const double *)veo.b.buf, *ET = (const double *)vet.b.buf;
+    const double sc = POW10[dec];
+    const Py_ssize_t w = 2 + 5 * nt;
+    Py_ssize_t K = 0;
+    for (Py_ssize_t i = 0; i < n; i++) {
+        int nm = (int)M[i * 5 * P_KMAX];
+        K += nm > 0 && nm <= P_KMAX ? nm : 0;
+    }
+    bm = PyBytes_FromStringAndSize(NULL, K * w * (Py_ssize_t)sizeof(double));
+    br = PyBytes_FromStringAndSize(NULL, n * 3 * (Py_ssize_t)sizeof(double));
+    bl = PyBytes_FromStringAndSize(NULL, n * 7 * (Py_ssize_t)sizeof(double));
+    lnames = PyList_New(0);
+    enames = PyList_New(0);
+    sel = PyDict_New();
+    if (!bm || !br || !bl || !lnames || !enames || !sel)
+        goto done;
+    double *MO = (double *)PyBytes_AsString(bm), *RO = (double *)PyBytes_AsString(br), *LO = (double *)PyBytes_AsString(bl);
+    Py_ssize_t k_out = 0;
+    for (Py_ssize_t i = 0; i < n; i++) {
+        const double *m = M + i * 5 * P_KMAX;
+        int nm = (int)m[0], ok = nm > 0 && nm <= P_KMAX;
+        for (int q = 0; q < 7; q++)
+            LO[7 * i + q] = rint(LN[7 * i + q] * 1000.0) / 1000.0;
+        for (int k = 0; ok && k < nm; k++) {
+            const double *tr = t + ((size_t)i * P_KMAX + k) * nt * 6;
+            double *row = MO + (k_out + k) * w;
+            row[0] = rint(m[4 * P_KMAX + k] * 1000.0) / 1000.0;
+            row[1] = rint(m[3 * P_KMAX + k] * 1000.0) / 1000.0;
+            for (int q = 0; q < 5 && ok; q++)
+                for (Py_ssize_t j = 0; j < nt; j++) {
+                    double v = rint(tr[6 * j + q] * sc) / sc;
+                    if (!isfinite(v)) {
+                        ok = 0;
+                        break;
+                    }
+                    row[2 + q * nt + j] = v;
+                }
+            int code = (int)m[2 * P_KMAX + k];
+            if (code < 0 || code >= nn) {
+                PyErr_SetString(PyExc_ValueError, "predict_handoff: a name code without a name");
+                goto done;
+            }
+        }
+        RO[3 * i] = (double)k_out;
+        RO[3 * i + 1] = ok ? (double)nm : 0.0;
+        RO[3 * i + 2] = ok ? 1.0 : 2.0;
+        if (ok) {
+            for (int k = 0; k < nm; k++)
+                if (PyList_Append(lnames, PyTuple_GetItem(names, (int)m[2 * P_KMAX + k])) < 0)
+                    goto done;
+            k_out += nm;
+        }
+        PyObject *ix = PyLong_FromSsize_t(i);
+        if (ix == NULL || PyDict_SetItem(sel, PyList_GetItem(ids, i), ix) < 0) {
+            Py_XDECREF(ix);
+            goto done;
+        }
+        Py_DECREF(ix);
+    }
+    if (k_out < K) {                               /* an object's futures were not whole: the rows written are fewer */
+        PyObject *cut = PyBytes_FromStringAndSize(PyBytes_AsString(bm), k_out * w * (Py_ssize_t)sizeof(double));
+        if (cut == NULL)
+            goto done;
+        Py_DECREF(bm);
+        bm = cut;
+    }
+    int ego_ok = ego_n > 0, v_bad = 0;
+    if (ego_ok) {
+        const Py_ssize_t we = 1 + 3 * nt;
+        be = PyBytes_FromStringAndSize(NULL, ego_n * we * (Py_ssize_t)sizeof(double));
+        if (be == NULL)
+            goto done;
+        double *E = (double *)PyBytes_AsString(be);
+        for (int k = 0; k < ego_n; k++) {
+            double *row = E + k * we;
+            row[0] = rint(EO[2 * k] * 1000.0) / 1000.0;
+            for (Py_ssize_t j = 0; j < nt; j++)
+                for (int q = 0; q < 3; q++) {
+                    double v = rint(ET[((size_t)k * nt + j) * 3 + q] * sc) / sc;
+                    if (!isfinite(v)) {
+                        if (q == 2)
+                            v_bad = 1;
+                        else
+                            ego_ok = 0;
+                    }
+                    row[1 + q * nt + j] = v;
+                }
+            int code = (int)EO[2 * k + 1];
+            if (code < 0 || code >= nn) {
+                PyErr_SetString(PyExc_ValueError, "predict_handoff: a name code without a name");
+                goto done;
+            }
+            if (PyList_Append(enames, PyTuple_GetItem(names, code)) < 0)
+                goto done;
+        }
+    }
+    res = Py_BuildValue("(OOOOOOOi)", bm, lnames, br, bl, ego_ok ? be : Py_None, enames, sel, v_bad);
+done:
+    Py_XDECREF(bm);
+    Py_XDECREF(lnames);
+    Py_XDECREF(br);
+    Py_XDECREF(bl);
+    Py_XDECREF(be);
+    Py_XDECREF(enames);
+    Py_XDECREF(sel);
+    view_drop(&vt);
+    view_drop(&vm);
+    view_drop(&vl);
+    view_drop(&veo);
+    view_drop(&vet);
+    return res;
+}
+
 #define PREDICT_METHODS                                                                                                \
     {"predict_cfg", n_predict_cfg, METH_NOARGS, "the predictor's constants: {name: default}, in the array's order"},  \
     {"predict_names", n_predict_names, METH_NOARGS, "(manoeuvre names, lane names, intent slots, array widths)"},     \
     {"predict_frame", n_predict_frame, METH_VARARGS, "one frame of the predictor: lanes, intents, futures"},          \
     {"predict_futs", n_predict_futs, METH_VARARGS, "the futures' message form: per object a list of dicts"},      \
+    {"predict_handoff", n_predict_handoff, METH_VARARGS, "the prediction as the decision layer takes it in process"}, \
     {"predict_score", n_predict_score, METH_VARARGS, "a past prediction against what the object did"},

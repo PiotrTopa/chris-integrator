@@ -60,7 +60,7 @@ class Fixtures(unittest.TestCase):
 class Futures(unittest.TestCase):
     def test_contract_futures_are_taken_and_now_prepended(self):
         msg, _ = FX.frames("cut_in")[5]
-        F = FU.build(msg, FU.DEFAULT_CFG)
+        F = FU.build(msg, FU.DEFAULT_CFG, None, FU.from_message(msg))
         self.assertEqual(F.t[0], 0.0)
         self.assertEqual(len(F.t), len(FX.T_GRID) + 1)
         self.assertFalse(F.degraded["ego"])
@@ -86,7 +86,7 @@ class Futures(unittest.TestCase):
     def test_a_future_not_as_the_contract_says_is_replaced_and_counted(self):
         msg, _ = FX.frames("cut_in")[5]
         bad = dict(msg, objects=[dict(msg["objects"][0], fut=[{"p": 1.0, "x": [1.0, 2.0]}])])
-        F = FU.build(bad, FU.DEFAULT_CFG)
+        F = FU.build(bad, FU.DEFAULT_CFG, None, FU.from_message(bad))
         self.assertEqual(F.objects[0][2], "cv")
         self.assertEqual(F.degraded["invalid"], 1)
 

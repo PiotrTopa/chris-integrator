@@ -32,7 +32,7 @@ def cases():
 
 
 def inputs(msg, tcfg):
-    F = FU.build(msg, FU.DEFAULT_CFG)
+    F = FU.build(msg, FU.DEFAULT_CFG, None, FU.from_message(msg))
     tm = TH.ThreatModel(tcfg)
     t = F.t
     N, E = len(t), len(F.ego)

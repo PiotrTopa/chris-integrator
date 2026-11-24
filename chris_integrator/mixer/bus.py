@@ -4,7 +4,8 @@ A message on the bus is an `Envelope`: the stream's name, the message (a JSON ob
 message is valid at (`ts_mono_ns` of the message: the stack's one time axis), the time it reached the bus
 (the bus clock), who put it there, and its serialised line (made at most once, reused by every output
 channel; an input channel that received a line hands it over, so a message that is only passed on is never
-re-serialised).
+re-serialised). A plug-in of this process may publish its result as an object with the message made on demand
+(`LazyEnvelope`): a consumer in the same process that takes the object never pays for the message.
 
 Clocks. Plug-ins never read the wall clock. The bus clock is the only "now": `LiveClock` in a running stack,
 `MessageClock` in a replay (it advances with the messages), so a replay of a recording is deterministic and
@@ -47,6 +48,27 @@ class Envelope:
         if self._line is None:
             self._line = dumps(self.msg)       # json.dumps(msg, separators=(",", ":")) (the native writer)
         return self._line
+
+
+class LazyEnvelope(Envelope):
+    """An envelope of a message that is made when it is first read. Its producer runs in this process and hands
+    over `obj` (its result as it holds it: arrays) with `make()` (the message of it): a plug-in that declared the
+    input `native` gets `obj` and never pays for the message; every other reader (`msg`, `line`: an output
+    channel with a subscriber, the recorder, the HTTP API, another plug-in) gets the message, made once."""
+    __slots__ = ("obj", "_make", "_m")
+
+    def __init__(self, stream, obj, make, ts, t_arr, source, seq):
+        self.stream, self.t_arr, self.source, self.seq, self._line = stream, t_arr, source, seq, None
+        self.obj, self._make, self._m = obj, make, None
+        self.ts = ts if isinstance(ts, int) else None
+
+    @property
+    def msg(self):
+        m = self._m
+        if m is None:
+            m = self._m = self._make()
+            self._make = None
+        return m
 
 
 class LiveClock:
@@ -120,6 +142,13 @@ class Bus:
     def put(self, stream, msg, source, line=None):
         self.seq += 1
         e = Envelope(stream, msg, self.clock.now(), source, self.seq, line)
+        self.latest[stream] = e
+        self.count[stream] = self.count.get(stream, 0) + 1
+        return e
+
+    def put_lazy(self, stream, obj, make, ts, source):
+        self.seq += 1
+        e = LazyEnvelope(stream, obj, make, ts, self.clock.now(), source, self.seq)
         self.latest[stream] = e
         self.count[stream] = self.count.get(stream, 0) + 1
         return e

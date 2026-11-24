@@ -335,8 +335,9 @@ class Prediction:
         self.p, self.p0 = modes[:, 3], modes[:, 4]
         self.traj, self.lane, self.intent, self.feat = traj, lane, intent, feat
         self.ego_n, self.ego_p, self.ego_m, self.ego_traj = ego_n, ego_out[:, 0], ego_out[:, 1].astype(int), ego_traj
+        self._ego_out = ego_out
         self.stats, self._dec, self.source = stats, dec, source
-        self._index = self._f = self._lane = self._intent = None
+        self._index = self._f = self._lane = self._intent = self._hand = None
 
     def index(self, oid):
         if self._index is None:
@@ -380,6 +381,23 @@ class Prediction:
         if self._lane is None:
             self._lane = np.round(self.lane, 3).tolist()
         return dict(zip(LANES, self._lane[i]))
+
+    def handoff(self):
+        """The prediction as the decision layer takes it in process (decide/futures.py `Futures`): the arrays with
+        the numbers the `radar_fut` message carries, no message made."""
+        h = self._hand
+        if h is None:
+            from ..decide.futures import Futures, ego_speed
+            modes, names, rows, lanes, ego, ego_names, sel, v_bad = _N.predict_handoff(
+                self.traj, self._modes, self.lane, self._ego_out, self.ego_traj, int(self.ego_n), NAMES, self._dec, self.ids)
+            n = len(self.t)
+            if ego is not None:
+                ego = np.frombuffer(ego).reshape(-1, 1 + 3 * n)
+                if v_bad:
+                    ego = ego_speed(ego, self.t)
+            h = self._hand = Futures(self.t, ego, ego_names, True, np.frombuffer(modes).reshape(-1, 2 + 5 * n), names,
+                                     np.frombuffer(rows).reshape(-1, 3), np.frombuffer(lanes).reshape(-1, 7), sel)
+        return h
 
     def message(self, radar_msg):
         """`radar_fut`: the radar message of the same stamp with the prediction added. Top level `fut` {"t"},

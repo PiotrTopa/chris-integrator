@@ -176,6 +176,76 @@ class Contract(unittest.TestCase):
         json.dumps(d)                                        # serialisable: it is served as /v2/mixer
 
 
+class Made:
+    """A producer's in-process result."""
+
+    def __init__(self, ts, v):
+        self.ts_mono_ns, self.v, self.made = ts, v, 0
+
+    def message(self):
+        self.made += 1
+        return {"type": "b", "ts_mono_ns": self.ts_mono_ns, "v": self.v}
+
+
+class LazyDouble(Plugin):
+    name = "double"
+    inputs = (In("a", trigger=True),)
+    outputs = (Out("b"),)
+
+    def on_input(self, stream, msg, ctx):
+        self.last = Made(msg["ts_mono_ns"], 2 * msg["v"])
+        ctx.emit_lazy("b", self.last, self.last.message, self.last.ts_mono_ns)
+
+
+class TakesObject(Plugin):
+    name = "native"
+    inputs = (In("b", trigger=True, native=True),)
+    outputs = (Out("c"),)
+
+    def on_input(self, stream, msg, ctx):
+        self.got = (msg, ctx.get("b"))
+        ctx.emit("c", {"type": "c", "ts_mono_ns": msg.ts_mono_ns if isinstance(msg, Made) else msg["ts_mono_ns"]})
+
+
+class TakesMessage(Plugin):
+    name = "plain"
+    inputs = (In("b", trigger=True),)
+    outputs = (Out("d"),)
+
+    def on_input(self, stream, msg, ctx):
+        self.got = (msg, ctx.get("b"))
+
+
+class InProcessObjects(unittest.TestCase):
+    def test_a_native_input_takes_the_object_and_the_message_is_made_only_for_a_reader(self):
+        m = Mixer(MessageClock())
+        ch = m.add_input("src", [StreamSpec("a", "raw", "sample")])
+        prod, nat = m.add(LazyDouble()), m.add(TakesObject())
+        ch.deliver("a", a(1, 5))
+        self.assertIs(nat.got[0], prod.last)
+        self.assertIs(nat.got[1], prod.last)
+        self.assertEqual(prod.last.made, 0)                      # nobody read the message: it was never made
+        self.assertEqual(m.bus.latest["b"].ts, 1000)
+        self.assertEqual(m.bus.get("b"), {"type": "b", "ts_mono_ns": 1000, "v": 10})     # a reader: made now ...
+        self.assertEqual(m.bus.latest["b"].line, '{"type":"b","ts_mono_ns":1000,"v":10}')
+        self.assertEqual(prod.last.made, 1)                      # ... once
+        plain = m.add(TakesMessage())
+        got = []
+        m.add_output("test", lambda e: got.append((e.stream, e.msg)), streams=("b",))
+        ch.deliver("a", a(2, 1))
+        self.assertIs(nat.got[0], prod.last)
+        self.assertEqual(plain.got, ({"type": "b", "ts_mono_ns": 2000, "v": 2},) * 2)
+        self.assertIs(plain.got[0], got[-1][1])                  # one message for all its readers
+        self.assertEqual(prod.last.made, 1)
+
+    def test_a_native_input_still_takes_messages(self):
+        m = Mixer(MessageClock())
+        ch = m.add_input("src", [StreamSpec("b", "raw", "sample")])
+        nat = m.add(TakesObject())
+        ch.deliver("b", {"type": "b", "ts_mono_ns": 7, "v": 1})
+        self.assertEqual(nat.got[0], {"type": "b", "ts_mono_ns": 7, "v": 1})
+
+
 class Alone(unittest.TestCase):
     def test_a_real_plugin_on_the_bench(self):
         from .test_vision_road import road

@@ -26,7 +26,10 @@ import math
 
 import numpy as np
 
+from .. import native as _native
 from ..core import classvote
+
+LANES = _native.predict.predict_names()[1]
 
 # prior footprint by class: length, width, 1 sigma of each (m)
 CLASS_SIZE = {
@@ -236,40 +239,149 @@ def _arr(m, k, n):
     return a if len(a) == n and np.all(np.isfinite(a)) else None
 
 
-def _prob(v, default):
-    return min(1.0, max(0.0, float(v))) if _fin(v) else default
+class Futures:
+    """The contract's futures of one frame as arrays: what the prediction layer hands the decision layer in process
+    (`Prediction.handoff()`, no message made) and what `from_message` reads out of a `radar` / `radar_fut` message.
+    The numbers are the message's (rounded as it rounds them), so a decision is the same either way.
+
+        t          (N,) the grid, s from now; None: no grid (then no futures count)
+        ego        (E, 1 + 3 N): p (NaN: not given), x, y, v of the car's futures; None: none usable
+        ego_names  [E]; ego_given: the message had an `ego_fut`
+        modes      (K, 2 + 5 N): p0, p (NaN: not given), x, y, sx, sy, rxy (a row of NaN: not given)
+        names      [K]
+        rows       (R, 3): first mode, modes, state (0 no futures, 1 as the contract says, 2 not: the adapter
+                   stands in and it is counted)
+        lanes      None | [R] of the message's lane dicts (or None) | (R, 7) probabilities of LANES
+        sel        {object id: row} | [row or -1 per object of the radar message]"""
+    __slots__ = ("t", "ego", "ego_names", "ego_given", "modes", "names", "rows", "lanes", "sel")
+
+    def __init__(self, t, ego, ego_names, ego_given, modes, names, rows, lanes, sel):
+        self.t, self.ego, self.ego_names, self.ego_given = t, ego, ego_names, ego_given
+        self.modes, self.names, self.rows, self.lanes, self.sel = modes, names, rows, lanes, sel
 
 
-def contract_modes(o, fut, t_in, prepend):
-    """The object's modes of the contract on the grid (now prepended when t_in[0] > 0), or None when invalid.
-    One array per mode (x, y, sx, sy, rxy), one finiteness check: the prediction may send a dozen objects with a
-    few modes each per frame."""
+def ego_speed(ego, t):
+    """Rows of the car's futures (p, x, y, v) with the speed derived from the places where it is not given."""
+    n = len(t)
+    ego = np.array(ego)
+    for row in ego:
+        if not np.all(np.isfinite(row[1 + 2 * n:])):
+            row[1 + 2 * n:] = np.hypot(np.gradient(row[1:1 + n], t), np.gradient(row[1 + n:1 + 2 * n], t))
+    return ego
+
+
+def _raw(v):
+    return float(v) if _fin(v) else math.nan
+
+
+def _mode_rows(fut, n):
+    """The modes of one object's `fut` as rows (p0, p, x, y, sx, sy, rxy), or None where it is not as the contract
+    says (not a list of dicts with x and y of the grid's length, a number that is none)."""
     if not isinstance(fut, (list, tuple)) or not fut:
         return None
-    n = len(t_in)
-    x0, y0 = float(o.get("x_m", 0.0)), float(o.get("y_m", 0.0))
-    sd = o.get("std") or (1.0, 1.0)
-    sx0, sy0 = (float(sd[0]), float(sd[1])) if len(sd) >= 2 and _fin(sd[0]) and _fin(sd[1]) else (1.0, 1.0)
-    out = []
-    head = np.array([[x0], [y0], [sx0], [sy0], [0.0]]) if prepend else None
+    rows = np.empty((len(fut), 2 + 5 * n))
+    nan = (math.nan,) * n
     for i, m in enumerate(fut):
         if not isinstance(m, dict) or m.get("x") is None or m.get("y") is None:
             return None
         sx, sy, r = m.get("sx"), m.get("sy"), m.get("rxy")
         try:
-            a = np.array((m["x"], m["y"], sx if sx is not None else (sx0,) * n, sy if sy is not None else (sy0,) * n,
-                          r if r is not None else (0.0,) * n), float)
+            a = np.array((m["x"], m["y"], sx if sx is not None else nan, sy if sy is not None else nan,
+                          r if r is not None else nan), float)
         except (TypeError, ValueError):
             return None
-        if a.shape != (5, n) or not np.isfinite(a).all():
+        if a.shape != (5, n):
             return None
+        for q, given in enumerate((True, True, sx is not None, sy is not None, r is not None)):
+            if given and not np.isfinite(a[q]).all():
+                return None
+        rows[i, 0], rows[i, 1] = _raw(m.get("p0")), _raw(m.get("p"))
+        rows[i, 2:] = a.ravel()
+    return rows
+
+
+def from_message(radar_msg, companion=None, cv=False):
+    """The contract's fields of a `radar` message (and its companion `radar_fut`) as `Futures`: the message's adapter
+    (a recording, a prediction layer in another process). None where the messages carry none of it. cv: the
+    futures are not taken (cfg `futures: "cv"`), only what the radar message's objects say of their lanes."""
+    comp = companion if isinstance(companion, dict) and not cv else {}
+    grid = None if cv else _grid(radar_msg.get("fut") or comp.get("fut"))
+    efut = None if cv else (radar_msg.get("ego_fut") or comp.get("ego_fut"))
+    n = len(grid) if grid is not None else 0
+    ego, ego_names = None, []
+    if grid is not None and isinstance(efut, dict) and isinstance(efut.get("modes"), (list, tuple)) and efut["modes"]:
+        ego = np.full((len(efut["modes"]), 1 + 3 * n), math.nan)
+        for i, m in enumerate(efut["modes"]):
+            x, y, v = (_arr(m, k, n) if isinstance(m, dict) else None for k in ("x", "y", "v"))
+            if x is None or y is None:
+                ego = None
+                break
+            ego[i, 0], ego[i, 1:1 + n], ego[i, 1 + n:1 + 2 * n] = _raw(m.get("p")), x, y
+            if v is not None:
+                ego[i, 1 + 2 * n:] = v
+            ego_names.append(str(m.get("m") or "mode%d" % i))
+        if ego is not None and not np.isfinite(ego[:, 1 + 2 * n:]).all():
+            ego = ego_speed(ego, grid)
+    by_id = {}
+    for co in comp.get("objects") or ():
+        if isinstance(co, dict) and "id" in co:
+            by_id[co["id"]] = co
+    sel, rows, lanes, modes, names = [], [], [], [], []
+    k = 0
+    some = grid is not None or isinstance(efut, dict)
+    for o in radar_msg.get("objects") or ():
+        if not isinstance(o, dict) or o.get("state") not in ("confirmed", "coast"):
+            sel.append(-1)
+            continue
+        c = by_id.get(o.get("id")) or {}
+        fut = None if cv else o.get("fut", c.get("fut"))
+        lane = o.get("lane", c.get("lane"))
+        mr = _mode_rows(fut, n) if grid is not None and fut is not None else None
+        sel.append(len(rows))
+        rows.append((k, 0 if mr is None else len(mr), 0 if fut is None else 1 if mr is not None else 2))
+        lanes.append(lane if isinstance(lane, dict) else None)
+        some = some or fut is not None or isinstance(lane, dict)
+        if mr is not None:
+            modes.append(mr)
+            names += [str(m.get("m") or "mode%d" % i) for i, m in enumerate(fut)]
+            k += len(mr)
+    if not some:
+        return None
+    return Futures(grid, ego, ego_names, isinstance(efut, dict),
+                   np.concatenate(modes) if modes else np.zeros((0, 2 + 5 * n)), names,
+                   np.array(rows, float).reshape(-1, 3), lanes, sel)
+
+
+def _prob(v, default):
+    return min(1.0, max(0.0, float(v))) if math.isfinite(v) else default
+
+
+def contract_modes(o, H, row, prepend):
+    """The object's modes of the contract on the grid (now prepended when the grid starts later), or None when
+    their probabilities do not sum."""
+    n = len(H.t)
+    x0, y0 = float(o.get("x_m", 0.0)), float(o.get("y_m", 0.0))
+    sd = o.get("std") or (1.0, 1.0)
+    sx0, sy0 = (float(sd[0]), float(sd[1])) if len(sd) >= 2 and _fin(sd[0]) and _fin(sd[1]) else (1.0, 1.0)
+    out = []
+    head = np.array([[x0], [y0], [sx0], [sy0], [0.0]]) if prepend else None
+    first, cnt = int(H.rows[row, 0]), int(H.rows[row, 1])
+    for i in range(cnt):
+        r = H.modes[first + i]
+        a = r[2:].reshape(5, n).copy()
+        if math.isnan(a[2, 0]):
+            a[2] = sx0
+        if math.isnan(a[3, 0]):
+            a[3] = sy0
+        if math.isnan(a[4, 0]):
+            a[4] = 0.0
         a[2:4] = np.abs(a[2:4])
         np.clip(a[4], -0.99, 0.99, out=a[4])
         if prepend:
             a = np.concatenate([head, a], axis=1)
-        p = _prob(m.get("p"), 1.0 / len(fut))
-        p0 = _prob(m.get("p0"), p)
-        out.append((str(m.get("m") or "mode%d" % i), p0, p, a[0], a[1], a[2], a[3], a[4]))
+        p = _prob(r[1], 1.0 / cnt)
+        p0 = _prob(r[0], p)
+        out.append((H.names[first + i], p0, p, a[0], a[1], a[2], a[3], a[4]))
     s0, sc = sum(q[1] for q in out), sum(q[2] for q in out)
     if not (s0 > 0.0 and sc > 0.0):
         return None
@@ -440,12 +552,10 @@ def ego_futures(ego, t, cfg, path=None):
     return modes
 
 
-def build(radar_msg, cfg, path=None, companion=None):
-    """FrameFutures for one `radar` message (and its companion `radar_fut`, if any). Objects listed: confirmed and
-    coast (a remembered object is never judged: nothing sees it)."""
-    comp = companion if isinstance(companion, dict) else {}
-    top = radar_msg.get("fut") or comp.get("fut")
-    grid = _grid(top)
+def build(radar_msg, cfg, path=None, H=None):
+    """FrameFutures for one `radar` message and the contract's futures of its frame (`Futures`, or None: the degraded
+    adapters). Objects listed: confirmed and coast (a remembered object is never judged: nothing sees it)."""
+    grid = H.t if H is not None else None
     if grid is None:
         t = np.arange(0.0, cfg["horizon_s"] + 1e-9, cfg["grid_dt_s"])
         prepend = False
@@ -453,27 +563,21 @@ def build(radar_msg, cfg, path=None, companion=None):
         prepend = grid[0] > 1e-9
         t = np.concatenate([[0.0], grid]) if prepend else grid
     F = FrameFutures(t)
-    t_in = grid if grid is not None else t
     ego = radar_msg.get("ego") or {}
     if not any(isinstance(o, dict) and o.get("state") in ("confirmed", "coast") for o in radar_msg.get("objects") or ()):
         F.ego = [("none", 1.0, None, None, None)]          # nothing to judge: the car's futures are not made
-        F.degraded["ego"] = not (isinstance(radar_msg.get("ego_fut") or comp.get("ego_fut"), dict))
+        F.degraded["ego"] = not (H is not None and H.ego_given)
         return F
-    efut = radar_msg.get("ego_fut") or comp.get("ego_fut")
     em = None
-    if grid is not None and isinstance(efut, dict) and isinstance(efut.get("modes"), (list, tuple)) and efut["modes"]:
+    if grid is not None and H.ego is not None:
         em = []
-        n = len(t_in)
+        n = len(grid)
         v0 = float(ego.get("speed_mps") or 0.0)
-        for i, m in enumerate(efut["modes"]):
-            x, y, v = (_arr(m, k, n) if isinstance(m, dict) else None for k in ("x", "y", "v"))
-            if x is None or y is None:
-                em = None
-                break
-            v = np.hypot(np.gradient(x, t_in), np.gradient(y, t_in)) if v is None else np.maximum(v, 0.0)
+        for i, row in enumerate(H.ego):
+            x, y, v = row[1:1 + n], row[1 + n:1 + 2 * n], np.maximum(row[1 + 2 * n:], 0.0)
             if prepend:
                 x, y, v = np.concatenate([[0.0], x]), np.concatenate([[0.0], y]), np.concatenate([[v0], v])
-            em.append((str(m.get("m") or "mode%d" % i), _prob(m.get("p"), 1.0 / len(efut["modes"])), x, y, v))
+            em.append((H.ego_names[i], _prob(row[0], 1.0 / len(H.ego)), x, y, v))
         if em:
             sp = sum(q[1] for q in em)
             em = [(nm, p / sp, x, y, v) for nm, p, x, y, v in em] if sp > 0 else None
@@ -481,18 +585,15 @@ def build(radar_msg, cfg, path=None, companion=None):
         em = ego_futures(ego, t, cfg, path)
         F.degraded["ego"] = True
     F.ego = em
-    by_id = {}
-    for co in comp.get("objects") or ():
-        if isinstance(co, dict) and "id" in co:
-            by_id[co["id"]] = co
-    for o in radar_msg.get("objects") or ():
+    by_id = H is not None and isinstance(H.sel, dict)
+    for j, o in enumerate(radar_msg.get("objects") or ()):
         if not isinstance(o, dict) or o.get("state") not in ("confirmed", "coast"):
             continue
-        c = by_id.get(o.get("id")) or {}
-        fut = o.get("fut", c.get("fut"))
-        modes = contract_modes(o, fut, t_in, prepend) if grid is not None and fut is not None else None
+        row = -1 if H is None else H.sel.get(o.get("id"), -1) if by_id else H.sel[j]
+        state = int(H.rows[row, 2]) if row >= 0 else 0
+        modes = contract_modes(o, H, row, prepend) if grid is not None and state == 1 else None
         if modes is None:
-            if fut is not None:
+            if state != 0:
                 F.degraded["invalid"] += 1
             modes = cv_futures(o, t, cfg, path)
             F.degraded["objects"] += 1
@@ -506,10 +607,9 @@ def build(radar_msg, cfg, path=None, companion=None):
             px, py, ps = path
             sp, _ = _project(px, py, ps, float(o.get("x_m", 0.0)), float(o.get("y_m", 0.0)))
             F.road_hdg[o.get("id")] = float(_along(px, py, ps, [sp])[2][0])
-        lane, intent = o.get("lane", c.get("lane")), o.get("intent", c.get("intent"))
-        if isinstance(lane, dict):
-            F.lane[o.get("id")] = lane
-        if intent is not None:
-            F.intent[o.get("id")] = intent
+        if row >= 0 and H.lanes is not None:
+            lane = H.lanes[row] if isinstance(H.lanes, list) else dict(zip(LANES, H.lanes[row].tolist()))
+            if lane is not None:
+                F.lane[o.get("id")] = lane
         F.objects.append((o, modes, src))
     return F

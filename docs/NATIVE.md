@@ -7,8 +7,8 @@ The module is part of the package: it is required, and every function in it exis
 pure-Python implementation of what is native, and no switch between two.
 
     python -m chris_integrator.native      the module in use, and its self-test on this machine
-    GET /v2/health  ->  "native": {"active": true, "implementation": "native", "parts": [...], "version": 8, "module": "..."}
-    the daemon's first log lines: "native core version 8 (_chris_native.abi3.so; json, round, interp, ekf, lanes, radar, predict, decide)"
+    GET /v2/health  ->  "native": {"active": true, "implementation": "native", "parts": [...], "version": 9, "module": "..."}
+    the daemon's first log lines: "native core version 9 (_chris_native.abi3.so; json, round, interp, ekf, lanes, radar, predict, decide)"
 
 A package without the module (or with one of another version) does not import: the error says that the native
 core is not built, does not load, or is of the wrong version, and how to build it (below).
