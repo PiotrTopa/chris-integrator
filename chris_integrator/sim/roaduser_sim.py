@@ -16,7 +16,9 @@ in the zoom view, scores p10/50/90 0.44/0.61/0.81, 40 % of the boxes cut at the 
 Frames and signs: World's car frame is x forward, y LEFT, z ignored; the camera frame used for projection is
 x forward, y RIGHT, z DOWN with the camera at the origin and the road `height_m` below it (core/roadusers.Camera).
 """
+import json
 import math
+import os
 import random
 
 import numpy as np
@@ -52,6 +54,23 @@ class Actor:
         self.group, self.group_kind, self.group_t = group, group_kind, (float(group_t[0]), float(group_t[1]))
 
 
+# per-actor size spread (world option dims_spread): (L, W, H) relative log-normal sigmas around the nominal (or the
+# scenario's explicit) size. A: European fleet, small cars to SUVs (about 1.7-1.95 m wide, 1.4-1.75 m tall); vans and
+# trucks half the relative spread; pedestrians the height only.
+DIMS_SPREAD = {"car": (0.08, 0.04, 0.06), "truck": (0.04, 0.02, 0.03), "human": (0.0, 0.0, 0.05),
+               "bike": (0.0, 0.0, 0.05), "post": (0.0, 0.0, 0.0)}
+
+
+def spread_dims(actors, seed):
+    """Scale each actor's (L, W, H) by exp(N(0, sigma)) per DIMS_SPREAD, from a generator of its own per actor
+    (seeded from the scenario seed and the actor id; no other stream is touched)."""
+    for a in actors:
+        sg = DIMS_SPREAD.get(a.kind, (0.0, 0.0, 0.0))
+        r = random.Random(int(seed) * 1_000_003 + int(a.id) * 7_919 + 104_729)
+        f = [math.exp(r.gauss(0.0, s)) for s in sg]
+        a.L, a.W, a.H = a.L * f[0], a.W * f[1], a.H * f[2]
+
+
 def _plan(plan, t):
     return np.interp(t, [p[0] for p in plan], [p[1] for p in plan])
 
@@ -65,8 +84,15 @@ class ScenarioWorld(World):
     spec: dict(T, speed [(t, v)], curv [(arc m, 1/m)], accel_lim, grade_amp, lane_change (s_start, length,
     shift) or None, actors: fn(world) -> [Actor] (called after the ego's motion is known), lead_range_m)."""
 
-    def __init__(self, spec, seed=1, name="custom", night=False):
+    def __init__(self, spec, seed=1, name="custom", night=False, world=None):
         self.name, self.night, self.spec = name, night, spec
+        # world options (all off by default; the world is bit-identical then): the environment's CHRIS_SIM_DET key
+        # "world" (or a preset's), then `world` (explicit wins). dims_spread: per-actor size spread (spread_dims)
+        self.world_opts = {}
+        env = os.environ.get("CHRIS_SIM_DET")
+        if env:
+            self.world_opts.update(det_params_arg(env).get("world") or {})
+        self.world_opts.update(world or {})
         curv = list(spec.get("curv") or [(0, 0.0)])
         lc = spec.get("lane_change")
         if lc:
@@ -94,6 +120,8 @@ class ScenarioWorld(World):
             self.Lofs = np.zeros(len(self.S))
             self.lc_s0 = None
         self.actors = list(spec["actors"](self)) if spec.get("actors") else []
+        if self.world_opts.get("dims_spread"):
+            spread_dims(self.actors, seed)
         self._actor_arrays()
 
     # ---- geometry helpers ----------------------------------------------------------------------------------
@@ -331,6 +359,61 @@ DET_DAY = dict(
     yaw_err_deg=0.2,               # true yaw - calib yaw (sign random per seed)
     pitch_per_mps2_deg=0.15,       # body pitch: nose down 0.15 deg per m/s^2 of braking (1.5 deg/g)
     pitch_bump_deg=0.08, pitch_bump_tau_s=0.4,  # road-roughness pitch (Gauss-Markov)
+    # ---- detection inputs (lane detin; docs/VISUAL_RADAR_EVAL.md "Detection inputs"): every option OFF here; with
+    # all of them off the messages are bit-identical to the simulator without them. M = measured (roadsense
+    # docs/lanes/detin-detection-inputs.md, roadsense-signs docs/DETECTION_INPUTS.md, detin-emb-distances.json),
+    # A = assumed. Everything new is drawn from a second generator (seed * 31 + 7), never from the base stream.
+    visible_boxes=False,     # an actor's box = bounding box of the part of its projected box that nearer actors (and
+                             # `roadside` occluders) do not cover and that lies inside the 1280 x 720 frame
+    vis_grid=24,             # raster cells per box side for that (A: resolution only)
+    occl_pd_from=0.15, occl_pd_at=0.5,  # detection probability x1 at cover <= occl_pd_from, falling linearly to
+                             # x occl_pd_at at cover = occl_cover (dropped beyond, as before) (A)
+    roadside=None,           # world occluders that are no road users (with visible_boxes; vectors: their own latent):
+                             # e.g. ROADSIDE (posts, trees with crowns, low kerbside railings / hedges; density A)
+    flags=False,             # trunc / occ / occ_by / occ_edges from the EMITTED boxes, signd/detin.cc's rule (ported)
+    low=None,                # low-score list floor (e.g. 0.10): `road_users_low`; None = off
+    low_thr=(("person", 0.40), ("rider", 0.35), ("car", 0.40), ("truck", 0.40), ("bus", 0.40), ("train", 0.50),
+             ("motor", 0.35), ("bike", 0.35)),   # class thresholds of the first list (signd lights.h ru_thr): a low
+                             # box scores uniformly in (low, threshold]
+    p_low_run=0.68,          # a missed actor inside a miss run (miss chain state) is in the low list: M (gap passes with
+                             # a low box on the object at floor 0.10: warsaw-city 68 %, night rides 75-100 %)
+    p_low_draw=0.4,          # ... missed by the size ramp / off-axis / partial-cover draw: M (BDD100K: 41 % of the misses)
+    p_low_small=0.5, low_h_from=(0.5, 0.8),  # below the first list's h_min: p_low_small x a ramp from low_h_from[0] to
+                             # [1] x h_min (A; aims at M: boxes under 30 px found 15 % -> 46 % with the low list)
+    p_low_occl=0.3, low_occl_max=0.85,  # an actor dropped for cover >= occl_cover but < low_occl_max (A: its visible
+                             # part still scores)
+    low_edge_x=1.5, low_edge_rel=0.10,  # low box edge noise: 1.5 x the px terms, relative term 0.10 (M, BDD100K)
+    low_cls_wrong=0.05,      # class wrong (M: right 95 % against 98 %)
+    low_clutter=0.65,        # low boxes on nothing per pass (M x A: ride rate of low boxes on no first-list object,
+                             # day 1.22 x 0.93, x 0.57 = BDD100K's share of those on no label at all)
+    low_clutter_fixed=0.3, low_clutter_dur_s=(1.0, 2.0), low_clutter_p_det=0.6,  # share of clutter at one image place
+                             # for 1-2 s, re-boxed with p per pass (A: as the camera's false boxes recur)
+    p_low_beside=0.15,       # per first-list actor box: a low box on part of / beside it, IoU <= the NMS limit (M range:
+                             # rides 0.04-0.45 per first-list box, day 0.18; A pick)
+    low_max=20, low_nms=0.5,  # signd: at most 20 low boxes a pass; dropped when a first-list or better low box
+                             # overlaps by IoU > 0.5
+    emb=None,                # None | "yuv3x3" | "reid32+yuv3x3": `emb` per box (both lists) and `emb_kind`
+    emb_level=0.0,           # common level of the nine Y cells ((Y - 110) / 50) of the scene (A: day 0, night -1.5)
+    emb_max=16,              # reid32+yuv3x3: vectors on at most this many boxes a pass (signd --lights-ru-emb-max)
+    lamps=False,             # lamp pairs (night only; never by day: the detector's frame-darkness gate)
+    lamp_p=0.65,             # found on a LIT vehicle facing within lamp_cone_deg: M (61-73 % of night vehicle boxes)
+    lamp_p_unlit=0.05,       # ... on a parked (unlit) one: reflections of the ego's headlamps, colour red / unknown (A)
+    lamp_cone_deg=40.0,      # rear or front within this of the line of sight (A)
+    lamp_S=(0.67, 0.12),     # lamp separation per actor: 0.67 x width x exp(N(0, 0.12)) (A: ~1.2 m for a car)
+    lamp_h_rel=0.6,          # lamp height as a share of the body height (A)
+    lamp_wrong=0.1, lamp_wrong_x=(0.6, 0.9),  # a pair on the wrong blobs: separation x 0.6-0.9 (M: by-eye sheet, ~1 in 10..15)
+    lamp_unknown=0.13, lamp_colour_wrong=0.03,  # colour unknown / wrong (M: 19 of 142 unknown; sheet: 28 of 30 right)
+    lamp_noise=(0.35, 0.02), lamp_small_px=10.0, lamp_small_noise=0.8,  # separation noise hypot(0.35 px, 2 %) (M);
+                             # under 10 px 0.8 px (M: the pair flips between lamps and reflections); stated sep_std
+                             # = the detector's hypot(0.25 px per centroid, 2 %) whatever the size
+    scale_corr=False,        # with `scale_rate`: per actor and pass a noisy log size, the rate = WLS slope over the
+                             # window's samples (successive values share errors); lamp-pair rates with `lamps` at night
+    scale_occ_max=0.3,       # no patch value from a box covered more than this (A)
+    scale_inc_T=0.6,         # the per-pass alignment error's variance per second: a value over 0.6 s has the base
+                             # model's std (A: the typical baseline of the recorded values)
+    lamp_scale_min_n=3, lamp_scale_min_px=10.0, lamp_scale_step=0.25, lamp_scale_x=1.5,  # signd scale.cc's lamp
+                             # line: >= 3 passes, separations >= 10 px, no step above 0.25 in ln, std x 1.5 (M)
+    lamp_scale_tail=(0.1, 3.0),  # a lamp sample is off by tail[1] x its noise with probability tail[0] (A: heavier tail)
 )
 DET_NIGHT = dict(
     DET_DAY,
@@ -343,7 +426,305 @@ DET_NIGHT = dict(
     bottom_px=4.5, bottom_rel=0.06, bottom_bias_rel=0.03,   # dark car bodies: 1.5x the documented edge noise
     score=(0.58, 0.13),
     fp_transient_per_min=3.0, fp_fixed_per_min=0.5, fp_post_per_min=1.0,
+    p_low_run=0.75,          # M: a1-night-fog 75 %, krakow-night-tunnel 6 of 7, gdansk-night-snow 4 of 4
+    low_clutter=0.35,        # M x A: night rides 0.55-1.04 low boxes a pass, 87-99 % on no first-list object, x 0.57
+    p_low_beside=0.2,        # M range (night rides 0.17-0.45 per first-list box); A pick
+    emb_level=-1.5,          # A: a dark scene (Y ~ 35)
 )
+
+# Roadside occluders that are no road users (posts, trees, low kerbside railings / hedges), per km and side of the road,
+# |lateral| in `lat` m from the original lane centre (the kerb line beyond parked cars): A. Used with visible_boxes.
+ROADSIDE = dict(post_per_km=25.0, tree_per_km=15.0, hedge_per_km=6.0, lat=(4.0, 5.2))
+
+# The preset: everything on at the recommended values (the detector's documented switch-on set: floor 0.10, flags,
+# model-free vector, lamps). scale_corr acts only together with a `scale_rate` dict (tools/visual_radar_eval.py
+# SCALE_DAY / SCALE_NIGHT). DETIN_REID: the same with the learnt vector kind.
+DETIN = dict(visible_boxes=True, roadside=ROADSIDE, flags=True, low=0.10, emb="yuv3x3", lamps=True, scale_corr=True,
+             world={"dims_spread": True})   # "world": read by scenario() / ScenarioWorld (DetectorSim ignores it)
+DETIN_REID = dict(DETIN, emb="reid32+yuv3x3")
+DETIN_KEYS = ("visible_boxes", "roadside", "flags", "low", "emb", "lamps", "scale_corr")
+
+
+def det_params_arg(s):
+    """A DetectorSim parameter dict from a command line / environment string: "detin" (DETIN), "detin_reid"
+    (DETIN_REID), or a JSON object ({"detin": true, ...} starts from DETIN and overrides)."""
+    s = s.strip()
+    if s in ("detin", "detin_reid"):
+        return dict(DETIN if s == "detin" else DETIN_REID)
+    d = json.loads(s)
+    if not isinstance(d, dict):
+        raise ValueError("detector parameters: a JSON object, 'detin' or 'detin_reid'")
+    base = {}
+    for k, pre in (("detin", DETIN), ("detin_reid", DETIN_REID)):
+        if d.pop(k, None):
+            base = dict(pre)
+    base.update(d)
+    return base
+
+FLAGS_CFG = dict(edge_px=2.0, tie_px=2.0, tie_rel=0.04, edge_hidden=0.5)   # signd RuFlagsConfig defaults
+FRAME = (1280, 720)
+EDGE_BITS = {"l": 1, "t": 2, "r": 4, "b": 8}
+
+
+def _bits(s):
+    return sum(EDGE_BITS[c] for c in s)
+
+
+def _letters(bits):
+    return "".join(c for c, v in (("l", 1), ("t", 2), ("r", 4), ("b", 8)) if bits & v)
+
+
+def ru_nearer(a, b, cfg=FLAGS_CFG):
+    """signd detin.cc ru_nearer: a, b = (box, cut bits = clip | trunc). +1 a nearer, -1 b nearer, 0 not ordered."""
+    ca, cb = a[1] & 8, b[1] & 8
+    if ca and cb:
+        return 0
+    if ca:
+        return 1
+    if cb:
+        return -1
+    tie = max(cfg["tie_px"], cfg["tie_rel"] * max(a[0][3] - a[0][1], b[0][3] - b[0][1]))
+    d = a[0][3] - b[0][3]
+    return 1 if d > tie else (-1 if d < -tie else 0)
+
+
+def flag_one(u, self_i, occluders, cfg=FLAGS_CFG):
+    """signd detin.cc flag_one: u = (box, cut bits); occluders: [(box, cut bits)] -> (occ, occ_by, occ_edges bits);
+    occ 0 / occ_by -1 when nothing covers it."""
+    x0, y0, x1, y1 = u[0]
+    w, h = x1 - x0, y1 - y0
+    if not (w > 0) or not (h > 0):
+        return 0.0, -1, 0
+    G = 16
+    cov = [[0] * G for _ in range(G)]
+    best, occ_by, anyc = 0.0, -1, False
+    for j, o in enumerate(occluders):
+        if j == self_i:
+            continue
+        ob = o[0]
+        ix0, iy0, ix1, iy1 = max(x0, ob[0]), max(y0, ob[1]), min(x1, ob[2]), min(y1, ob[3])
+        if ix1 <= ix0 or iy1 <= iy0:
+            continue
+        if ru_nearer(o, u, cfg) < 0:
+            continue
+        anyc = True
+        a = (ix1 - ix0) * (iy1 - iy0)
+        if a > best:
+            best, occ_by = a, j
+        c0 = max(0, int(math.ceil((ix0 - x0) / w * G - 0.5)))
+        c1 = min(G - 1, int(math.floor((ix1 - x0) / w * G - 0.5)))
+        r0 = max(0, int(math.ceil((iy0 - y0) / h * G - 0.5)))
+        r1 = min(G - 1, int(math.floor((iy1 - y0) / h * G - 0.5)))
+        for r in range(r0, r1 + 1):
+            row = cov[r]
+            for c in range(c0, c1 + 1):
+                row[c] = 1
+    if not anyc:
+        return 0.0, -1, 0
+    n = sum(sum(r) for r in cov)
+    el = sum(cov[i][0] for i in range(G))
+    er = sum(cov[i][G - 1] for i in range(G))
+    et, eb = sum(cov[0]), sum(cov[G - 1])
+    need = int(math.ceil(cfg["edge_hidden"] * G))
+    edges = (1 if el >= need else 0) | (2 if et >= need else 0) | (4 if er >= need else 0) | (8 if eb >= need else 0)
+    return n / float(G * G), (occ_by if n else -1), edges
+
+
+def trunc_of(box, fw=FRAME[0], fh=FRAME[1], e=FLAGS_CFG["edge_px"]):
+    """signd detin.cc trunc_of: frame edges within e px of the box, as bits."""
+    return (1 if box[0] <= e else 0) | (2 if box[1] <= e else 0) | (4 if box[2] >= fw - e else 0) | (8 if box[3] >= fh - e else 0)
+
+
+def ru_flags(users, low=None):
+    """Fill `trunc` (always) and `occ`, `occ_by`, `occ_edges` (only when covered) into road-user dicts in place, as
+    signd ru_flags: low boxes are flagged against the first list and are never occluders."""
+    def cut(d):
+        tb = trunc_of(d["box"])
+        d["trunc"] = _letters(tb)
+        return (d["box"], _bits(d.get("clip") or "") | tb)
+    occl = [cut(d) for d in users]
+    lows = [cut(d) for d in (low or ())]
+    for lst, items, self_idx in ((users, occl, True), (low or (), lows, False)):
+        for i, (d, u) in enumerate(zip(lst, items)):
+            occ, by, edges = flag_one(u, i if self_idx else -1, occl)
+            if occ > 0 and by >= 0:
+                d["occ"], d["occ_by"], d["occ_edges"] = round(occ, 2), by, _letters(edges)
+
+
+def _iou(a, b):
+    ix = max(0.0, min(a[2], b[2]) - max(a[0], b[0]))
+    iy = max(0.0, min(a[3], b[3]) - max(a[1], b[1]))
+    i = ix * iy
+    u = (a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - i
+    return i / u if u > 0 else 0.0
+
+
+# ---- appearance vectors: a latent per object (per-object log-normal scale), an Ornstein-Uhlenbeck drift (the longer
+# since the last observation, the further it has moved) and white per-observation noise, both scaled by a per-object
+# log-normal volatility and the white part also by a per-observation one; a few dominant directions (exponential
+# spectra, a fixed rotation). Fitted to roadsense docs/lanes/detin-emb-distances.json (warsaw-city by day,
+# krakow-night-tunnel at night; the fit and its tables: docs/VISUAL_RADAR_EVAL.md "Detection inputs").
+# yuv: (sigma latent, tau latent, kappa latent spectrum, sigma drift, T drift s, sigma white, kappa noise spectrum,
+# tau volatility, tau per-observation[, share of frozen objects, their volatility]); learnt (32 numbers about a common direction of length 1, then L2-normalised):
+# (sigma latent, kappa, sigma drift, sigma white), sharing T, the taus and the scale draws with the yuv part.
+EMB_MODEL = {
+    "day": {"yuv": [0.99870, 0.55409, 14.40613, 1.51218, 24.79792, 0.46091, 0.99950, 0.05418, 0.42828, 0.08500, 0.05479],
+            "learnt": [1.00161, 1.62142, 0.18533, 0.45248]},
+    "night": {"yuv": [0.99107, 0.89105, 0.04000, 0.89842, 1.88598, 0.07750, 4.06507, 0.29006, 1.83907],
+              "learnt": [0.24408, 5.30138, 0.39046, 0.08944]},
+}
+
+
+def _emb_basis(d, seed):
+    q, _ = np.linalg.qr(np.random.RandomState(seed).randn(d, d))
+    return q
+
+
+def _emb_lam(d, kappa):
+    v = np.exp(-np.arange(d) / kappa)
+    return v / np.sqrt(np.sum(v * v))
+
+
+class EmbGen:
+    """Appearance vectors as the detector publishes them (int8 lists) for keys (actor ids, false boxes, roadside
+    items). observe(key, t) steps the key's drift by the time since its last observation and adds white noise;
+    `mix` (share, other key) blends towards another key's look (a partly covered box). Draws from `rng` only."""
+
+    def __init__(self, kind, night, rng, level=0.0):
+        self.kind, self.rng, self.level = kind, rng, float(level)
+        m = EMB_MODEL["night" if night else "day"]
+        self.y, self.l = m["yuv"], m["learnt"]
+        self.QY = _emb_basis(27, 27)
+        self.LM, self.LN = _emb_lam(27, self.y[2]), _emb_lam(27, self.y[6])
+        if kind == "reid32+yuv3x3":
+            self.QL, self.LL = _emb_basis(32, 32), _emb_lam(32, self.l[1])
+        self.st = {}
+
+    def _g(self, n):
+        g = self.rng.gauss
+        return np.array([g(0.0, 1.0) for _ in range(n)])
+
+    def _new(self, key):
+        sm, tm, _, sa, _, _, _, tv, _ = self.y[:9]
+        so = math.exp(tm * self.rng.gauss(0.0, 1.0))
+        sv = math.exp(tv * self.rng.gauss(0.0, 1.0))
+        if len(self.y) > 9 and self.rng.random() < self.y[9]:
+            sv = self.y[10]              # a "frozen" object: next to no change between its crops (standing scenes)
+        s = {"sv": sv, "m": sm * so * self._g(27) * self.LM, "a": sa * sv * self._g(27) * self.LN, "t": None}
+        if self.kind == "reid32+yuv3x3":
+            sml, _, sal, _ = self.l
+            s["ml"], s["al"] = sml * so * self._g(32) * self.LL, sal * sv * self._g(32) * self.LL
+        self.st[key] = s
+        return s
+
+    def _step(self, s, t):
+        if s["t"] is not None and t > s["t"]:
+            rho = math.exp(-(t - s["t"]) / self.y[4])
+            c = math.sqrt(max(0.0, 1.0 - rho * rho))
+            s["a"] = rho * s["a"] + c * self.y[3] * s["sv"] * self._g(27) * self.LN
+            if "al" in s:
+                s["al"] = rho * s["al"] + c * self.l[2] * s["sv"] * self._g(32) * self.LL
+        s["t"] = t if s["t"] is None else max(s["t"], t)
+
+    def _raw(self, s, noise=True):
+        xy, xl = s["m"] + s["a"], (s["ml"] + s["al"]) if "ml" in s else None
+        if noise:
+            go = s["sv"] * math.exp(self.y[8] * self.rng.gauss(0.0, 1.0))
+            xy = xy + self.y[5] * go * self._g(27) * self.LN
+            if xl is not None:
+                xl = xl + self.l[3] * go * self._g(32) * self.LL
+        return xy, xl
+
+    def observe(self, key, t, mix=0.0, other=None):
+        s = self.st.get(key) or self._new(key)
+        self._step(s, t)
+        xy, xl = self._raw(s)
+        if mix > 0.0:
+            so = self.st.get(other) if other is not None else None
+            if so is None:
+                so = self._new(other if other is not None else ("anon", len(self.st)))
+            self._step(so, t)
+            oy, ol = self._raw(so, noise=False)
+            xy = (1.0 - mix) * xy + mix * oy
+            if xl is not None:
+                xl = (1.0 - mix) * xl + mix * ol
+        y = self.QY @ xy
+        y[:9] += self.level
+        out = [int(v) for v in np.clip(np.round(y * 32.0), -127, 127)]
+        if xl is not None:
+            v = self.QL @ xl
+            v[0] += 1.0
+            v = v / max(1e-9, float(np.linalg.norm(v)))
+            out = [int(q) for q in np.clip(np.round(v * 127.0), -127, 127)] + out
+        return out
+
+
+def emb_hex(v):
+    return "".join("%02x" % (q & 0xFF) for q in v)
+
+
+def emb_unhex(s):
+    b = bytes.fromhex(s)
+    return [q - 256 if q > 127 else q for q in b]
+
+
+def emb_distance(a, b, kind):
+    """The contract's distance between two published vectors (int8 lists or hex)."""
+    a = emb_unhex(a) if isinstance(a, str) else a
+    b = emb_unhex(b) if isinstance(b, str) else b
+    if kind == "yuv3x3":
+        return math.sqrt(sum((x - y) ** 2 for x, y in zip(a, b))) / 32.0
+    dl = math.sqrt(sum((x - y) ** 2 for x, y in zip(a[:32], b[:32]))) / 127.0
+    dy = math.sqrt(sum((x - y) ** 2 for x, y in zip(a[32:], b[32:]))) / 32.0
+    return math.sqrt(dl * dl + (0.5 * dy) ** 2)
+
+
+def _hull(P):
+    """Convex hull (CCW) of image points (n, 2)."""
+    pts = sorted(set(map(tuple, np.round(P, 4).tolist())))
+    if len(pts) <= 2:
+        return np.array(pts)
+
+    def cross(o, a, b):
+        return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+    lo, up = [], []
+    for q in pts:
+        while len(lo) >= 2 and cross(lo[-2], lo[-1], q) <= 0:
+            lo.pop()
+        lo.append(q)
+    for q in reversed(pts):
+        while len(up) >= 2 and cross(up[-2], up[-1], q) <= 0:
+            up.pop()
+        up.append(q)
+    return np.array(lo[:-1] + up[:-1])
+
+
+def _in_polys(X, Y, polys):
+    """Grid points inside any of the convex CCW polygons."""
+    m = np.zeros(X.shape, bool)
+    for ax, ay, ex, ey in polys:
+        m |= np.all(ex * (Y[None] - ay) - ey * (X[None] - ax) >= 0, axis=0)
+    return m
+
+
+def _poly_edges(P):
+    """A convex CCW polygon as broadcastable edge arrays for _in_polys (None when degenerate)."""
+    if len(P) < 3:
+        return None
+    B = np.roll(P, -1, axis=0)
+    return (P[:, 0, None, None], P[:, 1, None, None], (B[:, 0] - P[:, 0])[:, None, None], (B[:, 1] - P[:, 1])[:, None, None])
+
+
+def _wls_slope(samples):
+    """[(t, y, sigma)] -> (slope, its 1-sigma) of the weighted least-squares line."""
+    sw = sum(1.0 / (s * s) for _, _, s in samples)
+    tm = sum(t / (s * s) for t, _, s in samples) / sw
+    ym = sum(y / (s * s) for _, y, s in samples) / sw
+    stt = sum((t - tm) ** 2 / (s * s) for t, _, s in samples)
+    if stt <= 0:
+        return None, None
+    sl = sum((t - tm) * (y - ym) / (s * s) for t, y, s in samples) / stt
+    return sl, 1.0 / math.sqrt(stt)
 
 FP_CLASSES = (("car", 0.55), ("person", 0.45))
 
@@ -357,13 +738,25 @@ class DetectorSim:
     the road ahead is not flat (World's grade profile: the actors' ground height relative to the ego's plane)."""
 
     def __init__(self, seed=51, night=False, params=None, calib=None, pitch_sign=None, yaw_sign=None, views=VIEWS):
-        self.p = dict(DET_NIGHT if night else DET_DAY, **(params or {}))
+        # parameters: the day / night dict, then the environment's CHRIS_SIM_DET (a JSON object, or "detin" /
+        # "detin_reid" for the presets: lets whole-stack tools that build DetectorSim(seed, night) themselves switch
+        # the detection-input options on), then `params` (explicit parameters win)
+        self.p = dict(DET_NIGHT if night else DET_DAY)
+        env = os.environ.get("CHRIS_SIM_DET")
+        if env:
+            self.p.update(det_params_arg(env))
+        self.p.update(params or {})
         self.seed, self.night, self.calib, self.views = seed, night, dict(calib or CALIB), views
         rng = random.Random(seed * 7 + 3)
         self.pitch_err = math.radians(self.p["pitch_err_deg"]) * (pitch_sign if pitch_sign else rng.choice((-1, 1)))
         self.yaw_err = math.radians(self.p["yaw_err_deg"]) * (yaw_sign if yaw_sign else rng.choice((-1, 1)))
         self.log = []            # [(t, view, [(actor id | "fp:...", cls, box, clip)])]
         self._seen = {}          # actor -> [(time, true box height)] of its whole boxes within the baseline window
+        # detection inputs (only with an option on): the low list as the first list's log, and per message the truth
+        # of every emitted box of both lists (see _generate_detin)
+        self.log_low = []        # [(t, view, [(actor id | "fp:clutter" | "fp:clutter_fixed" | "fp:beside:<id>", cls, box, clip)])]
+        self.log_x = []          # [{"t", "view", "first": [truth per box], "low": [truth per box]}]
+        self._detin = any(self.p.get(k) for k in DETIN_KEYS) or self.p.get("low") is not None
 
     def calib_msg(self, ts_ns):
         return dict(self.calib, ts_mono_ns=ts_ns, ts_real_ns=ts_ns + 1_700_000_000 * NS)
@@ -472,6 +865,9 @@ class DetectorSim:
         return out
 
     def generate(self, w):
+        if self._detin:
+            yield from self._generate_detin(w)
+            return
         p = self.p
         rng = random.Random(self.seed)
         miss = {}
@@ -622,6 +1018,736 @@ class DetectorSim:
             yield t + rng.uniform(*p["latency_s"]), msg
             seq += 1
             t += dt_slot
+
+    # ---- detection inputs (lane detin) ---------------------------------------------------------------------------
+    # _generate_detin runs the base detector draw for draw on the base generator `rng` (the same calls in the same
+    # order as generate(), on the full truth boxes and the old occlusion rule), records those draws, and decides what
+    # is emitted on top of them: wherever the new behaviour leaves an actor's outcome alone, its box, class and score
+    # are the base ones; what the base did not draw (an actor the base dropped but the new rules report) and
+    # everything new comes from the second generator `r2`. So the base stream (miss chains, false positives, the
+    # base boxes) never shifts with the options.
+    def _roadside_items(self, w):
+        cfg = self.p["roadside"]
+        r = random.Random(self.seed * 31 + 9)
+        items = []
+        s_lo = float(w.s[0]) + CAM_TO_AXLE
+        s_hi = float(w.s[-1]) + CAM_TO_AXLE + 160.0
+        for side in (-1, 1):
+            for kind in ("post", "tree", "hedge"):
+                dens = float(cfg.get(kind + "_per_km") or 0.0)
+                if dens <= 0.0:
+                    continue
+                s = s_lo + r.expovariate(dens / 1000.0)
+                while s < s_hi:
+                    d = side * r.uniform(*cfg["lat"])
+                    if kind == "post":
+                        dims = (0.25, 0.25, r.uniform(4.0, 7.0))           # lamp / sign posts
+                    elif kind == "tree":
+                        tw = r.uniform(0.3, 0.55)
+                        dims = (tw, tw, 2.6)                                # the trunk (the crown is above the traffic)
+                    else:
+                        dims = (r.uniform(4.0, 12.0), 0.6, r.uniform(0.9, 1.4))  # railing / hedge along the kerb
+                    items.append({"key": "rs:%s:%d" % (kind, len(items)), "s": s, "d": d, "dims": dims})
+                    s += r.expovariate(dens / 1000.0)
+        items.sort(key=lambda it: it["s"])
+        return items
+
+    def _roadside_boxes(self, w, t, R, items):
+        """[(range, key, box)] of the roadside items in front of the camera at t."""
+        tr = w.truth_at(t)
+        s_e = tr["s"] + CAM_TO_AXLE
+        g_e = float(np.interp(s_e, w.S, w.grade_S))
+        alt_e = float(np.interp(s_e, w.S, w.alt_S))
+        out = []
+        for it in items:
+            ds = it["s"] - s_e
+            if ds < -2.0 or ds > 150.0:
+                continue
+            X, Y, hd = w._road_xy(it["s"], it["d"])
+            x, y = w._to_car(tr, X, Y)
+            L, W_, H_ = it["dims"]
+            if x - L / 2 < 1.0:
+                continue
+            dz = float(np.interp(it["s"], w.S, w.alt_S) - alt_e) - math.sin(g_e) * ds
+            o = {"x": x, "y": y, "heading": hd - tr["psi"], "L": L, "W": W_, "H": H_, "dz": dz}
+            b = self._box(R, o)
+            if b is None or b[2] < 0 or b[0] > FRAME[0] or b[3] < 0 or b[1] > FRAME[1]:
+                continue
+            out.append((max(0.5, math.hypot(x, y) - 0.5 * max(L, W_)), it["key"], b))
+        return out
+
+    # silhouettes for the visible-part raster: a vehicle is a body cuboid (lower body_h of its height) and a cabin
+    # (the rest, inset to cabin_l x cabin_w of its length / width; cars only); a van / truck one cuboid, a person a
+    # cuboid of 0.8 x its width (A: a box's corners are not the object)
+    SIL = {"car": (0.6, 0.55, 0.85), "truck": (1.0, 1.0, 1.0), "bike": (1.0, 1.0, 1.0), "human": (1.0, 1.0, 0.8)}
+
+    def _silhouette(self, R, o):
+        """Convex image polygons (CCW, (k, 2) arrays) of an actor's silhouette, or None."""
+        c = self.calib
+        Hc = float(c["height_m"])
+        bh, cl, cw = self.SIL.get(o["kind"], (1.0, 1.0, 1.0))
+        parts = [(o["L"], o["W"] * (cw if bh >= 1.0 else 1.0), 0.0, o["H"] * bh)]
+        if bh < 1.0:
+            parts.append((o["L"] * cl, o["W"] * cw, o["H"] * bh, o["H"]))
+        ch, sh = math.cos(o["heading"]), math.sin(o["heading"])
+        zg = Hc - o["dz"]
+        polys = []
+        for L, W_, z0, z1 in parts:
+            pts = []
+            for lx in (-L / 2, L / 2):
+                for ly in (-W_ / 2, W_ / 2):
+                    x = o["x"] + lx * ch - ly * sh
+                    y = o["y"] + lx * sh + ly * ch
+                    pts.append((x, -y, zg - z0))
+                    pts.append((x, -y, zg - z1))
+            u, v, d = project(R, float(c["focal_px"]), float(c["cx"]), float(c["cy"]), np.array(pts))
+            if not np.all(d > 0.5):
+                return None
+            e = _poly_edges(_hull(np.stack([u, v], axis=1)))
+            if e is not None:
+                polys.append(e)
+        return polys
+
+    def _vis(self, cand, occs, R, roi):
+        """Per candidate (range, o, b, st): the visible part of its silhouette against nearer occluders [(range, key,
+        box, polygons | None)] on a grid over b, inside the frame: {box (bounding box of the visible cells, frame-
+        clipped; None: nothing visible), cover (covered share of the in-frame silhouette), cover_box (covered share
+        of the silhouette cells within `box`), hidden (truth edges hidden by occluders), out (truth edges beyond the
+        frame), by (key covering most), keys {key: covered cells}}."""
+        G = int(self.p["vis_grid"])
+        FW, FH = FRAME
+        idx = (np.arange(G) + 0.5) / G
+        sil = {}
+        res = []
+        hmin = 0.5 * min(self.p["h_min"])
+        for rg, o, b, _ in cand:
+            bw, bh = b[2] - b[0], b[3] - b[1]
+            if bh < hmin or b[2] < roi[0] or b[0] > roi[2] or b[3] < roi[1] or b[1] > roi[3]:
+                res.append({"box": None, "cover": 0.0, "cover_box": 0.0, "hidden": "", "out": "", "by": None, "keys": {}})
+                continue                 # can be in neither list in this view: not rasterised
+            xc, yc = b[0] + idx * bw, b[1] + idx * bh
+            X, Y = np.meshgrid(xc, yc)
+            inx, iny = (xc >= 0) & (xc <= FW), (yc >= 0) & (yc <= FH)
+            if o["id"] not in sil:
+                sil[o["id"]] = self._silhouette(R, o)
+            own = _in_polys(X, Y, sil[o["id"]]) if sil[o["id"]] else np.ones((G, G), bool)
+            inf = np.outer(iny, inx) & own
+            nin0 = int(np.count_nonzero(inf))
+            cov = np.zeros((G, G), bool)
+            keys = {}
+            for rk, key, ob, polys in occs:
+                if rk >= rg or key == o["id"] or ob[2] <= b[0] or ob[0] >= b[2] or ob[3] <= b[1] or ob[1] >= b[3]:
+                    continue
+                if polys == "actor":
+                    if key not in sil:
+                        sil[key] = self._silhouette(R, next(c[1] for c in cand if c[1]["id"] == key))
+                    polys = sil[key]
+                mx, my = (xc >= ob[0]) & (xc <= ob[2]), (yc >= ob[1]) & (yc <= ob[3])
+                m = np.outer(my, mx) & inf
+                if polys and m.any():
+                    ri, ci = np.where(my)[0], np.where(mx)[0]
+                    sl_ = (slice(ri[0], ri[-1] + 1), slice(ci[0], ci[-1] + 1))
+                    sub = np.zeros((G, G), bool)
+                    sub[sl_] = _in_polys(X[sl_], Y[sl_], polys)
+                    m &= sub
+                n = int(np.count_nonzero(m))
+                if n:
+                    keys[key] = n
+                    cov |= m
+                    if n == nin0 or np.count_nonzero(cov) == nin0:
+                        break                    # all of it covered: nearer things change nothing more
+            out = ("l" if b[0] < 0 else "") + ("t" if b[1] < 0 else "") + ("r" if b[2] > FW else "") + ("b" if b[3] > FH else "")
+            nin = int(np.count_nonzero(inf))
+            vis = inf & ~cov
+            if nin == 0 or not vis.any():
+                res.append({"box": None, "cover": 1.0 if nin else 0.0, "cover_box": 1.0, "hidden": "", "out": out,
+                            "by": max(keys, key=keys.get) if keys else None, "keys": keys})
+                continue
+            rows, cols = np.where(vis.any(axis=1))[0], np.where(vis.any(axis=0))[0]
+            r0, r1, c0, c1 = int(rows[0]), int(rows[-1]), int(cols[0]), int(cols[-1])
+            # a side whose visible extent reaches the silhouette's own (in-frame) extent keeps the exact truth edge
+            rows_s, cols_s = np.where(inf.any(axis=1))[0], np.where(inf.any(axis=0))[0]
+            vb = [max(0.0, b[0] if c0 == cols_s[0] else b[0] + c0 * bw / G),
+                  max(0.0, b[1] if r0 == rows_s[0] else b[1] + r0 * bh / G),
+                  min(float(FW), b[2] if c1 == cols_s[-1] else b[0] + (c1 + 1) * bw / G),
+                  min(float(FH), b[3] if r1 == rows_s[-1] else b[1] + (r1 + 1) * bh / G)]
+            cover = float(np.count_nonzero(cov)) / nin
+            cover_box = float(np.count_nonzero(cov[r0:r1 + 1, c0:c1 + 1])) / max(1, int(np.count_nonzero(inf[r0:r1 + 1, c0:c1 + 1])))
+            hid = ""
+            if keys:
+                # an edge of the (in-frame) silhouette is hidden when at least half of its outermost cells are covered
+                rows_in, cols_in = np.where(inf.any(axis=1))[0], np.where(inf.any(axis=0))[0]
+                for letter, line, mask, mine in (
+                        ("l", cov[:, cols_in[0]], inf[:, cols_in[0]], inx[0] or cols_in[0] > 0),
+                        ("t", cov[rows_in[0], :], inf[rows_in[0], :], iny[0] or rows_in[0] > 0),
+                        ("r", cov[:, cols_in[-1]], inf[:, cols_in[-1]], inx[-1] or cols_in[-1] < G - 1),
+                        ("b", cov[rows_in[-1], :], inf[rows_in[-1], :], iny[-1] or rows_in[-1] < G - 1)):
+                    if mine and np.count_nonzero(line) >= 0.5 * max(1, np.count_nonzero(mask)):
+                        hid += letter
+            res.append({"box": vb, "cover": cover, "cover_box": cover_box, "hidden": hid, "out": out,
+                        "by": max(keys, key=keys.get) if keys else None, "keys": keys})
+        return res
+
+    @staticmethod
+    def _clip_v(b, roi, ub):
+        """_clip with the bottom overshoot from ub() (called only when the bottom is cut, as _clip draws it)."""
+        x0, y0, x1, y1 = b
+        clip = ""
+        if x0 <= roi[0] + 1.0:
+            x0, clip = float(roi[0]), clip + "l"
+        if y0 <= roi[1] + 1.0:
+            y0, clip = float(roi[1]), clip + "t"
+        if x1 >= roi[2] - 1.0:
+            x1, clip = float(roi[2]), clip + "r"
+        if y1 >= roi[3] - 1.0:
+            y1, clip = roi[3] + ub(), clip + "b"
+        if x1 - x0 < 3 or y1 - y0 < 3:
+            return None, ""
+        return [x0, y0, x1, y1], clip
+
+    @staticmethod
+    def _lit(o):
+        """A vehicle with its lamps on: moving or standing in traffic; parked cars (roles naming a parked car or
+        a parked row) are unlit."""
+        role = o.get("role") or ""
+        return not ("park" in role or role in ("occ_row", "pair_d"))
+
+    def _cls_wrong(self, cls, r2):
+        alt = {"car": ("truck",), "truck": ("car", "bus"), "bus": ("truck",), "person": ("rider",),
+               "rider": ("person", "bike"), "bike": ("rider", "motor"), "motor": ("bike",), "train": ("bus",)}
+        return r2.choice(alt.get(cls, ("car",)))
+
+    def _generate_detin(self, w):
+        p = self.p
+        rng = random.Random(self.seed)
+        r2 = random.Random(self.seed * 31 + 7)
+        miss, bias, bias2, biasL = {}, {}, {}, {}
+        bump, bump_t = 0.0, None
+        fps = []
+        t = w.t0 + 0.031
+        seq = 0
+        k_view = 0
+        pm, run = p["p_miss"], p["miss_run"]
+        p_h2m = pm / (run * (1.0 - pm)) if pm < 1.0 else 1.0
+        p_m2h = 1.0 / run
+        f = float(self.calib["focal_px"])
+        Hc = float(self.calib["height_m"])
+        sp = p.get("scale_rate")
+        low_on = p.get("low") is not None
+        lamps_on = bool(p.get("lamps")) and self.night
+        vis_on = bool(p.get("visible_boxes"))
+        thr_cls = dict(p["low_thr"])
+        items = self._roadside_items(w) if p.get("roadside") else []
+        emb = EmbGen(p["emb"], self.night, r2, p["emb_level"]) if p.get("emb") else None
+        lamp_S = {}
+        chains = {}          # actor -> [(t, ln size + error, sigma)]   (scale_corr: the pass's own log-size error)
+        lchains = {}         # actor -> [(t, ln sep, sigma, colour)]    (lamp-pair separations)
+        clutter = []         # persistent low clutter: [t_end, box, cls, key]
+        msgs_s = p["rate_hz"] * (1.0 - p["p_skip"])
+        rate = 1.0 / 60.0 / msgs_s
+        nfp = 0
+        while t < w.t0 + w.T - 0.5:
+            dt_slot = 1.0 / p["rate_hz"]
+            if rng.random() < p["p_skip"]:
+                t += dt_slot
+                continue
+            view, roi = self.views[k_view % len(self.views)]
+            k_view += 1
+            if bump_t is not None:
+                rho = math.exp(-(t - bump_t) / p["pitch_bump_tau_s"])
+                bump = rho * bump + math.sqrt(1 - rho * rho) * rng.gauss(0.0, math.radians(p["pitch_bump_deg"]))
+            bump_t = t
+            R = self.camera(w, t, bump)
+            dets, logd = [], []
+            ents = []                 # per first-list box: {"aid", "o", "V", "key", "h_true"}
+            missed = []               # low-list candidates: (o, visible box, why, V, truth box)
+            elig = []                 # actors seen in this view's region (visible part inside it by min_frac)
+            cand = []
+            for o in w.actors_at(t):
+                aid = o["id"]
+                st = miss.get(aid)
+                if st is None:
+                    st = rng.random() < pm
+                else:
+                    st = (rng.random() >= p_m2h) if st else (rng.random() < p_h2m)
+                miss[aid] = st
+                if o["ref_x"] < 1.0:
+                    continue
+                b = self._box(R, o)
+                if b is not None:
+                    cand.append((o["range"], o, b, st))
+            cand.sort(key=lambda c: c[0])
+            occl = self._occluded([c[2] for c in cand]) if p["occl_cover"] else [False] * len(cand)
+            occs = [(c[0], c[1]["id"], c[2], "actor") for c in cand]
+            if items:
+                occs += [(rk, key, bx, None) for rk, key, bx in self._roadside_boxes(w, t, R, items)]
+            V_all = self._vis(cand, occs, R, roi)
+            for (_, o, b, st), hidden, V in zip(cand, occl, V_all):
+                aid = o["id"]
+                # -- the base path, draw for draw as generate() --
+                rec = {}
+                h, wd = b[3] - b[1], b[2] - b[0]
+                fw, fh = self._frac(b, roi)
+                if not hidden and fw >= p["min_frac_w"] and fh >= p["min_frac_h"]:
+                    pd = self._ramp(h, view) * (p["vru_factor"] if o["kind"] == "human" else 1.0)
+                    if abs(math.degrees(math.atan2(o["ref_y"], o["ref_x"]))) > p["offaxis_deg"]:
+                        pd *= p["offaxis_factor"]
+                    if not st:
+                        rec["u"] = rng.random()
+                        if rec["u"] < pd:
+                            if aid not in bias:
+                                bias[aid] = rng.gauss(0.0, p["bottom_bias_rel"])
+                            sg = (p["edge_px"] + p["edge_rel"] * wd, p["edge_px"] + p["edge_rel"] * wd,
+                                  p["edge_px"] + p["edge_rel"] * h, p["bottom_px"] + p["bottom_rel"] * h)
+                            e = (rng.gauss(0.0, sg[0]), rng.gauss(0.0, sg[1]), rng.gauss(0.0, sg[2]), rng.gauss(0.0, sg[3]))
+                            rec["e"], rec["sg"] = e, sg
+                            x0, x1, y0, y1 = b[0] + e[0], b[2] + e[1], b[1] + e[2], b[3] + bias[aid] * h + e[3]
+                            rec["gross"] = None
+                            if rng.random() < p["p_gross"]:
+                                rec["gross"] = (rng.choice((-1, 1)), rng.uniform(0.3, 1.0))
+                                sh = rec["gross"][0] * rec["gross"][1] * (x1 - x0)
+                                x0, x1 = x0 + sh, x1 + sh
+                            if not (x1 - x0 < 3 or y1 - y0 < 3):
+                                rec["r"] = rng.random()
+                                mu = p["score"][0] - 0.12 * (1.0 - self._ramp(h, view))
+                                rec["sv"], rec["mu"] = rng.gauss(mu, p["score"][1]), mu
+
+                                def ub0(rec=rec):
+                                    rec["ub"] = rng.uniform(-0.6, 2.2)
+                                    return rec["ub"]
+                                box0, clip0 = self._clip_v([x0, y0, x1, y1], roi, ub0)
+                                if box0 is not None and sp:
+                                    hist = [q for q in self._seen.get(aid, ()) if t - q[0] <= sp["max_dt"]]
+                                    old = [q for q in hist if t - q[0] >= sp["min_dt"]]
+                                    if old and not clip0 and h >= 8.0 and rng.random() < sp["p"]:
+                                        prev = old[0]
+                                        dts = t - prev[0]
+                                        sl = math.hypot(sp["px"] / h, sp["px"] / prev[1], sp["rel"])
+                                        if sl <= sp["max_std"]:
+                                            rec["scale"] = dict(scale_rate=round(math.log(h / prev[1]) / dts + rng.gauss(0.0, sl / dts), 5),
+                                                                scale_rate_std=round(sl / dts, 5), scale_dt_s=round(dts, 3))
+                                            rec["scale_true"] = math.log(h / prev[1]) / dts
+                                    if not clip0:
+                                        self._seen[aid] = hist + [(t, h)]
+                # -- the new decision on top --
+                vb = V["box"] if vis_on else b
+                if vb is None:
+                    continue
+                hv, wv = vb[3] - vb[1], vb[2] - vb[0]
+                fw, fh = self._frac(vb, roi)
+                if fw < p["min_frac_w"] or fh < p["min_frac_h"]:
+                    continue
+                elig.append(aid)
+                cover = V["cover"]
+                if vis_on and p["occl_cover"]:
+                    if cover >= p["occl_cover"]:
+                        if cover < p["low_occl_max"]:
+                            missed.append((o, vb, "occl", V, b))
+                        continue
+                elif hidden:
+                    continue
+                pd = self._ramp(hv, view) * (p["vru_factor"] if o["kind"] == "human" else 1.0)
+                if abs(math.degrees(math.atan2(o["ref_y"], o["ref_x"]))) > p["offaxis_deg"]:
+                    pd *= p["offaxis_factor"]
+                if vis_on and p["occl_cover"] and cover > p["occl_pd_from"]:
+                    u_ = min(1.0, (cover - p["occl_pd_from"]) / max(1e-6, p["occl_cover"] - p["occl_pd_from"]))
+                    pd *= 1.0 - u_ * (1.0 - p["occl_pd_at"])
+                if st:
+                    missed.append((o, vb, "run", V, b))
+                    continue
+                u = rec["u"] if "u" in rec else r2.random()
+                if u >= pd:
+                    missed.append((o, vb, "small" if self._ramp(hv, view) <= 0.0 else "draw", V, b))
+                    continue
+                # the persistent bottom offset: the base's draw whenever the base has drawn it (an actor that the new
+                # rules report before the base ever did uses a second-stream draw until then)
+                if aid in bias:
+                    bv = bias[aid]
+                elif aid in bias2:
+                    bv = bias2[aid]
+                else:
+                    bv = bias2[aid] = r2.gauss(0.0, p["bottom_bias_rel"])
+                sg = (p["edge_px"] + p["edge_rel"] * wv, p["edge_px"] + p["edge_rel"] * wv,
+                      p["edge_px"] + p["edge_rel"] * hv, p["bottom_px"] + p["bottom_rel"] * hv)
+                if "e" in rec:
+                    e = tuple(ev if s1 == s0 else ev * (s1 / s0) for ev, s0, s1 in zip(rec["e"], rec["sg"], sg))
+                else:
+                    e = tuple(r2.gauss(0.0, s) for s in sg)
+                x0, x1, y0, y1 = vb[0] + e[0], vb[2] + e[1], vb[1] + e[2], vb[3] + bv * hv + e[3]
+                gross = rec["gross"] if "gross" in rec else (
+                    (r2.choice((-1, 1)), r2.uniform(0.3, 1.0)) if r2.random() < p["p_gross"] else None)
+                if gross:
+                    sh = gross[0] * gross[1] * (x1 - x0)
+                    x0, x1 = x0 + sh, x1 + sh
+                if x1 - x0 < 3 or y1 - y0 < 3:
+                    continue
+                cls = {"car": "car", "truck": "truck", "human": "person", "bike": "rider"}[o["kind"]]
+                r = rec["r"] if "r" in rec else r2.random()
+                if cls == "car" and r < p["p_car_as_truck"]:
+                    cls = "truck"
+                elif cls == "truck" and r < p["p_truck_as_car"]:
+                    cls = "car"
+                elif cls == "person" and r < p["p_person_as_rider"]:
+                    cls = "rider"
+                mu = p["score"][0] - 0.12 * (1.0 - self._ramp(hv, view))
+                if "sv" in rec:
+                    sv = rec["sv"] if mu == rec["mu"] else rec["sv"] - rec["mu"] + mu
+                else:
+                    sv = r2.gauss(mu, p["score"][1])
+                score = max(0.3, min(0.95, sv))
+
+                def ub(rec=rec):
+                    return rec["ub"] if "ub" in rec else r2.uniform(-0.6, 2.2)
+                box, clip = self._clip_v([x0, y0, x1, y1], roi, ub)
+                if box is None:
+                    continue
+                d = {"cls": cls, "score": round(score, 3), "box": [round(v, 1) for v in box], "clip": clip, "rider": False}
+                en = {"aid": aid, "o": o, "V": V, "b": b, "key": aid}
+                if "scale" in rec and not p.get("scale_corr") and not clip and (not vis_on or V["cover_box"] <= p["scale_occ_max"]):
+                    d.update(rec["scale"])
+                    en["scale_true"] = rec["scale_true"]
+                dets.append(d)
+                logd.append((aid, cls, box, clip))
+                ents.append(en)
+            # false positives: the base code, draw for draw
+            if rng.random() < p["fp_transient_per_min"] * rate:
+                bx = self._fp_box(rng, roi)
+                if bx:
+                    dets.append(dict(bx[0], score=round(rng.uniform(0.32, 0.55), 3)))
+                    logd.append(("fp:transient", bx[0]["cls"], bx[0]["box"], bx[0]["clip"]))
+                    nfp += 1
+                    ents.append({"aid": "fp:transient", "o": None, "V": None, "key": ("fp", nfp)})
+            if rng.random() < p["fp_fixed_per_min"] * rate:
+                bx = self._fp_box(rng, (0, 0, 1280, 446))
+                if bx:
+                    fps.append(("fixed", t + rng.uniform(*p["fp_dur_s"]), bx[1], bx[0]["cls"]))
+            if rng.random() < p["fp_post_per_min"] * rate:
+                fps.append(("post", t + rng.uniform(*p["fp_dur_s"]), self._post(w, t, rng), "person"))
+            keep = []
+            for kind, t_end, geo, cls in fps:
+                if t > t_end:
+                    continue
+                keep.append((kind, t_end, geo, cls))
+                if rng.random() >= p["fp_p_det"]:
+                    continue
+                if kind == "fixed":
+                    bb = [v + rng.gauss(0.0, 1.0) for v in geo]
+                else:
+                    o = self._post_actor(w, t, geo)
+                    bb = None if o is None or o["ref_x"] < 2.0 else self._box(R, o)
+                    if bb is not None:
+                        bb = [bb[0] + rng.gauss(0, 1.5), bb[1] + rng.gauss(0, 2), bb[2] + rng.gauss(0, 1.5),
+                              bb[3] + rng.gauss(0, p["bottom_px"] + p["bottom_rel"] * (bb[3] - bb[1]))]
+                if bb is None:
+                    continue
+                fw, fh = self._frac(bb, roi)
+                if fw < 0.5 or fh < 0.5:
+                    continue
+                box, clip = self._clip(bb, roi, rng)
+                if box is None:
+                    continue
+                dets.append({"cls": cls, "score": round(rng.uniform(0.4, 0.7), 3), "box": [round(v, 1) for v in box],
+                             "clip": clip, "rider": False})
+                logd.append(("fp:" + kind, cls, box, clip))
+                ents.append({"aid": "fp:" + kind, "o": None, "V": None, "key": ("fp", kind, t_end)})
+            fps = keep
+            # ---- the low list ----
+            low, lents = [], []
+            if low_on:
+                floor = float(p["low"])
+                cands = []
+                for o, vb, why, V, b in missed:
+                    hv, wv = vb[3] - vb[1], vb[2] - vb[0]
+                    if why == "run":
+                        pl = p["p_low_run"]
+                    elif why == "draw":
+                        pl = p["p_low_draw"]
+                    elif why == "occl":
+                        pl = p["p_low_occl"]
+                    else:
+                        hm = p["h_min"][view]
+                        a0, a1 = p["low_h_from"]
+                        pl = p["p_low_small"] * max(0.0, min(1.0, (hv - a0 * hm) / max(1e-6, (a1 - a0) * hm)))
+                    if pl <= 0.0 or r2.random() >= pl:
+                        continue
+                    aid = o["id"]
+                    bv = bias[aid] if aid in bias else bias2.get(aid)
+                    if bv is None:
+                        bv = biasL[aid] if aid in biasL else biasL.setdefault(aid, r2.gauss(0.0, p["bottom_bias_rel"]))
+                    kx, kr = p["low_edge_x"], p["low_edge_rel"]
+                    sx, sy, sb = kx * p["edge_px"] + kr * wv, kx * p["edge_px"] + kr * hv, kx * p["bottom_px"] + kr * hv
+                    bb = [vb[0] + r2.gauss(0, sx), vb[1] + r2.gauss(0, sy), vb[2] + r2.gauss(0, sx),
+                          vb[3] + bv * hv + r2.gauss(0, sb)]
+                    if bb[2] - bb[0] < 3 or bb[3] - bb[1] < 3:
+                        continue
+                    cls = {"car": "car", "truck": "truck", "human": "person", "bike": "rider"}[o["kind"]]
+                    if r2.random() < p["low_cls_wrong"]:
+                        cls = self._cls_wrong(cls, r2)
+                    cands.append((bb, cls, {"aid": aid, "o": o, "V": V, "b": b, "key": aid, "why": why}))
+                # clutter on nothing: transient, and recurring at one image place
+                lam = float(p["low_clutter"])
+                fx = float(p["low_clutter_fixed"])
+                per_fixed = max(1.0, p["low_clutter_p_det"] * 0.5 * sum(p["low_clutter_dur_s"]) * msgs_s)
+                for _ in range(4):
+                    if r2.random() < lam * (1.0 - fx) / 4.0:
+                        bx = self._low_fp_box(r2, roi)
+                        if bx:
+                            nfp += 1
+                            cands.append((bx[0], bx[1], {"aid": "fp:clutter", "o": None, "V": None, "key": ("lowfp", nfp),
+                                                         "why": "clutter"}))
+                    if r2.random() < lam * fx / per_fixed / 4.0:
+                        bx = self._low_fp_box(r2, (0, 0, 1280, 446))
+                        if bx:
+                            nfp += 1
+                            clutter.append([t + r2.uniform(*p["low_clutter_dur_s"]), bx[0], bx[1], ("lowfp", nfp), True])
+                kept = []
+                for c in clutter:
+                    if t > c[0]:
+                        continue
+                    kept.append(c)
+                    first = c[4]
+                    c[4] = False
+                    if first or r2.random() < p["low_clutter_p_det"]:
+                        bb = [v + r2.gauss(0.0, 1.5) for v in c[1]]
+                        if self._frac(bb, roi)[0] >= 0.5 and self._frac(bb, roi)[1] >= 0.5:
+                            cands.append((bb, c[2], {"aid": "fp:clutter_fixed", "o": None, "V": None, "key": c[3],
+                                                     "why": "clutter_fixed"}))
+                clutter = kept
+                # beside a first-list actor box: part of it, or beside it
+                for d, en in zip(dets, ents):
+                    if en["o"] is None or r2.random() >= p["p_low_beside"]:
+                        continue
+                    x0, y0, x1, y1 = d["box"]
+                    bw_, bh_ = x1 - x0, y1 - y0
+                    if r2.random() < 0.5:
+                        sh = r2.choice((-1, 1)) * r2.uniform(0.4, 0.8) * bw_
+                        bb = [x0 + sh, y0 + r2.gauss(0, 0.05 * bh_), x1 + sh, y1 + r2.gauss(0, 0.05 * bh_)]
+                    else:
+                        k = r2.uniform(0.3, 0.45)
+                        bb = [x0, y0, x1, y0 + k * bh_] if r2.random() < 0.5 else (
+                            [x0, y0, x0 + k * bw_, y1] if r2.random() < 0.5 else [x1 - k * bw_, y0, x1, y1])
+                    cands.append((bb, d["cls"], {"aid": "fp:beside:%s" % en["aid"], "o": en["o"], "V": None,
+                                                 "key": en["key"], "why": "beside", "beside": True}))
+                # scores, the region, NMS against the first list and better low boxes, the cap
+                scored = []
+                for bb, cls, en in cands:
+                    box, clip = self._clip_v(bb, roi, lambda: r2.uniform(-0.6, 2.2))
+                    if box is None:
+                        continue
+                    sc = r2.uniform(floor + 0.0005, thr_cls.get(cls, 0.40))     # scores above the floor
+                    scored.append((sc, box, clip, cls, en))
+                scored.sort(key=lambda s: -s[0])
+                first_boxes = [d["box"] for d in dets]
+                for sc, box, clip, cls, en in scored:
+                    if len(low) >= p["low_max"]:
+                        break
+                    rb = [round(v, 1) for v in box]
+                    if any(_iou(rb, fb) > p["low_nms"] for fb in first_boxes) or any(_iou(rb, l["box"]) > p["low_nms"] for l in low):
+                        continue
+                    low.append({"cls": cls, "score": round(sc, 3), "box": rb, "clip": clip, "rider": False})
+                    lents.append(dict(en, box=box, clip=clip, cls=cls))
+            # ---- flags ----
+            if p.get("flags"):
+                ru_flags(dets, low if low_on else None)
+            # ---- lamps (night), scale, appearance ----
+            for lst, el in ((dets, ents), (low, lents)):
+                for d, en in zip(lst, el):
+                    o = en["o"]
+                    if o is None or en.get("beside"):
+                        continue
+                    if lamps_on and d["cls"] in ("car", "truck", "bus", "train") and o["kind"] in VEHICLE_KINDS:
+                        lp = self._lamps(o, d, R, r2, lamp_S)
+                        if lp is not None:
+                            d["lamps"], en["sep_true"] = lp
+                    if p.get("scale_corr") and sp:
+                        self._scale_x(o, d, en, t, r2, sp, chains, lchains, lst is low)
+            if emb is not None:
+                n_emb = 0
+                order = sorted(range(len(dets)), key=lambda i: -(dets[i]["box"][2] - dets[i]["box"][0]) * (dets[i]["box"][3] - dets[i]["box"][1]))
+                todo = [(dets[i], ents[i]) for i in order] + list(zip(low, lents))
+                for d, en in todo:
+                    bx = d["box"]
+                    if bx[2] - bx[0] < 8.0 or bx[3] - bx[1] < 8.0:
+                        continue
+                    if p["emb"] == "reid32+yuv3x3" and n_emb >= p["emb_max"]:
+                        continue
+                    n_emb += 1
+                    V = en.get("V")
+                    mix, other = 0.0, None
+                    if en.get("beside"):
+                        mix, other = 0.5, ("bg", r2.random())
+                    elif V is not None:
+                        mix = V["cover_box"] if vis_on else V["cover"]
+                        other = V["by"]
+                        if mix <= 0.0:
+                            mix = 0.0
+                    d["emb"] = emb_hex(emb.observe(en["key"], t, mix, other))
+            ts = int(round(t * NS))
+            msg = {"type": "lights", "seq": seq, "ts_mono_ns": ts, "ts_real_ns": ts + 1_700_000_000 * NS,
+                   "lights_ms": 100.0, "frame": [1280, 720], "roi": list(roi), "view": view, "lights": [],
+                   "road_users": dets}
+            if low_on:
+                msg["road_users_low"] = low
+            if emb is not None:
+                msg["emb_kind"] = p["emb"]
+            self.log.append((t, view, logd))
+            if low_on:
+                self.log_low.append((t, view, [(en["aid"], en["cls"], en["box"], en["clip"]) for en in lents]))
+            self.log_x.append({"t": t, "view": view, "seen": elig, "first": [self._truth(en) for en in ents],
+                               "low": [dict(self._truth(en), why=en["why"]) for en in lents]})
+            yield t + rng.uniform(*p["latency_s"]), msg
+            seq += 1
+            t += dt_slot
+
+    @staticmethod
+    def _truth(en):
+        V = en.get("V")
+        out = {"id": en["aid"], "cover": None}
+        if V is not None:
+            out = {"id": en["aid"], "cover": round(V["cover"], 3), "cover_box": round(V["cover_box"], 3),
+                   "hidden": V["hidden"], "out": V["out"], "by": V["by"]}
+        for k in ("scale_true", "sep_true"):
+            if k in en:
+                out[k] = en[k]
+        if en.get("b") is not None:
+            out["h"] = en["b"][3] - en["b"][1]
+        return out
+
+    @staticmethod
+    def _low_fp_box(r2, roi):
+        cls = "car" if r2.random() < FP_CLASSES[0][1] else "person"
+        h = r2.uniform(12.0, 50.0)
+        wd = h * (r2.uniform(1.0, 2.2) if cls == "car" else r2.uniform(0.3, 0.5))
+        if roi[2] - roi[0] < wd + 2:
+            return None
+        cx = r2.uniform(roi[0] + wd / 2, roi[2] - wd / 2)
+        y1 = r2.uniform(roi[1] + 0.5 * (roi[3] - roi[1]), roi[3] + 0.2 * h)
+        return [cx - wd / 2, y1 - h, cx + wd / 2, y1], cls
+
+    def _lamps(self, o, d, R, r2, lamp_S):
+        """The lamp pair of a vehicle box at night, as the detector reports it, or None."""
+        p = self.p
+        h = o["heading"]
+        ch, sh = math.cos(h), math.sin(h)
+        cos_a = (ch * o["x"] + sh * o["y"]) / max(1e-6, math.hypot(o["x"], o["y"]))   # > 0: driving away, rear seen
+        if abs(cos_a) < math.cos(math.radians(p["lamp_cone_deg"])):
+            return None
+        lit = self._lit(o)
+        if r2.random() >= (p["lamp_p"] if lit else p["lamp_p_unlit"]):
+            return None
+        aid = o["id"]
+        if aid not in lamp_S:
+            lamp_S[aid] = p["lamp_S"][0] * o["W"] * math.exp(r2.gauss(0.0, p["lamp_S"][1]))
+        S = lamp_S[aid]
+        sg = 1.0 if cos_a > 0 else -1.0
+        ex, ey = o["x"] - sg * o["L"] / 2 * ch, o["y"] - sg * o["L"] / 2 * sh       # the end facing the camera
+        zl = float(self.calib["height_m"]) - o["dz"] - p["lamp_h_rel"] * o["H"]
+        P = np.array([[ex - S / 2 * sh, -(ey + S / 2 * ch), zl], [ex + S / 2 * sh, -(ey - S / 2 * ch), zl]])
+        c = self.calib
+        u, v, dd = project(R, float(c["focal_px"]), float(c["cx"]), float(c["cy"]), P)
+        if not np.all(dd > 0.5):
+            return None
+        if u[0] > u[1]:
+            u, v = u[::-1], v[::-1]
+        cx_, cy_ = 0.5 * (u[0] + u[1]), 0.5 * (v[0] + v[1])
+        sep_t = sep_true = float(math.hypot(u[1] - u[0], v[1] - v[0]))
+        if r2.random() < p["lamp_wrong"]:
+            sep_t *= r2.uniform(*p["lamp_wrong_x"])
+        noise = p["lamp_small_noise"] if sep_t < p["lamp_small_px"] else math.hypot(p["lamp_noise"][0], p["lamp_noise"][1] * sep_t)
+        k = noise / math.sqrt(2.0)
+        xl, xr = cx_ - sep_t / 2 + r2.gauss(0, k), cx_ + sep_t / 2 + r2.gauss(0, k)
+        yl, yr = cy_ + r2.gauss(0, 0.3 * k), cy_ + r2.gauss(0, 0.3 * k)
+        sep = math.hypot(xr - xl, yr - yl)
+        bx = d["box"]
+        bw = bx[2] - bx[0]
+        if not (bx[0] <= xl <= bx[2] and bx[0] <= xr <= bx[2] and bx[1] <= yl <= bx[3] and bx[1] <= yr <= bx[3]):
+            return None
+        if sep < 0.3 * bw or sep > 0.98 * bw or sep < 4.0:
+            return None
+        cut = _bits(d.get("clip") or "") | _bits(d.get("trunc") or "") | trunc_of(bx)
+        if not (cut & 5) and abs(0.5 * (xl + xr) - 0.5 * (bx[0] + bx[2])) > 0.25 * bw:
+            return None
+        if lit:
+            col = "red" if cos_a > 0 else "white"
+            r = r2.random()
+            if r < p["lamp_unknown"]:
+                col = "unknown"
+            elif r < p["lamp_unknown"] + p["lamp_colour_wrong"]:
+                col = "white" if col == "red" else "red"
+        else:
+            col = "red" if r2.random() < 0.5 else "unknown"
+        sep_std = math.hypot(math.hypot(0.25, 0.25), p["lamp_noise"][1] * sep)
+        return ({"c": col, "l": [round(xl, 1), round(yl, 1)], "r": [round(xr, 1), round(yr, 1)], "sep": round(sep, 2),
+                 "sep_std": round(sep_std, 2)}, sep_true)
+
+    def _scale_x(self, o, d, en, t, r2, sp, chains, lchains, is_low):
+        """scale_corr: per actor and pass a noisy log size (a chain of increments, each with the pass's own error);
+        the rate is this pass against the oldest sample of the window, as the patch alignment does; at night with
+        lamps also the WLS line through ln(separation) of the window (signd scale.cc), combined as signd does."""
+        p = self.p
+        aid = o["id"]
+        b = en.get("b")
+        if b is None:                                   # a low box: its truth box from the visible-part record
+            b = en["V"]["box"] if en.get("V") and en["V"].get("box") else d["box"]
+        h = b[3] - b[1]
+        V = en.get("V")
+        clip = d.get("clip") or ""
+        patch = None
+        ok_patch = (not clip and h >= 8.0 and (V is None or not p.get("visible_boxes") or V["cover_box"] <= p["scale_occ_max"]))
+        if ok_patch:
+            # the patch chain: this pass's log size = the previous pass's + the true change + this pass's own alignment
+            # error (variance in proportion to the step: a value over scale_inc_T s has the base model's std
+            # hypot(px / h, px / h_ref, rel)); the value = this pass against the oldest sample of the window, its
+            # stated std the accumulated one. Successive values share the increments of their overlap.
+            ch = chains.get(aid) or []
+            lnh = math.log(h)
+            if ch and t - ch[-1][0] <= sp["max_dt"]:
+                tl, yl, vl, ytl, hl = ch[-1]
+                var = math.hypot(sp["px"] / h, sp["px"] / hl, sp["rel"]) ** 2 * (t - tl) / p["scale_inc_T"]
+                ch = [q for q in ch if t - q[0] <= sp["max_dt"]] or [ch[-1]]
+                ch.append((t, yl + (lnh - ytl) + r2.gauss(0.0, math.sqrt(var)), vl + var, lnh, h))
+            else:
+                ch = [(t, lnh, 0.0, lnh, h)]
+            chains[aid] = ch
+            old = [q for q in ch[:-1] if sp["min_dt"] <= t - q[0] <= sp["max_dt"]]
+            if old and r2.random() < sp["p"]:
+                ref, now = old[0], ch[-1]
+                dts = t - ref[0]
+                sl = math.sqrt(max(1e-12, now[2] - ref[2]))
+                if sl <= sp["max_std"]:
+                    patch = ((now[1] - ref[1]) / dts, sl / dts, dts, (now[3] - ref[3]) / dts)
+        lamp = None
+        lp = d.get("lamps")
+        if lp is not None and lp["sep"] >= p["lamp_scale_min_px"]:
+            sig = lp["sep_std"] / lp["sep"]
+            y = math.log(lp["sep"])
+            if r2.random() < p["lamp_scale_tail"][0]:
+                y += r2.choice((-1, 1)) * p["lamp_scale_tail"][1] * sig
+            lc = [q for q in lchains.get(aid, ()) if t - q[0] <= sp["max_dt"] and q[3] == lp["c"]]
+            lc.append((t, y, sig, lp["c"], math.log(en["sep_true"])))
+            lchains[aid] = lc
+            if (len(lc) >= p["lamp_scale_min_n"] and t - lc[0][0] >= sp["min_dt"]
+                    and all(abs(lc[i + 1][1] - lc[i][1]) <= p["lamp_scale_step"] for i in range(len(lc) - 1))):
+                sl, sd = _wls_slope([(q[0], q[1], q[2]) for q in lc])
+                dts = t - lc[0][0]
+                if sl is not None and sd * dts <= sp["max_std"]:
+                    lamp = (sl, sd, dts, _wls_slope([(q[0], q[4], q[2]) for q in lc])[0])
+        if patch and lamp:
+            wp, wl = 1.0 / patch[1] ** 2, 1.0 / lamp[1] ** 2
+            v = (wp * patch[0] + wl * lamp[0]) / (wp + wl)
+            sd = max(1.0 / math.sqrt(wp + wl), 0.7 * min(patch[1], lamp[1]))
+            if abs(patch[0] - lamp[0]) > 3.0 * math.hypot(patch[1], lamp[1]):
+                sd += 0.5 * abs(patch[0] - lamp[0])
+            d.update(scale_rate=round(v, 5), scale_rate_std=round(sd, 5), scale_dt_s=round(max(patch[2], lamp[2]), 3),
+                     scale_src="both")
+            en["scale_true"] = (wp * patch[3] + wl * lamp[3]) / (wp + wl)
+        elif patch:
+            d.update(scale_rate=round(patch[0], 5), scale_rate_std=round(patch[1], 5), scale_dt_s=round(patch[2], 3))
+            en["scale_true"] = patch[3]
+        elif lamp:
+            d.update(scale_rate=round(lamp[0], 5), scale_rate_std=round(lamp[1] * p["lamp_scale_x"], 5),
+                     scale_dt_s=round(lamp[2], 3), scale_src="lamps")
+            en["scale_true"] = lamp[3]
 
     def _occluded(self, boxes):
         """Boxes sorted near to far -> hidden flags: a box covered by nearer boxes for at least `occl_cover` of its
@@ -1384,11 +2510,12 @@ def sc_park_out_curve(seed, night):
 EGO_SCENARIOS = {"park_out_curve": sc_park_out_curve}
 
 
-def scenario(name, seed=1, night=False):
-    """A ScenarioWorld by name (SCENARIOS, PREDICT_SCENARIOS, EGO_SCENARIOS or ALERT_SCENARIOS)."""
+def scenario(name, seed=1, night=False, world=None):
+    """A ScenarioWorld by name (SCENARIOS, PREDICT_SCENARIOS, EGO_SCENARIOS or ALERT_SCENARIOS). world: world
+    options (e.g. {"dims_spread": True}); also read from CHRIS_SIM_DET's "world" key (explicit `world` wins)."""
     fn = SCENARIOS.get(name) or PREDICT_SCENARIOS.get(name) or EGO_SCENARIOS.get(name) or ALERT_SCENARIOS[name]
     spec = fn(seed, night)
-    return ScenarioWorld(spec, seed=seed, name=name, night=night)
+    return ScenarioWorld(spec, seed=seed, name=name, night=night, world=world)
 
 
 # ---- lane DECIDE: the driver does not react (forward-collision-warning tests) -------------------------------------

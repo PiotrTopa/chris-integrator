@@ -461,3 +461,210 @@ with the simulator's static radar clutter).
 Not built: a group as an estimated object of its own (a shared velocity for a platoon, a pitch between the slots
 of a row from which a hidden slot could be predicted, births along a row: section 5's open case); groups do not
 constrain moving members.
+
+## 8. The detector's further inputs
+
+The class detector (roadsense-signs `signd`, roadsense `docs/ARCHITECTURE.md`, "Detection inputs for a tracker") can
+send more per box than its edges, class and score: which edges are hidden, a second list of boxes below the class
+threshold, an appearance vector, a vehicle's lamp pair in the dark, where a scale rate came from. All of it is
+optional there and off by default. This section is the tracker's half: what each input does here. Every one is a
+knob of `radar.tracker` (`tracker.CFG`, the `in_*` knobs and `grade_k`), **off by default**; with all of them off a
+scan is, bit for bit, what it was (the detector's fields are passed on by `core/roadusers.from_lights` and not
+read). The arithmetic is in the native core (`chris_native.c`, "The detector's further inputs"); `Hyp.cycle` takes
+the scan's constants for it as an optional last argument (`xcfg`), and the hypotheses keep a small memory beside
+every row (`Hyp.X`: how the object looks, its last lamp pair, how often a ruler's prior was used, when it last took
+a scale rate), copied where a row is copied, so that every story has its own.
+
+The proposal these follow is roadsense `docs/lanes/detin-consumption-design.md`. Where the tracker as it is asked for
+something else than the proposal, it is said below ("against the proposal").
+
+### Flags (`in_flags`, `in_box_occl`)
+The hidden edges of a box are `E = clip + trunc + occ_edges` (cut by the view, by the frame, under a nearer box).
+* **Rows** (`radar/box.py`): a hidden bottom gives no ground angle (kind `b` / `bt`), a hidden top no box height
+  (`rb`), a hidden side no width for the extent and no aspect; a box covered by a tenth or more teaches no extent
+  either (a pedestrian merged with a neighbour, a car half behind another: the boxes that taught a person 3 m of
+  length). Covered with no edge hidden: the height row's spread times `1 + occ`.
+* **A box with one side hidden is the visible part of the object** (`x_det_leaf`): its centre is not the object's.
+  The hidden part's width is what the leaf's silhouette at its range has beyond the box; the box centre is moved by
+  half of that towards the hidden side, and that half is its added spread. (Against the proposal, which only widens
+  the bearing's variance: the side is known, so the error has a sign.)
+* **The scan's own boxes hide** (`in_box_occl`, `x_box_cover`): section 3 knows settled objects as occluders. A box
+  of this scan, tracked or not, first list or low, hides what stands behind it: nearer as the detector orders two
+  boxes (the bottom edge lower; a bottom cut by the view or the frame lower than it shows), as far as the leaf's own
+  bottom edge is known (`box_occl_margin`). In the story "the leaf took box j" box j is the leaf's own and hides
+  nothing of it; in the story "not reported" every box hides. So an object behind a van that was boxed a moment ago
+  for the first time is not held to its missing box.
+* **A far box with its bottom under another box** is a direction only (kind `b` / `bt`). Until now such kinds came
+  from boxes cut by the view's bottom, which only an object nearer than the view's first ground point can have
+  given; a box whose bottom a nearer box hides can be of an object at any range. `flags_far_bearing` lets a far
+  object take it; the default leaves it to the near ones, because measured on the simulator a direction alone does
+  not tell the cars of a row apart: taken, id switches were 264 against 207 (132 runs) for 3 % more tracked time.
+  What would use such a box properly is its one-sided range (the true bottom lies below the visible one: the object
+  is no farther than the visible bottom says): not built.
+* Not built: the detector's `occ_by` (an index into the message) is not carried into the message's `occ_by`; `sym`
+  is not read.
+
+### The low-score list (`in_low`)
+`objects_low`: the boxes between the detector's floor and the class threshold. They enter the same scan as a second
+kind of detection (no second pass: the hypotheses weigh all stories at once). For a leaf with existence r:
+
+    in the first list    pd                      weight  r pd l(z) F / lam(z)
+    in the low list      pdlo = k (vis - pd)     weight  r pdlo l(z) F / lam_low(z)
+    in neither           1 - pd - pdlo           weight  1 - r (pd + pdlo)
+
+`k` is `low_p` (0.4: of what the first list misses on BDD100K, 41 % is in the low list at a floor of 0.10), and
+`low_p_run` (0.7) for an object the first list had within `low_run_s` (the detector misses in runs, and on rides a
+low box lay on the object in 68-100 % of such passes). `lam_low`: `low_false_per_scan` low boxes on nothing per scan
+at least, followed upwards from the scans themselves. A low box starts nothing (no birth, not in the map of
+unexplained boxes), confirms nothing (no sighting counted, existence gains the least a detection gains and no
+score), does not weigh "it stands" against "it drives" (the motion hypotheses keep their probabilities: its edges
+are too sloppy for that), does not teach the extent, the camera's size limit or the scan's common pitch; its edges are sloppier
+(`low_px`, `low_rel`), its class votes with `low_weight`. An object whose last `low_coast` sightings are all low is
+put out as `coast`. A scan in which a visible object is in neither list tells against it more than a plain miss did.
+
+### The appearance vector (`in_app`, `in_reid`)
+A leaf remembers the mean of its object's vectors (`app_gain`; only whole, uncovered first-list boxes teach it; a
+vector of another kind starts it anew). A pairing of a box with a leaf is weighed by
+
+    F_app = clamp( p_same(d | gap) / p_other(d),  1 / B,  B )
+
+d the distance between the box's vector and the memory (the kind's own distance), gap the time since the memory was
+refreshed, `p_same` / `p_other` the measured log-normal fits (`app_tables`: roadsense
+`docs/lanes/detin-emb-distances.json`; the fit at the gap, the 1 s fit below 1 s). The ratio of two log-normals is a
+parabola in ln d that turns round in the fits' tails; beyond its turning point it is held (monotone). B (`app_bound`)
+is 8 by day and 3 at night; day and night are mixed in the logarithm by how dark the scene is, which the tracker
+reads off the vectors' own luma cells (`app_y_day`, `app_y_night`; or told: `app_dark`). No memory, no vector, a
+kind without a table, two kinds: the factor is 1.
+* **Re-identification** (`in_reid`): an object dropped by the upkeep goes into a gallery (its id, place, velocity,
+  memory) for `reid_s`. An object born where a dropped one could be by now (its last velocity carried on, unsure by
+  that velocity; `reid_gate`) takes the dropped one's id, age and class vote when its first vector says so `reid_lr`
+  times likelier than not and twice likelier than the next candidate. It is tentative again until its own boxes
+  confirm it.
+
+### The lamp pair (`in_lamp_colour`, `in_lamp_size`)
+* **Colour**: red, the rear faces the camera; white, the front. For the extent: which end is the front, where the
+  object's motion has not shown it (turned when two more boxes say the other end than say this one: a colour is
+  wrong now and then), and the heading along the line of sight to `lamp_colour_deg` and no better however often
+  (like the road's axis). For a birth with white lamps: both moving stories start from the car's speed reversed
+  (an oncoming vehicle; "it stands" keeps its share).
+* **Separation: a ruler** (`in_lamp_size`, `x_aux_rows`): see "Rulers" below.
+
+### Rulers: the box width of an axial view (`in_width`), the lamp pair's separation (`in_lamp_size`)
+A ruler is a size of the object that the detection does not know, seen from the object's distance: a vehicle's
+width (known to a tenth), its lamp separation (to a fifth). The proposal takes each as a range row with a constant
+of the object's own, "like the height". **Against the proposal**, neither is a row on the range here, and neither
+gets a state:
+
+* **Two sizes seen from one distance measure their ratio, whatever the distance.** The box height against the box
+  width, or against the lamp separation, is a measurement of the object's height state `lh` itself, free of the
+  range:
+
+      ln(h_px / w_px) = lh - ln(W(lh) s)        s = (L |sin a| + W |cos a|) / W, a: the heading against the line of sight
+      ln(h_px / sep)  = lh - ln(lamp_sep_ratio W(lh) |cos a|)
+
+  with `W(h) = 1.8 + 0.35 (h - 1.5)` m the width of a vehicle of that height (cars 1.8 x 1.5, vans 2.0-2.1 x 2.5,
+  lorries and buses 2.5 x 3.4: widths vary far less than heights across everything the detector calls a vehicle,
+  which makes the width a ruler without knowing the class). What the height then says of the range it says in every
+  later box, through the box-height row and the filter's own knowledge of how the two hang together: the ruler's
+  information stays with the object as its height does. (The first build had the rulers as rows on the range; their
+  information was gone with the next seconds' process noise: a car 1.7 m tall, taken as 1.6 m, read 6 % near again
+  two seconds after the ruler's last use. As a measurement of the height it reads right for as long as it is
+  followed: `tests/test_radar_inputs.py::Rulers`.) Every motion hypothesis takes the row, also the moving ones that
+  hold the height against the box's own rows (section 2): there is no range in it, so the drift that made the height
+  a consider parameter there cannot arise from it.
+* **The constant is not counted once per box.** A width's own deviation from `W(h)` is the same in every box. Each
+  of `ruler_uses` uses takes that variance (`width_rel`^2, `lamp_sep_rel`^2) times `ruler_uses`, with the box's own
+  noise beside it (which does average): all uses together hold the prior's information once.
+* **Where it applies.** The width: a vehicle whose both sides, top and bottom are in the picture and uncovered,
+  seen along its axis: the length's share of the silhouette under 0.4 of the width's (within 8 degrees for a car:
+  what the detector calls a car is 3.5 to 6 m long, and at a larger angle that is what the box width would
+  measure), the silhouette at the heading believed known to a third (its spread over what is not known of the
+  heading by the folded normal: at the axis the silhouette has a kink). **Against the proposal** ("a car 1.8 m,
+  10 %: half the height prior's 20 %", for any view "within 20 deg of the line of sight"): at 20 degrees a car's
+  silhouette is 3.2 m, not 1.8 m, and what is known of it is what is known of the heading and the length. The lamp
+  pair: within about 50 degrees of the axis, a box whose top and bottom are its own.
+* **How the range changes needs no constant**: the lamp separation against the leaf's last pair (the heading against
+  the line of sight taken out) is a scale rate over the time between them, a row like the detector's own, to the
+  lamp centroids' fraction of a pixel; not taken where the box's scale rate already comes from the lamp pair
+  (`scale_src`), nor across more than 1.2 s.
+* All these rows are mixtures: with `ruler_eps` the number is not the object's (one lamp pair in ten is found on
+  other blobs; a box edge on a neighbour) and says nothing; taken only where it is likelier the object's than not.
+  They are scalar rows processed after the box's other rows: in the update per motion hypothesis; in the pairing on
+  the leaf as a whole, as the likelihood of the extra rows given the others (a van's box on a car's track: the
+  wrong aspect).
+
+### The road's vertical curvature (`grade_k`)
+With a vertical curvature k the ground at distance x lies k x^2 / 2 off the plane under the car, and the ground
+angle is off by k x / 2. **Against the proposal** (a variance term on the row): that error is not noise from box
+to box, it is the object's own offset and the same in the next box, so as row noise it would be averaged away over
+the object's boxes. It goes where the tracker already has such an offset: the state `dp` is born unknown by
+`grade_k` x / 2 on top (`r_birth`), and walks by `grade_k` dr / 2 when the range changes by dr (`h_step`).
+
+### The scale rate (`in_scale`)
+* Successive values of one object share most of their baseline (a value is the mean rate over `scale_dt_s`, a new
+  one comes every 0.2-0.4 s): the variance times the baseline over the time since this leaf's previous scale row,
+  where that is shorter (`x_det_leaf`).
+* `scale_src` "lamps": Huber's weight at `scale_lamps_k` sigma on the leaf's own innovation (the variance raised
+  until the innovation is that many sigma).
+
+### What was measured (2026-11-24)
+On the detector simulator emitting what a camera detector would (`sim/roaduser_sim.py` `DETIN`: visible-part boxes,
+roadside occluders, flags, the low list, vectors fitted to the measured distance tables, lamp pairs, scale rates
+with shared errors, vehicles of spread sizes; with the scale rate on: docs/VISUAL_RADAR_EVAL.md), the tracker alone
+(`sim.radar_score`), all 11 scenarios x seeds 1-6 x day and night = 132 runs per row. Confirmed outputs against the
+truth: error along the line of sight by range band (m), id switches, share of detectable time held and confirmed,
+seconds a standing actor was called `moving`. Then the whole stack's false `obstacle_ahead` episodes (shadow mode;
+6 scenarios x seeds 1-6 x day and night, with the prediction / with constant-velocity futures). The real drives'
+recordings carry none of the fields: there, with the knobs off, the output is identical (both captures of
+tools/cost_bench.py, every stream), and nothing more can be said from them.
+
+| knobs on | 0-25 p50 / p90 | 25-60 p50 / p90 | 60+ p50 / p90 | id switches | held | confirmed | standing called moving (s) | false episodes pred / cv |
+|---|---|---|---|---|---|---|---|---|
+| none (today's stream on today's simulator) | | | | | | | | 91 / 79 |
+| none (the realistic stream: the "before") | 0.76 / 3.77 | 2.40 / 8.21 | 6.06 / 19.5 | 262 | 0.262 | 0.091 | 74 | 110 / 93 |
+| `in_flags` | 0.74 / 3.70 | 2.52 / 8.12 | 7.67 / 21.5 | 207 | 0.250 | 0.086 | 69 | 117 / 108 |
+| `in_box_occl` | 0.75 / 3.71 | 2.36 / 8.12 | 6.34 / 19.5 | 270 | 0.261 | 0.090 | 72 | not run |
+| `in_low` | 0.82 / 3.93 | 2.66 / 8.90 | 7.81 / 22.0 | 282 | 0.270 | 0.115 | 111 | (with the set below: 126 / 128) |
+| `in_app` | 0.75 / 3.77 | 2.48 / 8.09 | 6.97 / 19.8 | 271 | 0.267 | 0.092 | 64 | 101 / 92 |
+| `in_lamp_size` | 0.77 / 3.66 | 2.39 / 8.06 | 6.34 / 21.3 | 252 | 0.264 | 0.091 | 72 | 108 / 96 |
+| `in_width` | 0.76 / 3.67 | 2.34 / 7.71 | 7.66 / 20.2 | 277 | 0.267 | 0.091 | 74 | 104 / 99 |
+| `in_scale` | 0.75 / 3.71 | 2.39 / 8.00 | 7.03 / 19.3 | 254 | 0.263 | 0.091 | 70 | 109 / 99 |
+| `grade_k` 1/3000 | 0.77 / 3.91 | 2.53 / 8.69 | 7.30 / 20.3 | 281 | 0.258 | 0.089 | 71 | not run |
+| `in_app` + `in_width` | | | | | | | | 104 / 91 |
+| **`in_app` + `in_width` + `in_lamp_size` + `in_scale`** | 0.74 / 3.48 | 2.09 / 7.59 | 7.46 / 18.4 | 255 | 0.273 | 0.093 | 64 | 101 / 103 |
+| ... + `in_flags` | 0.76 / 3.49 | 2.20 / 7.38 | 6.68 / 17.0 | 212 | 0.260 | 0.089 | 58 | 116 / 107 |
+| ... + `in_flags` + `in_low` | 0.77 / 3.63 | 2.27 / 7.55 | 6.82 / 19.2 | 208 | 0.268 | 0.112 | 87 | 126 / 128 |
+
+On the (actor, frame) pairs confirmed both before and with the four knobs of the bold row: at 25-60 m the mean error
+along the line of sight 3.22 -> 2.88 m by day and 3.77 -> 3.06 m at night (p90 8.8 -> 6.7 m at night); at 0-25 m
+1.77 -> 1.56 m at night; beyond 60 m the mean 8.2 -> 7.8 m by day with the median worse (5.7 -> 6.3 m).
+`in_lamp_colour` (the oncoming scenario at night, 12 seeds) and `in_reid` (it fires two or three times a run) change
+no score measurably.
+
+What it says:
+* **Range at 25-60 m**: the width ruler is the one input that moves it (leave it out of everything-on: 25-60 m
+  p50 2.31 -> 2.61, beyond 60 m 7.5 -> 8.9), the lamp pair adds at night. Neither needs a new state.
+* **Phantom motion of standing things** falls with the appearance ratio (74 -> 64 s) and is the one thing that also
+  lowers the false episodes with the prediction (110 -> 101). The id switches do NOT fall with it alone.
+* **The flags** cut id switches by a fifth and cost 3-5 % of the tracked time, and **the false episodes rise** with
+  them (110 / 93 -> 117 / 108; not the side shift: 115 / 112 without it). Dropping the rows of hidden edges takes
+  away wrong information and, in a row of parked cars where most boxes have a hidden edge, most of the information.
+* **The low list** buys a quarter more confirmed time and pays with standing things called moving (74 -> 111 s) and
+  more false episodes. The simulator's low list is three to five times as busy as the rides' (its excess of visible
+  actors), so this is a pessimistic reading; it is not evidence for switching it on.
+* **`grade_k`** does nothing for this simulator, whose roads' vertical curvature (at most 1 / 6000 m) is half the
+  1 / 3000 m assumed; **`in_box_occl`** is neutral.
+* **No set of knobs lowers the false `obstacle_ahead` episodes beyond what one run's noise could be** (101-104
+  against 110 with the prediction; with constant-velocity futures none is better than 91-92 against 93).
+
+Recommended: all knobs stay off in the code (the detector's options are off on the car, and the appearance tables
+are from other cameras). When the detector's options are switched on, with its scale rate: `in_app`, `in_width`,
+`in_lamp_size`, `in_scale`. Not `in_width` on today's stream without a scale rate: there (today's simulator with
+spread sizes, 132 runs) it moves 25-60 m from 3.43 to 3.22 m and standing things called moving from 192 to 239 s
+(each use shifts the height, and with no scale rate the range's shift reads as motion).
+
+Cost (this laptop, one scan of the tracker with the detections' making, the realistic stream; a phone's small core
+is 10 to 16 times slower): 0.30 ms with the knobs off; each knob but one adds 0.01 to 0.03 ms; `in_low` adds 0.14 ms
+(more detections); the four recommended together 0.30 ms; everything on 0.46 ms. With the knobs off the whole stack
+on the recorded captures costs what it did (tools/cost_bench.py: 1.461 -> 1.462 ms per road frame on the real
+capture, 6.42 -> 6.44 ms on the dense simulated one; outputs identical).

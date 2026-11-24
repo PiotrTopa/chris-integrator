@@ -131,7 +131,65 @@ CFG = dict(
     bias_ripe=0.5,               # an object speaks about the sensor's bias once its own angle offset is known
                                  # this much better (share of the variance it was born with)
     bias_seen_s=1.0,
+    # ---- the detector's further inputs (docs/RADAR.md, section 8; roadsense docs/ARCHITECTURE.md, "Detection inputs
+    # for a tracker"). Each is a knob, off until its evidence says otherwise; with all of them off a scan is what it
+    # was, bit for bit. They act only on a camera's boxes, and only where the detector sends the fields.
+    # flags: the hidden edges of a box (`clip` + `trunc` + `occ_edges`) decide which rows it has; the centre of a
+    # box with a hidden side is moved to the object's by what the object's silhouette has beyond the box; a covered
+    # box teaches no width
+    in_flags=False,
+    # flags_far_bearing: a box whose bottom is under a nearer box (a direction only) may be taken by an object beyond
+    # the view's first ground point. False: such a box is left to the near objects (measured: taken, it costs a
+    # fifth more id switches in rows for 3 % more tracked time; docs/RADAR.md, section 8)
+    flags_far_bearing=False,
+    # flags_side: the centre of a box with one side hidden is moved to the object's (by half of what the object's
+    # silhouette has beyond the box). False: such a box keeps its centre and its wider bearing spread
+    flags_side=True,
+    # the scan's own boxes hide what stands behind them (the miss probability): a box counts as nearer where its
+    # bottom lies lower than the object's by more than box_occl_margin of what is not known of the difference
+    in_box_occl=False, box_occl_margin=1.5,
+    # the low-score list (`objects_low`): a second kind of detection. Of what the first list leaves of a visible
+    # object the low list holds low_p (0.41 measured on BDD100K at a floor of 0.10), low_p_run inside a run of
+    # misses of an object the first list had within low_run_s (0.68-1.0 measured on rides); low_false_per_scan low
+    # boxes a scan on no known object at least (followed upwards from the scans: 0.35-1.1 measured); its edges:
+    # low_px times the px term and low_rel relative (measured 10-13 % of the box height against 4 %); its class
+    # vote weighs low_weight; an object whose last low_coast sightings are all low is put out as `coast`
+    in_low=False, low_p=0.4, low_p_run=0.7, low_run_s=1.0, low_false_per_scan=0.6, low_px=1.5, low_rel=0.10,
+    low_weight=0.3, low_coast=4,
+    # the appearance vector (`emb`): a likelihood ratio in the pairing, bounded to app_bound (day, night), from the
+    # measured distance fits (app_tables: per kind, day and night, the same object 1 / 2 / 4 s apart and another
+    # object: mu, sigma of the logarithm; roadsense docs/lanes/detin-emb-distances.json); the memory follows the
+    # object's whole first-list boxes with app_gain. How dark the scene is: read off the vectors' luma cells
+    # (app_y_day and above: day, app_y_night and below: night), or told (app_dark: 0..1; None: read).
+    # reid: an object that was dropped and is born again within reid_s where it could be by then takes its id back
+    # when its vector says so reid_lr times likelier than not (and twice likelier than the next candidate)
+    in_app=False, app_bound=(8.0, 3.0), app_gain=0.3, app_dark=None, app_y_day=-0.5, app_y_night=-1.2,
+    app_tables={1: ((-0.729, 0.903, -0.552, 0.884, -0.408, 0.914, 0.901, 0.462),
+                    (-0.087, 0.603, 0.067, 0.604, 0.225, 0.539, 0.686, 0.616)),
+                2: ((-0.925, 0.837, -0.771, 0.835, -0.641, 0.871, 0.558, 0.344),
+                    (-0.409, 0.497, -0.285, 0.519, -0.166, 0.473, 0.266, 0.491))},
+    in_reid=False, reid_s=6.0, reid_lr=4.0, reid_gate=16.0,
+    # the lamp pair (`lamps`). Its colour: which end faces the camera (the heading, to lamp_colour_deg and no
+    # better; a new object with white lamps comes the other way if it drives). Its separation: a ruler on the object
+    # (lamp centres lamp_sep_ratio of the vehicle's width apart, unknown to lamp_sep_rel in the logarithm), read
+    # against the box height as a measurement of the object's height, and its change from pair to pair as a scale
+    # rate; a pair under lamp_min_px apart is not used (the detector picks other blobs there)
+    in_lamp_colour=False, lamp_colour_deg=40.0, in_lamp_size=False, lamp_sep_ratio=0.67, lamp_sep_rel=0.2, lamp_min_px=10.0,
+    # the box width of a vehicle seen along its axis as a ruler: read against the box height it measures the
+    # object's height (a vehicle's width follows from its height to width_rel)
+    in_width=False, width_rel=0.10,
+    # the rulers: with ruler_eps their number is not the object's; "anywhere" spans ruler_span (logarithm); each
+    # ruler is used ruler_uses times, each use with a share 1 / ruler_uses of what its prior knows
+    ruler_eps=0.1, ruler_span=3.0, ruler_uses=8,
+    # the road's vertical curvature, 1 sigma (1/m; crest and sag radii of built roads are 2-10 km: 1 / 3000), in each
+    # object's own ground-angle offset. 0: the road ahead is the plane under the car
+    grade_k=0.0,
+    # the scale rate: successive values of one object share their baseline (the variance times the baseline over the
+    # time since the object's previous value); a value from the lamp pair alone is taken with Huber's weight at
+    # scale_lamps_k sigma
+    in_scale=False, scale_lamps_k=2.0,
 )
+_IN_KNOBS = ("in_flags", "in_box_occl", "in_low", "in_app", "in_reid", "in_lamp_colour", "in_lamp_size", "in_width", "in_scale")
 
 
 def _npsum(a):
@@ -300,7 +358,7 @@ class Obj:
     vote, verdict, group) and, as attributes, its numbers in the tracker's arrays (`State`): the parts of its
     primary row and its row of the table."""
     __slots__ = ("id", "h", "store", "t0", "_state", "sources", "last_seen", "vote", "nis", "verdict", "coast_s",
-                 "velocity_seen", "merge_t", "scores", "cls", "_kin", "grp", "grp_kind", "lhp")
+                 "velocity_seen", "merge_t", "scores", "cls", "_kin", "grp", "grp_kind", "lhp", "low_run")
     xs, Ps, mu, xf, Pf, x, P, e, Pe, st, m = (_view(a, b, sh) for _, a, b, sh in _OFF)
     t = _meta(M_T)                   # the time its numbers are of
     logodds = _meta(M_L)             # that it exists, in the primary's story (`exist`: over all stories)
@@ -340,6 +398,7 @@ class Obj:
         self.grp = None              # the group it is of (id), and the group's kind: row | queue | platoon
         self.grp_kind = None
         self.lhp = None              # the prior of its height (lh) its numbers hold: (mean, variance) (Tracker._size)
+        self.low_run = 0             # its last sightings in a row that were boxes of the low-score list
 
     @property
     def state(self):
@@ -432,6 +491,8 @@ class Tracker:
     def __init__(self, ego, cfg=None, model_cfg=None):
         self.ego = ego
         self.cfg = dict(CFG, **(cfg or {}))
+        # (any of the detector's further inputs is taken: box.py makes the detections' extra fields)
+        self.cfg["_in_any"] = any(self.cfg[k] for k in _IN_KNOBS) or self.cfg["grade_k"] > 0.0
         self.mcfg = dict(M.CFG, **(model_cfg or {}))
         self.next_id = 1
         self.reset()
@@ -465,6 +526,35 @@ class Tracker:
         self._ranges = {}            # sensor id -> it measures range (a microwave radar, a position)
         self._snap = None            # (the list of objects, `look` of them): see `looked`
         self._memrows = {}           # sensor id -> the map's entries of confirmed objects as the native core reads them
+        self.low_rate = {}           # sensor id -> low-list boxes per scan that no object took (followed over time)
+        self.gallery = deque()       # dropped objects that may come back: (id, time, x, y, vx, vy, var, memory, t0, vote)
+        self._xstatic = None         # the part of a scan's xcfg that the configuration alone gives
+
+    def _xcfg(self, src, sensor):
+        """The scan's constants for the detector's further inputs as the native core reads them (chris_native.c
+        `XC_*`), or None where nothing of them is taken (the scan is then what it was)."""
+        c = self.cfg
+        if not c["_in_any"] or sensor.kind != "camera_boxes":
+            return None
+        st = self._xstatic
+        if st is None:
+            dark = c["app_dark"]
+            st = self._xstatic = (
+                ((2.0 if c["flags_far_bearing"] else 1.0) if c["in_flags"] else 0.0, 1.0 if c["in_box_occl"] else 0.0,
+                 c["box_occl_margin"],
+                 1.0 if c["in_low"] else 0.0, c["low_p"], c["low_p_run"], c["low_run_s"]),
+                (-1.0 if dark is None else float(dark), c["app_bound"][0], c["app_bound"][1], c["app_gain"], c["app_y_day"],
+                 c["app_y_night"]),
+                (1.0 if c["in_lamp_colour"] else 0.0, math.radians(c["lamp_colour_deg"]), 1.0 if c["in_lamp_size"] else 0.0,
+                 c["lamp_sep_ratio"], c["lamp_sep_rel"], c["ruler_eps"], c["ruler_span"], float(c["ruler_uses"]),
+                 1.0 if c["in_width"] else 0.0, c["width_rel"], c["grade_k"], 1.0 if c["in_scale"] else 0.0,
+                 c["scale_lamps_k"] if c["in_scale"] else 0.0, 1.0 if c["flags_side"] else 0.0))
+        ek = getattr(sensor, "emb_kind", 0) if c["in_app"] else 0
+        tab = c["app_tables"].get(ek) or c["app_tables"].get(str(ek))
+        if tab is None:
+            ek, tab = 0, ((0.0, 1.0) * 4,) * 2           # a kind of vector there is no table for: not used
+        return st[0] + (max(c["low_false_per_scan"], self.low_rate.get(src, 0.0)), 1.0 if ek else 0.0, float(ek)) + st[1] \
+            + tuple(tab[0]) + tuple(tab[1]) + st[2]
 
     def look(self, objs):
         """Several objects' numbers at once, as lists (the upkeep and the message read every object once per
@@ -649,6 +739,9 @@ class Tracker:
                 rows, float(len(self.scan_times.get(src) or ())), acfg, par, (c["mu_hold_hits"], c["mu_floor"]), bcfg, b,
                 (c["oosm_max_s"], 1.0 if c["consider_moving"] else 0.0, c["consider_range_s"],
                  1.0 if c["consider_stand"] else 0.0))
+        xcfg = self._xcfg(src, sensor) if c["_in_any"] else None
+        if xcfg is not None:                             # the detector's further inputs (docs/RADAR.md, section 8)
+            args += (xcfg,)
         while True:
             res = self.hyp.cycle(store.a, store.tab, store.hist, *args)
             if not isinstance(res, int):
@@ -669,6 +762,12 @@ class Tracker:
             hit.append(o)
         st["assigned"] += len(hit)
         kept = hit
+        if xcfg is not None and c["in_low"]:
+            # the low-score boxes no object took, per scan, followed over time: the low list's own "something else"
+            nlow = sum(1 for d in dets if (d.get("attrs") or {}).get("low"))
+            took = sum(1 for _, j in hits if (dets[j].get("attrs") or {}).get("low"))
+            r0 = self.low_rate.get(src, 0.0)
+            self.low_rate[src] = r0 + c["new_rate_gain"] * (nlow - took - r0)
         if dead:
             gone = set(dead)
             for o in self.objects:
@@ -688,8 +787,14 @@ class Tracker:
             self._memrows.pop(src, None)
         for h, j in births:
             d = dets[j]
-            o = Obj(self.next_id, h, t, src, sensor.coast_s, store)
-            self.next_id += 1
+            back = self._reid(h, t, xcfg) if xcfg is not None and c["in_reid"] and self.gallery else None
+            if back is None:
+                o = Obj(self.next_id, h, t, src, sensor.coast_s, store)
+                self.next_id += 1
+            else:                                        # a dropped object, back: its id, its age, its class vote
+                o = Obj(back[0], h, t, src, sensor.coast_s, store)
+                o.t0, o.vote = back[8], back[9]
+                st["reid"] = st.get("reid", 0) + 1
             if rg:
                 self._range_seen(o)
             sc = self._score(d)
@@ -771,7 +876,9 @@ class Tracker:
         n = float(self.store.a[o.slot, _MO + M_NIS])
         if n == n:
             o.nis[src] = n if o.nis.get(src) is None else o.nis[src] + 0.2 * (n - o.nis[src])
-        sc = self._score(d)
+        low = (d.get("attrs") or {}).get("low")          # a box of the low-score list: seen, weakly
+        o.low_run = o.low_run + 1 if low else 0
+        sc = None if low else self._score(d)
         if sc is not None:
             if o.state == "tentative":
                 o.scores.append((src, sc))
@@ -820,7 +927,7 @@ class Tracker:
                         self._score_learn(o.scores, True)
                         o.scores = []
                 else:
-                    o.state = "coast" if T - last > 0.3 else "confirmed"
+                    o.state = "coast" if T - last > 0.3 or o.low_run >= c["low_coast"] else "confirmed"
             else:
                 # out of every field: remembered while where it is remains worth knowing
                 if o.state == "tentative":
@@ -843,6 +950,7 @@ class Tracker:
         self.objects = keep
         self._snap = (keep,) + sn
         for o in gone:
+            self._remember(o, T)
             self._drop(o)
         if len(self.real_ids) > 4096:
             self.real_ids = {o.id for o in keep if o.state != "tentative"}
@@ -961,6 +1069,59 @@ class Tracker:
             los = math.atan2(float(o.x[PY]) - pose[1], float(o.x[PX]) - pose[0])
             _NR.radar_heading_prior(self.store.a, self.hyp.rows(o.h), math.atan2(ey[kk], ex[kk]), los,
                                     c["road_prior_std"], c["road_prior_snap"], c["road_prior_mirror"])
+
+    def _remember(self, o, T):
+        """A dropped object that may come back (`in_reid`): its id, where it was and how it moved, how it looked."""
+        c = self.cfg
+        if not c["in_reid"] or o.state == "tentative":
+            return
+        try:
+            xr = self.hyp.xrow(o.slot)
+        except (IndexError, ValueError):
+            return
+        if not xr or not xr[0] > 0.0:                    # no memory of its appearance
+            return
+        x, P = o.x, o.P
+        self.gallery.append((o.id, T, float(x[PX]), float(x[PY]), float(x[VX]), float(x[VY]),
+                             float(max(P[PX, PX], P[PY, PY])), xr, o.t0, o.vote))
+        while self.gallery and (len(self.gallery) > 32 or T - self.gallery[0][1] > c["reid_s"]):
+            self.gallery.popleft()
+
+    def _reid(self, h, t, xcfg):
+        """The dropped object that the new object h is, or None: among those dropped within reid_s whose place by
+        now (carried on at their last velocity, unsure by that velocity) the new one's is within reid_gate, the one
+        whose remembered appearance the new one's box matches: reid_lr times likelier the same than another, and
+        twice likelier than the next candidate. It leaves the gallery."""
+        c = self.cfg
+        row = int(self.store.tab[h, OT_SLOT])
+        xn = self.hyp.xrow(row)
+        if not xn or not xn[0] > 0.0:
+            return None
+        a = self.store.a[row]
+        ox, oP = OFF["x"][0], OFF["P"][0]
+        px, py = float(a[ox + PX]), float(a[ox + PY])
+        pv = float(max(a[oP + PX * N + PX], a[oP + PY * N + PY]))
+        dark = self.hyp.xstate()[2]
+        best = second = None
+        for g in self.gallery:
+            gap = t - g[1]
+            if gap <= 0.0 or gap > c["reid_s"]:
+                continue
+            sv = max(2.0, 0.5 * math.hypot(g[4], g[5]))
+            d2 = ((px - g[2] - g[4] * gap) ** 2 + (py - g[3] - g[5] * gap) ** 2) / (pv + g[6] + (sv * gap) ** 2)
+            if d2 > c["reid_gate"]:
+                continue
+            lr = _NR.radar_app_lr(xcfg, dark, g[7], xn, gap)
+            if best is None or lr > best[0]:
+                best, second = (lr, g), best
+            elif second is None or lr > second[0]:
+                second = (lr, g)
+        if best is None or best[0] < c["reid_lr"] or (second is not None and best[0] < 2.0 * second[0]):
+            return None
+        if any(o.id == best[1][0] for o in self.objects):
+            return None
+        self.gallery.remove(best[1])
+        return best[1]
 
     def _drop(self, o):
         """The object taken out of the hypotheses (it is no longer in `objects`); what ends with it ends too."""

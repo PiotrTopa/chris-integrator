@@ -70,6 +70,10 @@ from .tracker import (M_HITS, M_RANGE_T, M_T, OT_CONS, OT_HASVS, OT_NCHECKS, OT_
                       Tracker)
 
 NS = 1e9
+# the appearance vector's kinds (roadsense docs/ARCHITECTURE.md): the native core's code and the vector's length
+_EMB_KINDS = {"yuv3x3": (1, 27), "reid32+yuv3x3": (2, 59)}
+_LAMP_C = {"red": 1.0, "white": 2.0}
+_SCALE_SRC = {"lamps": 1.0, "both": 2.0}
 _NR = M.NR                      # the native core (the message's objects: radar_frame)
 _UNPREDICTABLE = ("unpredictable",)
 
@@ -156,65 +160,136 @@ class Radar:
             cover = {"bearing_min": math.radians(cov["bearing_min_deg"]) - 0.02,
                      "bearing_max": math.radians(cov["bearing_max_deg"]) + 0.02, "ground_min_m": float(cov["ground_min_m"])}
         dets = []
-        f, hc = self.focal_px, self.cam_height
-        jit = math.radians(c["pitch_jitter_deg"])
+        # the detector's further inputs (docs/RADAR.md, section 8), as far as the tracker is set to take them
+        tc = self.tracker.cfg
+        xin = tc["_in_any"]
+        ek = _EMB_KINDS.get(msg.get("emb_kind"), (0, 0)) if tc["in_app"] else (0, 0)
         for o in objs:
-            if not isinstance(o, dict) or not isinstance(o.get("class"), str) or not _fin(o.get("bearing_deg")):
-                continue
-            b = math.radians(o["bearing_deg"])
-            at = {"class": o["class"], "class_conf": o.get("class_conf"), "weight": o.get("weight", 1.0), "box": o.get("box")}
-            clip = o.get("clip") or ""
-            box = o.get("box")
-            box = [float(v) for v in box] if isinstance(box, (list, tuple)) and len(box) == 4 and all(_fin(v) for v in box) else None
-            hpx = box[3] - box[1] if box else None
-            wa = (box[2] - box[0]) / f if box and box[2] > box[0] else None      # the box's width as an angle
-            wok = bool(box) and "l" not in clip and "r" not in clip             # ... and it is the object's own
-            if box and not clip and hpx and hpx >= 6.0 and wa:
-                at["aspect"] = (box[2] - box[0]) / hpx   # of a whole box: which way a vehicle points
-            # the box's centre: as good as its edges, unless a side is cut (then the centre is not the object's)
-            if box and "l" not in clip and "r" not in clip:
-                sb = math.hypot(c["bearing_rel"] * (box[2] - box[0]) / f, math.radians(c["bearing_floor_deg"]))
-            else:
-                sb = math.radians(o["bearing_std_deg"]) if _fin(o.get("bearing_std_deg")) else math.radians(1.0)
-            if _fin(o.get("range_m")) and o["range_m"] > 0.5:
-                # the ground point as the camera saw it: the angle below the horizon of the bottom edge
-                r = float(o["range_m"])
-                ang = math.atan2(hc, r)
-                if hpx is not None and hpx > 0.0:
-                    sa = math.hypot((c["bottom_px"] + c["bottom_rel"] * hpx) / f, jit)
-                else:                                    # no box given: what the stated range error is as an angle
-                    sr = float(o["range_std_m"]) if _fin(o.get("range_std_m")) else 0.2 * r
-                    sa = max(sr * hc / (r * r + hc * hc), jit)
-                if hpx is not None and hpx >= 6.0 and "t" not in clip and "b" not in clip:
-                    sh = (c["height_std_px"] + c["height_std_rel"] * hpx) / hpx          # of the logarithm
-                    dets.append({"kind": "rbh", "z": np.array([ang, b, math.log(hpx * self.frame_scale)]),
-                                 "R": np.array([sa * sa, sb * sb, sh * sh]), "attrs": at, "w": wa, "wok": wok})
-                else:
-                    dets.append({"kind": "rb", "z": np.array([ang, b]), "R": np.array([sa * sa, sb * sb]), "attrs": at,
-                                 "w": wa, "wok": wok})
-                self._scale_rate(dets[-1], o)
-            elif "b" in clip:
-                top = None
-                if box and "t" not in clip and self.cam is not None and hpx:
-                    ry = self.cam.ray(0.5 * (box[0] + box[2]), box[1])
-                    top = math.atan2(ry[2], math.hypot(ry[0], ry[1]))          # below the horizon: positive
-                if top is not None:
-                    st = math.hypot((c["bottom_px"] + c["bottom_rel"] * hpx) / f, jit)
-                    dets.append({"kind": "bt", "z": np.array([b, top]), "R": np.array([sb * sb, st * st]), "attrs": at,
-                                 "w": wa, "wok": wok})
-                else:
-                    dets.append({"kind": "b", "z": np.array([b]), "R": np.array([sb * sb]), "attrs": at, "w": wa, "wok": wok})
-                self._scale_rate(dets[-1], o)
+            self._box_det(dets, o, c, xin, ek, False)
+        n_hi = len(dets)
+        low = msg.get("objects_low")
+        if tc["in_low"] and isinstance(low, list):
+            for o in low:
+                self._box_det(dets, o, c, xin, ek, True)
         # the detector's size limit in this view, as its boxes show it: the smallest seen, forgotten slowly
         key = round(cover["ground_min_m"]) if cover else None
-        hs = [math.exp(d["z"][2]) for d in dets if d["kind"] in ("rbh", "rbhs")]
+        hs = [math.exp(d["z"][2]) for d in dets[:n_hi] if d["kind"] in ("rbh", "rbhs")]
         hm = self.h_min.get(key)
         if hs:
             hm = min(hs) if hm is None else min(min(hs), hm * 1.002)
             self.h_min[key] = hm
         elif hm is None and self.h_min:
             hm = float("inf")                            # a box feed, but this view has not shown a box yet
-        self._push((ts / NS, msg.get("sensor") or "cam", CameraBoxes(cover, c, f, hc, hm), dets))
+        sen = CameraBoxes(cover, c, self.focal_px, self.cam_height, hm)
+        sen.emb_kind = ek[0]
+        self._push((ts / NS, msg.get("sensor") or "cam", sen, dets))
+
+    def _box_det(self, dets, o, c, xin, ek, low):
+        """One box of a `road_users` message as a detection of the tracker (appended to dets), or nothing. xin: the
+        tracker takes the detector's further inputs (flags, lamps, appearance, the scale rate's source: `x`, `emb`);
+        low: a box of the low-score list (sloppier edges, a class vote of less weight)."""
+        f, hc = self.focal_px, self.cam_height
+        jit = math.radians(c["pitch_jitter_deg"])
+        if not isinstance(o, dict) or not isinstance(o.get("class"), str) or not _fin(o.get("bearing_deg")):
+            return
+        tc = self.tracker.cfg
+        b = math.radians(o["bearing_deg"])
+        at = {"class": o["class"], "class_conf": o.get("class_conf"), "weight": o.get("weight", 1.0), "box": o.get("box")}
+        clip = o.get("clip") or ""
+        occ, flags = 0.0, xin and tc["in_flags"]
+        if flags:
+            # the hidden edges of the box: cut by the view (clip), by the frame (trunc), under a nearer box
+            # (occ_edges). No ground angle from a hidden bottom, no height from a hidden top, no width or centre from
+            # a hidden side
+            for k in ("trunc", "occ_edges"):
+                v = o.get(k)
+                if isinstance(v, str):
+                    clip += v
+            if _fin(o.get("occ")):
+                occ = min(max(float(o["occ"]), 0.0), 1.0)
+        bpx, brel, hpxs, hrel, crel = c["bottom_px"], c["bottom_rel"], c["height_std_px"], c["height_std_rel"], c["bearing_rel"]
+        if low:
+            bpx, brel = bpx * tc["low_px"], tc["low_rel"]
+            hpxs, hrel = hpxs * tc["low_px"], 1.25 * tc["low_rel"]
+            crel *= tc["low_rel"] / 0.04
+            at["weight"] = tc["low_weight"] * (at["weight"] if _fin(at["weight"]) else 1.0)
+            at["low"] = True
+        box = o.get("box")
+        box = [float(v) for v in box] if isinstance(box, (list, tuple)) and len(box) == 4 and all(_fin(v) for v in box) else None
+        hpx = box[3] - box[1] if box else None
+        wa = (box[2] - box[0]) / f if box and box[2] > box[0] else None      # the box's width as an angle
+        wok = bool(box) and "l" not in clip and "r" not in clip             # ... and it is the object's own
+        if box and not clip and hpx and hpx >= 6.0 and wa:
+            at["aspect"] = (box[2] - box[0]) / hpx   # of a whole box: which way a vehicle points
+        # the box's centre: as good as its edges, unless a side is cut (then the centre is not the object's)
+        if box and "l" not in clip and "r" not in clip:
+            sb = math.hypot(crel * (box[2] - box[0]) / f, math.radians(c["bearing_floor_deg"]))
+        else:
+            sb = math.radians(o["bearing_std_deg"]) if _fin(o.get("bearing_std_deg")) else math.radians(1.0)
+        if _fin(o.get("range_m")) and o["range_m"] > 0.5 and not (flags and "b" in clip):
+            # the ground point as the camera saw it: the angle below the horizon of the bottom edge
+            r = float(o["range_m"])
+            ang = math.atan2(hc, r)
+            if hpx is not None and hpx > 0.0:
+                sa = math.hypot((bpx + brel * hpx) / f, jit)
+            else:                                    # no box given: what the stated range error is as an angle
+                sr = float(o["range_std_m"]) if _fin(o.get("range_std_m")) else 0.2 * r
+                sa = max(sr * hc / (r * r + hc * hc), jit)
+            if hpx is not None and hpx >= 6.0 and "t" not in clip and "b" not in clip:
+                sh = (hpxs + hrel * hpx) / hpx          # of the logarithm
+                if occ > 0.0:                            # partly covered with no edge hidden: its size is less sure
+                    sh *= 1.0 + occ
+                dets.append({"kind": "rbh", "z": np.array([ang, b, math.log(hpx * self.frame_scale)]),
+                             "R": np.array([sa * sa, sb * sb, sh * sh]), "attrs": at, "w": wa, "wok": wok})
+            else:
+                dets.append({"kind": "rb", "z": np.array([ang, b]), "R": np.array([sa * sa, sb * sb]), "attrs": at,
+                             "w": wa, "wok": wok})
+        elif "b" in clip:
+            top = None
+            if box and "t" not in clip and self.cam is not None and hpx:
+                ry = self.cam.ray(0.5 * (box[0] + box[2]), box[1])
+                top = math.atan2(ry[2], math.hypot(ry[0], ry[1]))          # below the horizon: positive
+            if top is not None:
+                st = math.hypot((bpx + brel * hpx) / f, jit)
+                dets.append({"kind": "bt", "z": np.array([b, top]), "R": np.array([sb * sb, st * st]), "attrs": at,
+                             "w": wa, "wok": wok})
+            else:
+                dets.append({"kind": "b", "z": np.array([b]), "R": np.array([sb * sb]), "attrs": at, "w": wa, "wok": wok})
+        else:
+            return
+        d = dets[-1]
+        self._scale_rate(d, o)
+        if not xin:
+            return
+        if occ >= 0.1:
+            d["wok"] = False                             # a width (and a length) is not learnt from a covered box
+        hid = ("l" in clip) + 2 * ("t" in clip) + 4 * ("r" in clip) + 8 * ("b" in clip)
+        lc = ls = lv = 0.0
+        lm = o.get("lamps")
+        if (tc["in_lamp_colour"] or tc["in_lamp_size"]) and isinstance(lm, dict) and not low:
+            sp, sd = lm.get("sep"), lm.get("sep_std")
+            if _fin(sp) and _fin(sd) and sd > 0.0 and sp >= tc["lamp_min_px"]:
+                lc = _LAMP_C.get(lm.get("c"), 3.0)
+                ls, lv = math.log(sp / f), (sd / sp) ** 2
+        src = _SCALE_SRC.get(o.get("scale_src"), 0.0) if tc["in_scale"] or tc["in_lamp_size"] else 0.0
+        top = bot = math.nan
+        tr = o.get("trunc")                              # (the bottom cut by the view or the frame, not by a box)
+        cut = 1.0 if "b" in (o.get("clip") or "") or (isinstance(tr, str) and "b" in tr) else 0.0
+        if tc["in_box_occl"] and box and self.cam is not None:
+            # the box in the picture as angles below the horizon (what it hides of the things behind it); its
+            # bottom cut by the view or the frame is lower than it shows
+            u, ray = 0.5 * (box[0] + box[2]), self.cam.ray
+            ry = ray(u, box[1])
+            top = math.atan2(ry[2], math.hypot(ry[0], ry[1]))
+            ry = ray(u, box[3])
+            bot = math.atan2(ry[2], math.hypot(ry[0], ry[1]))
+        d["x"] = (float(hid), occ, 1.0 if low else 0.0, lc, ls, lv, src, top, bot, cut)
+        e = o.get("emb")
+        if ek[0] and isinstance(e, str) and len(e) == 2 * ek[1]:
+            try:
+                d["emb"] = bytes.fromhex(e)
+            except ValueError:
+                pass
 
     def _scale_rate(self, det, o):
         """The detector's own measurement of how fast the object's image grows (`scale_rate`, 1/s, with its

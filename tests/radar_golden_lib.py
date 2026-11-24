@@ -46,6 +46,8 @@ class Codec:
             return {"array": key}
         if isinstance(v, (np.floating, np.integer)):
             return v.item()
+        if isinstance(v, bytes):                         # (a detection's appearance vector)
+            return {"bytes": v.hex()}
         if isinstance(v, tuple):
             return {"tuple": [self.enc(x) for x in v]}
         if isinstance(v, list):
@@ -72,6 +74,8 @@ class Codec:
                 return a
             if "tuple" in v:
                 return tuple(self.dec(x) for x in v["tuple"])
+            if "bytes" in v:
+                return bytes.fromhex(v["bytes"])
             if "set" in v:
                 return set(self.dec(x) for x in v["set"])
             if "dict" in v:

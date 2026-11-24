@@ -7,6 +7,12 @@
                                                          "bearing_deg", "bearing_std_deg", "range_m", "range_std_m",
                                                          "x_m", "y_m" (car frame, y LEFT), "method", "weight"}]}
 
+Where the detector sends its further inputs for a tracker (roadsense docs/ARCHITECTURE.md, "Detection inputs for a
+tracker"; each optional there), they are passed on as sent: per object `trunc`, `occ`, `occ_by`, `occ_edges`, `sym`,
+`lamps`, `emb`, `scale_src`; the message's `emb_kind`; and the boxes below the class threshold (`road_users_low`) as
+a second list of the same form, `objects_low`. Absent there, absent here. The radar reads them as far as its knobs
+say (docs/RADAR.md, section 8); nothing else does.
+
 Non-critical: the estimator reads it only to annotate its tracks with a class (`road_users` source kind,
 core/roadusers.py), the view to draw the road users it cannot place otherwise (trackers/roadusers_view.py).
 A light message without the key (road users off, or not decoded on this frame) gives nothing. The provider's
