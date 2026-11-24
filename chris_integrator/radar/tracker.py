@@ -80,6 +80,16 @@ CFG = dict(
     # back within 1.5 lags; once per smooth_hist_s the pass looks as far as smooth_s for it). An object's trajectory
     # (`Obj.history`) is smoothed as far back as smooth_s when it is asked for
     smooth=True, smooth_s=2.0, smooth_lag_s=0.5, smooth_hist_s=0.5,
+    # smooth_every_s: an object's past is smoothed at most this often (0: after every sighting). A sighting that
+    # comes sooner keeps the smoothed velocity the object has (`vs`, and what the verdict "it moves" reads), its age
+    # (`vs_age_s`) grown by the time since; the backward pass is a third of the tracker's arithmetic in a dense scene
+    # at a detector's frame rate. What it changes: docs/RADAR.md, section 6
+    smooth_every_s=0.0,
+    # smooth_for: whose past is smoothed. "all": every object's. "read": only where the tracker itself reads the
+    # smoothed estimate: an object whose verdict is not "moving" (the verdict "it moves" and the groups read what its
+    # sightings by themselves show of its speed). A moving object then has no `vs` (null, as before a second
+    # sighting); should its verdict be released, the filtered estimate stands in until its next sighting
+    smooth_for="all",
     # structure (docs/RADAR.md, section 7): rows of standing things, queues, platoons. The free room between two
     # members (standing / driving), how alike two drivers' velocities are, how straight the line is (m + share
     # of its length), how near the car's own line a queue's passes, members needed (a queue: two)
@@ -825,7 +835,8 @@ class Tracker:
                            (c["check_window_s"], c["inconsistent"], c["inflate"], c["history_s"], len(hz)) + tuple(hz)
                            + (0.0,) * (4 - len(hz))
                            + (1.0 if c["smooth"] else 0.0, c["hyp_keep_steps"], c["smooth_s"], 1.5 * c["smooth_lag_s"],
-                              c["smooth_lag_s"], c["smooth_hist_s"]))
+                              c["smooth_lag_s"], c["smooth_hist_s"], c["smooth_every_s"]),
+                           None if c["smooth_for"] != "read" else [o.h for o in kept if o.verdict != "moving"])
         r0 = self.new_rate.get(src, 0.0)
         self.new_rate[src] = r0 + c["new_rate_gain"] * (len(births) - r0)
 
