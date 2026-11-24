@@ -2334,9 +2334,19 @@ static int traj_dir(const double *t, int nt, int k, double *cx, double *sy)
 /* The probability that two futures meet: at each sample the two places are Gaussian; the pair is in conflict when
  * the other's centre lies inside the rectangle the two bodies cover together, lengthened behind a road user that
  * drives the same way by the gap the follower keeps. The largest over the horizon. *now: the plain overlap of the
- * bodies at the first sample (two tracks that already lie on each other say nothing about the future). */
+ * bodies at the first sample (two tracks that already lie on each other say nothing about the future).
+ *
+ * now == NULL: only whether the largest exceeds P_CONF_ANY (1.0) or not (0.0), the question pair_table asks of
+ * every pair of futures before it needs a number. A sample further than 2.2 sigma outside the rectangle along or
+ * across has a share there below 1 - Phi(2.2) = 0.014, so a product below P_CONF_ANY: it is left out without its
+ * four erfc; the other samples are computed as they are. */
+#define P_CONF_ANY 0.02
 static double pair_conflict(const PCtx *c, const PAgent *A, int ma, const PAgent *B, int mb, double *now)
 {
+    const int screen = now == NULL;
+    double now_;
+    if (screen)
+        now = &now_;
     const double *ta = A->traj + ma * A->stride, *tb = B->traj + mb * B->stride;
     double hw = c->cfg[PC_conflict_headway_s], best = 0.0;
     int nt = c->nt;
@@ -2379,12 +2389,28 @@ static double pair_conflict(const PCtx *c, const PAgent *A, int ma, const PAgent
             Lm += hw * vb;
         }
         if (k == 0) {
-            *now = (p_phi((Lh - dl) / sl) - p_phi((-Lh - dl) / sl)) * (p_phi((W - dw) / sw) - p_phi((-W - dw) / sw));
+            if (!screen)
+                *now = (p_phi((Lh - dl) / sl) - p_phi((-Lh - dl) / sl)) * (p_phi((W - dw) / sw) - p_phi((-W - dw) / sw));
             continue;
         }
         if (fabs(dl) > (Lp > Lm ? Lp : Lm) + 4.0 * sl || fabs(dw) > W + 4.0 * sw)
             continue;
-        double P = (p_phi((Lp - dl) / sl) - p_phi((-Lm - dl) / sl)) * (p_phi((W - dw) / sw) - p_phi((-W - dw) / sw));
+        if (screen) {
+            if (fabs(dw) > W + 2.2 * sw || dl > Lp + 2.2 * sl || dl < -Lm - 2.2 * sl)
+                continue;
+            if ((p_phi((Lp - dl) / sl) - p_phi((-Lm - dl) / sl)) * (p_phi((W - dw) / sw) - p_phi((-W - dw) / sw)) > P_CONF_ANY)
+                return 1.0;
+            continue;
+        }
+        /* the largest over the horizon: a sample whose share across alone (a probability: at most one times the
+         * share along) does not exceed the largest so far cannot raise it, and its share along is not computed */
+        double Pw = p_phi((W - dw) / sw) - p_phi((-W - dw) / sw);
+        if (Pw >= 0.0 && Pw <= best)
+            continue;
+        double Pl = p_phi((Lp - dl) / sl) - p_phi((-Lm - dl) / sl);
+        if (Pl >= 0.0 && Pl <= best)
+            continue;
+        double P = Pl * Pw;
         if (P > best)
             best = P;
     }
@@ -2421,6 +2447,26 @@ static int pair_table(const PCtx *c, int a, int b, double *psi)
     agent_of(c, b, &B);
     double conf[P_KMAX][P_KMAX];
     int any = 0;
+    /* most pairs of road users never meet: whether any pair of their futures does (a conflict above P_CONF_ANY)
+     * is asked first, without the numbers; only a pair that does is worked out (below, as it always was) */
+    for (int i = 0; i < A.nm && !any; i++)
+        for (int j = 0; j < B.nm && !any; j++) {
+            const double *ba = A.bb[i], *bq = B.bb[j];
+            const double *fa = A.traj + i * A.stride, *fb = B.traj + j * B.stride;
+            int last = 6 * (c->nt - 1) + 5;
+            double vm = fa[5] > fa[last] ? fa[5] : fa[last];
+            if (fb[5] > vm)
+                vm = fb[5];
+            if (fb[last] > vm)
+                vm = fb[last];
+            double m = 0.5 * (A.len + B.len) + vm * c->cfg[PC_conflict_headway_s] + 1.0;
+            if (ba[0] > bq[2] + m || bq[0] > ba[2] + m || ba[1] > bq[3] + m || bq[1] > ba[3] + m)
+                continue;
+            any = pair_conflict(c, &A, i, &B, j, NULL) > 0.5;
+        }
+    if (!any)
+        return 0;
+    any = 0;
     for (int i = 0; i < A.nm; i++)
         for (int j = 0; j < B.nm; j++) {
             conf[i][j] = 0.0;
@@ -2441,7 +2487,7 @@ static int pair_table(const PCtx *c, int a, int b, double *psi)
             if (now > 0.3)
                 return 0;                                       /* they lie on each other now: no statement */
             conf[i][j] = v;
-            if (v > 0.02)
+            if (v > P_CONF_ANY)
                 any = 1;
         }
     if (!any)
