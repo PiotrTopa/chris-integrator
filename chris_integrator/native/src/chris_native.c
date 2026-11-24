@@ -11452,7 +11452,7 @@ static PyObject *hyp_after(PyObject *self, PyObject *args)
     View vS, vT, vH;
     vS.held = vT.held = vH.held = 0;
     Py_ssize_t cap, trows, hrows, hcols, nh = 0, nk = 0, nb = 0, *hit = NULL, *kept = NULL, *born = NULL;
-    double cfg[RAFT_N], *hb = NULL;
+    double cfg[RAFT_N];
     RPar par;
     if (store_get(oS, &vS, &cap) < 0 || tab_get(oT, &vT, ROTW, &trows, NULL, "table") < 0 ||
         tab_get(oHi, &vH, 0, &hrows, &hcols, "hist") < 0 || rpar_get(opar, &par) < 0 || rnums_get(ocfg, RAFT_N, cfg, "cfg") < 0)
@@ -11470,11 +11470,6 @@ static PyObject *hyp_after(PyObject *self, PyObject *args)
     }
     Py_ssize_t hn = (hcols - 1) / 5;
     double *A = (double *)vS.b.buf, *tab = (double *)vT.b.buf, *hist = (double *)vH.b.buf;
-    hb = (double *)PyMem_Malloc((size_t)(steps + 1) * 6 * sizeof(double));
-    if (hb == NULL) {
-        PyErr_NoMemory();
-        goto done;
-    }
     for (Py_ssize_t i = 0; i < nh + nk + nb; i++) {
         Py_ssize_t h = i < nh ? hit[i] : i < nh + nk ? kept[i - nh] : born[i - nh - nk];
         double v = tab[h * ROTW + ROT_SLOT];
@@ -11573,32 +11568,21 @@ static PyObject *hyp_after(PyObject *self, PyObject *args)
                 PyErr_SetString(PyExc_ValueError, "Hyp: an object that does not exist");
                 goto done;
             }
-            double *T = tab + h * ROTW, *Hh = hist + h * hcols;
+            double *T = tab + h * ROTW;
             double ot = A[(Py_ssize_t)T[ROT_SLOT] * RROW + RO_M + M_T], lag[5], fl[5], pl;
-            /* back to the lag after every sighting; the whole trajectory, as far as the smoother reaches, once per
-             * cfg[RAFT_WHOLE_S] */
+            /* back to the lag: the first node at least the lag back within cfg[RAFT_SHORT_S], and once per
+             * cfg[RAFT_WHOLE_S] within cfg[RAFT_SMOOTH_S] (sightings far apart: the nearer reach finds none). The
+             * trajectory itself is smoothed when it is asked for (Hyp.history). */
             int whole = ot - T[ROT_HIST_T] >= cfg[RAFT_WHOLE_S], np = 0;
-            if (!smooth_core(H, A, tr, &par, steps, whole ? cfg[RAFT_SMOOTH_S] : cfg[RAFT_SHORT_S], cfg[RAFT_LAG_S],
-                             whole ? hb : NULL, &np, lag, fl, &pl))
+            if (!smooth_core(H, A, tr, &par, steps, whole ? cfg[RAFT_SMOOTH_S] : cfg[RAFT_SHORT_S], cfg[RAFT_LAG_S], NULL,
+                             &np, lag, fl, &pl))
                 continue;
             memcpy(T + ROT_VS, lag, sizeof(lag));
             memcpy(T + ROT_FS, fl, sizeof(fl));
             T[ROT_PSLAG] = pl;
             T[ROT_HASVS] = 1.0;
-            if (!whole)
-                continue;
-            T[ROT_HIST_T] = ot;
-            double t_old = hb[6 * (np - 1)] - 1e-6;      /* older than the smoother reaches: as it was */
-            Py_ssize_t n = (Py_ssize_t)Hh[0], w = 0;
-            for (Py_ssize_t k = 0; k < n; k++)
-                if (Hh[1 + 5 * k] < t_old) {
-                    if (w != k)
-                        memmove(Hh + 1 + 5 * w, Hh + 1 + 5 * k, 5 * sizeof(double));
-                    w++;
-                }
-            Hh[0] = (double)w;
-            for (int k = np - 1; k >= 0; k--)
-                hist_push(Hh, hn, hb[6 * k], hb[6 * k + 1], hb[6 * k + 2], hb[6 * k + 3], hb[6 * k + 4]);
+            if (whole)
+                T[ROT_HIST_T] = ot;
         }
     for (Py_ssize_t i = 0; i < nb; i++) {
         const double *row = A + (Py_ssize_t)tab[born[i] * ROTW + ROT_SLOT] * RROW;
@@ -11610,14 +11594,84 @@ done:
     PyMem_Free(hit);
     PyMem_Free(kept);
     PyMem_Free(born);
-    PyMem_Free(hb);
     view_drop(&vS);
     view_drop(&vT);
     view_drop(&vH);
     return res;
 }
 
+/* Hyp.history(S, hist, handle, par, max_steps, max_s) -> [(t, x, y, vx, vy)], the oldest first
+ * An object's trajectory on the ground, as it is asked for: the points written at its sightings (hist: the filtered
+ * place and velocity of each), and in their place, as far back as the smoother reaches from the primary now
+ * (smooth_core: at most max_steps nodes and max_s seconds), the smoothed place and velocity of every node of the
+ * primary's story. Nothing is written. An object that has ended, or whose story has one node: the points as written. */
+static PyObject *hyp_history(PyObject *self, PyObject *args)
+{
+    Hyp *H = (Hyp *)self;
+    PyObject *oS, *oHi, *opar, *res = NULL;
+    Py_ssize_t h;
+    int max_steps;
+    double max_s;
+    if (!PyArg_ParseTuple(args, "OOnOid", &oS, &oHi, &h, &opar, &max_steps, &max_s))
+        return NULL;
+    View vS, vH;
+    vS.held = vH.held = 0;
+    Py_ssize_t cap, hrows, hcols;
+    RPar par;
+    double *hb = NULL;
+    if (store_get(oS, &vS, &cap) < 0 || tab_get(oHi, &vH, 0, &hrows, &hcols, "hist") < 0 || rpar_get(opar, &par) < 0)
+        goto done;
+    if (h < 0 || h >= hrows || hcols < 6 || (hcols - 1) % 5 != 0 || max_steps < 0 || cap < H->cap) {
+        PyErr_SetString(PyExc_ValueError, "Hyp.history: the arrays or the object do not fit");
+        goto done;
+    }
+    {
+        const double *Hh = (const double *)vH.b.buf + h * hcols;
+        Py_ssize_t n = (Py_ssize_t)Hh[0], hn = (hcols - 1) / 5;
+        double lag[5], fl[5], pl, t_old = INFINITY;
+        int np = 0;
+        hb = (double *)PyMem_Malloc((size_t)(max_steps + 1) * 6 * sizeof(double));
+        if (hb == NULL) {
+            PyErr_NoMemory();
+            goto done;
+        }
+        if (h < H->ntr && H->tr[h].alive &&
+            smooth_core(H, (const double *)vS.b.buf, &H->tr[h], &par, max_steps, max_s, INFINITY, hb, &np, lag, fl, &pl))
+            t_old = hb[6 * (np - 1)] - 1e-6;             /* older than the smoother reaches: as it was written */
+        else
+            np = 0;
+        if ((res = PyList_New(0)) == NULL)
+            goto done;
+        Py_ssize_t keep = 0;
+        for (Py_ssize_t k = 0; k < n; k++)
+            keep += Hh[1 + 5 * k] < t_old;
+        Py_ssize_t skip = keep + np > hn ? keep + np - hn : 0;   /* (at most hn points: the oldest go) */
+        for (Py_ssize_t k = 0; k < n + np; k++) {
+            const double *p = k < n ? Hh + 1 + 5 * k : hb + 6 * (np - 1 - (k - n));
+            if (k < n && !(p[0] < t_old))
+                continue;
+            if (skip > 0) {
+                skip--;
+                continue;
+            }
+            PyObject *o = Py_BuildValue("(ddddd)", p[0], p[1], p[2], p[3], p[4]);
+            if (o == NULL || PyList_Append(res, o) < 0) {
+                Py_XDECREF(o);
+                Py_CLEAR(res);
+                goto done;
+            }
+            Py_DECREF(o);
+        }
+    }
+done:
+    PyMem_Free(hb);
+    view_drop(&vS);
+    view_drop(&vH);
+    return res;
+}
+
 static PyMethodDef hyp_methods[] = {
+    {"history", hyp_history, METH_VARARGS, "an object's trajectory, smoothed as far as the smoother reaches"},
     {"scan", hyp_scan, METH_VARARGS, "one scan: the hypotheses of every cluster, the objects' primaries"},
     {"cycle", hyp_cycle, METH_VARARGS, "one scan of the tracker: its objects in, what the scan did to them out"},
     {"after", hyp_after, METH_VARARGS, "after a scan's sightings: predictions checked and written down, trajectories, the smoothed past"},

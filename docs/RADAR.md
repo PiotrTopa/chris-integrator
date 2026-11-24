@@ -403,7 +403,7 @@ the square of the range) or a class / appearance term over several scans.
 The filtered state is the estimate from the detections up to now; it is what the message carries as the present.
 The past can be known better: the chain of nodes from an object's primary back is one story's history, each node
 holding the motion hypotheses after its scan and the step that led into it (switching matrix, dt, what the car's
-own movement added). The smoother (in `Hyp.after`; by itself `Hyp.smooth`) runs a backward pass over it after every sighting back to the lag, and once per `smooth_hist_s`
+own movement added). The smoother (in `Hyp.after`; by itself `Hyp.smooth`) runs a backward pass over it after every sighting back to the lag; an object's trajectory (`Obj.history`, read by tools and tests, not by the message) is smoothed when it is asked for (`Hyp.history`), and was until then once per `smooth_hist_s`
 (0.5 s; 0: every sighting) as far back as `smooth_s` (2 s) for the trajectory: per motion hypothesis a Rauch-Tung-Striebel step (the gain from a Cholesky factor of the predicted
 covariance), with the hypotheses mixed backwards (the smoother of the interacting multiple model filter: each
 hypothesis of a node receives the child's smoothed hypotheses in proportion to what it handed them), and a plain
