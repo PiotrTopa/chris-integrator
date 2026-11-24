@@ -989,7 +989,7 @@ same messages (a decision is never made on a message whose futures were left out
 
 | key | default | |
 |---|---|---|
-| `mode` | `full` | `full`: every radar message. `fixed`: the low rate, whatever happens. `adaptive`: every message while something could matter, the low rate otherwise |
+| `mode` | `adaptive` | `full`: every radar message. `fixed`: the low rate, whatever happens. `adaptive`: every message while something could matter, the low rate otherwise |
 | `idle_hz` | 10 | the low rate: a message is left out only when the one after it (expected one radar period later) still comes within `1 / idle_hz` + 0.01 s of the last look. At 20 radar messages a second that is every second message; a radar at 12 a second is not thinned |
 | `hold_s` | 0.5 | adaptive: the full rate is kept this long after the last sign that something could matter |
 | `hot_level`, `hot_p`, `thw_s` | 1, 0.01, 2.0 | adaptive, the decision layer's signs: an object at this level or above (entry or exit level), a collision probability from `hot_p`, a headway under `thw_s`; also any alert at a stage or with a level held on its way to one |
@@ -1001,3 +1001,39 @@ only when the look before it found nothing that could matter, the message shows 
 within the low rate's period; so whatever arises is first judged at most `1 / idle_hz` minus the radar's period
 later than at full rate (0.05 s at 20 messages a second), and from then on every message is judged. The pace's
 counts are in `Pace.health()` (messages, looked, and why: `interval`, `hot`, `cue`, `new`).
+
+What it costs and saves, measured 2026-11-24 (the simulator with the road model at 20 frames a second, whose jitter
+makes a mean of 17.5: `idle_hz` 8 there leaves out every second message as 10 does of a phone's even 20; six false-
+warning scenarios x seeds 1-6 x day and night = 72 runs, eight collision scenarios x seeds 1-3 x day and night with
+11 warnings said; every variant judged on the same radar stream as `full`; a decision layer with 255 draws in place
+of 256 changes no run: differences are the variant's, not chance):
+
+| mode | first said, against `full` | false episodes said (prediction / constant velocity) | share of messages looked at |
+|---|---|---|---|
+| `full` | | 95 / 87 | 1 |
+| `fixed` | 8 of 11 later, by 0.04-0.10 s (mean 0.045 s) | 88 / 84 | 0.53 |
+| `adaptive` as configured (`hot_p` 0.01, `hold_s` 0.5) | none moved | 93 / 87 (2 runs of 72 differ) | 0.83 (parked rows 0.95, a junction 0.63) |
+| `adaptive`, levels only (`hot_p` 1), `hold_s` 0.3 | none moved | 92 / 86 (5 runs differ: 4 down, 1 up) | 0.64 (0.53-0.74) |
+| `adaptive`, `idle_hz` half of that again | none moved | 94 / 87 | 0.73 |
+
+The conflicts in the hard geometry (the seven `TRUE_BEND_SCENARIOS` of lane/curves x seeds 1-6 x day and night, 84
+runs, 63 of them warned in the last 8 s; the time of the last said episode before the collision): as configured, one
+warning one frame later (0.07 s), the rest at the same frames; with levels only and `hold_s` 0.3, one warning of 63
+was lost (and another gained, one 1 s earlier): the looser signs are not the default. `fixed`: 19 of 63 later by more
+than 0.06 s, up to 0.27 s. On the detector's realistic stream (`DETIN`, 36 runs and 48 collision runs at 20 frames a
+second) only the looser signs were run: no run differs (56 / 54 false episodes, 15 and 13 warnings at the same
+frames); `fixed`: 14 of 28 warnings later, by up to 0.21 s.
+The simulator's own 13 frames a second (the older road model) are not thinned by any mode: nothing saved, nothing
+changed. Cost (`tools/cost_bench.py`, user instructions of the whole replay): the recorded night drive -1.6 %
+(`fixed` -2.4 %); of `predict` + `decide` there that is a fifth. With `fixed` the same warnings come later and a
+tenth fewer false episodes are said: a slower look is a longer hold; not taken as the default.
+
+`decide.json` `{"threat": {"samples": N}}`: the draws of the collision probability, 128 since 2026-11-24 (256
+before). Against 4096 draws over 4967 object-frames of the simulator's scenarios: 256 draws rms 0.0025, largest
+0.022; 128 draws rms 0.0041, largest 0.029; 64 draws 0.0070 / 0.068; the level of an object differs from the
+reference's in 4, 5 and 12 of 322 object-frames. No warning's time moved with 128 (22 said in the two streams, 63 in the bends);
+false episodes 90 / 78 -> 90 / 78 (72 runs), on `DETIN` 195 / 180 -> 194 / 181 (140 runs). A tenth of the layer's
+instructions in a dense scene. Other sequences were tried for fewer draws at the same error (an additive
+recurrence, Sobol' points): on five-dimensional indicator integrals neither beats the Halton draws at 64-256.
+`sim_dt_s` 0.1 (0.05) would save two fifths of the layer and is not taken: on `DETIN` one warning of ten came
+0.82 s later and two 0.08 s, in the bends one of 63 was lost and five came 0.07-0.27 s later; `horizon_s` 5 or 4 loses collisions beyond it (the probability off by up to 0.2 / 0.4).
