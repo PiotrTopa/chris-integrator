@@ -172,6 +172,14 @@ actor id. Cars use sigma 0.08 / 0.04 / 0.06, vans and trucks half that, pedestri
 (A: the European fleet, small cars to SUVs). Explicit `dims=` are spread the same way. Off: the worlds are
 unchanged. The lamp separation follows the spread width.
 
+**World option `dims_fleet`** (`world={"dims_fleet": True}`, the same ways): every car of the nominal size takes a
+size of `DIMS_FLEET` (small hatchbacks, compacts, crossovers, car-derived vans, large SUVs: 1.42-1.90 m tall, mean
+1.57 m, 1.63-2.0 m wide, at most 4.8 m long; a generator of its own per actor); a scenario's explicit size stays;
+everything else as `dims_spread`. **The detector's scale rate as a preset**: `scale_rate: "auto"` (or true) is
+`SCALE_DAY` or `SCALE_NIGHT` by the run; `det_params_arg("scale")` is today's stream with it, `"detin_scale"` and
+`"detin_pose_scale"` the presets with it (the presets themselves emit no scale rate; the car's unit does:
+docs/RADAR.md, section 11).
+
 ### Appearance fit (`EMB_MODEL`)
 
 Quantiles 5 / 25 / 50 / 75 / 95 % of the contract's distance, simulated with `EmbGen` against the table
