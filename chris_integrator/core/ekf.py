@@ -296,3 +296,55 @@ class Filter:
                 if age is None or d < age:
                     age = d
         return age, sorted(srcs)
+
+    def near_many(self, T, window_s, kinds_seq, reach_s=1.0):
+        """[near(T, window_s, kinds, reach_s) for kinds in kinds_seq], the window's entries walked once for all."""
+        reach = max(window_s, reach_s)
+        times, entries = self.times, self.entries
+        lo, hi = bisect.bisect_left(times, T - reach), bisect.bisect_right(times, T + reach)
+        wl = max(lo, bisect.bisect_left(times, T - window_s - 1e-6))
+        wh = min(hi, bisect.bisect_right(times, T + window_s + 1e-6))
+        m = len(kinds_seq)
+        ages = [None] * m
+        srcs = [set() for _ in range(m)]
+        js = tuple(zip(range(m), kinds_seq, srcs))
+        for e in entries[wl:wh]:
+            u = e.usedq
+            if not u:
+                continue
+            d = abs(e.t - T)
+            inw = d <= window_s
+            for q, src in u:
+                for j, kinds, sj in js:
+                    if kinds is None or q in kinds:
+                        if inw:
+                            sj.add(src)
+                        a = ages[j]
+                        if a is None or d < a:
+                            ages[j] = d
+        carry = getattr(self, "carry", ())
+        out = []
+        for j, kinds, sj in js:
+            age = ages[j]
+            if age is None:
+                for k in range(wl - 1, lo - 1, -1):
+                    u = entries[k].usedq
+                    if u and (kinds is None or any(q in kinds for q, _ in u)):
+                        age = abs(entries[k].t - T)
+                        break
+                for k in range(wh, hi):
+                    u = entries[k].usedq
+                    if u and (kinds is None or any(q in kinds for q, _ in u)):
+                        d = abs(entries[k].t - T)
+                        if age is None or d < age:
+                            age = d
+                        break
+            for tt, q, src in carry:
+                d = abs(tt - T)
+                if d <= reach and (kinds is None or q in kinds) and q != "pos":
+                    if d <= window_s:
+                        sj.add(src)
+                    if age is None or d < age:
+                        age = d
+            out.append((age, sorted(sj)))
+        return out

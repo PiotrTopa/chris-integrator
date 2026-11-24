@@ -226,13 +226,17 @@ def ego_state(I, ts_mono_ns, ts_real_ns=None):
         I.now = T
     I.seq += 1
     sm = I.ekf.at(T)
-    speed = _quantity(I, T, sm, E.V, _SPEED_KINDS, 3)
-    # (acceleration and grade ask the same query of every kind: asked once, the grade gets its own list)
-    nr_all = None if sm is None else I.ekf.near(T, I.cfg["fresh_s"], None, I.cfg["max_coast_s"] + 0.01)
+    # the quantities' `near` queries (one window, three kinds) walked at once; acceleration and grade ask the same
+    # query (every kind): the grade gets its own list
+    nr_sp = nr_all = nr_yaw = None
+    if sm is not None:
+        nr_sp, nr_all, nr_yaw = I.ekf.near_many(T, I.cfg["fresh_s"], (_SPEED_KINDS, None, _YAW_KINDS),
+                                                I.cfg["max_coast_s"] + 0.01)
+    speed = _quantity(I, T, sm, E.V, _SPEED_KINDS, 3, nr=nr_sp)
     accel = _quantity(I, T, sm, E.A, None, 3, nr=nr_all)
     if not speed["valid"]:
         accel = dict(accel, value=None, std=None, valid=False, reason=speed["reason"], mode="none")
-    yr = _quantity(I, T, sm, E.W, _YAW_KINDS, 5)
+    yr = _quantity(I, T, sm, E.W, _YAW_KINDS, 5, nr=nr_yaw)
     still = _standstill(I, T)
     if still["value"] and still["source"] is not None and speed["valid"] and I.still_exact.get(still["source"]) and \
             any(s.startswith(still["source"] + ".") for s in speed["sources"]) and abs(speed["value"]) < 0.05:
