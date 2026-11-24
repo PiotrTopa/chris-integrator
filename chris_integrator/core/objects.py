@@ -314,11 +314,11 @@ class ObjectLayer:
                 return
             st["late"] += 1
             late = self.t - scan.t           # the tracks stay where they are; the scan is compared with the
-        else:                               # tracks retrodicted by their own velocity (below)
+            ego = ego_fn(scan.t)            # tracks retrodicted by their own velocity (below)
+        else:
             late = 0.0
-            ego = ego_fn(scan.t)
+            ego = ego_fn(scan.t)            # (advancing the tracks does not change the estimate: asked once)
             self._advance(scan.t, ego)
-        ego = ego_fn(scan.t)
         if model.process is not None:
             model.process(self, scan, ego)
             return
