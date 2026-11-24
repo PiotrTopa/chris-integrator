@@ -40,6 +40,14 @@ ALERT_DEFAULTS = dict(
     entry_hold_s=(0.3, 0.2, 0.1, 0.0),             # per stage 1..4: the level must hold this long to enter
     exit_hold_s=(0.5, 0.6, 0.8, 1.0),              # ... and be below the stage this long to leave it
     min_hold_s=(0.5, 1.0, 1.5, 2.0),               # a stage is shown at least this long
+    # Entry by evidence (0: by time alone, as before). A level is entered once the conflict's probability mass at it
+    # (decide.objects[].mass), as far as it exceeds the level's minimum, has added up to `entry_hold_s` of a clear
+    # conflict: per second (mass - minimum) / (entry_evidence - minimum), at most 1. A conflict of mass
+    # `entry_evidence` or more enters after entry_hold_s as before; one just over the minimum (a roadside car whose
+    # range, for a second, leaves a third of it in the lane) has to last in proportion. Below the level the sum runs
+    # down again second for second.
+    entry_evidence=0.6,
+    mass_min=None,                                  # {kind: (4 minima)}; None: threat.THRESHOLDS
     latch_imminent=True,
     switch_hold_s=0.3,
     exist_min=0.6, seen_max_s=2.5,
@@ -98,6 +106,8 @@ class Alert:
         self.primary = None             # object id
         self.since = None               # when the stage was entered
         self.up_since = {}              # level -> since when the primary's entry level has been at least it
+        self.ev = {}                    # level -> the evidence added up (s of a clear conflict; cfg entry_evidence)
+        self._T = None                  # the last step's time
         self.down_since = None          # since when the primary's exit level has been below the stage
         self.challenger = None          # (id, since)
         self.latched = False
@@ -185,6 +195,7 @@ class Alert:
                 self.primary = best
                 self.challenger = None
                 self.up_since = {}
+                self.ev = {}
             elif not self.challenger or self.challenger[0] != best:
                 self.challenger = (best, T)
         else:
@@ -196,9 +207,32 @@ class Alert:
                 self.up_since.setdefault(L, T)
             else:
                 self.up_since.pop(L, None)
+        ref = c["entry_evidence"]
+        if ref and c["source"] != "headway":
+            dt = 0.0 if self._T is None else min(0.5, max(0.0, T - self._T))
+            mass = (rec.get("mass") if rec is not None else None) or (0.0,) * 4
+            if c["mass_min"] is None:
+                from .threat import THRESHOLDS
+                c["mass_min"] = {k: v["mass"] for k, v in THRESHOLDS.items()}
+            thr = c["mass_min"].get((rec or {}).get("kind"), c["mass_min"]["unknown"])
+            # only where the object's place is what is in doubt (decide.objects[].p_place: the prediction gave it two
+            # places, P(in the car's way) below entry_evidence); a pedestrian about to step out, a car surely in
+            # the lane enter by time as ever
+            pp = (rec or {}).get("p_place")
+            doubt = isinstance(pp, (int, float)) and pp < ref
+            for L in range(1, 5):
+                if le >= L:
+                    m = mass[L - 1] if isinstance(mass[L - 1], (int, float)) else 1.0
+                    rate = 1.0 if ref <= thr[L - 1] or not doubt else min(1.0, max(0.0, (m - thr[L - 1]) / (ref - thr[L - 1])))
+                    self.ev[L] = self.ev.get(L, 0.0) + rate * dt
+                else:
+                    self.ev[L] = max(0.0, self.ev.get(L, 0.0) - dt)
+        else:
+            doubt = False
+        self._T = T
         new = self.stage
         for L in range(4, self.stage, -1):
-            if L in self.up_since and T - self.up_since[L] >= c["entry_hold_s"][L - 1] - 1e-9:
+            if L in self.up_since and (self.ev.get(L, 0.0) if doubt else T - self.up_since[L]) >= c["entry_hold_s"][L - 1] - 1e-9:
                 new = L
                 break
         if new > self.stage:
