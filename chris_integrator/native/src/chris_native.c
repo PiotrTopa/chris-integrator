@@ -2899,6 +2899,8 @@ static PyType_Slot stream_slots[] = {
 static PyType_Spec stream_spec = {"chris_integrator.native._chris_native.StreamState", sizeof(StreamSt), 0,
                                   Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE, stream_slots};
 
+#include "egomotion.c"               /* ego-motion hygiene (docs/EGO_MOTION.md): Stand, Lag, the rows' measurement functions; EGOMOTION_METHODS */
+
 /* ---- the filter pass ------------------------------------------------------------------------------------ */
 enum {
     A_t, A_rows, A_xp, A_Pp, A_F, A_x, A_P, A_anchor, A_usedq,
@@ -3301,28 +3303,62 @@ static PyObject *n_ekf_run(PyObject *self, PyObject *args)
                 ok = 1;
                 goto row_done;
             }
-            if ((h = PyObject_GetAttr(r, AN[A_h])) == NULL || (hr = PyObject_CallFunctionObjArgs(h, x, NULL)) == NULL ||
-                unpack3(hr, &pred, &idx, &coef) < 0)
+            /* the row's model: native (kind, idx, par), evaluated here (egomotion.c), or a callable h(x) */
+            double cfb[EH_MAXM], pr;
+            const double *cfp;
+            Py_ssize_t m;
+            const int64_t *ix;
+            if ((h = PyObject_GetAttr(r, AN[A_model])) == NULL)
                 goto row_done;
             if (!Pv.held && view_conv(P, &Pv, 'd', 2, "P", &Pc) < 0)
                 goto row_done;
-            if (view_conv(idx, &iv, 'i', 1, "idx", &ic) < 0 || view_conv(coef, &cv, 'd', 1, "coef", &cc) < 0)
-                goto row_done;
-            Py_ssize_t m = iv.b.shape[0];
-            const int64_t *ix = (const int64_t *)iv.b.buf;
-            if (Pv.b.shape[0] != n || Pv.b.shape[1] != n || cv.b.shape[0] != m || m < 1) {
-                PyErr_SetString(PyExc_ValueError, "ekf_project: shapes");
-                goto row_done;
-            }
-            for (Py_ssize_t j = 0; j < m; j++)
-                if (ix[j] < 0 || ix[j] >= n) {
-                    PyErr_SetString(PyExc_IndexError, "ekf_project: an index beyond the state");
+            if (h != Py_None) {
+                if (!PyTuple_Check(h) || PyTuple_Size(h) != 3) {
+                    PyErr_SetString(PyExc_TypeError, "ekf_run: a row's model must be (kind, idx, par)");
                     goto row_done;
                 }
-            double s0 = project_core(DATA(Pv), n, ix, DATA(cv), m, ph);
-            double pr = PyFloat_AsDouble(pred);
-            if (pr == -1.0 && PyErr_Occurred())
-                goto row_done;
+                long kind = PyLong_AsLong(PyTuple_GetItem(h, 0));
+                if ((kind == -1 && PyErr_Occurred()) || view_get(PyTuple_GetItem(h, 1), &iv, 0, 'i', 1, "idx") < 0 ||
+                    view_get(PyTuple_GetItem(h, 2), &cv, 0, 'd', 1, "par") < 0)
+                    goto row_done;
+                m = iv.b.shape[0];
+                ix = (const int64_t *)iv.b.buf;
+                if (Pv.b.shape[0] != n || Pv.b.shape[1] != n || n < NCORE) {
+                    PyErr_SetString(PyExc_ValueError, "ekf_project: shapes");
+                    goto row_done;
+                }
+                for (Py_ssize_t j = 0; j < m; j++)
+                    if (ix[j] < 0 || ix[j] >= n) {
+                        PyErr_SetString(PyExc_IndexError, "ekf_project: an index beyond the state");
+                        goto row_done;
+                    }
+                if (eh_eval(kind, DATA(xv), ix, m, DATA(cv), cv.b.shape[0], &pr, cfb) < 0)
+                    goto row_done;
+                cfp = cfb;
+            } else {
+                Py_DECREF(h);
+                if ((h = PyObject_GetAttr(r, AN[A_h])) == NULL || (hr = PyObject_CallFunctionObjArgs(h, x, NULL)) == NULL ||
+                    unpack3(hr, &pred, &idx, &coef) < 0)
+                    goto row_done;
+                if (view_conv(idx, &iv, 'i', 1, "idx", &ic) < 0 || view_conv(coef, &cv, 'd', 1, "coef", &cc) < 0)
+                    goto row_done;
+                m = iv.b.shape[0];
+                ix = (const int64_t *)iv.b.buf;
+                if (Pv.b.shape[0] != n || Pv.b.shape[1] != n || cv.b.shape[0] != m || m < 1) {
+                    PyErr_SetString(PyExc_ValueError, "ekf_project: shapes");
+                    goto row_done;
+                }
+                for (Py_ssize_t j = 0; j < m; j++)
+                    if (ix[j] < 0 || ix[j] >= n) {
+                        PyErr_SetString(PyExc_IndexError, "ekf_project: an index beyond the state");
+                        goto row_done;
+                    }
+                cfp = DATA(cv);
+                pr = PyFloat_AsDouble(pred);
+                if (pr == -1.0 && PyErr_Occurred())
+                    goto row_done;
+            }
+            double s0 = project_core(DATA(Pv), n, ix, cfp, m, ph);
             double z = attr_double(r, A_z, &err);
             double var = attr_double(r, A_var, &err);
             if (err)
@@ -11346,6 +11382,7 @@ static PyMethodDef methods[] = {
     {"radar_check", n_radar_check, METH_VARARGS, "Tracker._check for one expectation"},
     {"radar_register", n_radar_register, METH_VARARGS, "Tracker._register for one sensor: the shared offset, taken out"},
     PREDICT_METHODS
+    EGOMOTION_METHODS
     {"decide_eval", n_decide_eval, METH_VARARGS, "the decision layer's threat measures per object, mode and ego mode (decide.c)"},
     {"decide_inst_prob", n_decide_inst_prob, METH_VARARGS, "the exact probability that two footprints overlap at one time (decide.c)"},
     {"decide_draws", n_decide_draws, METH_O, "the decision layer's fixed standard-normal draws (decide.c)"},
@@ -11383,6 +11420,8 @@ PyMODINIT_FUNC PyInit__chris_native(void)
     Py_INCREF(SelfWinType);
     Py_INCREF(StreamType);
     if (PyModule_AddObject(m, "SelfWindow", SelfWinType) < 0 || PyModule_AddObject(m, "StreamState", StreamType) < 0)
+        goto fail;
+    if (egomotion_types(m) < 0)
         goto fail;
     if ((HypType = PyType_FromSpec(&hyp_spec)) == NULL)
         goto fail;
