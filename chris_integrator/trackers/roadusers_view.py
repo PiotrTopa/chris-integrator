@@ -397,26 +397,32 @@ class RadarDisplay:
                 sx = float((self.seen[oid]["o"].get("std") or [0.0])[0])
                 if abs(place[oid][0] - place[first][0]) <= max(3.0, 2.0 * sx):
                     lead_ids.add(oid)
+        alert_states, max_x, max_y, fade_s = c["alert_states"], c["max_range_m"], c["max_lateral_m"], c["fade_s"]
         for oid, (x, y, gone) in place.items():
             s = self.seen[oid]
             o = s["o"]
             fl = o.get("flags") or ()
             is_lead = oid in lead_ids
-            th, ob, ttc = flags_of(o, dec, by_id)
-            if dec is None and gone is None and o.get("state") in c["alert_states"] and (th or ob):
+            # the flags (a pure function of o and the frame's decide) only where an alert or a drawn object uses them
+            fla = None
+            if dec is None and gone is None and o.get("state") in alert_states:
+                fla = th, ob, ttc = flags_of(o, dec, by_id)
+            if fla is not None and (th or ob):
                 level = "threat" if th else "obstacle"
                 if alert is None or (level == "threat") > (alert["level"] == "threat") or \
                         (level == alert["level"] and x < alert["x"]):
                     alert = {"level": level, "id": "ru:%d" % oid, "x": round(x, 2), "y": round(y, 2),
                              "ttc_s": ttc, "lead": is_lead}
             if dec_al is not None and dec_al.get("object") == oid and gone is None:
+                if fla is None:
+                    fla = th, ob, ttc = flags_of(o, dec, by_id)
                 st = dec_al["stage"]
                 rs = dec_al.get("reason") or {}
                 alert = {"level": "threat" if st >= 3 else "obstacle", "id": "ru:%d" % oid, "x": round(x, 2),
                          "y": round(y, 2), "ttc_s": ttc, "lead": is_lead, "stage": st, "stage_name": dec_al.get("stage_name"),
                          "mode": dec_al.get("mode"), "source": "decide", "tn": rs.get("tn"), "p_coll": rs.get("p_coll"),
                          "tm_s": rs.get("tm_s")}
-            if is_lead or not (0.5 < x <= c["max_range_m"] and abs(y) <= c["max_lateral_m"]):
+            if is_lead or not (0.5 < x <= max_x and abs(y) <= max_y):
                 s.pop("d0", None)                        # not drawn now: it fades in again when it is
                 continue
             cls = o.get("class") or None
@@ -424,10 +430,12 @@ class RadarDisplay:
             parked = "parked" in fl
             if label in ("bike", "motorbike") and o.get("motion") != "moving" and "on_path" not in fl:
                 continue
+            if fla is None:
+                th, ob, ttc = flags_of(o, dec, by_id)
             if gone is not None:
-                phase, alpha = "leave", max(0.0, 1.0 - max(gone, 0.0) / c["fade_s"])
+                phase, alpha = "leave", max(0.0, 1.0 - max(gone, 0.0) / fade_s)
             else:
-                fin = (T - s.setdefault("d0", T)) / c["fade_s"]      # from the frame it is first DRAWN in
+                fin = (T - s.setdefault("d0", T)) / fade_s      # from the frame it is first DRAWN in
                 phase = "appear" if fin < 1.0 else ("coast" if o.get("state") == "coast" else "steady")
                 alpha = min(1.0, max(0.0, fin))
             sd = o.get("std") or [0.0, 0.0, 0.0, 0.0]
@@ -508,9 +516,10 @@ class RadarDisplay:
             o = s["o"]
             fl = o.get("flags") or ()
             st = o.get("state")
-            label = self._label(o.get("class"))
-            raw = (o.get("class") or {}).get("label") if isinstance(o.get("class"), dict) else None
-            if raw in ("bike", "motorbike") and o.get("motion") != "moving" and "on_path" not in fl:
+            ocls, motion = o.get("class"), o.get("motion")
+            label = self._label(ocls)
+            raw = (ocls or {}).get("label") if isinstance(ocls, dict) else None
+            if raw in ("bike", "motorbike") and motion != "moving" and "on_path" not in fl:
                 continue                                 # a riderless two-wheeler beside the road
             # (_r1 written out for the floats here: round to 0.1, no "-0.0")
             rx, ry = round(x, 1), round(y, 1)
@@ -527,7 +536,7 @@ class RadarDisplay:
                 e["ago"] = _r1(min((o.get("seen") or {"": 0.0}).values()) + max(T - s["t"], 0.0))
             if label:
                 e["k"] = label
-            mv = _MOTION.get(o.get("motion"))
+            mv = _MOTION.get(motion)
             if mv:
                 e["mv"] = mv
             # a remembered object is never an obstacle or a threat: nothing sees it
