@@ -93,6 +93,51 @@ class RecorderTest(unittest.TestCase):
         self.assertEqual((kinds.count("road"), kinds.count("ego")), (10, 4))
         self.assertEqual(os.listdir(os.path.join(r.dir, "frames")), [])
 
+    def _feed_road(self, r, stamps, dt_clock, envelope):
+        from chris_integrator.mixer.bus import Envelope
+        for k, ts in enumerate(stamps):
+            self.clock.t += dt_clock
+            m = dict(road(k + 1), ts_mono_ns=ts)
+            if envelope:
+                r.on_envelope(Envelope("road", m, self.clock.t, "roadsense", k))
+            else:
+                r.on_message("road", json.dumps(m))
+        return [m["seq"] for m in self.lines(r) if m["type"] == "road"]
+
+    def test_default_caps_road_on_the_clock_only(self):
+        """No `stamp_hz`: every road message whose arrival keeps the clock cap is written, whatever its stamp
+        (stamps 10 ms apart, arrivals 50 ms apart: all 40), and one that arrives too soon is not."""
+        for envelope in (False, True):
+            stamps = [10 ** 12 + k * 10_000_000 for k in range(40)]
+            d = os.path.join(self.tmp.name, "d%d" % envelope)
+            self.assertEqual(self._feed_road(self.rec(frame_every_s=0, dir=d + "a"), stamps, 0.05, envelope),
+                             list(range(1, 41)))
+            self.assertEqual(self._feed_road(self.rec(frame_every_s=0, dir=d + "b"),
+                                             stamps[:10], 0.03, envelope), [1, 3, 5, 7, 9])
+
+    def test_stamp_hz_thins_road_by_its_own_stamps(self):
+        """`stamp_hz: {"road": 10}`: a message is written when its ts_mono_ns is >= 95 ms after the last written
+        one's (or before it: a new clock), whatever the arrival times (here all at one clock time); messages
+        without a stamp fall back to the clock cap; other topics keep their clock caps."""
+        for envelope in (False, True):
+            self.clock.t = 1000.0 + (100.0 if envelope else 0.0)
+            base = 10 ** 12
+            stamps = [base + k * 50_000_000 for k in range(20)]                  # 20 Hz: every second frame
+            stamps += [base + d for d in (994_000_000, 995_000_000, 1089_000_000, 1090_000_000)]     # 94 ms: no
+            stamps += [base, base + 20_000_000, base + 96_000_000]                # back in time: a new clock
+            got = self._feed_road(self.rec(frame_every_s=0, stamp_hz={"road": 10},
+                                           dir=os.path.join(self.tmp.name, "s%d" % envelope)), stamps, 0.0, envelope)
+            self.assertEqual(got, [1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 22, 24, 25, 27])
+        r = self.rec(frame_every_s=0, stamp_hz={"road": 10}, ego_hz=2.0, dir=os.path.join(self.tmp.name, "x"))
+        for k in range(40):
+            self.clock.t += 0.05
+            m = road(k + 1)
+            del m["ts_mono_ns"]
+            r.on_message("road", json.dumps(m))
+            r.on_message("ego", json.dumps({"type": "ego", "seq": k}))
+        kinds = [m["type"] for m in self.lines(r)]
+        self.assertEqual((kinds.count("road"), kinds.count("ego")), (40, 4))
+
     def test_old_sessions_are_pruned_and_the_current_one_kept(self):
         base = os.path.join(self.tmp.name, "rec")
         for name in ("20261101-080000", "20261102-080000"):
@@ -119,6 +164,9 @@ class RecorderTest(unittest.TestCase):
         with open(os.path.join(self.tmp.name, "recorder.json"), "w") as f:
             json.dump({"dir": "/x", "max_mb": 10, "nonsense": 1}, f)
         self.assertEqual(load_config(self.tmp.name), {"dir": "/x", "max_mb": 10})
+        with open(os.path.join(self.tmp.name, "recorder.json"), "w") as f:
+            json.dump({"dir": "/x", "stamp_hz": {"road": 10}}, f)
+        self.assertEqual(load_config(self.tmp.name), {"dir": "/x", "stamp_hz": {"road": 10}})
         with open(os.path.join(self.tmp.name, "recorder.json"), "w") as f:
             json.dump({"max_mb": 10}, f)
         self.assertIsNone(load_config(self.tmp.name))

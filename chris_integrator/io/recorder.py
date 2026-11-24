@@ -28,7 +28,15 @@ core per second. Old sessions are deleted, oldest first, when the directory exce
 the device. The recorder never raises into the fan-out: a full disk stops the recording, not the api.
 
 Config keys (all optional but `dir`): `max_mb` (4000), `road_hz` (20), `ego_hz` (25), `ego_state_hz` (2), `objects_hz` (10), `view_hz` (2),
-`frame_every_s` (1.0; 0 = no frames), `topics` (list; default below).
+`frame_every_s` (1.0; 0 = no frames), `topics` (list; default below), `stamp_hz` ({}; see below).
+
+The `<topic>_hz` caps are counted on the recorder's clock (the host's monotonic clock: when a message reaches the
+recorder). `stamp_hz`, a map topic -> rate (e.g. `{"road": 10}`), thins the topics it names by the messages' own
+`ts_mono_ns` instead: a message is written when its stamp is at least 1/rate - 5 ms after the stamp of the last one
+written (or earlier than it: a new clock); so the choice does not depend on when a message arrived, and a replay
+of the same messages writes the same lines. A message of such a topic without an integer `ts_mono_ns` falls back
+to the clock cap. Not set (the default): every topic by its clock cap, as before. `{"road": 10}` halves the
+recorded `road` lines of a 20 Hz camera (every second frame) and with them most of the recorder's per-frame cost.
 """
 import gzip
 import json
@@ -46,7 +54,7 @@ log = logging.getLogger("chris_integrator.recorder")
 DEFAULT_TOPICS = ("road", "lights", "signs", "env", "speed_limit", "rules", "fused", "map", "ego", "calib", "camera",
                   "vehicle", "objects", "view", "gnss", "ego_state", "tracks")
 DEFAULTS = dict(dir=None, max_mb=4000, road_hz=20.0, ego_hz=25.0, objects_hz=10.0, view_hz=2.0, frame_every_s=1.0,
-                ego_state_hz=2.0, topics=list(DEFAULT_TOPICS))
+                ego_state_hz=2.0, topics=list(DEFAULT_TOPICS), stamp_hz={})
 CLOCK_STEP_S = 120.0            # the wall clock moved this much against the monotonic one: re-date the session
 
 
@@ -95,6 +103,10 @@ class Recorder:
         c = self.cfg
         self._caps = {"road": c["road_hz"], "ego": c["ego_hz"], "objects": c["objects_hz"], "view": c["view_hz"],
                       "camera": 1.0, "ego_state": c["ego_state_hz"], "tracks": c["ego_state_hz"]}
+        # topic -> least spacing of the written messages' ts_mono_ns, in ns (`stamp_hz`; the 5 ms of the clock cap)
+        self._stamp = {k: 1e9 / hz - 5e6 for k, hz in (c["stamp_hz"] or {}).items()
+                       if isinstance(hz, (int, float)) and not isinstance(hz, bool) and hz > 0}
+        self._last_ts = {}          # topic -> ts_mono_ns of the last written message (stamp_hz)
         self.dir = None
         self.fh = None
         self.failed = False
@@ -172,7 +184,10 @@ class Recorder:
         if self.failed or mtype not in self.topics:
             return
         now = self.clock()
-        if not self._due(mtype, now):
+        if self._stamp and mtype in self._stamp and env.ts is not None:
+            if not self._due_ts(mtype, env.ts, now):
+                return
+        elif not self._due(mtype, now):
             return
         if mtype == "road" and isinstance(env.msg, dict):
             self._write(mtype, slim_road_line(env.msg), now)
@@ -184,10 +199,19 @@ class Recorder:
         if self.failed or mtype not in self.topics:
             return
         now = self.clock()
-        if not self._due(mtype, now):
+        msg = None
+        if self._stamp and mtype in self._stamp:
+            msg = json.loads(line)
+            ts = msg.get("ts_mono_ns") if isinstance(msg, dict) else None
+            if isinstance(ts, int):
+                if not self._due_ts(mtype, ts, now):
+                    return
+            elif not self._due(mtype, now):
+                return
+        elif not self._due(mtype, now):
             return
         if mtype == "road":
-            line = slim_road_line(json.loads(line))
+            line = slim_road_line(json.loads(line) if msg is None else msg)
         self._write(mtype, line, now)
 
     def _due(self, mtype, now):
@@ -195,6 +219,15 @@ class Recorder:
         cap = self._caps.get(mtype)
         if cap and now - self._last.get(mtype, -1e9) < 1.0 / cap - 0.005:
             return False
+        self._last[mtype] = now
+        return True
+
+    def _due_ts(self, mtype, ts, now):
+        """The `stamp_hz` cap of a topic: False when the last written message's stamp is too close before `ts`."""
+        last = self._last_ts.get(mtype)
+        if last is not None and last <= ts and ts - last < self._stamp[mtype]:
+            return False
+        self._last_ts[mtype] = ts
         self._last[mtype] = now
         return True
 
