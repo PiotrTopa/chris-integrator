@@ -159,13 +159,13 @@ def _position(I, T, sm, speed):
     # fix. Freshness is about arrival (before L43 a receiver with a 2 s delay and one fix a second sat on the edge
     # of the window, and the mode flipped between `fused` and `coast` every second).
     fresh = c["position_fresh_s"] + getattr(I, "abs_delay", 0.0)
-    age, srcs = I.ekf.near(T, fresh, ("pos",), 1e9)
+    # (the position's and the heading's sources: one walk of the window for both queries)
+    (age, srcs), (_, hsrc) = I.ekf.near_many(T, fresh, (("pos",), ("pos", "heading")), 1e9)
     cee, cen, cnn = float(P[E.PE, E.PE]), float(P[E.PE, E.PN]), float(P[E.PN, E.PN])
     tr, det = cee + cnn, cee * cnn - cen * cen
     hacc = math.sqrt(max(0.5 * tr + math.sqrt(max(0.25 * tr * tr - det, 0.0)), 0.0))     # 1-sigma semi-major
     lat, lon = E.to_geo(I.origin, float(x[E.PE]), float(x[E.PN]))
     hstd = math.degrees(math.sqrt(max(float(P[E.PSI, E.PSI]), 0.0)))
-    hsrc = I.ekf.near(T, fresh, ("pos", "heading"), 1e9)[1]
     head = {"value": round(E.psi_to_course(float(x[E.PSI])), 2), "std": round(hstd, 2), "valid": hstd <= 45.0,
             "reason": None if hstd <= 45.0 else "heading_uncertain", "mode": "fused" if hsrc else "coast",
             "age_s": None if age is None else round(age, 3), "sources": hsrc, "unit": "deg clockwise from north"}
