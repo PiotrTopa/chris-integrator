@@ -10608,13 +10608,31 @@ static void r_rts(int model, double *x, double *P, const double *xs, const doubl
     Pp[RN] += e[1];
     Pp[RN + 1] += e[2];
     r_trans(model, dt, par, F);
-    for (int i = 0; i < RN; i++)                         /* C = P F^T */
+    if (all_finite(P, RNN)) {
+        /* C = P F^T over the entries of F that are not zero (at most three per row): with a finite P the terms left
+         * out are zeros, and a sum that starts at +0 is the same float with or without them */
+        int nz[RN][RN], nn[RN];
         for (int j = 0; j < RN; j++) {
-            double acc = 0.0;
+            nn[j] = 0;
             for (int k = 0; k < RN; k++)
-                acc += P[i * RN + k] * F[j * RN + k];
-            C[i * RN + j] = acc;
+                if (F[j * RN + k] != 0.0)
+                    nz[j][nn[j]++] = k;
         }
+        for (int i = 0; i < RN; i++)
+            for (int j = 0; j < RN; j++) {
+                double acc = 0.0;
+                for (int q = 0; q < nn[j]; q++)
+                    acc += P[i * RN + nz[j][q]] * F[j * RN + nz[j][q]];
+                C[i * RN + j] = acc;
+            }
+    } else
+        for (int i = 0; i < RN; i++)                     /* C = P F^T */
+            for (int j = 0; j < RN; j++) {
+                double acc = 0.0;
+                for (int k = 0; k < RN; k++)
+                    acc += P[i * RN + k] * F[j * RN + k];
+                C[i * RN + j] = acc;
+            }
     if (r_chol8(Pp, L) < 0)
         return;                                          /* (a prediction that is not positive: the node stays filtered) */
     for (int i = 0; i < RN; i++) {                       /* G = C Pp^-1: each row solved against L L^T */
@@ -10782,6 +10800,8 @@ static int smooth_core(Hyp *H, const double *A, HTrack *t, const RPar *par, int 
                 have_lag = t0 - tp >= lag_s;
             }
             c = p;
+            if (hist == NULL && have_lag)
+                break;                                   /* the lag is all that was asked for: nothing further back changes it */
         }
         memcpy(lag_out, lag, sizeof(lag));
         memcpy(fl_out, fl, sizeof(fl));
