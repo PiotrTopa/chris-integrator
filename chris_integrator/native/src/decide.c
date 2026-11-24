@@ -93,6 +93,27 @@ static double dk_sep(const DkRect *a, const DkRect *b)
     return best;
 }
 
+/* dk_sep(a, b) >= 0 (the rectangles do not overlap), without the largest gap: the same gaps along the same axes,
+ * done at the first that is not negative (no gap a number: 0, as dk_sep's -1e300 says) */
+static int dk_apart(const DkRect *a, const DkRect *b)
+{
+    double dx = b->cx - a->cx, dy = b->cy - a->cy;
+    const DkRect *r[2] = {a, b};
+    for (int q = 0; q < 2; q++) {
+        double ax[2][2] = {{r[q]->c, r[q]->s}, {-r[q]->s, r[q]->c}};
+        for (int k = 0; k < 2; k++) {
+            double ux = ax[k][0], uy = ax[k][1];
+            double d = fabs(dx * ux + dy * uy);
+            double pa = a->hl * fabs(a->c * ux + a->s * uy) + a->hw * fabs(-a->s * ux + a->c * uy);
+            double pb = b->hl * fabs(b->c * ux + b->s * uy) + b->hw * fabs(-b->s * ux + b->c * uy);
+            double g = d - (pa + pb);
+            if (g >= 0.0)
+                return 1;
+        }
+    }
+    return 0;
+}
+
 /* ---- the standard normal quantile (Acklam, one Halley step on erfc) and the fixed draws -------------------- */
 static double dk_qnorm(double p)
 {
@@ -137,6 +158,7 @@ static double dk_halton(long i, int base)
 
 static double DK_Z[DK_MAXS][5];
 static double DK_RZ[DK_MAXS];        /* the largest |(z0, z1)| of the draws up to this one */
+static double DK_ZM[DK_MAXS][2];     /* ... and the largest z2 and z3 */
 static int dk_z_n = 0;
 
 /* The draws' places (z0, z1) ordered along DK_ND directions (dk_pc: which draws lie beyond a line is read off the
@@ -200,6 +222,8 @@ static void dk_draws(int n)
             DK_Z[i][k] = dk_qnorm(dk_halton(i + 1, base[k]));
         double rz = sqrt(DK_Z[i][0] * DK_Z[i][0] + DK_Z[i][1] * DK_Z[i][1]);
         DK_RZ[i] = i > 0 && DK_RZ[i - 1] > rz ? DK_RZ[i - 1] : rz;
+        for (int k = 0; k < 2; k++)
+            DK_ZM[i][k] = i > 0 && DK_ZM[i - 1][k] > DK_Z[i][2 + k] ? DK_ZM[i - 1][k] : DK_Z[i][2 + k];
     }
     dk_z_n = n;
 }
@@ -535,16 +559,16 @@ static double dk_pair_prep(DkCtx *C, int j, int k)
     DkRect er = e->er[0], r;
     double f = 1.0;
     dk_obj_rect(C->cfg, &C->ob[k], 0, 0.0, 0.0, 0.0, 1.0, &r);
-    if (dk_sep(&er, &r) < 0.0) {
+    if (!dk_apart(&er, &r)) {
         dk_obj_rect(C->cfg, &C->ob[k], 0, 0.0, 0.0, 0.0, 0.0, &r);
-        if (dk_sep(&er, &r) < 0.0)
+        if (!dk_apart(&er, &r))
             f = 0.0;
         else {                                  /* the largest share that keeps it clear now */
             double lo = 0.0, hi = 1.0;
             for (int q = 0; q < 12; q++) {
                 double m = 0.5 * (lo + hi);
                 dk_obj_rect(C->cfg, &C->ob[k], 0, 0.0, 0.0, 0.0, m, &r);
-                if (dk_sep(&er, &r) < 0.0)
+                if (!dk_apart(&er, &r))
                     hi = m;
                 else
                     lo = m;
@@ -634,7 +658,7 @@ static int dk_clear(const DkCtx *C, int j, int k, double ts, double a_long, doub
         const DkRect *tg = &C->tgt[i];
         double ddx = tg->cx - er.cx, ddy = tg->cy - er.cy, RR = Re + tg->hl + tg->hw;
         int near = ddx * ddx + ddy * ddy <= RR * RR;
-        if (near && dk_sep(&er, tg) < 0.0) {
+        if (near && !dk_apart(&er, tg)) {
             if (t_hit)
                 *t_hit = tau;
             return 0;
@@ -649,7 +673,7 @@ static int dk_clear(const DkCtx *C, int j, int k, double ts, double a_long, doub
                 double dx = r2.cx - er.cx, dy = r2.cy - er.cy, R = er.hl + er.hw + r2.hl + r2.hw;
                 if (dx * dx + dy * dy > R * R)
                     continue;
-                if (dk_sep(&er, &r2) < 0.0) {
+                if (!dk_apart(&er, &r2)) {
                     if (t_hit)
                         *t_hit = tau;
                     return 0;
@@ -742,9 +766,10 @@ static double dk_pc(const DkCtx *C, int j, int k, double *t_contact)
         DD[i] = sqrt(dx * dx + dy * dy);
         double gap = DD[i] - (Ro0 + Re);
         live[i] = !(gap > cfg[DC_PRUNE] * sqrt(lmax > 0.0 ? lmax : 0.0));
-        if (live[i])
-            any = 1;
-        double l11 = sqrt(sxx > 1e-12 ? sxx : 1e-12);
+        if (!live[i])
+            continue;
+        any = 1;
+        double l11 = sqrt(sxx > 1e-12 ? sxx : 1e-12);    /* (the draws' factor: read at a live step only) */
         double l21 = sxy / l11, r = syy - l21 * l21;
         L11[i] = l11;
         L21[i] = l21;
@@ -786,21 +811,19 @@ static double dk_pc(const DkCtx *C, int j, int k, double *t_contact)
     dk_order(ns);
     /* the draws' footprints (extent and, where a draw comes near, the turn of its heading) */
     static double QHL[DK_MAXS], QHW[DK_MAXS], QR[DK_MAXS], QCD[DK_MAXS], QSD[DK_MAXS];
-    static unsigned char qhit[DK_MAXS], qturned[DK_MAXS];
-    double rmax = 0.0;
-    for (int q = 0; q < ns; q++) {
-        const double *z = DK_Z[q];
-        double hl = o->hl + 0.5 * o->sdl * z[2], hw = o->hw + 0.5 * o->sdw * z[3];
+    static unsigned char qst[DK_MAXS];           /* per draw: 1 its extent is made, 2 its turn is made, 4 it has touched */
+    memset(qst, 0, (size_t)ns);
+    /* no draw's bounding circle is larger than that of the largest extents drawn (the draws' largest z2 and z3) */
+    double rmax;
+    {
+        double hl = o->hl + 0.5 * o->sdl * DK_ZM[ns - 1][0], hw = o->hw + 0.5 * o->sdw * DK_ZM[ns - 1][1];
         if (hl < 0.05)
             hl = 0.05;
         if (hw < 0.05)
             hw = 0.05;
-        QHL[q] = hl;
-        QHW[q] = hw;
-        QR[q] = sqrt(hl * hl + hw * hw) + Re;
-        if (!(QR[q] <= rmax))
-            rmax = QR[q] > rmax ? QR[q] : INFINITY;      /* (not a number: no step is left out) */
-        qhit[q] = qturned[q] = 0;
+        rmax = (sqrt(hl * hl + hw * hw) + Re) * (1.0 + 1e-9);
+        if (!(rmax < INFINITY))
+            rmax = INFINITY;                     /* (not a number: no step is left out) */
     }
     /* Which (draw, step) can touch at all, decided before the draw is placed. The draw moves the object's centre
      * by e = L z; with u the unit vector from the object's mean centre to the car's (their distance D), the moved
@@ -850,9 +873,20 @@ static double dk_pc(const DkCtx *C, int j, int k, double *t_contact)
                     break;                       /* the rest lie further back along the direction */
                 q = cand[r];
             }
-            if (qhit[q])
+            if (qst[q] & 4)
                 continue;
             const double *z = DK_Z[q];
+            if (!(qst[q] & 1)) {
+                double hl = o->hl + 0.5 * o->sdl * z[2], hw = o->hw + 0.5 * o->sdw * z[3];
+                if (hl < 0.05)
+                    hl = 0.05;
+                if (hw < 0.05)
+                    hw = 0.05;
+                QHL[q] = hl;
+                QHW[q] = hw;
+                QR[q] = sqrt(hl * hl + hw * hw) + Re;
+                qst[q] |= 1;
+            }
             const double z0 = z[0], z1 = z[1], R = QR[q];
             if (pa * z0 + pb * z1 + R * (1.0 + 1e-9) < pt)
                 continue;
@@ -863,20 +897,20 @@ static double dk_pc(const DkCtx *C, int j, int k, double *t_contact)
             double dx = orr.cx - ER[i].cx, dy = orr.cy - ER[i].cy;
             if (dx * dx + dy * dy > R * R)
                 continue;
-            if (!qturned[q]) {
+            if (!(qst[q] & 2)) {
                 double dh = o->sdh * z[4];
                 QCD[q] = cos(dh);
                 QSD[q] = sin(dh);
-                qturned[q] = 1;
+                qst[q] |= 2;
             }
             const double cd = QCD[q], sd = QSD[q];
             orr.c = o->c[i] * cd - o->s[i] * sd;
             orr.s = o->s[i] * cd + o->c[i] * sd;
             orr.hl = QHL[q];
             orr.hw = QHW[q];
-            if (dk_sep(&ER[i], &orr) < 0.0) {
+            if (!dk_apart(&ER[i], &orr)) {
                 th_hit[hits++] = i * dt;
-                qhit[q] = 1;
+                qst[q] |= 4;
             }
         }
     }
@@ -907,14 +941,18 @@ static double dk_first_contact(const DkCtx *C, int j, int k, int infl, double *s
             orr = C->tgt[i];
         else
             dk_obj_rect(C->cfg, &C->ob[k], i, 0.0, 0.0, 0.0, 0.0, &orr);
+        if (!sep_min) {                          /* the first contact alone */
+            if (!dk_apart(&e->er[i], &orr)) {
+                tc = i * C->g.dt;
+                break;
+            }
+            continue;
+        }
         double sp = dk_sep(&e->er[i], &orr);
         if (sp < best)
             best = sp;
-        if (sp < 0.0 && isnan(tc)) {
+        if (sp < 0.0 && isnan(tc))
             tc = i * C->g.dt;
-            if (!sep_min)
-                break;
-        }
     }
     if (sep_min)
         *sep_min = best > 0.0 ? best : 0.0;
