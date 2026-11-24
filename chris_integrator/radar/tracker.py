@@ -138,6 +138,10 @@ CFG = dict(
     # box with a hidden side is moved to the object's by what the object's silhouette has beyond the box; a covered
     # box teaches no width
     in_flags=False,
+    # flags_far_bearing: a box whose bottom is under a nearer box (a direction only) may be taken by an object beyond
+    # the view's first ground point. False: such a box is left to the near objects (measured: taken, it costs a
+    # fifth more id switches in rows for 3 % more tracked time; docs/RADAR.md, section 8)
+    flags_far_bearing=False,
     # the scan's own boxes hide what stands behind them (the miss probability): a box counts as nearer where its
     # bottom lies lower than the object's by more than box_occl_margin of what is not known of the difference
     in_box_occl=False, box_occl_margin=1.5,
@@ -533,7 +537,8 @@ class Tracker:
         if st is None:
             dark = c["app_dark"]
             st = self._xstatic = (
-                (1.0 if c["in_flags"] else 0.0, 1.0 if c["in_box_occl"] else 0.0, c["box_occl_margin"],
+                ((2.0 if c["flags_far_bearing"] else 1.0) if c["in_flags"] else 0.0, 1.0 if c["in_box_occl"] else 0.0,
+                 c["box_occl_margin"],
                  1.0 if c["in_low"] else 0.0, c["low_p"], c["low_p_run"], c["low_run_s"]),
                 (-1.0 if dark is None else float(dark), c["app_bound"][0], c["app_bound"][1], c["app_gain"], c["app_y_day"],
                  c["app_y_night"]),

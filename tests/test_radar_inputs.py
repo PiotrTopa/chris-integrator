@@ -135,6 +135,16 @@ class Flags(unittest.TestCase):
         # without the knob the flags are not read
         self.assertEqual(dets_of({}, box(30.0, 2.0, 1.8, 1.5, occ=0.3, occ_edges="b"))[0]["kind"], "rbh")
 
+    def test_a_far_box_with_its_bottom_under_another_is_a_direction_only_and_taken_only_when_asked(self):
+        def things(s, k):
+            return [box(40.0, 2.0, 1.8, 1.5)] if s < 2.0 else [box(40.0, 2.0, 1.8, 1.5, occ=0.3, occ_edges="b")]
+        hits = {}
+        for name, cfg in (("left", {"in_flags": True}), ("taken", {"in_flags": True, "flags_far_bearing": True})):
+            _, out = run(cfg, things, T_s=4.0, v=0.0)
+            hits[name] = (out[38][1]["objects"][0]["hits"], out[-1][1]["objects"][0]["hits"])
+        self.assertEqual(hits["left"][0], hits["left"][1])
+        self.assertGreater(hits["taken"][1], hits["taken"][0] + 5)
+
     def test_a_box_with_a_hidden_side_is_read_as_the_visible_part_of_the_object(self):
         """A car 20 m ahead whose right half is under a nearer box: the box is the left half. Read as the object's
         centre it pulls the object left by a quarter of its width; with the flags the object stays where it is."""

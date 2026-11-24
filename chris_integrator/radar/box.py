@@ -273,7 +273,8 @@ class Radar:
                 ls, lv = math.log(sp / f), (sd / sp) ** 2
         src = _SCALE_SRC.get(o.get("scale_src"), 0.0) if tc["in_scale"] or tc["in_lamp_size"] else 0.0
         top = bot = math.nan
-        cut = 0.0
+        tr = o.get("trunc")                              # (the bottom cut by the view or the frame, not by a box)
+        cut = 1.0 if "b" in (o.get("clip") or "") or (isinstance(tr, str) and "b" in tr) else 0.0
         if tc["in_box_occl"] and box and self.cam is not None:
             # the box in the picture as angles below the horizon (what it hides of the things behind it); its
             # bottom cut by the view or the frame is lower than it shows
@@ -282,8 +283,6 @@ class Radar:
             top = math.atan2(ry[2], math.hypot(ry[0], ry[1]))
             ry = ray(u, box[3])
             bot = math.atan2(ry[2], math.hypot(ry[0], ry[1]))
-            tr = o.get("trunc")
-            cut = 1.0 if "b" in (o.get("clip") or "") or (isinstance(tr, str) and "b" in tr) else 0.0
         d["x"] = (float(hid), occ, 1.0 if low else 0.0, lc, ls, lv, src, top, bot, cut)
         e = o.get("emb")
         if ek[0] and isinstance(e, str) and len(e) == 2 * ek[1]:

@@ -8234,12 +8234,19 @@ static void ras_row(const RAs *q, const double *row, double pd, double pdlo, dou
         const double *d0 = dt + J[0] * RDET;
         int kind = (int)d0[D_KIND];
         double sdt = d0[D_SDT];
-        if (sen->type == SEN_CAMERA && sen->cover && ((kind & 7) == K_B || (kind & 7) == K_BT) &&
-            !(py_hypot(cx, cy) <= sen->near * sen->gmin))
-            continue;                                    /* CameraBoxes.takes */
+        /* a box cut at the bottom of the view is of a thing nearer than the view's first ground point
+         * (CameraBoxes.takes). A box whose bottom is under a nearer box (the detector's flags) is not: it may be of
+         * a thing at any range, and says of it a direction only. XC_FLAGS 2: a far leaf may take such a box; 1: it
+         * may not (a direction alone does not tell the cars of a row apart: measured, it costs identities) */
+        int cutfar = sen->type == SEN_CAMERA && sen->cover && ((kind & 7) == K_B || (kind & 7) == K_BT) &&
+                     !(py_hypot(cx, cy) <= sen->near * sen->gmin);
+        if (cutfar && q->xc == NULL)
+            continue;
         int anyok = 0;
         for (Py_ssize_t a = 0; a < nJ; a++) {
             ok[a] = dt[J[a] * RDET + D_VEH] * ov >= 0.0;    /* a pedestrian's box does not continue a vehicle */
+            if (cutfar && (((int)dt[J[a] * RDET + D_HID] & 24) != 8 || q->xc->c[XC_FLAGS] < 2.0))
+                ok[a] = 0;
             anyok |= ok[a];
         }
         if (!anyok)
@@ -8465,6 +8472,10 @@ static int r_update_full(double *row, const RSens *sen, const double *pose, cons
     }
     double tot = (mu[0] * like[0] + mu[1] * like[1]) + mu[2] * like[2];
     double w[3] = {mu[0] * like[0], mu[1] * like[1], mu[2] * like[2]};
+    /* (a box of the low-score list does not say how the object moves: its edges are too sloppy to weigh "it
+     * stands" against "it drives"; the hypotheses keep their probabilities) */
+    if (d[D_LOW] != 0.0)
+        tot = 0.0;
     if (tot > 0.0 && (sen->type == SEN_MICROWAVE || hits >= hold || (kind & K_SCALE))) {
         double nm[3], s2 = 0.0, post[3];
         for (int j = 0; j < 3; j++) {

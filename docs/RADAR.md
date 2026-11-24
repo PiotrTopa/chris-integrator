@@ -494,7 +494,15 @@ The hidden edges of a box are `E = clip + trunc + occ_edges` (cut by the view, b
   bottom edge is known (`box_occl_margin`). In the story "the leaf took box j" box j is the leaf's own and hides
   nothing of it; in the story "not reported" every box hides. So an object behind a van that was boxed a moment ago
   for the first time is not held to its missing box.
-* Not built: the detector's `occ_by` (an index into the message) is not carried into the message's `occ_by`.
+* **A far box with its bottom under another box** is a direction only (kind `b` / `bt`). Until now such kinds came
+  from boxes cut by the view's bottom, which only an object nearer than the view's first ground point can have
+  given; a box whose bottom a nearer box hides can be of an object at any range. `flags_far_bearing` lets a far
+  object take it; the default leaves it to the near ones, because measured on the simulator a direction alone does
+  not tell the cars of a row apart: taken, id switches were 264 against 207 (132 runs) for 3 % more tracked time.
+  What would use such a box properly is its one-sided range (the true bottom lies below the visible one: the object
+  is no farther than the visible bottom says): not built.
+* Not built: the detector's `occ_by` (an index into the message) is not carried into the message's `occ_by`; `sym`
+  is not read.
 
 ### The low-score list (`in_low`)
 `objects_low`: the boxes between the detector's floor and the class threshold. They enter the same scan as a second
@@ -509,7 +517,8 @@ kind of detection (no second pass: the hypotheses weigh all stories at once). Fo
 low box lay on the object in 68-100 % of such passes). `lam_low`: `low_false_per_scan` low boxes on nothing per scan
 at least, followed upwards from the scans themselves. A low box starts nothing (no birth, not in the map of
 unexplained boxes), confirms nothing (no sighting counted, existence gains the least a detection gains and no
-score), does not teach the extent, the camera's size limit or the scan's common pitch; its edges are sloppier
+score), does not weigh "it stands" against "it drives" (the motion hypotheses keep their probabilities: its edges
+are too sloppy for that), does not teach the extent, the camera's size limit or the scan's common pitch; its edges are sloppier
 (`low_px`, `low_rel`), its class votes with `low_weight`. An object whose last `low_coast` sightings are all low is
 put out as `coast`. A scan in which a visible object is in neither list tells against it more than a plain miss did.
 
