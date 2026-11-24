@@ -12,7 +12,8 @@ Stages: 0 none, 1 information, 2 caution, 3 warning, 4 imminent. Per alert (`ALE
   to the primary's exit level once that has held below the stage for `exit_hold_s[stage]` and the stage has been
   shown for `min_hold_s[stage]`; `imminent` latches until the exit level is at most information (held) or the
   car stands;
-* suppression (the stage is kept, nothing is said, the reason is given): the driver already brakes at least
+* suppression (the stage is kept, nothing is said, the reason is given; `object_gone`: a stage never said whose
+  object has left, cfg `unsaid_needs_object`): the driver already brakes at least
   `brake_share` of what is required (and at least `brake_min_mps2`); the driver steers away (lateral acceleration
   `steer_min_mps2` towards a side whose required demand it already covers); speed below the kind's
   `min_speed_mps`; the sensors degraded (the radar's newest sensor sample older than `sensor_max_age_s`, or the
@@ -60,6 +61,12 @@ ALERT_DEFAULTS = dict(
     latch_imminent=True,
     switch_hold_s=0.3,
     exist_min=0.6, seen_max_s=2.5,
+    # An alert that has not been said since it left none (below show_from, or suppressed: the driver braked, steered
+    # away, the car crawled) and whose object is no longer a candidate is not said then: suppressed "object_gone"
+    # for the rest of its holds. (With no record the suppression rules have nothing to judge: on a bend the driver's
+    # steering suppressed a stage, the object left, and the held stage was then said without an object: 2-7 of
+    # the said episodes of a set of the simulator's streets.) False: as before
+    unsaid_needs_object=False,
     # an object whose velocity is not observed yet (the radar's verdict unknown, its velocity's 1 sigma above
     # this, whichever futures are judged): its "it stands" is near the radar's prior, not evidence; it raises at
     # most `immature_max_stage` until p_stationary has moved to `immature_stand_p` (a lead appearing far ahead
@@ -127,6 +134,7 @@ class Alert:
         self.challenger = None          # (id, since)
         self.latched = False
         self.suppressed = None
+        self.shown = False              # a stage from show_from on has been said (not suppressed) since the alert last was at none
         self.said = (0, None, None)     # (stage, object, suppressed) last logged
 
     # ---- candidates ------------------------------------------------------------------------------------------
@@ -288,6 +296,12 @@ class Alert:
         sup = None
         if self.stage > 0:
             sup = self._suppress(rec, ctx)
+            if sup is None and rec is None and not self.shown and c["unsaid_needs_object"] and c["source"] == "threat":
+                sup = "object_gone"
+            if sup is None and self.stage >= c["show_from"]:
+                self.shown = True
+        else:
+            self.shown = False
         self.suppressed = sup
         out = {"id": self.name, "mode": c["mode"], "stage": self.stage, "stage_name": STAGES[self.stage],
                "active": c["mode"] == "on" and self.stage >= c["show_from"] and sup is None,

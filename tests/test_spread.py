@@ -369,6 +369,41 @@ def test_a_place_in_doubt_enters_by_time_once_the_time_margin_is_gone():
     assert entered(cfg, None) == t                              # no time margin (no contact on the mean futures): the rule
 
 
+# ---- a stage never said whose object is gone ---------------------------------------------------------------------------
+def test_a_stage_suppressed_all_along_is_not_said_once_its_object_is_gone():
+    rec = {"id": 1, "kind": "vehicle", "level": 3, "level_exit": 3, "mass": [0.9] * 4, "p_coll": 0.9, "tm_s": 0.5,
+           "a_req": {"brake": 3.0, "left": 1.0, "right": 9.0}, "why": {}}
+    ob = {1: {"id": 1, "state": "confirmed", "exist": 1.0, "motion": "stationary", "p_stationary": 0.95, "flags": []}}
+
+    def run(cfg, steer_until):
+        """The object for 0.5 s, the driver steering away (2 m/s^2 to the left) until steer_until; then no object."""
+        a = AL.Alert("obstacle_ahead", cfg)
+        out = []
+        for k in range(50):
+            T = k * 0.05
+            o, _ = a.step(T, [rec] if T < 0.5 else [], ob, {"v": 13.0, "a_lat": 2.0 if T < steer_until else 0.0})
+            out.append((o["stage"], o["suppressed"], o["object"]))
+        return out
+    was = run({}, 0.7)
+    assert (3, None, None) in was                               # as it was: the held stage said without an object
+    now = run({"unsaid_needs_object": True}, 0.7)
+    assert all(s[1] is not None for s in now if s[0] > 0) and (3, "object_gone", None) in now
+    assert [s[0] for s in now] == [s[0] for s in was]           # the stages and their holds as they were
+    # a stage that WAS said keeps its holds as before, object or not
+    said = run({"unsaid_needs_object": True}, 0.3)
+    assert (3, None, 1) in said and (3, None, None) in said and not any(s[1] == "object_gone" for s in said)
+    assert said == run({}, 0.3)
+    # information shown first (below show_from: nothing said), then a warning while the driver steers away: not said
+    a = AL.Alert("obstacle_ahead", {"unsaid_needs_object": True})
+    out = []
+    for k in range(60):
+        T = k * 0.05
+        r = dict(rec, level=1 if T < 0.5 else 3, level_exit=1 if T < 0.5 else 3)
+        o, _ = a.step(T, [r] if T < 1.0 else [], ob, {"v": 13.0, "a_lat": 2.0 if 0.5 <= T < 1.2 else 0.0})
+        out.append((o["stage"], o["suppressed"]))
+    assert (1, None) in out and (3, "driver_steering_away") in out and (3, "object_gone") in out and (3, None) not in out
+
+
 if __name__ == "__main__":
     for k, v in list(globals().items()):
         if k.startswith("test_"):
