@@ -137,7 +137,9 @@ static const char *const PLANE[P_NLANE] = {"ego", "left", "right", "onc", "cross
 
 /* object row */
 enum { PO_X, PO_Y, PO_VX, PO_VY, PO_AX, PO_AY, PO_SX, PO_SY, PO_SVX, PO_SVY, PO_KIND, PO_PSTAT, PO_LEN, PO_WID, PO_HDG, PO_HDGSD,
-       PO_EXIST, PO_SEEN, PO_IND, PO_BRAKE, PO_PARKED, PO_ID, PO_VIS, PO_MOTION, PO_WITH, P_NO };
+       PO_EXIST, PO_SEEN, PO_IND, PO_BRAKE, PO_PARKED, PO_ID, PO_VIS, PO_MOTION, PO_WITH, PO_CX, PO_CY, P_NO };
+/* PO_X, PO_Y: the radar's reference point (the near face: where the futures start, what the decision layer's
+ * footprint is drawn from); PO_CX, PO_CY: the object's centre (NaN: not given), its place on the road */
 /* an object's kept state */
 enum { PS_INIT, PS_T, PS_LANE, PS_INT = PS_LANE + P_NLANE, PS_D = PS_INT + P_NM, PS_DR, PS_PDD, PS_PDR, PS_PRR, PS_V, PS_A, PS_PVV,
        PS_PVA, PS_PAA, PS_TSTAND, PS_TMOVE, PS_LMAP, PS_TKERB, PS_TOP, PS_DIR, PS_TLANE, PS_GSTAND, PS_PSL, P_NS = 48 };
@@ -719,6 +721,7 @@ typedef struct {
     const double *kin;
     int grp;                        /* 0 vehicle, 1 cyclist, 2 pedestrian */
     double s, d, sd_d, sd_s, th, kap, vt, vn, sp, psi, spsi;
+    double sref, dref;              /* the reference point (near face) less the centre, along and beside the base path */
     double len, wid, pstat, minfo, exist;
     int lane, band, dir;
     double dc, bw;                  /* its lane's centre and width (base frame) */
@@ -822,6 +825,10 @@ static int band_at(const PCtx *c, double d, int need_dir)
 static void lane_step(PCtx *c, PObj *q, double dt, double *lane_out)
 {
     const double *o = q->o, *cfg = c->cfg;
+    /* its place on the road is its centre where the radar gives it (the near face of a car beside the lane is up
+     * to half its width nearer the lane than the car); the futures start at the reference point (roll_on_base) */
+    int has_c = o[PO_CX] == o[PO_CX] && o[PO_CY] == o[PO_CY];
+    double ox = has_c ? o[PO_CX] : o[PO_X], oy = has_c ? o[PO_CY] : o[PO_Y];
     double geo[P_NLANE] = {0, 0, 0, 0, 0, 0, 0};
     double sx = o[PO_SX], sy = o[PO_SY];
     int along_x = sx >= sy;
@@ -830,7 +837,7 @@ static void lane_step(PCtx *c, PObj *q, double dt, double *lane_out)
     double dm = 0.0, d2 = 0.0, res2 = 0.0, sm = 0.0, s2 = 0.0, dk[3], sk[3];
     for (int k = 0; k < 3; k++) {
         double off = (k - 1) * 1.7320508075688772 * big;
-        double x = o[PO_X] + (along_x ? off : 0.0), y = o[PO_Y] + (along_x ? 0.0 : off);
+        double x = ox + (along_x ? off : 0.0), y = oy + (along_x ? 0.0 : off);
         double s, d, px, py, th, kap;
         pp_project(&c->base, x, y, &s, &d);
         pp_eval(&c->base, s, &px, &py, &th, &kap);
@@ -856,8 +863,15 @@ static void lane_step(PCtx *c, PObj *q, double dt, double *lane_out)
         s2 += W3[k] * p_sq(sk[k] - sm);
     }
     double px, py;
-    pp_project(&c->base, o[PO_X], o[PO_Y], &q->s, &q->d);
+    pp_project(&c->base, ox, oy, &q->s, &q->d);
     pp_eval(&c->base, q->s, &px, &py, &q->th, &q->kap);
+    q->sref = q->dref = 0.0;
+    if (has_c) {
+        double sr, dr;
+        pp_project(&c->base, o[PO_X], o[PO_Y], &sr, &dr);
+        q->sref = sr - q->s;
+        q->dref = dr - q->d;
+    }
     q->sd_d = sqrt(d2 + res2);
     q->sd_s = sqrt(s2 + p_sq(along_x ? sin(q->th) * small : cos(q->th) * small) + 0.01);
     double ct = cos(q->th), sn = sin(q->th);
@@ -886,7 +900,7 @@ static void lane_step(PCtx *c, PObj *q, double dt, double *lane_out)
     double box_s = 0.0, box_d = 0.0;
     for (int a = 0; a < c->na; a++) {
         double as, ad;
-        pp_project(&c->arm[a], o[PO_X], o[PO_Y], &as, &ad);
+        pp_project(&c->arm[a], ox, oy, &as, &ad);
         if (as < -c->w)
             continue;
         double sdx = sqrt(p_sq(sx * sin(c->arm[a].th[0])) + p_sq(sy * cos(c->arm[a].th[0])) + 0.04);
@@ -1636,8 +1650,8 @@ static void roll_on_base(const PCtx *c, const PObj *q, PRoll *r)
     r->known_lo = c->known_lo;
     r->known_hi = c->known_hi;
     r->dir = q->dir != 0 ? q->dir : 1;
-    r->s0 = q->s;
-    r->d0 = st[PS_D];
+    r->s0 = q->s + q->sref;                 /* the futures carry the reference point */
+    r->d0 = st[PS_D] + q->dref;
     r->dr0 = st[PS_DR];
     r->pss = ct * ct * sx2 + sn * sn * sy2;
     r->psd = ct * sn * (sy2 - sx2);

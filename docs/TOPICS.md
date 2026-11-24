@@ -566,7 +566,9 @@ recording carries `view` messages).
 `chris_integrator/predict` (plug-in `predict`; the design is in that package's docstring): for every object of the
 `radar` message several futures over 8 s, each a manoeuvre with a probability and a trajectory with its spread;
 the probability of each kind of lane the object may be in; the manoeuvre probabilities; the car's own futures.
-One message per `radar` message, **at the same `ts_mono_ns` and `seq`**: it is that radar message, every field
+An object's place on the road (its lane, where it is along and beside the path) is its centre (`ctr`) where the radar
+gives it, else `x_m`, `y_m`; its futures start at `x_m`, `y_m` (the radar's reference point, the near face), as the
+decision layer reads them. One message per `radar` message, **at the same `ts_mono_ns` and `seq`**: it is that radar message, every field
 as it was, with the fields below added. A companion message and not fields of `radar` itself because of its size
 (about 1.3 kB per future: 4-8 kB per object against 0.7 kB of the radar's own object): `radar` stays as it was for
 every consumer that does not want futures, and `radar_fut` is serialised only for a consumer that subscribes to

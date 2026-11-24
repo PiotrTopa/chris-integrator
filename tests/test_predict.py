@@ -211,6 +211,22 @@ def test_parked_stays_and_may_pull_out_and_a_standing_queue_moves_off():
     assert q["move_off"][2][-1, 2] > 5.0                                    # when is not known: a wide spread along the lane
 
 
+def test_the_place_on_the_road_is_the_centre_and_the_futures_start_at_the_near_face():
+    """A car standing in the right lane, its near face (x_m, y_m: what the radar sees nearest) 0.25 m inside the
+    car's lane, its centre (`ctr`) 0.65 m inside the right lane: placed by the near face it is in the car's lane,
+    by its centre in its own; either way its futures carry the reference point the radar gave (the decision
+    layer draws the footprint from it)."""
+    def run(ctr):
+        def scene(t):
+            return [K.obj(1, 40.0, -1.5, 0.0, 0.0, ps=0.97, std=(1.0, 0.3, 0.3, 0.3), **({"ctr": ctr} if ctr else {}))]
+        return drive(scene, 1.0, K.context(arm=False), v=0.0)[1]
+    near, centre = run(None), run([40.0, -2.4])
+    assert lane(near, 1) == "ego" and lane(centre, 1) == "right"
+    for pred in (near, centre):
+        f = futures(pred, 1)
+        assert np.allclose(f["stopped"][2][0, :2], (40.0, -1.5)) and abs(f["move_off"][2][-1, 1] + 1.5) < 0.05
+
+
 def test_oncoming_drift_and_cyclist_swerve():
     def scene(t):
         lat = min(1.4, 0.45 * max(0.0, t - 0.5))

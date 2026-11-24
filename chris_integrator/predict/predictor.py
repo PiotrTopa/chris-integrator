@@ -90,6 +90,14 @@ def _num(v, d=math.nan):
     return float(v) if _fin(v) else d
 
 
+def _ctr(c):
+    """The radar's `ctr` (the object's centre, car axes) as two numbers, NaN where it is not given: the object's place
+    on the road (lanes, the path); x_m, y_m (the near face) stay where its futures start."""
+    if c.__class__ in (list, tuple) and len(c) == 2 and _fin(c[0]) and _fin(c[1]):
+        return float(c[0]), float(c[1])
+    return _NAN, _NAN
+
+
 def _dist(v, n):
     """P(k) for k = 0..n-1 from an int, a probability of "at least one", or a list of probabilities."""
     if isinstance(v, (list, tuple)):
@@ -460,7 +468,8 @@ class Predictor:
                     _NAN if ind is None else 1.0 if ind == "left" else -1.0 if ind == "right" else 0.0,
                     _NAN if br is None else 1.0 if br else 0.0, 1.0 if "parked" in fl else 0.0, i,
                     _NAN if vis is None else 0.0 if vis in ("occluded", "hidden", False) else 1.0,
-                    1.0 if mo == "stationary" else -1.0 if mo == "moving" else 0.0, 1.0 if "with_traffic" in fl or "oncoming" in fl else 0.0)
+                    1.0 if mo == "stationary" else -1.0 if mo == "moving" else 0.0, 1.0 if "with_traffic" in fl or "oncoming" in fl else 0.0,
+                    *_ctr(g("ctr")))
             ids.append(g("id"))
         if n:
             num = a[:, :12]
