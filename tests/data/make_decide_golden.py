@@ -14,7 +14,7 @@ import numpy as np
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(os.path.dirname(HERE)))
 
-from chris_integrator.decide import fixtures as FX, futures as FU, threat as TH  # noqa: E402
+from chris_integrator.decide import fixtures as FX, threat as TH  # noqa: E402
 from chris_integrator.native import decide as ND  # noqa: E402
 
 
@@ -32,28 +32,17 @@ def cases():
 
 
 def inputs(msg, tcfg):
-    F = FU.build(msg, FU.DEFAULT_CFG, None, FU.from_message(msg))
+    """The evaluation's arrays of one frame, as the native core's frame makes them (threat.Explained)."""
     tm = TH.ThreatModel(tcfg)
-    t = F.t
-    N, E = len(t), len(F.ego)
-    ego = np.empty((E, 1 + 3 * N))
-    for j, (_, p, x, y, v) in enumerate(F.ego):
-        ego[j] = np.concatenate([[p], x, y, v])
-    K = sum(len(m) for _, m, _ in F.objects)
-    ohdr, modes, k = np.zeros((len(F.objects), 10)), np.empty((K, 2 + 5 * N)), 0
-    for i, (o, ms, _) in enumerate(F.objects):
-        L, W, sL, sW, h, sh, label, _ = FU.extent(o)
-        ohdr[i] = (k, len(ms), L, W, sL, sW, h, sh, FU.KIND_SET[FU.kind_of(label)], 0.0)
-        for (_, p0, p, x, y, sx, sy, r) in ms:
-            modes[k] = np.concatenate([[p0, p], x, y, sx, sy, r])
-            k += 1
-    v0 = float(msg["ego"]["speed_mps"])
-    along, lat = TH.available(v0, tm.cfg)
-    return t, ego, ohdr, modes, tm.native_cfg(v0, 0.0, along, lat), tm.thr
+    ex = tm.explain(msg)
+    cfg = tm.native_cfg()[:34]
+    cfg[3], cfg[5], cfg[6] = float(msg["ego"]["speed_mps"]), ex.a_avail[0], ex.a_avail[1]
+    return ex.t, ex.ego, ex.ohdr, ex.modes, cfg, tm.thr
 
 
 def run(inp):
     t, ego, ohdr, modes, cfg, thr = inp
+    t, ego, ohdr, modes = (np.ascontiguousarray(a) for a in (t, ego, ohdr, modes))
     pair = np.empty((len(modes) * len(ego), TH.PF))
     obj = np.empty((len(ohdr), TH.OF))
     ND.decide_eval(t, ego, ohdr, modes, cfg, thr, pair, obj)

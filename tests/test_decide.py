@@ -57,17 +57,41 @@ class Fixtures(unittest.TestCase):
         self.assertTrue(raise_["would_show"])
 
 
+def plan(xs, ys_left):
+    """A road model's plan (y right, as it gives it) as the decision layer's path."""
+    return FU.plan_path({"ts_mono_ns": 0, "plan": {"x": [float(x) for x in xs], "y": [-float(y) for y in ys_left]}}, 0)
+
+
+STRAIGHT = plan([0.0, 100.0], [0.0, 0.0])           # the road along x: its direction 0 everywhere
+
+
+def judged(o, ms, t, v=11.0, lane=None, path=STRAIGHT):
+    """One object with the given futures [(name, p0, p, x, y, sx, sy, rxy)] on the grid t against the car driving
+    straight on at v, on a straight road: what the native core made of it (threat.Explained)."""
+    fut = [{"m": nm, "p0": p0, "p": pc, "x": np.asarray(x).tolist(), "y": np.asarray(y).tolist(), "sx": np.asarray(sx).tolist(),
+            "sy": np.asarray(sy).tolist(), "rxy": np.asarray(r).tolist()} for nm, p0, pc, x, y, sx, sy, r in ms]
+    msg = {"objects": [dict(o, fut=fut, **({"lane": lane} if lane else {}))], "ego": {"speed_mps": v},
+           "fut": {"t": t.tolist()}, "ego_fut": {"modes": [{"p": 1.0, "m": "path", "x": (v * t).tolist(), "y": (0.0 * t).tolist(),
+                                                           "v": (v + 0.0 * t).tolist()}]}}
+    return TH.ThreatModel().explain(msg, path=path)
+
+
+def footprint(o, path=STRAIGHT, lane=None):
+    """(heading, its 1 sigma, weight of its standing mode) of a radar object without futures, as it is judged."""
+    ex = TH.ThreatModel().explain({"objects": [dict(o, **({"lane": lane} if lane else {}))], "ego": {"speed_mps": 11.0}}, path=path)
+    return ex.ohdr[0, 6], ex.ohdr[0, 7], ex.modes[0, 0], ex
+
+
 class Futures(unittest.TestCase):
     def test_contract_futures_are_taken_and_now_prepended(self):
         msg, _ = FX.frames("cut_in")[5]
-        F = FU.build(msg, FU.DEFAULT_CFG, None, FU.from_message(msg))
-        self.assertEqual(F.t[0], 0.0)
-        self.assertEqual(len(F.t), len(FX.T_GRID) + 1)
-        self.assertFalse(F.degraded["ego"])
-        (o, ms, src), = F.objects
-        self.assertEqual(src, "contract")
-        self.assertEqual([m[0] for m in ms], ["cut_in", "keep"])
-        self.assertAlmostEqual(ms[0][3][0], o["x_m"])
+        ex = TH.ThreatModel().explain(msg)
+        self.assertEqual(ex.t[0], 0.0)
+        self.assertEqual(len(ex.t), len(FX.T_GRID) + 1)
+        self.assertFalse(ex.ego_own)
+        self.assertEqual(ex.src, ["contract"])
+        self.assertEqual(ex.mode_names(0), ["cut_in", "keep"])
+        self.assertAlmostEqual(ex.modes[0, 2], msg["objects"][0]["x_m"])
 
     def test_without_futures_the_adapter_stands_in_and_says_so(self):
         msg, _ = FX.frames("cut_in")[5]
@@ -86,9 +110,9 @@ class Futures(unittest.TestCase):
     def test_a_future_not_as_the_contract_says_is_replaced_and_counted(self):
         msg, _ = FX.frames("cut_in")[5]
         bad = dict(msg, objects=[dict(msg["objects"][0], fut=[{"p": 1.0, "x": [1.0, 2.0]}])])
-        F = FU.build(bad, FU.DEFAULT_CFG, None, FU.from_message(bad))
-        self.assertEqual(F.objects[0][2], "cv")
-        self.assertEqual(F.degraded["invalid"], 1)
+        ex = TH.ThreatModel().explain(bad)
+        self.assertEqual(ex.src[0], "cv")
+        self.assertEqual(ex.invalid, 1)
 
     def test_a_companion_message_carries_the_futures(self):
         msg, _ = FX.frames("lead_braking")[25]
@@ -104,15 +128,19 @@ class Futures(unittest.TestCase):
 
     def test_the_degraded_future_follows_the_path_for_traffic_along_it_and_uses_the_radars_stand_hypothesis(self):
         xs = np.linspace(0, 100, 51)
-        path = (xs, 0.002 * xs ** 2, FU._polyline_s(xs, 0.002 * xs ** 2))
-        o = {"x_m": 20.0, "y_m": 0.8, "vx_mps": 10.0, "vy_mps": 0.8, "std": [1, 0.3, 1, 0.3], "motion": "moving"}
-        t = np.arange(0, 5.01, 0.25)
-        nm, *_, x, y, sx, sy, r = FU.cv_future(o, t, FU.DEFAULT_CFG, path)
-        self.assertEqual(nm, "cv_path")
+        path = plan(xs, 0.002 * xs ** 2)
+        o = {"id": 1, "state": "confirmed", "x_m": 20.0, "y_m": 0.8, "vx_mps": 10.0, "vy_mps": 0.8, "std": [1, 0.3, 1, 0.3],
+             "motion": "moving"}
+        ego = {"speed_mps": 10.0}
+        ex = TH.ThreatModel().explain({"objects": [o], "ego": ego}, path=path)
+        n = len(ex.t)
+        self.assertEqual(ex.t.tolist(), np.arange(0, 5.01, 0.25).tolist())
+        self.assertEqual(ex.names, ["cv_path"])
+        x, y = ex.modes[0, 2:2 + n], ex.modes[0, 2 + n:2 + 2 * n]
         self.assertAlmostEqual(y[-1] - 0.002 * x[-1] ** 2, 0.0, delta=0.6)    # keeps its place beside the path
-        ms = FU.cv_futures(dict(o, motion="unknown", p_stationary=0.7), t, FU.DEFAULT_CFG, None)
-        self.assertEqual([m[0] for m in ms], ["stand", "cv"])
-        self.assertAlmostEqual(ms[0][1], 0.7)
+        ex = TH.ThreatModel().explain({"objects": [dict(o, motion="unknown", p_stationary=0.7)], "ego": ego})
+        self.assertEqual(ex.names, ["stand", "cv"])
+        self.assertAlmostEqual(ex.p[0, 0], 0.7)
 
     def test_a_parked_car_beside_the_path_is_drawn_where_the_radar_says_and_along_the_road(self):
         """The footprint's centre is the radar's `ctr` (not reconstructed along the line of sight); a standing car's
@@ -120,75 +148,83 @@ class Futures(unittest.TestCase):
         car's lane; a mode starting beside the radar's point does not turn the car across the path."""
         o = {"id": 7, "state": "confirmed", "x_m": 9.0, "y_m": -1.8, "ctr": [11.25, -2.7], "len": 4.5, "wid": 1.8,
              "hdg": -0.3, "motion": "stationary", "flags": ["parked"], "std": [0.5, 0.2, 0.1, 0.1]}
-        np.testing.assert_allclose(FU.centre_offset(o), (2.25, -0.9))
-        self.assertTrue(FU.stands(o) and not FU.heading_from_motion(o))
-        self.assertAlmostEqual(FU.road_axis(-0.3, 0.2, 0.05, 0.7, 0.1)[0], 0.05)
-        self.assertAlmostEqual(FU.road_axis(-3.0, 0.2, 0.05, 0.7, 0.1)[0], -3.0 + (0.05 - (-3.0 + math.pi)))
-        self.assertEqual(FU.road_axis(1.5, 0.2, 0.0, 0.7, 0.1), (1.5, 0.2))           # a bay-parked car: as stated
-        self.assertAlmostEqual(FU.in_path_weight(o, {"ego": 0.1, "park": 0.85, "cross": 0.05}, 0.05), 0.15)
-        self.assertEqual(FU.in_path_weight(dict(o, flags=["in_path"]), {"park": 1.0}, 0.05), 1.0)
-        self.assertEqual(FU.in_path_weight(o, None, 0.05), 1.0)
+        road = plan([0.0, 100.0], [0.0, 100.0 * math.tan(0.05)])         # a road in the direction 0.05 rad
+        h, sh, _, ex = footprint(o, road)
+        np.testing.assert_allclose(ex.ohdr[0, 9:12], (1.0, 2.25, -0.9))  # the centre: the radar's, from its point
+        self.assertAlmostEqual(h, 0.05)                                  # it stands, its heading is not its travel's:
+        self.assertAlmostEqual(sh, 0.1)                                  # ... the road's axis, within 0.7 rad of it
+        self.assertAlmostEqual(footprint(dict(o, hdg=-3.0), road)[0], -3.0 + (0.05 - (-3.0 + math.pi)))   # either direction
+        self.assertEqual(footprint(dict(o, hdg=1.5, hdg_std=0.1))[:2], (1.5, 0.1))    # a bay-parked car: as stated
+        # the weight of its standing mode: P(lane ego) + P(lane cross), unless the radar says it is in the path
+        self.assertAlmostEqual(footprint(o, lane={"ego": 0.1, "park": 0.85, "cross": 0.05})[2], 0.15)
+        self.assertEqual(footprint(dict(o, flags=["in_path"]), lane={"park": 1.0})[2], 1.0)
+        self.assertEqual(footprint(o)[2], 1.0)
         # through the native core: the car stands beside a straight path, 1.0 m clear of the car's side
         t = np.arange(0.0, 4.01, 0.25)
-        F = FU.FrameFutures(t)
-        F.ego = [("path", 1.0, 11.0 * t, 0.0 * t, 11.0 + 0.0 * t)]
         x0, y0 = np.full(len(t), 9.0), np.full(len(t), -1.8)
         jump = y0.copy()
         jump[1:] -= 0.4                                   # a mode 0.4 m beside the radar's point from its first step
-        F.objects = [(o, [("stopped", 0.6, 0.6, x0, y0, 0.1 + 0 * t, 0.1 + 0 * t, 0 * t),
-                          ("move_off", 0.4, 0.4, x0, jump, 0.1 + 0 * t, 0.1 + 0 * t, 0 * t)], "contract")]
-        F.road_hdg[7] = 0.0
-        res, _ = TH.ThreatModel().evaluate(F, {"speed_mps": 11.0})
-        orow = res[0][3]
-        self.assertLess(orow[TH.DO_PC], 0.05)
+        ex = judged(o, [("stopped", 0.6, 0.6, x0, y0, 0.1 + 0 * t, 0.1 + 0 * t, 0 * t),
+                        ("move_off", 0.4, 0.4, x0, jump, 0.1 + 0 * t, 0.1 + 0 * t, 0 * t)], t)
+        self.assertEqual(ex.src, ["contract"])
+        self.assertLess(ex.obj[0, TH.DO_PC], 0.05)
 
     def test_a_box_heading_the_radar_did_not_resolve_and_a_margin_breach_without_contact_do_not_alarm(self):
         """A standing car beside the path whose box the radar turned a quarter turn with a wide heading spread is
         drawn along the road; an oncoming car the prediction puts in its lane is drawn along it whatever its box
         says; a pair whose mean futures miss (only the margin breached) has no time margin."""
-        self.assertTrue(FU.heading_resolved(0.08, 0.15) and FU.heading_resolved(math.nan, 0.15))
-        self.assertFalse(FU.heading_resolved(0.33, 0.15))
-        self.assertAlmostEqual(FU.along_lane_p({"onc": 0.9, "park": 0.1}), 0.9)
         t = np.arange(0.0, 4.01, 0.25)
-
-        def judge(o, ms, lane=None, v=11.0):
-            F = FU.FrameFutures(t)
-            F.ego = [("path", 1.0, v * t, 0.0 * t, v + 0.0 * t)]
-            F.objects = [(o, ms, "contract")]
-            F.road_hdg[o["id"]] = 0.0
-            if lane:
-                F.lane[o["id"]] = lane
-            res, _ = TH.ThreatModel().evaluate(F, {"speed_mps": v})
-            return res[0][3], res[0][4]
         # parked 2.8 m right of the path (centre), its box turned to 1.6 rad with a heading spread of 0.33 rad
         o = {"id": 3, "state": "confirmed", "x_m": 20.0, "y_m": -1.9, "ctr": [21.5, -2.8], "len": 3.2, "wid": 1.8,
              "hdg": 1.6, "ext_std": [0.4, 0.18, 0.33], "motion": "stationary", "std": [1.0, 0.3, 0.1, 0.1]}
+        # a heading is resolved at a 1 sigma of 0.15 rad at most, or where none is stated
+        self.assertEqual(footprint(dict(o, ext_std=[0.4, 0.18, 0.08]), None)[0], 1.6)
+        self.assertEqual(footprint({k: v for k, v in o.items() if k != "ext_std"}, None)[0], 1.6)
+        self.assertLess(abs(math.sin(footprint(o)[0])), 1e-9)            # 0.33 rad: not resolved, the road's axis
         stand = [("stopped", 1.0, 1.0, np.full(len(t), 20.0), np.full(len(t), -1.9), 0.3 + 0 * t, 0.3 + 0 * t, 0 * t)]
-        orow, _ = judge(o, stand)
-        self.assertLess(orow[TH.DO_PC], 0.05)
-        self.assertEqual(int(orow[TH.DO_LE]), 0)
-        orow, _ = judge(dict(o, ext_std=[0.4, 0.18, 0.05]), stand)          # resolved: a bay-parked car, as stated
-        self.assertGreater(orow[TH.DO_PC], 0.2)                          # (its length across: 0.3 m off the side)
+        ex = judged(o, stand, t)
+        self.assertLess(ex.obj[0, TH.DO_PC], 0.05)
+        self.assertEqual(int(ex.obj[0, TH.DO_LE]), 0)
+        ex = judged(dict(o, ext_std=[0.4, 0.18, 0.05]), stand, t)           # resolved: a bay-parked car, as stated
+        self.assertGreater(ex.obj[0, TH.DO_PC], 0.2)                     # (its length across: 0.3 m off the side)
         # an oncoming truck in its lane (centre 3.6 m left), its 9.6 m box turned 0.35 rad toward the car
         tr = {"id": 4, "state": "confirmed", "x_m": 30.0, "y_m": 2.7, "ctr": [34.8, 3.6], "len": 9.6, "wid": 2.5,
               "hdg": 0.35, "ext_std": [1.9, 0.18, 0.06], "motion": "moving", "class": {"label": "truck"},
               "std": [2.0, 0.4, 2.0, 0.5]}
         onc = [("onc_keep", 1.0, 1.0, 30.0 - 12.0 * t, np.full(len(t), 2.7), 0.5 + 0.3 * t, 0.4 + 0 * t, 0 * t)]
-        orow, _ = judge(tr, onc)
-        self.assertGreater(orow[TH.DO_PC], 0.3)                          # its box's corner in the car's lane
-        orow, _ = judge(tr, onc, lane={"onc": 0.94, "ego": 0.02})
-        self.assertLess(orow[TH.DO_PC], 0.05)
+        ex = judged(tr, onc, t)
+        self.assertEqual(ex.ohdr[0, 6], 0.35)
+        self.assertGreater(ex.obj[0, TH.DO_PC], 0.3)                     # its box's corner in the car's lane
+        ex = judged(tr, onc, t, lane={"onc": 0.94, "ego": 0.02})         # P(a lane along the road) 0.96: along it
+        self.assertLess(abs(math.sin(ex.ohdr[0, 6])), 1e-9)
+        self.assertLess(ex.obj[0, TH.DO_PC], 0.05)
+        self.assertEqual(judged(tr, onc, t, lane={"onc": 0.4, "park": 0.6}).ohdr[0, 6], 0.35)      # below one half: as stated
         # a car beside the path, 0.15 m clear of the car's side on the mean futures, a wide spread: the margin is
         # breached, there is no collision to time
         b = {"id": 5, "state": "confirmed", "x_m": 15.0, "y_m": -1.9, "ctr": [17.25, -2.8], "len": 4.5, "wid": 1.8,
              "hdg": 0.0, "ext_std": [0.4, 0.18, 0.05], "motion": "stationary", "std": [1.0, 0.8, 0.1, 0.1]}
         ms = [("stopped", 1.0, 1.0, np.full(len(t), 15.0), np.full(len(t), -1.9 + 0.95), 0.8 + 0 * t,
                0.8 + 0 * t, 0 * t)]
-        orow, prow = judge(b, ms)
-        p = prow[0, 0]
+        p = judged(b, ms, t).pairs(0)[0, 0]
         self.assertTrue(math.isnan(p[TH.DP_TTC]) and p[TH.DP_COURSE] > 0.5)    # mean miss, the margin breached
         self.assertTrue(math.isnan(p[TH.DP_TM]))
         self.assertLessEqual(int(p[TH.DP_LE]), 1)
+
+    def test_class_priors_and_labels_as_the_native_core_reads_them(self):
+        """The footprint of a class where the radar gives no extent, and the threshold set of its kind: the native
+        core's table against futures.CLASS_SIZE; labels as the class vote normalises them."""
+        from chris_integrator.core import classvote
+        o = {"id": 1, "state": "confirmed", "x_m": 30.0, "y_m": 0.0, "std": [1, 1, 1, 1], "motion": "stationary"}
+        kinds = {"car": "vehicle", "van": "vehicle", "truck": "vehicle", "bus": "vehicle", "tram": "vehicle",
+                 "human": "vru", "bike": "vru", "motorbike": "vru"}
+        labels = list(FU.CLASS_SIZE) + list(classvote.ALIASES) + ["  Pedestrian ", "TRUCK", "animal", "", 7]
+        for lab in labels:
+            norm = classvote.norm_label(lab)
+            ex = TH.ThreatModel().explain({"objects": [dict(o, **{"class": {"label": lab}})], "ego": {"speed_mps": 10.0}})
+            self.assertEqual(ex.ohdr[0, 2:6].tolist(), list(FU.CLASS_SIZE.get(norm, FU.CLASS_SIZE[None])), lab)
+            self.assertEqual(ex.records[0]["kind"], kinds.get(norm, "unknown"), lab)
+            self.assertEqual(int(ex.ohdr[0, 8]), FU.KIND_SET[kinds.get(norm, "unknown")], lab)
+            self.assertEqual(ex.records[0]["size_src"], "class")
 
 
 def rec(oid, le, lx=None, tn=0.5, tm=0.5, kind="vehicle", ab=3.0, al=2.0, ar=2.0, mass=None):

@@ -1,7 +1,9 @@
 """The threat measure: for the car against every object, from the braking and steering actually required.
 
 Per object, over its modes (unconditioned probabilities `p0`: the other party does not yield; the conditioned
-figure `p` alongside) and the car's own modes, the native core (native/src/decide.c `decide_eval`) gives per pair:
+figure `p` alongside) and the car's own modes, the native core (native/src/decide.c: `decide_frame` makes the
+futures and the footprints of a radar message and writes the records, `decide_eval` inside it judges) gives per
+pair:
 
     pc          collision probability over the horizon: the two position distributions and both extents
     a_req       the smallest constant demand that avoids it: braking, steering left / right, both on the friction
@@ -26,7 +28,6 @@ import numpy as np
 from ..native import decide as _ND, round
 from . import futures as FU
 
-G = 9.81
 LEVELS = ("none", "information", "caution", "warning", "imminent")
 MEASURES = {1: "threat_number", 2: "time_margin", 3: "collision_course"}
 ROAD_MU = {"dry": 0.9, "wet": 0.6, "snow": 0.3, "ice": 0.12}
@@ -127,16 +128,6 @@ def road_from_env(env):
     return None
 
 
-def available(v, c, road=None):
-    """(braking, lateral) acceleration a driver can get at speed v on the road condition."""
-    mu = ROAD_MU.get(road or c["road"], ROAD_MU["dry"])
-    fade = max(0.5, 1.0 - c["speed_fade"] * max(0.0, v))
-    along = mu * G * c["brake_share"] * fade
-    lat = mu * G * c["steer_share"] * fade
-    lat = min(lat, max(v, 0.5) ** 2 / c["turn_radius_m"])
-    return along, max(lat, 0.05)
-
-
 def threshold_table(c):
     th = {k: dict(v) for k, v in THRESHOLDS.items()}
     for k, v in (c.get("thresholds") or {}).items():
@@ -159,133 +150,99 @@ DO_PC, DO_PCC, DO_LE, DO_LX, DO_ME, DO_MX, DO_BEST, DO_WHY, DO_LC, DO_TTC, DO_TH
 
 
 class ThreatModel:
-    def __init__(self, cfg=None):
+    """The threat measure of one frame, by the native core (native/src/decide.c `decide_frame`).
+
+        tm = ThreatModel(cfg, future_cfg)               # keys of DEFAULT_CFG, of futures.DEFAULT_CFG
+        tm.frame(objects, ego, futures, path, road, shown, opt)       # the plug-in's call: the native tuple
+        tm.explain(radar_msg, futures, path)            # the same frame with its arrays (tests, tools)"""
+
+    def __init__(self, cfg=None, future_cfg=None, list_min_p=0.01):
         self.cfg = dict(DEFAULT_CFG, **(cfg or {}))
+        self.fcfg = dict(FU.DEFAULT_CFG, **(future_cfg or {}))
         self.thr = threshold_table(self.cfg).ravel()
         self.t_react = reaction_time(self.cfg)
         self.last_n = 0
+        self._fc = FU.cfg_array(self.fcfg)
+        self._t_own = FU.own_grid(self.fcfg)
+        self._tc = self.native_cfg(list_min_p)
 
-    def native_cfg(self, v0, a0, along, lat):
+    def native_cfg(self, list_min_p=0.01):
+        """The model's constants as the native core reads them (decide.c DC_*, DX_*). The car's speed and
+        acceleration and the accelerations available are the frame's: the native core sets them."""
         c = self.cfg
-        return np.array([c["front_m"], c["rear_m"], 0.5 * c["width_m"], v0, a0, along, lat, self.t_react,
+        return np.array([c["front_m"], c["rear_m"], 0.5 * c["width_m"], 0.0, 0.0, 0.0, 0.0, self.t_react,
                          c["brake_buildup_s"], c["steer_buildup_s"], c["sim_dt_s"], c["max_offset_m"], c["k_sigma"],
                          c["margin_long_m"], c["margin_lat_m"], 1.0 if c["pc_method"] == "analytic" else 0.0,
                          float(c["samples"]), c["prune_sigma"], c["ego_accel_sigma"], c["ego_lat_sigma"],
                          float(c["combo_dirs"]), c["search_factor"], c["tol_accel"], c["tol_time"],
                          1.0 if c["obj_ref"] == "nearest" else 0.0, 1.0 if c["others"] else 0.0, c["p_mode_min"],
                          c["horizon_s"], c["horizon_ext_s"], c["ego_long_cap_m"], c["ego_lat_cap_m"],
-                         c["k_sigma_cap_m"][0], c["k_sigma_cap_m"][1], 1.0 if c["tm_needs_contact"] else 0.0])
+                         c["k_sigma_cap_m"][0], c["k_sigma_cap_m"][1], 1.0 if c["tm_needs_contact"] else 0.0,
+                         # beyond the evaluation's (DX_*): the grip, the footprint's heading, the lanes' weight
+                         c["brake_share"], c["steer_share"], c["speed_fade"], c["turn_radius_m"], c["hdg_resolved_rad"],
+                         1.0 if c["road_axis_standing"] else 0.0, c["road_axis_snap_rad"], c["road_axis_std_rad"],
+                         c["lane_axis_p"], 1.0 if c["lane_weight"] else 0.0, c["lane_weight_floor"], c["stand_move_m"],
+                         list_min_p], float)
 
-    def evaluate(self, F, ego, road=None):
-        """Per object of FrameFutures F: (object, modes, source, native object row, native pair rows (K_obj x E)).
-        ego: the radar message's `ego`. Returns (results, frame info)."""
-        t = F.t
-        N = len(t)
-        E = len(F.ego)
-        ego_rows = np.empty((E, 1 + 3 * N))
-        for j, (_, p, x, y, v) in enumerate(F.ego):
-            ego_rows[j, 0] = p
-            ego_rows[j, 1:1 + N] = x
-            ego_rows[j, 1 + N:1 + 2 * N] = y
-            ego_rows[j, 1 + 2 * N:] = v
-        M = len(F.objects)
-        K = sum(len(m) for _, m, _ in F.objects)
-        ohdr = np.zeros((M, 12))
-        modes = np.empty((K, 2 + 5 * N))
-        k = 0
-        ext = []
-        for i, (o, ms, _) in enumerate(F.objects):
-            L, W, sL, sW, h, sh, label, esrc = FU.extent(o)
-            rh = F.road_hdg.get(o.get("id"))
-            if math.isfinite(h) and not FU.heading_resolved(sh, self.cfg["hdg_resolved_rad"]):
-                if FU.heading_from_motion(o):
-                    h, sh = FU.travel_heading(o)
-                elif rh is not None:
-                    h, sh = FU.road_axis(h, math.nan, rh, math.pi, self.cfg["road_axis_std_rad"])
-            elif not math.isfinite(h) and rh is not None:
-                h = F.road_hdg[o.get("id")]
-            elif rh is not None and FU.kind_of(label) == "vehicle" and (
-                    FU.along_lane_p(F.lane.get(o.get("id"))) >= self.cfg["lane_axis_p"] or o.get("id") in F.along):
-                h, sh = FU.road_axis(h, sh, rh, math.pi, self.cfg["road_axis_std_rad"])
-            elif rh is not None and self.cfg["road_axis_standing"] and FU.stands(o) and not FU.heading_from_motion(o):
-                h, sh = FU.road_axis(h, sh, rh, self.cfg["road_axis_snap_rad"], self.cfg["road_axis_std_rad"])
-            ext.append((L, W, label, esrc))
-            w_stand = FU.in_path_weight(o, F.lane.get(o.get("id")), self.cfg["lane_weight_floor"]) \
-                if self.cfg["lane_weight"] else 1.0
-            ohdr[i, :9] = (k, len(ms), L, W, sL, sW, h, sh, FU.KIND_SET[FU.kind_of(label)])
-            off = FU.centre_offset(o)
-            if off is not None:          # the radar says where the footprint's centre is (decide.c: has_ctr)
-                ohdr[i, 9:] = (1.0, off[0], off[1])
-            for (_, p0, p, x, y, sx, sy, r) in ms:
-                row = modes[k]
-                f = w_stand if w_stand < 1.0 and FU.mode_stands(x, y, self.cfg["stand_move_m"]) else 1.0
-                row[0], row[1] = p0 * f, p * f
-                row[2:2 + N] = x
-                row[2 + N:2 + 2 * N] = y
-                row[2 + 2 * N:2 + 3 * N] = sx
-                row[2 + 3 * N:2 + 4 * N] = sy
-                row[2 + 4 * N:] = r
-                k += 1
-        v0 = max(0.0, float(ego.get("speed_mps") or 0.0))
-        a0 = float(ego.get("accel_mps2") or 0.0)
-        along, lat = available(v0, self.cfg, road)
-        pair = np.empty((K * E, PF))
-        obj = np.empty((M, OF))
-        if M:
-            n, _ = _ND.decide_eval(np.ascontiguousarray(t), ego_rows, ohdr, modes,
-                                   self.native_cfg(v0, a0, along, lat), self.thr, pair, obj)
-            self.last_n = n
-        res = []
-        k = 0
-        for i, (o, ms, src) in enumerate(F.objects):
-            nk = len(ms)
-            res.append((o, ms, src, obj[i], pair[k * E:(k + nk) * E].reshape(nk, E, PF), ext[i]))
-            k += nk
-        return res, {"a_avail_mps2": (along, lat), "t_react_s": self.t_react, "road": road or self.cfg["road"]}
+    def frame(self, objects, ego, futures=None, path=None, road=None, shown=None, opt=0):
+        """One radar message's decision (decide.c `decide_frame`): objects, ego: the message's; futures: a
+        `futures.Futures` or None (the degraded adapters); path: `futures.plan_path`; road: the road condition
+        (None: the configured); shown: {id: level shown} of the frame before; opt: 1 every pair in the records,
+        2 a record of every judged object and the arrays. Returns the native tuple:
+        (records, listed, objects by id, shown, judged, cv, invalid, ego_own, steps, a_long, a_lat, ego_modes,
+        horizon, detail)."""
+        res = _ND.decide_frame(objects, ego, None if futures is None else futures.fields, path, self._t_own, self._fc,
+                               self._tc, self.thr, ROAD_MU.get(road or self.cfg["road"], ROAD_MU["dry"]),
+                               {} if shown is None else shown, opt)
+        if res[8] >= 0:
+            self.last_n = res[8]
+        return res
+
+    def explain(self, radar_msg, futures=None, path=None, road=None):
+        """A frame with everything the native core made of it (tests, tools): `Explained`. futures: None reads
+        the contract's fields out of the message itself."""
+        if futures is None:
+            futures = FU.from_message(radar_msg)
+        objs = radar_msg.get("objects") or []
+        return Explained(self.frame(objs if isinstance(objs, list) else list(objs), radar_msg.get("ego"), futures, path,
+                                    road, None, 2), self)
 
 
-def _r(v, n=2):
-    return None if v is None or not math.isfinite(v) else round(float(v), n)
+class Explained:
+    """One frame as the native core judged it:
 
+        records     the record (decide.objects[]) of every judged object, in the radar message's order
+        t           (N,) the grid (now first); ego (E, 1 + 3 N): p, x, y, v; ego_names [E]
+        modes       (K, 2 + 5 N): p0, p (weighted by the lanes where the mode stands), x, y, sx, sy, rxy; names [K];
+                    p (K, 2): p0, p as the futures gave them (normalised)
+        ohdr        (M, 12): first mode, modes, len, wid, their 1 sigma, heading, its 1 sigma, threshold set,
+                    has_ctr, ctr_dx, ctr_dy (decide.c: the footprint as it is judged)
+        pair        (K, E, PF) the pairs' measures (DP_*); obj (M, OF) the objects' (DO_*); src [M]: "cv" | "contract"
+        cv, invalid, ego_own, a_avail, t_react, steps"""
 
-def object_record(o, ms, src, orow, prow, ext, F):
-    """The message's dict of one judged object (decide.objects[])."""
-    E = prow.shape[1]
-    lv = int(orow[DO_LE])
-    rec = {"id": o.get("id"), "level": lv, "level_name": LEVELS[lv], "level_exit": int(orow[DO_LX]),
-           "level_cond": int(orow[DO_LC]), "p_coll": _r(orow[DO_PC], 3), "p_coll_cond": _r(orow[DO_PCC], 3),
-           "ttc_s": _r(orow[DO_TTC]), "thw_s": _r(orow[DO_THW]), "sep_m": _r(orow[DO_SEP]),
-           "kind": FU.kind_of(ext[2]), "size": [_r(ext[0], 1), _r(ext[1], 1)], "size_src": ext[3], "fut": src,
-           "mass": [_r(v, 3) for v in orow[DO_ME:DO_ME + 4]]}
-    b = int(orow[DO_BEST])
-    if b >= 0:
-        km, j = divmod(b, E)
-        p = prow[km, j]
-        rec.update({"btn": _r(p[DP_BTN]), "stn": _r(p[DP_STN]), "tn": _r(p[DP_TN]),
-                    "a_req": {"brake": _r(p[DP_AB]), "left": _r(p[DP_AL]), "right": _r(p[DP_AR]),
-                              "comb": _r(p[DP_AC]), "comb_dir_deg": _r(math.degrees(p[DP_DIR]), 0)},
-                    "ttb_s": _r(p[DP_TTB]), "tts_s": _r(p[DP_TTS]), "tm_s": _r(p[DP_TM]),
-                    "why": {"mode": ms[km][0], "p0": _r(ms[km][1], 3), "p": _r(ms[km][2], 3),
-                            "ego_mode": F.ego[j][0], "measure": MEASURES.get(int(orow[DO_WHY]), "collision_course"),
-                            "pc": _r(p[DP_PC], 3), "t_contact_s": _r(p[DP_TCON])}})
-    else:
-        rec.update({"btn": 0.0, "stn": 0.0, "tn": 0.0, "a_req": None, "ttb_s": None, "tts_s": None, "tm_s": None,
-                    "why": None})
-    if o.get("id") in F.lane:
-        rec["lane"] = F.lane[o.get("id")]
-    return rec
+    def __init__(self, res, model):
+        (self.records, self.listed, self.objects, self.shown, self.judged, self.cv, self.invalid, ego_own, self.steps,
+         al, at, self.ego_modes, self.horizon, d) = res
+        self.ego_own, self.a_avail, self.t_react = bool(ego_own), (al, at), model.t_react
+        if d is None:                          # nothing judged
+            self.t = self.ego = self.modes = self.p = self.ohdr = self.pair = self.obj = None
+            self.names, self.ego_names, self.src = [], [], []
+            return
+        self.names, self.ego_names, self.src = d["names"], d["ego_names"], d["src"]
+        n, E = len(d["t"]) // 8, len(self.ego_names)
+        self.t = np.frombuffer(d["t"])
+        self.ego = np.frombuffer(d["ego"]).reshape(E, 1 + 3 * n)
+        self.modes = np.frombuffer(d["modes"]).reshape(-1, 2 + 5 * n)
+        self.p = np.frombuffer(d["p"]).reshape(-1, 2)
+        self.ohdr = np.frombuffer(d["ohdr"]).reshape(-1, 12)
+        self.pair = np.frombuffer(d["pair"]).reshape(-1, E, PF)
+        self.obj = np.frombuffer(d["obj"]).reshape(-1, OF)
 
+    def pairs(self, i):
+        """The pair rows (modes x car's modes x PF) of judged object i."""
+        k, nk = int(self.ohdr[i, 0]), int(self.ohdr[i, 1])
+        return self.pair[k:k + nk]
 
-def pairs_record(ms, prow, F):
-    """Every judged pair (for the explain view and the tools): [{mode, ego_mode, p0, p, pc, tn, tm, ttc, level}]."""
-    out = []
-    for km, m in enumerate(ms):
-        for j in range(prow.shape[1]):
-            p = prow[km, j]
-            if not (p[DP_W0] > 0.0 or p[DP_WC] > 0.0):
-                continue
-            out.append({"mode": m[0], "ego_mode": F.ego[j][0], "w0": _r(p[DP_W0], 3), "w": _r(p[DP_WC], 3),
-                        "pc": _r(p[DP_PC], 3), "course": bool(p[DP_COURSE] > 0.5), "tn": _r(p[DP_TN]),
-                        "btn": _r(p[DP_BTN]), "stn": _r(p[DP_STN]), "tm_s": _r(p[DP_TM]), "ttc_s": _r(p[DP_TTC]),
-                        "level": int(p[DP_LE]) if math.isfinite(p[DP_LE]) else 0})
-    return out
+    def mode_names(self, i):
+        k, nk = int(self.ohdr[i, 0]), int(self.ohdr[i, 1])
+        return self.names[k:k + nk]

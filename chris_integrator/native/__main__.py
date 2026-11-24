@@ -90,6 +90,8 @@ def selftest(n=20000, seed=1):
         bad.append("radar_marginals differs from the reference")
     from ._predict_selftest import check as predict_check          # the predictor on a fixed scene
     bad.extend(predict_check())
+    from ._decide_selftest import check as decide_check            # the decision's frame on two fixed frames
+    bad.extend(decide_check())
     return bad
 
 

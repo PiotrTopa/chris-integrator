@@ -19,11 +19,9 @@ def one(x0, y0=0.0, v_ego=14.0, vx=0.0, vy=0.0, label="car", std=(0.01, 0.01, 0.
     o = {"id": 1, "state": "confirmed", "x_m": x0, "y_m": y0, "vx_mps": vx, "vy_mps": vy, "std": list(std),
          "motion": motion or ("stationary" if vx == 0 and vy == 0 else "moving"), "class": {"label": label}}
     m = {"objects": [o], "ego": {"speed_mps": v_ego, "yaw_rate_rps": 0.0, "accel_mps2": 0.0}}
-    F = FU.build(m, dict(FU.DEFAULT_CFG, cv_modes="single", horizon_s=8.0))
-    tm = TH.ThreatModel(dict(EXACT, **(cfg or {})))
-    res, info = tm.evaluate(F, m["ego"])
-    o, ms, src, orow, prow, ext = res[0]
-    return TH.object_record(o, ms, src, orow, prow, ext, F), info, prow
+    tm = TH.ThreatModel(dict(EXACT, **(cfg or {})), dict(FU.DEFAULT_CFG, cv_modes="single", horizon_s=8.0))
+    ex = tm.explain(m)
+    return ex.records[0], {"a_avail_mps2": ex.a_avail, "t_react_s": ex.t_react}, ex.pairs(0)
 
 
 def phi(z):

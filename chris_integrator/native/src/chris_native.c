@@ -11297,7 +11297,7 @@ done:
 }
 
 #include "predict.c"                 /* the `predict` part (chris_integrator/predict): its functions are PREDICT_METHODS */
-#include "decide.c"          /* the decision layer's numerics (chris_integrator/decide) */
+#include "decide.c"                  /* the `decide` part (chris_integrator/decide): its functions are DECIDE_METHODS */
 
 /* ==================================================================================================== */
 static PyMethodDef methods[] = {
@@ -11346,9 +11346,7 @@ static PyMethodDef methods[] = {
     {"radar_check", n_radar_check, METH_VARARGS, "Tracker._check for one expectation"},
     {"radar_register", n_radar_register, METH_VARARGS, "Tracker._register for one sensor: the shared offset, taken out"},
     PREDICT_METHODS
-    {"decide_eval", n_decide_eval, METH_VARARGS, "the decision layer's threat measures per object, mode and ego mode (decide.c)"},
-    {"decide_inst_prob", n_decide_inst_prob, METH_VARARGS, "the exact probability that two footprints overlap at one time (decide.c)"},
-    {"decide_draws", n_decide_draws, METH_O, "the decision layer's fixed standard-normal draws (decide.c)"},
+    DECIDE_METHODS
     {NULL, NULL, 0, NULL}};
 
 static struct PyModuleDef moduledef = {PyModuleDef_HEAD_INIT, "_chris_native",

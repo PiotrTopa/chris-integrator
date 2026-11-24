@@ -12,6 +12,7 @@ import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "data"))
+sys.path.insert(0, HERE)
 
 import make_decide_port_golden as G  # noqa: E402
 
@@ -113,6 +114,43 @@ class Golden(unittest.TestCase):
                         ch.deliver(stream, msg)
                 self.same(dec, c["decide"], "%s: decide from radar_fut %s" % (
                     c["scenario"], "as the companion" if companion else "in place of radar"))
+
+
+class Handoff(unittest.TestCase):
+    def test_the_predictors_arrays_are_the_messages_numbers(self):
+        """What `decide` takes from the predictor in process (Prediction.handoff) and what the adapter reads out
+        of the `radar_fut` message of the same prediction (futures.from_message, after JSON): the same arrays, bit
+        for bit, and the same frame judged."""
+        import numpy as np
+        import predict_cases as K
+        from chris_integrator.decide import futures as FU, threat as TH
+        from chris_integrator.predict import Predictor
+        for radar, pred in K.run(Predictor({"selfcheck": {"enabled": False}}), keep=(10, 30, 60)):
+            a = pred.handoff()
+            b = FU.from_message(json.loads(json.dumps(pred.message(radar))))
+            self.assertEqual(a.t.tolist(), b.t.tolist())
+            self.assertEqual(np.asarray(a.ego).tolist(), b.ego.tolist())
+            self.assertEqual((a.ego_names, a.ego_given), (b.ego_names, b.ego_given))
+            judged = 0
+            for j, o in enumerate(radar["objects"]):
+                if o["state"] not in ("confirmed", "coast"):
+                    continue
+                judged += 1
+                ra, rb = a.sel[o["id"]], b.sel[j]
+                (fa, na, sa), (fb, nb, sb) = (int(v) for v in a.rows[ra]), (int(v) for v in b.rows[rb])
+                self.assertEqual((na, sa), (nb, sb))
+                self.assertEqual(sa, 1)
+                self.assertEqual(a.modes[fa:fa + na].tolist(), b.modes[fb:fb + nb].tolist())
+                self.assertEqual(a.names[fa:fa + na], b.names[fb:fb + nb])
+                self.assertEqual(a.lanes[ra].tolist(), list(b.lanes[rb].values()))
+                self.assertEqual(list(b.lanes[rb]), list(pred.lanes))
+            self.assertGreater(judged, 3)
+            tm = TH.ThreatModel()
+            ea, eb = tm.explain(radar, a), tm.explain(radar, b)
+            for k in ("t", "ego", "modes", "ohdr", "pair", "obj"):
+                self.assertTrue(np.array_equal(getattr(ea, k), getattr(eb, k), equal_nan=True), k)
+            self.assertEqual(ea.records, eb.records)
+            self.assertEqual(ea.src, ["contract"] * judged)
 
 
 if __name__ == "__main__":
