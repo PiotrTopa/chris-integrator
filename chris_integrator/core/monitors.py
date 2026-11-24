@@ -11,6 +11,16 @@ from ..native import core as _C
 from ..native import round                  # builtins.round (its results; the native core)
 
 
+def _median(data):
+    """statistics.median of a non-empty list (its arithmetic, without its generic overhead)."""
+    data = sorted(data)
+    n = len(data)
+    if n % 2 == 1:
+        return data[n // 2]
+    i = n // 2
+    return (data[i - 1] + data[i]) / 2
+
+
 class Series:
     """Raw measurements of one group for one quantity: (t, value, sigma), newest last."""
 
@@ -62,7 +72,18 @@ class _Window:
 
     def last(self, span_s):
         lim = self.ev - span_s
-        return [it for ev, it in self.q if ev >= lim]
+        q = self.q
+        if not q or q[0][0] >= lim:
+            return [it for ev, it in q]
+        # (the evidence clock never runs back: the items within the span are the newest ones, walked from the end;
+        # `not ev >= lim` stops where the comprehension would have dropped every older item, NaN included)
+        out = []
+        for ev, it in reversed(q):
+            if not ev >= lim:
+                break
+            out.append(it)
+        out.reverse()
+        return out
 
     def span(self):
         return self.ev - self.q[0][0] if self.q else 0.0
@@ -201,11 +222,11 @@ class Pair:
         c = self.c
         fire = self.win.last(c["fire_window_s"])
         n = len(fire)
-        share = sum(1 for b, _, _ in fire if b) / n if n else None
+        share = sum([1 for b, _, _ in fire if b]) / n if n else None
         ratio = None
         if n >= 3:
-            mr = statistics.median(r for _, _, r in fire)
-            ratio = statistics.median(v for _, v, _ in fire) / mr if abs(mr) > 1e-3 else None
+            mr = _median([r for _, _, r in fire])
+            ratio = _median([v for _, v, _ in fire]) / mr if abs(mr) > 1e-3 else None
         self.stats = {"n": n, "share": share, "ratio": ratio}
         if n >= c["min_n"] and c["mode"] == "share":
             self._peak("share", share / c["fire_share"])
