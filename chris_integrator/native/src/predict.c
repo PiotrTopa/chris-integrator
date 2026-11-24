@@ -139,7 +139,7 @@
                                    metres along the line of sight, centimetres across it: how far into the road it   \
                                    is, is known); 0: with a round one of the same size (a pedestrian 2.9 m from the   \
                                    lane's middle, range known to 2.8 m, stood "in the lane" with a fifth of it) */    \
-    X(std_rho, 0.0)             /* 1: where the radar gives the correlation of a place's x and y errors (`std_rho`),  \
+    X(std_rho, 1.0)             /* 1: where the radar gives the correlation of a place's x and y errors (`std_rho`),  \
                                    the place's covariance is that one: the needle is read along its own long axis     \
                                    (lane_step) and the futures start with it; 0: as if it were not given (the needle   \
                                    rebuilt from `std` and the bearing, the futures' spread upright) */
