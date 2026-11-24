@@ -227,23 +227,45 @@ def from_lights(msg, calib, sensor="cam", cfg=PROJ_CFG):
     if cov is not None:
         out["coverage"] = cov
     for o in ru or ():
-        if not isinstance(o, dict) or not isinstance(o.get("cls"), str) or not isinstance(o.get("box"), list) or len(o["box"]) != 4:
-            continue
-        if not all(fin(v) for v in o["box"]):
-            continue
-        label = LABELS.get(o["cls"], o["cls"])
-        p = project(o, cam, cfg)
-        clip = o.get("clip") or ""
-        q = dict(p, **{"class": label, "class_conf": o.get("score"), "det_class": o["cls"],
-                       "rider": bool(o.get("rider")), "clip": clip, "box": o["box"],
-                       "weight": cfg["clipped_weight"] if clip else 1.0})
-        # how fast the object's image grows, measured by the detector on the pixels themselves (1/s over
-        # `scale_dt_s`): a range rate without the box edges' jitter
-        if fin(o.get("scale_rate")) and fin(o.get("scale_rate_std")) and o["scale_rate_std"] > 0.0:
-            q["scale_rate"], q["scale_rate_std"] = float(o["scale_rate"]), float(o["scale_rate_std"])
-            q["scale_dt_s"] = float(o["scale_dt_s"]) if fin(o.get("scale_dt_s")) and o["scale_dt_s"] > 0.0 else 0.0
-        out["objects"].append(q)
+        q = _placed(o, cam, cfg)
+        if q is not None:
+            out["objects"].append(q)
+    # the detector's further inputs for a tracker (roadsense docs/ARCHITECTURE.md, "Detection inputs for a
+    # tracker"), each absent unless the detector sends it: the boxes below the class threshold as a second list
+    # of the same form (`objects_low`: to continue an object a tracker holds, never to start one), and what kind
+    # of appearance vector the boxes' `emb` is
+    low = msg.get("road_users_low")
+    if isinstance(low, list) and ru is not None:
+        out["objects_low"] = [q for q in (_placed(o, cam, cfg) for o in low) if q is not None]
+    if isinstance(msg.get("emb_kind"), str):
+        out["emb_kind"] = msg["emb_kind"]
     return out
+
+
+_DETIN = ("trunc", "occ", "occ_by", "occ_edges", "sym", "lamps", "emb", "scale_src")
+
+
+def _placed(o, cam, cfg):
+    """One road user of a `lights` message, placed: the `road_users` message's object, or None for a malformed one."""
+    if not isinstance(o, dict) or not isinstance(o.get("cls"), str) or not isinstance(o.get("box"), list) or len(o["box"]) != 4:
+        return None
+    if not all(fin(v) for v in o["box"]):
+        return None
+    label = LABELS.get(o["cls"], o["cls"])
+    p = project(o, cam, cfg)
+    clip = o.get("clip") or ""
+    q = dict(p, **{"class": label, "class_conf": o.get("score"), "det_class": o["cls"],
+                   "rider": bool(o.get("rider")), "clip": clip, "box": o["box"],
+                   "weight": cfg["clipped_weight"] if clip else 1.0})
+    # how fast the object's image grows, measured by the detector on the pixels themselves (1/s over
+    # `scale_dt_s`): a range rate without the box edges' jitter
+    if fin(o.get("scale_rate")) and fin(o.get("scale_rate_std")) and o["scale_rate_std"] > 0.0:
+        q["scale_rate"], q["scale_rate_std"] = float(o["scale_rate"]), float(o["scale_rate_std"])
+        q["scale_dt_s"] = float(o["scale_dt_s"]) if fin(o.get("scale_dt_s")) and o["scale_dt_s"] > 0.0 else 0.0
+    for k in _DETIN:                                     # passed on as sent; absent keys stay absent
+        if k in o:
+            q[k] = o[k]
+    return q
 
 
 def field_of(roi, cam):
