@@ -18,6 +18,7 @@ import math
 import numpy as np
 
 from ..native import round                  # builtins.round (its results; the native core)
+from ..core.lead import ego_of
 from ..core.objects import AX, VX, X, Y, Det, Scan, SensorModel, Track
 from ..core.registry import NS, Source, fin, all_fin
 
@@ -312,7 +313,6 @@ class CameraLeadModel(SensorModel):
 
     # ---- one frame -----------------------------------------------------------------------------------
     def process(self, layer, scan, ego):
-        from ..core.lead import ego_of
         raw = scan.raw
         ts = scan.ts_ns
         self._profile(layer, raw.get("road_model"), ts)
