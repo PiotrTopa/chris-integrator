@@ -195,6 +195,9 @@ class RoadGeometryTracker:
             self.cfg.update(cfg)
         self._local = LocalEgo()    # the integrator of a tracker that is not handed an ego state (docs/DESIGN.md)
         self._map = None            # the last `map` message
+        self._xl = self._xa = None  # _measure: the last distances (a copy of the list) and their array
+        self._wx = None             # _message: (x, width_x) -> the slice or index array of the width points
+        self._xr = None             # _message: (x, its rounded list)
         self.reset()
 
     # ---- life cycle ------------------------------------------------------
@@ -241,8 +244,15 @@ class RoadGeometryTracker:
         x = None
         for ln in list(ll) + list(re):
             if isinstance(ln, dict) and isinstance(ln.get("x"), list) and len(ln["x"]) >= 4:
-                x = _arr(ln["x"], len(ln["x"]))
+                lx = ln["x"]
+                if lx == self._xl:
+                    # the model's distances are the same every frame: the array of the last frame (checked
+                    # finite then; it is only read)
+                    x = self._xa
+                    break
+                x = _arr(lx, len(lx))
                 if x is not None:
+                    self._xl, self._xa = list(lx), x
                     break
         if x is None:
             return None
@@ -416,14 +426,16 @@ class RoadGeometryTracker:
         lines = [self._line(i, prob, ok, ys, sds) for i in range(N_LINES)]
         width = None
         if lines[1]["present"] and lines[2]["present"]:
-            m = (self.x >= c["width_x"][0]) & (self.x <= c["width_x"][1])
-            if m.any():
-                width = round(_median(self.y[2][m] - self.y[1][m]), 2)
+            width = self._width(c["width_x"])
+        x = self.x
+        xr = self._xr
+        if xr is None or xr[0] is not x:
+            xr = self._xr = (x, _round2(x))
         return {
             "type": "lanes", "seq": road.get("seq"), "ts_mono_ns": road.get("ts_mono_ns"),
             "ts_real_ns": road.get("ts_real_ns"),
             "road_model": road.get("road_model"),      # which model's lines these are (lane L27)
-            "x": _round2(self.x),
+            "x": list(xr[1]),                       # (x is the same array while the distances are: rounded once)
             "lines": lines[:N_LANE],                  # far left, left, right, far right
             "edges": lines[N_LANE:],                  # left, right
             "lane_to_left": bool(lines[0]["present"] and lines[1]["present"]),
@@ -436,6 +448,39 @@ class RoadGeometryTracker:
             # the integrator's ego motion of the frame (yaw rate positive right, the device frame's convention)
             "ego": {"speed_mps": round(v, 2), "yaw_rate": round(yaw, 4), "source": vsrc},
         }
+
+    def _width(self, wx):
+        """The lane width: the median of right - left over the points of x within wx (None when there is none).
+        The same values as round(_median(y[2][m] - y[1][m]), 2) with m the mask of those points: the points (a
+        function of x, which stays the same array while the model's distances do) are found once, and the
+        median of a few plain floats is taken without numpy (the same sort and the same middle arithmetic)."""
+        x = self.x
+        w = self._wx
+        if w is None or w[0] is not x or w[1] != tuple(wx):
+            m = (x >= wx[0]) & (x <= wx[1])
+            idx = np.flatnonzero(m)
+            if idx.size == 0:
+                sel = None
+            elif idx[-1] - idx[0] + 1 == idx.size:
+                sel = slice(int(idx[0]), int(idx[-1]) + 1)      # a run of points (x in order): a view, no copy
+            else:
+                sel = m
+            w = self._wx = (x, tuple(wx), sel)
+        sel = w[2]
+        if sel is None:
+            return None
+        a = self.y[2][sel] - self.y[1][sel]
+        d = a.tolist()
+        t = sum(d)
+        if t != t:                              # a NaN (or infinities): np.median's own handling
+            return round(_median(a), 2)
+        d.sort()
+        n = len(d)
+        h = n // 2
+        v = d[h] if n % 2 else (d[h - 1] + d[h]) / 2.0
+        if v == 0.0:                            # (-0.0 and 0.0 may sort apart in the two sorts: numpy decides)
+            return round(_median(a), 2)
+        return round(v, 2)
 
     def summary(self, msg):
         """Short form for /v1/health."""
