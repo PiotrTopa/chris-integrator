@@ -2540,3 +2540,136 @@ def sc_stopped_cruise(speed):
 
 for _v in (14, 25):
     ALERT_SCENARIOS["stopped_cruise_%d" % _v] = sc_stopped_cruise(float(_v))
+
+
+# ---- lane DECIDE: true conflicts in and around bends (the ego never reacts; collision_t as sc_stopped_cruise) ------
+# The ego's camera starts at arc CAM_TO_AXLE and moves at the constant `v`, so its front (2.1 m ahead of the camera)
+# reaches arc s at (s - 2.1 - CAM_TO_AXLE) / v.
+_EGO_FRONT = 2.1
+_CURVE_PARKED_CURV = [(0, 0.0), (80, 0.0), (80, 1 / 110.0), (300, 1 / 110.0), (300, 0.0), (400, 0.0),
+                      (400, -1 / 110.0), (620, -1 / 110.0), (620, 0.0)]
+
+
+def _t_front_at(s, v):
+    return (s - _EGO_FRONT - CAM_TO_AXLE) / v
+
+
+def _alert_spec(v, curv, t_col, actors, night):
+    return dict(T=t_col - 0.3, speed=[(0, v)], curv=curv, actors=actors, lead_range_m=70.0 if night else 100.0,
+                approach=v, mode="cruise", collision_t=t_col)
+
+
+def _bend_stopped(v, curv, s_rear, row_side, k, seed, night):
+    """A stationary car in the ego lane, rear at arc s_rear; a parked row on side row_side (None: none)."""
+    rng = random.Random(seed * 101 + k)
+    s_rear = s_rear + rng.uniform(-3.0, 3.0)
+    L = DIMS["car"][0]
+    s_car = s_rear + L / 2
+    t_col = _t_front_at(s_rear, v)
+    lat = rng.gauss(0, 0.15)
+    yaw = rng.gauss(0, 0.02)
+
+    def actors(w):
+        a = [Actor(800, "car", "stopped_in_lane", s_car, lateral=[(0, lat)], yaw_rel=yaw)]
+        if row_side is not None:
+            a += _parked_row(rng, 100, 60.0, 330.0, row_side, lat=(2.6, 3.2), p_gap=0.1)
+        return a
+    return _alert_spec(v, curv, t_col, actors, night)
+
+
+def sc_bend_stopped_13(seed, night):
+    """Town road of `curve_parked` (straight 80 m, a LEFT curve R 110 m from arc 80 to 300, then a right one), ego
+    13 m/s, never reacting. A stationary car stands IN the ego lane (lateral N(0, 0.15) m) ~75 m into the left curve:
+    its rear at arc 155 +- 3 m, so it comes into view around the bend. Cars are parked on the OUTSIDE (right,
+    2.6-3.2 m) from arc 60 to 330, beside and beyond it. collision_t: the ego's front at its rear (~11.6 s)."""
+    return _bend_stopped(13.0, _CURVE_PARKED_CURV, 80.0 + 75.0, -1, 41, seed, night)
+
+
+def sc_bend_stopped_clear_13(seed, night):
+    """As bend_stopped_13 (left curve R 110 m, the stopped car's rear at arc 155 +- 3 m, in the ego lane) without any
+    parked car: the stopped car alone. collision_t: the ego's front at its rear (~11.6 s)."""
+    return _bend_stopped(13.0, _CURVE_PARKED_CURV, 80.0 + 75.0, None, 42, seed, night)
+
+
+def sc_bend_exit_stopped_13(seed, night):
+    """Straight 80 m, a LEFT curve R 110 m from arc 80 to 230, then straight; ego 13 m/s, never reacting. A
+    stationary car stands in the ego lane on the straight ~15 m after the curve's END (rear at arc 245 +- 3 m), so for
+    most of the approach it is seen across the inside of the bend. Parked row on the outside (right, 2.6-3.2 m) from
+    arc 60 to 330. collision_t: the ego's front at its rear (~18.5 s)."""
+    curv = [(0, 0.0), (80, 0.0), (80, 1 / 110.0), (230, 1 / 110.0), (230, 0.0)]
+    return _bend_stopped(13.0, curv, 245.0, -1, 43, seed, night)
+
+
+def sc_right_bend_stopped_13(seed, night):
+    """Mirror of bend_stopped_13: straight 80 m, a RIGHT curve R 110 m from arc 80 to 300; a stationary car in the
+    ego lane with its rear at arc 155 +- 3 m (~75 m into the curve); parked row on the outside = LEFT (+2.6..+3.2 m)
+    from arc 60 to 330. collision_t: the ego's front at its rear (~11.6 s)."""
+    curv = [(0, 0.0), (80, 0.0), (80, -1 / 110.0), (300, -1 / 110.0), (300, 0.0)]
+    return _bend_stopped(13.0, curv, 80.0 + 75.0, +1, 44, seed, night)
+
+
+def _half_in_lane(v, curv, s_rear, row_to, k, seed, night):
+    rng = random.Random(seed * 101 + k)
+    s_rear = s_rear + rng.uniform(-3.0, 3.0)
+    L = DIMS["car"][0]
+    s_car = s_rear + L / 2
+    t_col = _t_front_at(s_rear, v)
+    yaw = rng.gauss(0, 0.02)
+
+    def actors(w):
+        row = _parked_row(rng, 100, 60.0, row_to, -1, lat=(2.6, 3.2), p_gap=0.1)
+        row = [a for a in row if abs(a.s0 - s_car) >= 7.0]
+        # body covers lateral -2.35..-0.55: 0.33 m into the ego's swept band (-0.88..0.88)
+        return row + [Actor(810, "car", "half_in_lane", s_car, lateral=[(0, -1.45)], yaw_rel=yaw)]
+    return _alert_spec(v, curv, t_col, actors, night)
+
+
+def sc_half_in_lane_13(seed, night):
+    """The `curve_parked` road (LEFT curve R 110 m from arc 80), ego 13 m/s, never reacting; parked row on the
+    outside (right, 2.6-3.2 m) from arc 60 to 330 and ONE car of that side standing half in the ego lane: centre
+    lateral -1.45 m (body -2.35..-0.55, 0.33 m into the ego's swept band), rear at arc 140 +- 3 m (~60 m into the
+    curve); row cars within 7 m of arc of it removed. collision_t: the ego's front at its rear (~10.4 s)."""
+    return _half_in_lane(13.0, _CURVE_PARKED_CURV, 80.0 + 60.0, 330.0, 45, seed, night)
+
+
+def sc_half_in_lane_straight_13(seed, night):
+    """A straight road, ego 13 m/s, never reacting; parked row on the right (2.6-3.2 m) from arc 60 to 330 and one
+    car half in the ego lane (centre lateral -1.45 m, body -2.35..-0.55) with its rear ~180 m ahead of the camera at
+    the start (arc 181.5 +- 3 m); row cars within 7 m of arc of it removed. collision_t: the ego's front at its rear
+    (~13.7 s)."""
+    return _half_in_lane(13.0, [(0, 0.0)], CAM_TO_AXLE + 180.0, 330.0, 46, seed, night)
+
+
+def sc_ped_between_parked_13(seed, night):
+    """The `curve_parked` road (LEFT curve R 110 m from arc 80), ego 13 m/s, never reacting; parked row on the outside
+    (right, 2.6-3.2 m) from arc 60 to 330 with a gap at arc 135 +- 3 m (~55 m into the curve; row cars whose footprint
+    comes within 3 m of it removed). A pedestrian stands in the gap at lateral -2.9 m and steps out at 1.4 m/s,
+    starting 2.6/1.4 = 1.86 s before the ego's front arrives, so it is at lateral -0.3 m (inside the ego's swept band)
+    exactly when the ego's front reaches its arc (collision_t, ~10.1 s); it walks on to the left after."""
+    rng = random.Random(seed * 101 + 47)
+    v = 13.0
+    s_p = 80.0 + 55.0 + rng.uniform(-3.0, 3.0)
+    t_col = _t_front_at(s_p, v)
+    vp = 1.4
+    t_go = t_col - (2.9 - 0.3) / vp
+
+    def actors(w):
+        row = _parked_row(rng, 100, 60.0, 330.0, -1, lat=(2.6, 3.2), p_gap=0.1)
+        row = [a for a in row if abs(a.s0 - s_p) >= a.L / 2 + 3.0]
+        ped = Actor(610, "human", "crossing_ped", s_p, speed=[(0, 0.0)],
+                    lateral=[(0, -2.9), (t_go, -2.9), (t_col, -0.3), (t_col + 6.0, -0.3 + 6.0 * vp)])
+        return row + [ped]
+    return _alert_spec(v, _CURVE_PARKED_CURV, t_col, actors, night)
+
+
+ALERT_SCENARIOS.update({
+    "bend_stopped_13": sc_bend_stopped_13,
+    "bend_stopped_clear_13": sc_bend_stopped_clear_13,
+    "bend_exit_stopped_13": sc_bend_exit_stopped_13,
+    "right_bend_stopped_13": sc_right_bend_stopped_13,
+    "half_in_lane_13": sc_half_in_lane_13,
+    "half_in_lane_straight_13": sc_half_in_lane_straight_13,
+    "ped_between_parked_13": sc_ped_between_parked_13,
+})
+TRUE_BEND_SCENARIOS = ("bend_stopped_13", "bend_stopped_clear_13", "bend_exit_stopped_13", "right_bend_stopped_13",
+                       "half_in_lane_13", "half_in_lane_straight_13", "ped_between_parked_13")

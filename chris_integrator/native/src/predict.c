@@ -98,8 +98,24 @@
     X(ego_len, 4.5)                                                                                                 \
     X(ego_wid, 1.8)                                                                                                 \
     X(ego_centre_x, -0.6)       /* the car's centre in its own frame (the origin is the camera) */                  \
-    X(ego_path_p, 0.8)          /* the car follows the road's path with this prior when one is known */             \
-    X(right_hand, 1.0)          /* traffic keeps right (-1: left) */
+    X(ego_path_p, 0.95)         /* the car follows the road's path with this prior when one is known (0.8 until      \
+                                   2026-11-24: a fifth of every frame's weight ran straight on through the bends) */             \
+    X(right_hand, 1.0)          /* traffic keeps right (-1: left) */                                                \
+    X(lane_los, 1.0)            /* 1: an object's place is spread along the line of sight (a camera's range), read   \
+                                   at up to P_LOS ranges; 0: three points along the frame's longer axis */             \
+    X(lane_mem, 0.0)            /* 1: the lane filter multiplies every frame's place into what it held (a range error \
+                                   that lasts is counted again each evid_tau); 0: the track's place now is all the    \
+                                   place evidence there is (the track is the sum of its sightings) */                 \
+    X(lane_hyp, 1.0)            /* 1: a vehicle whose range leaves open whether it is in the car's lane or beside it  \
+                                   gets futures of both places, each at the range that place means (needs lane_los) */ \
+    X(lane_hyp_min, 0.02)       /* ... from this probability of the less likely place */                           \
+    X(lane_hyp_stand, 0.3)      /* ... and of standing (a moving vehicle's futures are its lane's) */                 \
+    X(ego_kap_back, 0.0)        /* the car's own futures: where the stretch starts over which the path's curvature is \
+                                   compared with the yaw rate (ego_modes) */                                          \
+    X(motion_scale, 1.0)        /* 1: "it moves" counts no further than its velocity shows once the range's scale is  \
+                                   allowed for (motion_scale_bound) */                                                \
+    X(motion_scale_rel, 0.15)   /* ... the range's relative error at least (what the tracker's ranges showed) */      \
+    X(motion_scale_v, 8.0)      /* ... and the speeds of things that do move: 1 sigma (m/s) */
 
 enum {
 #define X(n, d) PC_##n,
@@ -142,11 +158,15 @@ enum { PO_X, PO_Y, PO_VX, PO_VY, PO_AX, PO_AY, PO_SX, PO_SY, PO_SVX, PO_SVY, PO_
  * footprint is drawn from); PO_CX, PO_CY: the object's centre (NaN: not given), its place on the road */
 /* an object's kept state */
 enum { PS_INIT, PS_T, PS_LANE, PS_INT = PS_LANE + P_NLANE, PS_D = PS_INT + P_NM, PS_DR, PS_PDD, PS_PDR, PS_PRR, PS_V, PS_A, PS_PVV,
-       PS_PVA, PS_PAA, PS_TSTAND, PS_TMOVE, PS_LMAP, PS_TKERB, PS_TOP, PS_DIR, PS_TLANE, PS_GSTAND, PS_PSL, P_NS = 48 };
+       PS_PVA, PS_PAA, PS_TSTAND, PS_TMOVE, PS_LMAP, PS_TKERB, PS_TOP, PS_DIR, PS_TLANE, PS_GSTAND, PS_PSL, PS_MOVED, P_NS = 48 };
+/* PS_MOVED: it has been seen to move (half a second of "it moves" on end): its lane is then also what its way of
+ * moving has shown over time */
 /* per object diagnostics (`feat`) */
 enum { PF_S, PF_D, PF_SD, PF_DC, PF_DIR, PF_LANE, PF_LEAD, PF_GAP, PF_E, PF_R, PF_A, PF_PSI, PF_STOP, PF_JDIST, PF_KERB, PF_OM, P_NF };
 /* the road */
-enum { PR_W, PR_Q, PR_KERBL, PR_KERBR, PR_VLIM, PR_SPARE1, PR_SPARE2, PR_SPARE3, P_NR };
+enum { PR_W, PR_Q, PR_KERBL, PR_KERBR, PR_VLIM, PR_ROWL, PR_ROWR, PR_SPARE3, P_NR };
+/* PR_ROWL, PR_ROWR: how many times likelier a standing vehicle on that side is one of those that stand beside the road
+ * there than one standing in a lane (0 or 1: nothing known; predictor.py `row_prior`) */
 enum { PB_LO, PB_HI, PB_TYPE, PB_P, PB_DIR, PB_SPARE, P_NB };
 enum { PA_I0, PA_N, PA_SJ, PA_SIDE, PA_PRIO, PA_ENTRY, PA_EXIT, PA_CTRL, P_NA };
 enum { PE_V, PE_W, PE_A, PE_SIG, PE_PATH, PE_SPARE1, PE_SPARE2, PE_SPARE3, P_NE };
@@ -159,6 +179,7 @@ enum { PK_ALON, PK_ALAT, PK_VMAX, PK_VSTILL, PK_WID, PK_LEN, P_NK };
 #define P_PTS 360
 #define P_AGENTS_MAX 64
 #define P_BIG 1e30
+#define P_LOS 9                     /* ranges along the line of sight at most (lane_step) */
 
 static inline double p_sq(double v) { return v * v; }
 static inline double p_clip(double v, double lo, double hi) { return v < lo ? lo : v > hi ? hi : v; }
@@ -775,6 +796,13 @@ typedef struct {
     double *traj;                   /* [P_KMAX][nt][6] */
     double sprof[P_STEPS_MAX + 1], vprof[P_STEPS_MAX + 1];
     double bb[P_KMAX][4];           /* each future's bounding box, spread included */
+    /* its place along the line of sight (lane_step, cfg lane_los; los_n 0: not read so) and the two places a
+     * vehicle may be in (cfg lane_hyp; hyp 0: one place): 0 the car's lane or across it, 1 elsewhere */
+    int los_n, hyp, side_h;         /* hyp 1: two places; 2: surely in the car's way (one place); side_h: the place its futures are of */
+    double los_r0, los_sr, los_sc;  /* the range of its centre, its 1 sigma along and across the line of sight */
+    double hyp_p[2], hyp_r[2], hyp_sd[2];   /* per place: its probability, the range's mean and 1 sigma given it */
+    double cs, cd, cvar;            /* the place of the futures being built (object_modes): arc length and offset
+                                     * beyond the track's own, its variance as a share of the track's */
 } PObj;
 
 typedef struct {
@@ -823,6 +851,36 @@ static double motion_state(const double *cfg, const double *o, double *info)
     return 0.5 + u * (ps - 0.5);
 }
 
+/* What a camera's velocity can say of "it moves" (cfg motion_scale). A camera measures bearing and size; the range
+ * is known to a share rho of itself, and while the car closes at v a range read long by the share b makes a standing
+ * thing move the car's way at b v (short: towards the car). The tracker's parked cars showed exactly that: called
+ * moving in a fifth of their frames, their velocity along the car's own within a point or two of it, 0.15-0.35 of
+ * the car's speed. So the velocity along the car's travel is, for a standing thing, N(0, (rho v)^2 + 1), and across
+ * it N(0, stated); for a moving one N(0, motion_scale_v^2 + stated) along, N(0, 3^2 + stated)
+ * across. With even odds before, that ratio is the most "it stands" has to be: the radar's p_stationary is raised to
+ * it, never lowered, and only for a vehicle beside the car's way (predict_frame). A lead driving at the car's speed,
+ * an oncoming car, anything crossing are far outside it. */
+static double motion_scale_bound(const double *cfg, const double *o, double v_ego)
+{
+    double r = hypot(o[PO_X], o[PO_Y]), sr = hypot(o[PO_SX], o[PO_SY]);
+    double rho = r > 1.0 ? sr / r : 0.0;
+    if (rho < cfg[PC_motion_scale_rel])
+        rho = cfg[PC_motion_scale_rel];
+    if (rho > 0.5)
+        rho = 0.5;
+    double svx = o[PO_SVX] == o[PO_SVX] ? o[PO_SVX] : 1.0, svy = o[PO_SVY] == o[PO_SVY] ? o[PO_SVY] : 1.0;
+    /* (the scale's share alone, with a metre a second of the filter's own: a velocity that is merely poorly known
+     * (a lead just born, 18 +- 9 m/s) is not thereby one a standing thing would show) */
+    double sx_s = p_sq(rho * v_ego) + 1.0, sy_s = p_sq(rho * v_ego * (r > 1.0 ? o[PO_Y] / r : 0.0)) + p_sq(svy) + 0.01;
+    double sx_m = p_sq(cfg[PC_motion_scale_v]) + p_sq(svx), sy_m = 9.0 + p_sq(svy);
+    /* (across, only what a velocity there takes away from standing: things that move drive along the road too) */
+    if (p_sq(o[PO_VY]) > 4.0 * sy_s)                 /* it moves across the car's travel: no scale explains that */
+        return 0.0;
+    double ll = 0.5 * log(sx_m / sx_s) - 0.5 * p_sq(o[PO_VX]) * (1.0 / sx_s - 1.0 / sx_m)
+                - 0.5 * p_sq(o[PO_VY]) * (1.0 / sy_s - 1.0 / sy_m);
+    return 1.0 / (1.0 + exp(-p_clip(ll, -30.0, 30.0)));
+}
+
 /* ---- lanes -------------------------------------------------------------------------------------------- */
 static double band_occ(const double *b, double d, double sd)
 {
@@ -864,7 +922,83 @@ static void lane_step(PCtx *c, PObj *q, double dt, double *lane_out)
     int along_x = sx >= sy;
     double big = along_x ? sx : sy, small = along_x ? sy : sx;
     static const double W3[3] = {1.0 / 6.0, 2.0 / 3.0, 1.0 / 6.0};
-    double dm = 0.0, d2 = 0.0, res2 = 0.0, sm = 0.0, s2 = 0.0, dk[3], sk[3];
+    double dm = 0.0, d2 = 0.0, res2 = 0.0, sm = 0.0, s2 = 0.0, dk[P_LOS], sk[P_LOS];
+    /* Along the line of sight (cfg lane_los). A camera knows the bearing to a tenth of a degree and the range to a
+     * tenth or a fifth of itself: the place's spread is a needle along the line of sight. The message states its
+     * extent along the frame's axes only (`std`); for a needle along the line of sight at bearing b these are
+     * sx^2 = vr cos^2 b + vc sin^2 b, sy^2 = vr sin^2 b + vc cos^2 b, which give vr (along) and vc (across) back.
+     * Where the two do not fit such a needle (vc well below zero, the bearing near 45 degrees) the frame's axes
+     * stand as before. On a bend the needle crosses the lanes: its ranges are read one by one (three where the
+     * needle stays within 0.6 m across the road, P_LOS else), each with what the range between it and the next
+     * adds across the road. */
+    int los = 0;
+    double gk[P_LOS][P_NLANE], wk[P_LOS], rk[P_LOS], vr = 0.0, vc = 0.0;
+    const double r0 = hypot(ox, oy);
+    q->los_n = q->hyp = 0;
+    if (cfg[PC_lane_los] > 0.5 && r0 > 3.0) {
+        double c2 = (ox * ox - oy * oy) / (r0 * r0);
+        if (fabs(c2) > 0.25) {
+            double tot = sx * sx + sy * sy, dif = (sx * sx - sy * sy) / c2;
+            vr = 0.5 * (tot + dif);
+            vc = 0.5 * (tot - dif);
+            if (vr > 0.0 && vr >= vc && vc > -0.05 * vr) {
+                if (vc < 0.0025)
+                    vc = 0.0025;
+                los = 3;
+            }
+        }
+    }
+    if (los) {
+        const double sr = sqrt(vr);
+        for (int k = 0; k < 3; k++) {
+            rk[k] = r0 + (k - 1) * 1.7320508075688772 * sr;
+            if (rk[k] < 0.1 * r0)
+                rk[k] = 0.1 * r0;
+            wk[k] = W3[k];
+            pp_project(&c->base, ox * rk[k] / r0, oy * rk[k] / r0, &sk[k], &dk[k]);
+        }
+        if (fabs(dk[2] - dk[0]) > 0.6 || fabs(dk[1] - 0.5 * (dk[0] + dk[2])) > 0.2) {
+            double ws = 0.0;
+            los = P_LOS;
+            for (int k = 0; k < P_LOS; k++) {
+                double z = (k - (P_LOS - 1) / 2) * (6.0 / (P_LOS - 1));
+                rk[k] = r0 + z * sr;
+                if (rk[k] < 0.1 * r0)
+                    rk[k] = 0.1 * r0;
+                wk[k] = exp(-0.5 * z * z);
+                ws += wk[k];
+                pp_project(&c->base, ox * rk[k] / r0, oy * rk[k] / r0, &sk[k], &dk[k]);
+            }
+            for (int k = 0; k < P_LOS; k++)
+                wk[k] /= ws;
+        }
+        for (int k = 0; k < los; k++) {
+            double step = k == 0 ? dk[1] - dk[0] : k == los - 1 ? dk[k] - dk[k - 1] : 0.5 * (dk[k + 1] - dk[k - 1]);
+            double rs = sqrt(vc + 0.0225 + step * step / 12.0), tot = 0.0;
+            for (int l = 0; l < P_NLANE; l++)
+                gk[k][l] = 0.0;
+            for (int b = 0; b < c->nb; b++) {
+                const double *B = c->bands + P_NB * b;
+                double oc = B[PB_P] * band_occ(B, dk[k], rs);
+                gk[k][(int)B[PB_TYPE]] += wk[k] * oc / (B[PB_HI] - B[PB_LO]);
+                tot += oc;
+            }
+            gk[k][PL_OFF] += wk[k] * (tot < 0.98 ? 1.0 - tot : 0.02) / 30.0;
+            for (int l = 0; l < P_NLANE; l++)
+                geo[l] += gk[k][l];
+            dm += wk[k] * dk[k];
+            sm += wk[k] * sk[k];
+        }
+        res2 = vc + 0.0225;
+        for (int k = 0; k < los; k++) {
+            d2 += wk[k] * p_sq(dk[k] - dm);
+            s2 += wk[k] * p_sq(sk[k] - sm);
+        }
+        q->los_n = los;
+        q->los_r0 = r0;
+        q->los_sr = sr;
+        q->los_sc = sqrt(vc);
+    } else {
     for (int k = 0; k < 3; k++) {
         double off = (k - 1) * 1.7320508075688772 * big;
         double x = ox + (along_x ? off : 0.0), y = oy + (along_x ? 0.0 : off);
@@ -892,6 +1026,7 @@ static void lane_step(PCtx *c, PObj *q, double dt, double *lane_out)
         d2 += W3[k] * p_sq(dk[k] - dm);
         s2 += W3[k] * p_sq(sk[k] - sm);
     }
+    }
     double px, py;
     pp_project(&c->base, ox, oy, &q->s, &q->d);
     pp_eval(&c->base, q->s, &px, &py, &q->th, &q->kap);
@@ -903,7 +1038,7 @@ static void lane_step(PCtx *c, PObj *q, double dt, double *lane_out)
         q->dref = dr - q->d;
     }
     q->sd_d = sqrt(d2 + res2);
-    q->sd_s = sqrt(s2 + p_sq(along_x ? sin(q->th) * small : cos(q->th) * small) + 0.01);
+    q->sd_s = sqrt(s2 + (los ? vc : p_sq(along_x ? sin(q->th) * small : cos(q->th) * small)) + 0.01);
     double ct = cos(q->th), sn = sin(q->th);
     q->vt = o[PO_VX] * ct + o[PO_VY] * sn;
     q->vn = -o[PO_VX] * sn + o[PO_VY] * ct;
@@ -997,6 +1132,16 @@ static void lane_step(PCtx *c, PObj *q, double dt, double *lane_out)
         em[PL_CROSS] = geo[PL_CROSS] * (st * s_cross + mv * m_cross);
         em[PL_PARK] = geo[PL_PARK] * (st * s_park + mv * slow);
         em[PL_OFF] = geo[PL_OFF] * (st * 1.0 + mv * 0.3);
+        /* where vehicles have been seen to stand beside the road on its side (and how many against those standing
+         * in a lane), one standing in a lane is that many times less likely than one of them (the lanes' standing
+         * share is divided: what stands across the road or on a side road is not part of that count) */
+        double row = c->road[dm >= 0.0 ? PR_ROWL : PR_ROWR];
+        if (row > 1.0 && q->grp == 0) {
+            em[PL_EGO] = geo[PL_EGO] * (st * s_lane / row + mv * m_with);
+            em[PL_LEFT] = geo[PL_LEFT] * (st * s_lane / row + mv * m_with);
+            em[PL_RIGHT] = geo[PL_RIGHT] * (st * s_lane / row + mv * m_with);
+            em[PL_ONC] = geo[PL_ONC] * (st * s_lane / row + mv * m_onc);
+        }
     }
     static const double PRIOR[P_NLANE] = {0.2, 0.12, 0.12, 0.15, 0.1, 0.16, 0.15};
     double *lp = q->st + PS_LANE, post[P_NLANE], sum = 0.0;
@@ -1021,6 +1166,18 @@ static void lane_step(PCtx *c, PObj *q, double dt, double *lane_out)
     double wgt = fresh ? 1.0 : dt / cfg[PC_evid_tau_s];
     if (wgt > 1.0)
         wgt = 1.0;
+    if (!(cfg[PC_lane_mem] > 0.5) && !(q->st[PS_MOVED] >= 1.0) && !fresh && occ_arm < 0.3 && occ_box < 0.3) {
+        /* A thing never seen to move. The track's place now IS the sum of what was seen of it: its lane is the
+         * prior times what that place says, not that multiplied into what the same track said a moment ago.
+         * Multiplied in frame after frame, a range error that put a roadside car's mean into the lane for a second
+         * became certainty (P(ego) above 0.5 for 22 % of the parked cars' frames at 40-50 m, twice the share whose
+         * mean was in the lane at all). What has moved keeps the filter: how it moved (along a lane, across the
+         * road, into the next lane) is evidence that does add up, and a car that drove up and stopped keeps the
+         * lane it drove in. So does what stands on a side road (a car waiting at the junction): which of the
+         * roads it is on is told apart by its body's direction, frame by frame. */
+        lam = 1.0;
+        wgt = 1.0;
+    }
     for (int l = 0; l < P_NLANE; l++) {
         double pred = (1.0 - lam) * lp[l] + lam * PRIOR[l];
         post[l] = pred * pow(em[l] > 1e-7 ? em[l] : 1e-7, wgt);
@@ -1038,6 +1195,88 @@ static void lane_step(PCtx *c, PObj *q, double dt, double *lane_out)
         lp[l] = lane_out[l] = post[l] / sum2;
         if (lp[l] > lp[best])
             best = l;
+    }
+    /* The two places of a vehicle seen along a line of sight that crosses the car's lane (cfg lane_hyp): in the
+     * car's lane (or across the road), or elsewhere (another lane, the parking strip, off the road). Each range read
+     * above says how much it belongs to either (the lanes' priors, what each lane says to the way it moves, the
+     * bands there); the probabilities are the lane filter's own; given a place, the range is the mean and spread of
+     * the ranges that belong to it. */
+    if (los && q->grp == 0 && cfg[PC_lane_hyp] > 0.5) {
+        double a[P_LOS], b[P_LOS], sa = 0.0, sb = 0.0, ma = 0.0, mb = 0.0, va = 0.0, vb = 0.0;
+        double fac[P_NLANE];
+        for (int l = 0; l < P_NLANE; l++)
+            fac[l] = geo[l] > 0.0 ? PRIOR[l] * em[l] / geo[l] : 0.0;
+        const double cross = PRIOR[PL_CROSS] * em[PL_CROSS];
+        /* "in the car's way": its body reaches into the strip the car's body sweeps along its lane (a car parked
+         * half in the lane is in the way though its lane is the parking strip's) */
+        const double reach = 0.5 * (cfg[PC_ego_wid] + q->wid) + 0.15, mid = 0.3 * c->ed0;
+        for (int k = 0; k < los; k++) {
+            double step = k == 0 ? dk[1] - dk[0] : k == los - 1 ? dk[k] - dk[k - 1] : 0.5 * (dk[k + 1] - dk[k - 1]);
+            double rs = sqrt(vc + 0.0225 + step * step / 12.0);
+            double in = p_phi((reach - (dk[k] - mid)) / rs) - p_phi((-reach - (dk[k] - mid)) / rs), all = 0.0;
+            for (int l = 0; l < P_NLANE; l++)
+                if (l != PL_CROSS)
+                    all += fac[l] * gk[k][l];
+            all += cross * wk[k];                     /* ("across the road" is no place of its own: wherever it is) */
+            a[k] = all * in;
+            b[k] = all * (1.0 - in);
+            sa += a[k];
+            sb += b[k];
+            ma += a[k] * rk[k];
+            mb += b[k] * rk[k];
+        }
+        const double hA = sa + sb > 0.0 ? sa / (sa + sb) : 0.0, pmin = cfg[PC_lane_hyp_min];
+        /* Two places only for what (probably) stands, and only where they are apart in range: a moving vehicle's
+         * futures are its lane's, and a place open across the line of sight alone (a car at the lane's edge) is one
+         * place whose spread says it. Those, and a vehicle as good as surely in the way, keep their futures as they
+         * are, with their weight (hyp 2: no lanes' weight on top). */
+        const int stands = q->pstat >= cfg[PC_lane_hyp_stand];
+        if (sa > 0.0 && sb > 0.0) {
+            ma /= sa;
+            mb /= sb;
+        }
+        const int apart = sa > 0.0 && sb > 0.0 && fabs(ma - mb) >= (0.5 * q->los_sr > 1.0 ? 0.5 * q->los_sr : 1.0);
+        if (hA >= pmin && (1.0 - hA < pmin || (stands && !apart))) {
+            q->hyp = 2;
+            q->hyp_p[0] = 1.0;
+            q->hyp_p[1] = 0.0;
+        } else if (stands && apart && hA >= pmin) {
+            for (int k = 0; k < los; k++) {
+                va += a[k] * p_sq(rk[k] - ma);
+                vb += b[k] * p_sq(rk[k] - mb);
+            }
+            const double cell = p_sq(rk[1] - rk[0]) / 12.0;      /* the ranges between two read */
+            q->hyp = 1;
+            q->hyp_p[0] = hA;
+            q->hyp_p[1] = 1.0 - hA;
+            q->hyp_r[0] = ma;
+            q->hyp_r[1] = mb;
+            q->hyp_sd[0] = sqrt(va / sa + cell);
+            q->hyp_sd[1] = sqrt(vb / sb + cell);
+            /* A future is a normal spread, a place is a stretch of the line of sight: each place's spread is kept
+             * within its stretch (two sigma to where the other place takes over between the two means), or the
+             * roadside future's tail lay in the lane again (pc 0.2-0.4 against the car's path for "parked") and
+             * the lane's mass was counted twice. */
+            double lo = ma < mb ? ma : mb, hi = ma < mb ? mb : ma, edge = 0.5 * (ma + mb);
+            for (int k = 0; k + 1 < los; k++) {
+                if (rk[k + 1] <= lo || rk[k] >= hi)
+                    continue;
+                double f0 = a[k] - b[k], f1 = a[k + 1] - b[k + 1];
+                if ((f0 > 0.0) != (f1 > 0.0)) {
+                    edge = rk[k] + (rk[k + 1] - rk[k]) * f0 / (f0 - f1);
+                    break;
+                }
+            }
+            if (edge > lo && edge < hi) {
+                if (q->hyp_sd[0] > 0.5 * fabs(ma - edge))
+                    q->hyp_sd[0] = 0.5 * fabs(ma - edge);
+                if (q->hyp_sd[1] > 0.5 * fabs(mb - edge))
+                    q->hyp_sd[1] = 0.5 * fabs(mb - edge);
+            }
+            for (int h = 0; h < 2; h++)
+                if (q->hyp_sd[h] < 0.3)
+                    q->hyp_sd[h] = 0.3;
+        }
     }
     /* the lane it was last said to be in holds unless another is clearly ahead */
     int was = (int)q->st[PS_LMAP];
@@ -1112,7 +1351,7 @@ static void feat_step(PCtx *c, PObj *q, double dt)
         st[PS_PVV] = rsp / infl;
         st[PS_PVA] = 0.0;
         st[PS_PAA] = p_sq(cfg[PC_acc_meas_sd]);
-        st[PS_TSTAND] = st[PS_TMOVE] = st[PS_TKERB] = 0.0;
+        st[PS_TSTAND] = st[PS_TMOVE] = st[PS_TKERB] = st[PS_MOVED] = 0.0;
         st[PS_TLANE] = 10.0;
         st[PS_LMAP] = -1.0;
         st[PS_TOP] = -1.0;
@@ -1162,6 +1401,11 @@ static void feat_step(PCtx *c, PObj *q, double dt)
         st[PS_TMOVE] += dt;
         if (st[PS_TMOVE] > 3.0)
             st[PS_TSTAND] = 0.0;
+    }
+    if (st[PS_MOVED] < 1.0) {                                   /* seen to move: half a second of a clear "it moves" on end */
+        st[PS_MOVED] = q->pstat < cfg[PC_lane_hyp_stand] ? st[PS_MOVED] + dt : 0.0;
+        if (st[PS_MOVED] >= 0.5)
+            st[PS_MOVED] = 1.0;
     }
     int dir = q->dir != 0 ? q->dir : 1;
     q->e = dir * (st[PS_D] - q->dc);
@@ -1693,6 +1937,34 @@ static void roll_on_base(const PCtx *c, const PObj *q, PRoll *r)
     r->v0 = q->v;
     r->a0 = q->a;
     r->len = q->len;
+    if (q->hyp == 1) {                      /* one of its two places (object_modes): there, as surely as that place is known */
+        r->s0 += q->cs;
+        r->d0 += q->cd;
+        r->pss *= q->cvar;
+        r->psd *= q->cvar;
+        r->pdd = r->pdd * q->cvar + p_sq(q->los_sc);
+    }
+}
+
+/* A standing future at one of a vehicle's two places (lane_step, cfg lane_hyp): the reference point at that place's
+ * range along the line of sight, the spread a needle along it (the range's 1 sigma given the place, the bearing's
+ * across). */
+static void roll_stand_at(const PObj *q, int side, const double *cfg, const double *times, int nt, double *out)
+{
+    const double *o = q->o;
+    double f = q->hyp_r[side] / q->los_r0, rr = hypot(o[PO_X], o[PO_Y]);
+    double ux = rr > 1e-6 ? o[PO_X] / rr : 1.0, uy = rr > 1e-6 ? o[PO_Y] / rr : 0.0;
+    double vr = p_sq(q->hyp_sd[side]), vc = p_sq(q->los_sc);
+    for (int k = 0; k < nt; k++) {
+        double w = p_sq(cfg[PC_stand_drift] * times[k]);
+        double cxx = vr * ux * ux + vc * uy * uy + w, cyy = vr * uy * uy + vc * ux * ux + w, cxy = (vr - vc) * ux * uy;
+        out[6 * k] = o[PO_X] * f;
+        out[6 * k + 1] = o[PO_Y] * f;
+        out[6 * k + 2] = sqrt(cxx);
+        out[6 * k + 3] = sqrt(cyy);
+        out[6 * k + 4] = p_clip(cxy / sqrt(cxx * cyy), -0.99, 0.99);
+        out[6 * k + 5] = 0.0;
+    }
 }
 
 /* the object put on another path: where it is along and beside it */
@@ -1800,6 +2072,11 @@ static int mode_build(PCtx *c, int i, int k, int m, PPath *tmp)
     q->yield[k] = 0;
     q->rank[k] = 3.0;
     double *sp = NULL, *vp = NULL;
+    if (m == PM_STAND && q->hyp == 1) {
+        roll_stand_at(q, q->side_h, cfg, c->times, c->nt, out);
+        q->rank[k] = 5.0;
+        return 1;
+    }
     if (m == PM_FREE || m == PM_STAND) {
         roll_free(o, q->kin, cfg, c->times, c->nt, out, m == PM_STAND);
         q->rank[k] = m == PM_STAND ? 5.0 : 3.0;
@@ -2157,6 +2434,18 @@ static void object_modes(PCtx *c, int i, PPath *tmp)
     if (kmax < 1)
         kmax = 1;
     int order[P_NM], used = 0;
+    const int side = q->lane == PL_EGO || q->lane == PL_CROSS || q->hyp_p[0] >= 0.5 ? 0 : 1;
+    q->side_h = side;
+    if (q->hyp == 1) {
+        /* its futures are those of the place its lane is of (side), at that place's range; the other place gets a
+         * standing future of its own below */
+        double f = q->hyp_r[side] / q->los_r0, s1, d1, s0, d0;
+        pp_project(&c->base, q->o[PO_X] * f, q->o[PO_Y] * f, &s1, &d1);
+        pp_project(&c->base, q->o[PO_X], q->o[PO_Y], &s0, &d0);
+        q->cs = s1 - s0;
+        q->cd = d1 - d0;
+        q->cvar = p_clip(p_sq(q->hyp_sd[side] / q->los_sr), 0.01, 1.0);
+    }
     for (int m = 0; m < P_NM; m++)
         order[m] = m;
     for (int a = 1; a < P_NM; a++) {
@@ -2191,6 +2480,30 @@ static void object_modes(PCtx *c, int i, PPath *tmp)
     }
     for (int k = 0; k < q->nm; k++)
         q->pri[k] /= sum;
+    if (q->hyp == 1) {
+        /* The futures built are of one place and weigh what that place weighs. The other place gets one future: it
+         * stands there ("stopped" in the car's lane, "parked" beside it). Whether it moves is part of what is not
+         * known of it; a vehicle that may move, in the car's lane, is judged as one standing there, and one beside
+         * the road as parked. */
+        const int alt = 1 - side;
+        const double p_st = q->hyp_p[alt];
+        for (int k = 0; k < q->nm; k++) {
+            q->pri[k] *= q->hyp_p[side];
+            if (q->slot[k] == PM_STAND && (q->name[k] == PN_PARKED || q->name[k] == PN_STOPPED))
+                q->name[k] = side == 0 ? PN_STOPPED : PN_PARKED;      /* named by the place, as the other one is */
+        }
+        if (q->nm < P_KMAX) {
+            int k = q->nm++;
+            roll_stand_at(q, alt, cfg, c->times, c->nt, q->traj + (size_t)k * c->nt * 6);
+            q->slot[k] = PM_STAND;
+            q->name[k] = alt == 0 ? PN_STOPPED : PN_PARKED;
+            q->yield[k] = 0;
+            q->rank[k] = 5.0;
+            q->pri[k] = p_st;
+            traj_bb(q->traj + (size_t)k * c->nt * 6, c->nt, q->bb[k]);
+        } else
+            q->pri[0] += p_st;
+    }
 }
 
 /* ---- the car's own futures ------------------------------------------------------------------------------------ */
@@ -2231,10 +2544,14 @@ static void ego_modes(PCtx *c, PPath *tmp)
      * (p_path at its 0.05 floor, curve_parked R 110 m, 2026-11-24) */
     double kap;
     {
-        double s1 = e[PE_V] > 5.0 ? e[PE_V] : 5.0, xa, ya, xb, yb, xc, yc, th, k;
-        pp_eval(&c->base, 0.0, &xa, &ya, &th, &k);
-        pp_eval(&c->base, 0.5 * s1, &xb, &yb, &th, &k);
-        pp_eval(&c->base, s1, &xc, &yc, &th, &k);
+        /* cfg ego_kap_back: the stretch starts this share of itself behind the car (0: all of it ahead; 0.5: the car
+         * in its middle). Ahead only, the road's turn is asked of the car a half second before it is there: at every
+         * bend's start and end the yaw rate "disagreed" with the path and the straight-on future took up to half
+         * the weight */
+        double s1 = e[PE_V] > 5.0 ? e[PE_V] : 5.0, xa, ya, xb, yb, xc, yc, th, k, sb = -p_clip(cfg[PC_ego_kap_back], 0.0, 1.0) * s1;
+        pp_eval(&c->base, sb, &xa, &ya, &th, &k);
+        pp_eval(&c->base, sb + 0.5 * s1, &xb, &yb, &th, &k);
+        pp_eval(&c->base, sb + s1, &xc, &yc, &th, &k);
         kap = wrap_pi(atan2(yc - yb, xc - xb) - atan2(yb - ya, xb - xa)) / (0.5 * s1);
     }
     double l_yaw = exp(p_logn(e[PE_W] - kap * e[PE_V], 0.0, 0.05, 0.05));
@@ -3016,6 +3333,19 @@ static PyObject *n_predict_frame(PyObject *self, PyObject *args)
         q->len = q->o[PO_LEN] == q->o[PO_LEN] && q->o[PO_LEN] > 0.2 ? q->o[PO_LEN] : q->kin[PK_LEN];
         q->wid = q->o[PO_WID] == q->o[PO_WID] && q->o[PO_WID] > 0.2 ? q->o[PO_WID] : q->kin[PK_WID];
         q->pstat = motion_state(c->cfg, q->o, &q->minfo);
+        if (c->cfg[PC_motion_scale] > 0.5 && q->grp == 0 && c->ego[PE_V] > 2.0) {
+            /* only beside the car's way (its place as the track has it): there "it may stand after all" takes a
+             * threat away. In the car's way the radar's word stands: a lead whose speed the tracker has not found yet
+             * (26 m/s read as 17) must not become a car standing in the lane */
+            double lo = motion_scale_bound(c->cfg, q->o, c->ego[PE_V]);
+            if (lo > q->pstat) {
+                int has_c = q->o[PO_CX] == q->o[PO_CX] && q->o[PO_CY] == q->o[PO_CY];
+                double s0, d0;
+                pp_project(&c->base, has_c ? q->o[PO_CX] : q->o[PO_X], has_c ? q->o[PO_CY] : q->o[PO_Y], &s0, &d0);
+                if (fabs(d0 - 0.3 * c->ed0) > 0.5 * (c->cfg[PC_ego_wid] + q->wid) + 0.15)
+                    q->pstat = lo;
+            }
+        }
         q->exist = p_clip(q->o[PO_EXIST], 0.0, 1.0);
         q->traj = traj + (size_t)i * P_KMAX * nt * 6;
         double dt = T - q->st[PS_T];
@@ -3071,6 +3401,7 @@ static PyObject *n_predict_frame(PyObject *self, PyObject *args)
             const PObj *q = c->obj + i;
             double *M = modes + (size_t)i * 5 * P_KMAX;
             M[0] = q->nm;
+            M[1] = q->hyp ? (q->hyp_p[0] > 1e-6 ? q->hyp_p[0] : 1e-6) : 0.0;   /* its futures carry both places: P(in the car's way) */
             for (int k = 0; k < q->nm; k++) {
                 M[P_KMAX + k] = q->slot[k];
                 M[2 * P_KMAX + k] = q->name[k];
@@ -3226,7 +3557,7 @@ done:
     X(hdg) X(hdg_std) X(exist) X(state) X(indicator) X(brake_lights) X(vis) X(flags) X(motion) X(ctr) X(id)            \
     X(tentative) X(memory) X(left) X(right) X(parked) X(occluded) X(hidden) X(stationary) X(moving) X(with_traffic)    \
     X(oncoming) X(objects) X(type) X(radar_fut) X(fut) X(t) X(ego_fut) X(modes) X(fut_ctx) X(lane) X(intent) X(p)      \
-    X(p0) X(m) X(x) X(y) X(sx) X(sy) X(rxy) X(v)
+    X(p0) X(m) X(x) X(y) X(sx) X(sy) X(rxy) X(v) X(lane_res)
 #define X(n) K_##n,
 enum { PK_STRS(X) K_N };
 #undef X
@@ -3766,7 +4097,8 @@ static PyObject *n_predict_message(PyObject *self, PyObject *args)
                 item = PyDict_Copy(ob);
                 if (item == NULL || PyDict_SetItem(item, pk_s[K_fut], PyList_GetItem(futs, i)) < 0 ||
                     pm_set(item, pk_s[K_lane], pm_lane(LN + i * P_NLANE, lanes)) < 0 ||
-                    pm_set(item, pk_s[K_intent], pm_intent(IN + i * P_NM, M + i * 5 * P_KMAX, names, slots)) < 0) {
+                    pm_set(item, pk_s[K_intent], pm_intent(IN + i * P_NM, M + i * 5 * P_KMAX, names, slots)) < 0 ||
+                    (M[i * 5 * P_KMAX + 1] > 0.0 && pm_set(item, pk_s[K_lane_res], PyFloat_FromDouble(rint(M[i * 5 * P_KMAX + 1] * 1000.0) / 1000.0)) < 0)) {
                     Py_XDECREF(item);
                     goto done;
                 }
@@ -4106,7 +4438,7 @@ static PyObject *n_predict_handoff(PyObject *self, PyObject *args)
         }
         RO[3 * i] = (double)k_out;
         RO[3 * i + 1] = ok ? (double)nm : 0.0;
-        RO[3 * i + 2] = ok ? 1.0 : 2.0;
+        RO[3 * i + 2] = ok ? (m[1] > 0.0 ? 3.0 + (m[1] < 0.999 ? rint(m[1] * 1000.0) / 1000.0 : 0.999) : 1.0) : 2.0;      /* 3: as the contract says, the lanes' weight in the futures */
         if (ok) {
             for (int k = 0; k < nm; k++)
                 if (PyList_Append(lnames, PyTuple_GetItem(names, (int)m[2 * P_KMAX + k])) < 0)

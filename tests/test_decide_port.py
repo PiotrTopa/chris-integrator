@@ -140,7 +140,8 @@ class Handoff(unittest.TestCase):
                 ra, rb = a.sel[o["id"]], b.sel[j]
                 (fa, na, sa), (fb, nb, sb) = (int(v) for v in ar[ra]), (int(v) for v in br[rb])
                 self.assertEqual((na, sa), (nb, sb))
-                self.assertEqual(sa, 1)
+                self.assertIn(sa, (1, 3))                     # as the contract says (3: with `lane_res`, its two places)
+                self.assertEqual(float(ar[ra][2]), float(br[rb][2]))      # ... and the same P(in the car's way) either way
                 self.assertEqual(am[fa:fa + na].tolist(), bm[fb:fb + nb].tolist())
                 self.assertEqual(a.names[fa:fa + na], b.names[fb:fb + nb])
                 self.assertEqual(al[ra].tolist(), list(bl[rb].values()))

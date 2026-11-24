@@ -602,6 +602,44 @@ not applied: `ego_fut` gives it, in the same frame.
 An object the predictor did not take (tentative; beyond `objects_max` = 48, the nearest are taken) is passed on
 without the three fields.
 
+**A vehicle's place under a camera's range** (`lane_res`, lane CURVES 2026-11-24). A camera knows a bearing to a
+tenth of a degree and a range to a sixth of itself (the tracker's stated 1 sigma was 17-20 % of the range at every
+age and distance on the simulated streets, its error within it): the place is a needle along the line of sight. On
+a bend that needle crosses the lanes: a car parked on the outside of the bend and a car stopped in the lane behind
+the bend lie on the same line of sight a few metres of range apart. What the predictor does about it (native
+constants, each a switch):
+
+* `lane_los` (1): the place is read at up to nine ranges along the line of sight (three where the needle stays
+  within 0.6 m across the road). The needle is recovered from `std`, which states it along the frame's axes: at
+  bearing b, sx^2 = vr cos^2 b + vc sin^2 b and sy^2 = vr sin^2 b + vc cos^2 b; where the two do not fit a needle
+  (vc well below zero, a bearing near 45 degrees) the frame's axes stand as before.
+* `lane_mem` (0): for a thing never seen to move (half a second of a clear "it moves" has not happened) and not on
+  a side road, the lane is the prior times what the track's place says NOW. A track is already the sum of its
+  sightings; multiplied into the lane filter again every 0.4 s, a range error that lasts a second became
+  certainty. What has moved, and what stands on a side road, keeps the filter (how it moved adds up; a car that
+  drove up and stopped keeps its lane). 1: the filter for all, as before.
+* `lane_hyp` (1): a vehicle that (probably) stands (`lane_hyp_stand` 0.3) and whose range leaves both open gets
+  **futures of two places**: in the car's way (its body reaches into the strip the car's body sweeps along its
+  lane: a car parked half in the lane is in the way, whatever its lane) and not. Each place is the stretch of the
+  line of sight that belongs to it, its futures stand at that stretch's mean range with a spread kept inside it;
+  the futures built for the object's lane are of the one place and weigh what it weighs, the other place gets one
+  standing future (`stopped` in the way, `parked` beside). The object then carries `"lane_res": P(in the car's
+  way)` (in process: state 3 + that probability in the hand-off's rows) and its futures' weights are final: the
+  decision layer does not weigh the standing ones by the lanes again. A place open only across the line of sight
+  (the two less than max(1 m, half the range's sigma) apart in range) stays one place whose spread says it, and a
+  vehicle as good as surely in the way keeps its futures: both with `lane_res` 1.
+* `row_odds_max` (predictor's own, 12; 0: off): where vehicles have been seen standing beside the road on a side
+  (their offset known to `row_sd_m`, within `row_mem_s`), a vehicle standing in a lane on that side is (beside +
+  1) / (in the lane + 1) times less likely, at most `row_odds_max`: a count of what this street has shown.
+* `motion_scale` (1): a camera's velocity along the car's own travel is, for a standing thing, as uncertain as
+  the range's scale times the car's speed (a range read 15 % long makes a parked car drive with the traffic at
+  0.15 v: the tracker called parked cars moving in a fifth of their frames, their velocity along the car's own,
+  0.15-0.35 of its speed). For a vehicle BESIDE the car's way whose velocity across the car's travel is within its
+  spread, p_stationary is raised to what that velocity leaves of "it stands" (never lowered; never for a vehicle in
+  the car's way: a lead whose speed is not found yet must not become a car standing in the lane).
+* `ego_path_p` 0.95 (was 0.8): the car's straight-on future (`ctra`) held a fifth of the weight in every frame
+  and ran through the bends' roadside cars; it still takes over where the yaw rate leaves the path.
+
 Manoeuvres (`m`, keys of `intent`): vehicles `keep`, `follow` (behind the one ahead, by the car-following law),
 `lc_left` / `lc_right`, `cut_in` (a lane change into the car's lane ahead of the car), `cut_out` (out of it),
 `turn_left` / `turn_right` (at a junction's arm; without a known junction: the turn its yaw rate shows), `stop`
@@ -959,6 +997,7 @@ How the numbers are made (docs/DESIGN.md section 17; the arithmetic is native, `
 | `ttb_s`, `tts_s`, `tm_s` | the latest onset of full braking / full steering (to either side) that still avoids it (with its margin); `tm_s` the later of the two less the reaction time. Only where the mean futures make contact with the footprint as it is (`tm_needs_contact`): a time margin needs a collision to have a time; where they miss and only the margin is breached these are null and the pair's level is its threat number's |
 | levels | per pair: a collision course and `tn >= tn_min` or `tm <= tm_max` of the level (per class: vehicle, vru, unknown); per object: the highest level whose mass reaches its minimum |
 | footprint | the futures carry the radar's reference point (`x_m`, `y_m`: the footprint's near face); the centre is the radar's `ctr` (its offset held in the body frame), else half the depth beyond along the line of sight. Heading now: the stated one (`hdg`, its 1 sigma `ext_std[2]`), where the radar resolved it (1 sigma at most `hdg_resolved_rad`, 0.15 rad: whole vehicles' boxes state 0.04-0.11 rad, partial side-on views 0.2-0.8 rad and are often a quarter turn off); an unresolved one gives way to the direction of travel (a speed clear of its spread), else the road's axis at the object's place. A vehicle the prediction puts in a lane along the road (P(ego) + P(left) + P(right) + P(onc) >= `lane_axis_p`, 0.5; without lanes: the degraded adapter's `cv_path`, driving along the path or against it) takes the road's axis (the direction nearer the stated one): a box seen head-on states a heading it cannot see. A standing object (radar verdict, p_stationary >= 0.5, `parked`) whose heading is not its direction of travel takes the road's axis at its place when within 0.7 rad of it (`road_axis_standing`; the camera cannot tell which side of the line of sight a car points). Later steps: the direction of the mode's travel over the next second from 1 m/s on average, else held, modulo a half turn |
+| two places | an object with `lane_res` (the prediction gave it futures of two places, above): the futures' weights are taken as they are (no lanes' weight), a future's "now" is its own first place, and the record carries `p_place`, the probability of the place in the car's way |
 | lanes | with predicted futures, a mode that stands (moves under 1 m over the horizon) is weighted by the prediction's P(lane ego) + P(lane cross), at least 0.05 (`lane_weight`); not where the radar's corridor test says it surely stands in the path (`in_path`, `threat`); moving modes (pulling out, crossing) keep their weight |
 
 Alerts (`chris_integrator/decide/alerts.py`): `obstacle_ahead` (everything on a collision course ahead) and
@@ -969,7 +1008,12 @@ would have been said, `active: false`). Stage entry needs the level held `entry_
 information .. imminent), a stage is shown at least `min_hold_s` (0.5, 1, 1.5, 2 s) and left when the exit level
 has been below it for `exit_hold_s` (0.5, 0.6, 0.8, 1 s); imminent latches until the exit level is information
 or the car stands. The primary changes to a challenger that ranks higher for `switch_hold_s` (0.3 s), at once to
-a higher level. Candidates: confirmed or coast, existence >= 0.6, seen within 2.5 s. On degraded futures: an
+a higher level. An object whose PLACE is in doubt (`p_place` below
+`entry_evidence`, 0.6) enters a stage by evidence instead of by time: the conflict's mass at that level, as far as
+it exceeds the level's minimum, adds up at (mass - minimum) / (entry_evidence - minimum) per second (at most 1) to
+`entry_hold_s`, and runs down again while the level is not held: a clear conflict enters as fast as ever, one that
+a second of range error lifts just over the minimum does not (`entry_evidence: 0` is the time rule for all).
+Candidates: confirmed or coast, existence >= 0.6, seen within 2.5 s. On degraded futures: an
 object whose velocity is not observed yet raises at most information until the radar's p_stationary has moved to
 0.65; one the radar calls parked at most information; one that most probably stands rises above caution only when
 the radar's corridor test puts it surely in the path (`in_path`, `threat`). Suppressed (stage kept, nothing said,
