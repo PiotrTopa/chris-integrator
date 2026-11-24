@@ -50,6 +50,8 @@ class RadarModel(SensorModel):
         return v - w * self.my, w * (self.mx + AXLE)
 
     def h(self, x, ego):
+        if type(x) is np.ndarray and x.dtype == np.float64:
+            x = x.tolist()                 # (Python floats: the same IEEE arithmetic as numpy's scalars, less overhead)
         dx, dy = x[X] - self.mx, x[Y] - self.my
         r = max(math.hypot(dx, dy), 0.5)
         vsx, vsy = self._sensor_vel(ego)
@@ -113,7 +115,10 @@ def ego_velocity(az, rr, rng, tol=0.35, iters=24):
     n = len(az)
     if n < 5:
         return None
-    A = -np.column_stack([np.cos(az), np.sin(az)])
+    # (column_stack and outer without their Python-level wrappers: the same arrays, the same products)
+    A = np.empty((n, 2))
+    A[:, 0], A[:, 1] = np.cos(az), np.sin(az)
+    A = -A
     # all candidate pairs at once
     # (`_randbelow(n)` is what `randrange(n)` returns for n > 0, without its argument checks: the same stream)
     rb = rng._randbelow
@@ -127,7 +132,7 @@ def ego_velocity(az, rr, rng, tol=0.35, iters=24):
     det = np.where(ok, det, 1.0)
     vx = (d * rr[ii] - b * rr[jj]) / det
     vy = (a * rr[jj] - c * rr[ii]) / det
-    res = np.abs(np.outer(vx, A[:, 0]) + np.outer(vy, A[:, 1]) - rr[None, :]) < tol
+    res = np.abs(vx[:, None] * A[:, 0][None, :] + vy[:, None] * A[:, 1][None, :] - rr[None, :]) < tol
     cnt = np.where(ok, res.sum(axis=1), -1)
     k = int(cnt.argmax())
     best = (int(cnt[k]), res[k])
@@ -263,13 +268,18 @@ class RadarSource(Source):
         model = RadarModel(self.mount, yaw, self.fov, self.max_range, self.sigma)
         static = ctx.mem.get("static")
         dets = []
-        for i in range(len(r)):
-            if static is not None and static[i]:
+        # (the arrays as Python floats: the same numbers and the same IEEE arithmetic, without numpy's scalars)
+        rl, azl, rrl = r.tolist(), az.tolist(), rr.tolist()
+        sl = None if static is None else static.tolist()
+        my, side, ss, vv = self.mount.y, self.roadside_m, sa * sa, sv * sv
+        for i in range(len(rl)):
+            ri = rl[i]
+            if sl is not None and sl[i]:
                 # the stationary world: roadside returns start no tracks; what stands on the road ahead does
-                if abs(self.mount.y + r[i] * math.sin(az[i] + yaw)) > self.roadside_m:
+                if abs(my + ri * math.sin(azl[i] + yaw)) > side:
                     continue
-            R = np.array([sr * sr + (0.005 * r[i]) ** 2, sa * sa, sv * sv])
-            dets.append(Det([r[i], az[i], rr[i]], R, at[i]))
+            R = np.array([sr * sr + (0.005 * ri) ** 2, ss, vv])
+            dets.append(Det([ri, azl[i], rrl[i]], R, at[i]))
         return Scan(self.id, self.group, ts / NS - ctx.val("tau"), dets, model, ts)
 
     def report(self, ctx):
