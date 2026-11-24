@@ -269,9 +269,40 @@ CFG = dict(
     in_pose_gn=False, in_pose_gc=False, in_pose_yaw=False, pose_corr_s=1.0, pose_gn_occ=1.5, pose_yaw_floor_deg=3.0,
     pose_yaw_huber=2.0, pose_vote_max=math.log(8.0), pose_vote_turn=math.log(4.0), pose_vote_dark=math.log(2.0),
     pose_axis_dark_p=0.9, pose_vote_half_s=0.5, pose_kind_min=0.5, pose_min_seen=0.5,
+    # ---- the range of a standing thing (docs/RADAR.md, section 11) ----
+    # scale_iter: the standing hypothesis takes a box with a scale rate by iteration (at most scale_iter_n steps).
+    # The image of a thing that stands grows at (the car's speed) / (its depth): a hyperbola in the range, of which
+    # one linear step from 0.6 of the range reaches 0.84 of it and states a spread as if it had arrived
+    # scale_seed: "it stands", brought back from the floor, is the standing thing THIS box's scale rate describes (at
+    # the range the rate says, as tall as its box is from there): the hypothesis is opened along the common factor of
+    # range and size (scale_seed_sigma, of its logarithm) and takes the rate from there, where the rate says the range
+    # scale_seed_k times better than the others' place did. Before, it was given the place of the hypotheses that
+    # DRIVE, where no standing thing gives that rate, and was refuted again at the next box. Measured (docs/RADAR.md,
+    # section 11): with the update iterated the hypothesis no longer falls to the floor by its own error, and the
+    # seed then lets an object that took a neighbour's box stand again at the neighbour: not recommended
+    scale_iter=False, scale_iter_n=8, scale_seed=False, scale_seed_sigma=0.7, scale_seed_k=3.0,
+    # scale_exact: a scale rate is read as what it is, the object's depth at the far end of its baseline (`scale_dt_s`
+    # ago, along the camera's axis as it pointed then) over its depth now: with the car's own pose then, from its
+    # movement's record. It was read as the depth's rate of this moment: right while the car drives straight at a
+    # steady speed, 1.3 % far 40 m ahead on a bend of 110 m radius, 9 % near while braking at 3 m/s^2
+    scale_exact=False,
+    # near_axis: a box's height and its scale rate go with the depth of the object's near face along the camera's
+    # axis (the picture's size is the size over that depth), not with its range along the line of sight: a car parked
+    # 3 m beside, 15 m ahead, read 0.1-0.2 m far
+    near_axis=False,
+    # ext_size: a vehicle's length and width priors follow its height (`_ext_size`, models.extent_of_height): the
+    # class vote's until its numbers know its own ext_size_learnt times better (in variance), then its own; exchanged
+    # in every story of it when the height says another size by ext_size_step (share of the size, or four times that
+    # of the prior's variance in the logarithm). An object keeps the extent of its first box's label otherwise
+    # (a car born from a box called `truck`: 10 x 2.5 m; a van called `truck`: 10 m for its 6): its centre then lies
+    # half that length behind a near face known to a few tenths of a metre
+    ext_size=False, ext_size_step=0.08, ext_size_learnt=0.25,
 )
 _IN_KNOBS = ("in_flags", "in_box_occl", "in_low", "in_app", "in_reid", "in_lamp_colour", "in_lamp_size", "in_width", "in_scale",
-             "sil_bearing", "row_ctx", "det_chain", "in_pose_gn", "in_pose_gc", "in_pose_yaw", "pd_learn", "exist_shared")
+             "sil_bearing", "row_ctx", "det_chain", "in_pose_gn", "in_pose_gc", "in_pose_yaw", "pd_learn", "exist_shared",
+             "scale_iter", "scale_seed", "scale_exact", "near_axis")
+_RANGE_KNOBS = ("scale_iter", "scale_seed", "scale_exact", "near_axis")
+_SPREV = 8                       # scale-rate baselines of one scan whose far end's pose is given (chris_native.c RSPREV)
 _POSE_KNOBS = ("in_pose_gn", "in_pose_gc", "in_pose_yaw")
 
 
@@ -359,6 +390,7 @@ OT_CHK = OT_NCHK + 1
 OTW = OT_CHK + 7 * OT_MAXCHK     # numbers per object
 _STATES = {"tentative": 0.0, "confirmed": 1.0, "coast": 2.0, "memory": 3.0}
 _MO = OFF["m"][0]
+_XLH, _PLH = OFF["x"][0] + M.LH, OFF["P"][0] + M.LH * N + M.LH      # of a row: the height (lh) and its variance
 
 
 # of a primary row: the free estimate's velocity and its covariance, "it stands", the velocity (Tracker._groups)
@@ -441,7 +473,7 @@ class Obj:
     vote, verdict, group) and, as attributes, its numbers in the tracker's arrays (`State`): the parts of its
     primary row and its row of the table."""
     __slots__ = ("id", "h", "store", "t0", "_state", "sources", "last_seen", "vote", "nis", "verdict", "coast_s",
-                 "velocity_seen", "merge_t", "scores", "cls", "_kin", "grp", "grp_kind", "lhp", "low_run", "sized", "los")
+                 "velocity_seen", "merge_t", "scores", "cls", "_kin", "grp", "grp_kind", "lhp", "low_run", "sized", "los", "extp")
     xs, Ps, mu, xf, Pf, x, P, e, Pe, st, m = (_view(a, b, sh) for _, a, b, sh in _OFF)
     t = _meta(M_T)                   # the time its numbers are of
     logodds = _meta(M_L)             # that it exists, in the primary's story (`exist`: over all stories)
@@ -483,6 +515,7 @@ class Obj:
         self.lhp = None              # the prior of its height (lh) its numbers hold: (mean, variance) (Tracker._size)
         self.low_run = 0             # its last sightings in a row that were boxes of the low-score list
         self.sized = False           # what its boxes said of its height has gone into its kind's prior (`_size_learn`)
+        self.extp = None             # the priors of its length and width its numbers hold: (L, variance, W, variance)
         self.los = None              # the line of sight to it at its first sighting, and how far it has swung since
                                      # (ground frame: [first, least, most]; `size_learn`)
 
@@ -649,13 +682,16 @@ class Tracker:
                    c["pose_vote_dark"], c["pose_axis_dark_p"], c["pose_vote_half_s"],
                    1.0 if c["pd_learn"] else 0.0, c["pd_learn_n0"], c["pd_learn_keep"], 1.0 if c["exist_shared"] else 0.0)
                 if (c["row_ctx"] or c["det_chain"] or (c["low_exist_only"] and c["in_low"]) or c["pd_learn"]
-                    or c["exist_shared"] or any(c[k] for k in _POSE_KNOBS)) else ())
+                    or c["exist_shared"] or any(c[k] for k in _POSE_KNOBS) or any(c[k] for k in _RANGE_KNOBS)) else (),
+                # the range of a standing thing (chris_native.c `XC_SITER` on)
+                (float(c["scale_iter_n"]) if c["scale_iter"] else 0.0, c["scale_seed_sigma"] if c["scale_seed"] else 0.0,
+                 c["scale_seed_k"], 1.0 if c["near_axis"] else 0.0) if any(c[k] for k in _RANGE_KNOBS) else ())
         ek = getattr(sensor, "emb_kind", 0) if c["in_app"] else 0
         tab = c["app_tables"].get(ek) or c["app_tables"].get(str(ek))
         if tab is None:
             ek, tab = 0, ((0.0, 1.0) * 4,) * 2           # a kind of vector there is no table for: not used
         return st[0] + (max(c["low_false_per_scan"], self.low_rate.get(src, 0.0)), 1.0 if ek else 0.0, float(ek)) + st[1] \
-            + tuple(tab[0]) + tuple(tab[1]) + st[2] + st[3]
+            + tuple(tab[0]) + tuple(tab[1]) + st[2] + st[3] + st[4]
 
     def look(self, objs):
         """Several objects' numbers at once, as lists (the upkeep and the message read every object once per
@@ -841,6 +877,21 @@ class Tracker:
                 (c["oosm_max_s"], 1.0 if c["consider_moving"] else 0.0, c["consider_range_s"],
                  1.0 if c["consider_stand"] else 0.0))
         xcfg = self._xcfg(src, sensor) if c["_in_any"] else None
+        if xcfg is not None and c["scale_exact"]:
+            # the car's pose at the far end of each scale rate's baseline (the scan's boxes share a few baselines:
+            # the detector's earlier passes)
+            sp = []
+            for d in dets:
+                dt = d.get("sdt")
+                if dt and dt > 0.0 and dt not in sp and len(sp) < _SPREV:
+                    sp.append(dt)
+            tail = []
+            for dt in sp:
+                p = self.ego.pose_at(t - dt)
+                if p is not None:
+                    tail += [float(dt), float(p[0]), float(p[1]), float(p[2])]
+            if tail:
+                xcfg = xcfg + (float(len(tail) // 4),) + tuple(tail)
         if xcfg is not None:                             # the detector's further inputs (docs/RADAR.md, section 8)
             args += (xcfg,)
             if c["row_ctx"] and dets and objs:
@@ -907,6 +958,8 @@ class Tracker:
             lab = classvote.norm_label((d.get("attrs") or {}).get("class"))
             kb = M.kinb(lab)
             o.lhp = (math.log(kb[7]), kb[8] * kb[8])     # the height prior it was born with (chris_native.c r_birth)
+            if kb[10] > 0.0 and lab in M.VEHICLES:       # ... and a vehicle's extent (r_extent_birth)
+                o.extp = (kb[10], (0.22 * kb[10]) ** 2, kb[9], (0.10 * kb[9]) ** 2)
             self._vote(o, d, src, t)
             kb = (d.get("kind") or "").rstrip("s")
             if kb in ("rb", "rbh"):
@@ -956,6 +1009,43 @@ class Tracker:
             la = o.label
             o.label_code = 0.0 if la is None else (1.0 if la in M.VEHICLES else -1.0)
             self._size(o)
+            if self.cfg["ext_size"] and o.extp is not None:
+                self._ext_size(o)
+
+    def _ext_size(self, o):
+        """A vehicle's length and width priors follow its height (`ext_size`): the height its class vote's prior
+        gives it (`_size`) until its own boxes have said more (its numbers' lh known ext_size_learnt times better
+        than that prior: a standing thing a scale rate has ranged), then its own. That height gives the size of a
+        vehicle that tall (models.extent_of_height), and where that differs from the priors its extent holds they
+        are exchanged in every story of it (the old one's information out, the new one's in: radar_ext_prior), as
+        `_size` does with the height. (A height not yet learnt moves with every box's noise and with the hypotheses'
+        weights: the size does not follow that.)"""
+        if o.label_code <= 0.0:
+            return
+        c = self.cfg
+        row = self.store.a[o.slot]
+        lh, vh = float(row[_XLH]), max(float(row[_PLH]), 0.0)
+        if o.lhp is not None and not vh < c["ext_size_learnt"] * o.lhp[1]:
+            lh, vh = o.lhp
+        L1, vL1, W1, vW1 = M.extent_of_height(math.exp(lh), math.sqrt(vh))
+        L0, vL0, W0, vW0 = o.extp
+        st = c["ext_size_step"]
+        rows = None
+        for k, m0, v0, m1, v1 in ((0, L0, vL0, L1, vL1), (1, W0, vW0, W1, vW1)):
+            if abs(m1 - m0) < st * m0 and abs(math.log(v1 / v0)) < 4.0 * st:
+                continue
+            if rows is None:
+                rows = self.hyp.rows(o.h)
+                p = self.ego.pose_at(o.t)                # the face the camera saw stays where it is (radar_ext_prior)
+                only = all(getattr(self.sensors.get(q, (None,))[0], "kind", "") == "camera_boxes" for q in o.sources)
+                cam = (float(p[0]), float(p[1])) if p is not None and only else (math.nan, math.nan)
+            _NR.radar_ext_prior(self.store.a, rows, k, 1.0 / v1 - 1.0 / v0, m1 / v1 - m0 / v0, cam[0], cam[1])
+            if k == 0:
+                L0, vL0 = m1, v1
+            else:
+                W0, vW0 = m1, v1
+        if rows is not None:
+            o.extp = (L0, vL0, W0, vW0)
 
     def _size(self, o):
         """The prior of the object's height follows what the class detector says of it (models.size_prior of the

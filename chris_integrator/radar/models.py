@@ -128,6 +128,31 @@ def size_prior(shares, over=None):
     return m, v2
 
 
+def extent_of_height(h, sd_lh=0.0):
+    """A vehicle's length and width by its height (m): (L, variance, W, variance). Cars 4.5 x 1.8 at 1.4-1.75 m (3.6 to
+    5.3 m long: a spread of 12 %), vans 5.5-7 x 2.0-2.1 at 2.1-2.7 m, lorries and buses 8-12 x 2.5 at 3.2-3.5 m (a
+    third); the width as the rulers take it (chris_native.c `x_width_of`: 1.8 + 0.35 (h - 1.5), to a tenth). sd_lh:
+    what is not known of the height (of its logarithm) goes into both variances. The height is what a camera can
+    learn of a standing vehicle's size (the scale rate ranges it, and its box height at that range is its height);
+    its length it sees only as a part of the silhouette."""
+    hh = min(max(h, 1.0), 4.2)
+    W, dW = 1.8 + 0.35 * (hh - 1.5), 0.35
+    if hh <= 1.75:
+        L, dL = 4.5, 0.0
+    elif hh <= 2.6:
+        dL = 1.5 / 0.85
+        L = 4.5 + dL * (hh - 1.75)
+    elif hh <= 3.4:
+        dL = 3.0 / 0.8
+        L = 6.0 + dL * (hh - 2.6)
+    else:
+        dL = 3.0
+        L = min(9.0 + dL * (hh - 3.4), 12.0)
+    rel = 0.12 + 0.18 * min(max((hh - 1.75) / 1.65, 0.0), 1.0)
+    sh = hh * sd_lh
+    return L, (rel * L) ** 2 + (dL * sh) ** 2, W, (0.10 * W) ** 2 + (dW * sh) ** 2
+
+
 _KINB = {}
 
 

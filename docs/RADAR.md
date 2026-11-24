@@ -1023,3 +1023,277 @@ vectorised pass over the scan's boxes and the judged objects; the chain and the 
 leaf). With the knobs off every stream of both captures is identical to the base's (`cost_bench.py diff`). The pose
 knobs and `in_app` were not costed through the stack: the captures carry neither. Deeper trees were measured and not
 taken (no gain), so nothing was added to the hypotheses' own cost.
+
+## 11. The range and the extent of a standing thing (2026-11-24)
+
+Five knobs of `radar.tracker`, all **off by default** (with them off every scan and every message is what it was: the
+goldens and digests of tests/test_native.py, tests/test_radar_inputs.py, tests/test_radar_parked.py and
+tests/test_radar_rows.py stand as recorded; both recorded captures and both simulated ones of tools/cost_bench.py:
+every stream identical). Recorded with them on: `tests/data/make_radar_golden.py --range` (tests/test_radar_range.py).
+The simulator got two options, both off by default and bit-identical then: the detector's scale rate as a preset
+(`scale`, `detin_scale`, `detin_pose_scale` of `roaduser_sim.det_params_arg`; `scale_rate: "auto"`: `SCALE_DAY` /
+`SCALE_NIGHT` by the run), and a fleet of vehicle sizes (world option `dims_fleet`: `DIMS_FLEET`, cars 1.42-1.90 m
+tall, mean 1.57 m, 1.63-2.0 m wide).
+
+### What was found
+
+Tools: the lane's scratch tools on tools/radar_trace.py (every 0.1 s every confirmed object with four sightings or
+more against the actor whose box it last took; `curve_parked` + `parked_street`, seeds 1-3, day and night: 10 minutes
+of driving per row) and tools/alert_truth.py.
+
+* **The bias is the height prior, per car, and half of it something else.** Objects fed by one car, 10-40 m, today's
+  stream: range +8.4 % long, the height state +7.0 % (the prior's 1.6 m against 1.5 m, hardly learnt). With the
+  simulator's cars made 1.6 m: +4.1 % and +3.2 %: the prior's mean is half of it; the other half was not traced (it
+  is gone with a scale rate, below). On a fleet of sizes the error is each car's own: cars under 1.55 m +10.5 to
+  +10.8 %, 1.55-1.70 m +1.6 %, 1.70-2.2 m -2.3 %. No constant is right; the height has to be the object's.
+* **None of the measured streams carried the detector's scale rate.** `--lights-ru-scale` is on in the car; the plain
+  stream and the `DETIN` preset emit no `scale_rate` unless given a `scale_rate` dictionary (section 8's rows had
+  one; the alert measurements of sections 9, 10 and DESIGN.md 17.2 had none). A thing that stands comes nearer at
+  the car's own speed: its image grows at (the car's speed) / (its depth), so the rate measures the depth outright,
+  to 2-4 % from one value at 30 m by day, whatever the thing's size, the camera's pitch and the road's slope; and the
+  box height at that range is the object's own height from then on. With the stream's scale rate and no change to
+  the tracker (`use_scale_rate` is on): the standing objects' median error along the line of sight 1.91 / 2.69 /
+  3.51 m at 10-20 / 20-30 / 30-40 m -> 0.44 / 0.64 / 0.89 m, the stated spread 0.17 of the range -> 0.05, the bias
+  +9 to +12 % -> -1 to +2 %, on the fleet +0.8 / +2.9 / +0.4 / -2.9 % by the four height classes, standing things
+  called moving 14.3 % of their frames -> 5.0 %, called stationary 63 -> 84 %, jumps 101 -> 47. And the stated spread
+  no longer held: within 1 / 2 sigma 0.65-0.76 / 0.85-0.92 where it was 0.59-0.79 / 0.87-0.97. (The other half of
+  section 9's finding stands: the simulator's detector boxes a near car 2-3 times under 25 m; with the range pinned
+  earlier that no longer matters to the range.)
+* **The false warnings did not follow** (false `obstacle_ahead` episodes of the streets: 58 without and 75 with the
+  scale rate on today's stream, 89 and 86 on the realistic one; today's stream draws the rates from the boxes' own
+  generator, so its two rows are other noise realisations and a six-seed total has a spread of 11-16): they are said
+  of the objects the tracker has NOT settled. Of
+  the 58-75 false episodes 35-56 are on a track believed standing with less than one half, 2.5 s old (median), 25 m
+  away, its range 3.2 m off; the well-ranged settled tracks, nearly all track-frames, raise none. What is left is
+  association (section 10), and three defects in how the scale rate was read, which the range of exactly those
+  objects hangs on:
+* **One linear step on a hyperbola.** The rate is v / r. A Kalman update linearised at a range r0 lands at r0 (2 -
+  r0 / r) for a true range r (0.84 r from 0.6 r) and states the spread the rate has at r0: (r0 / r)^2 of the right
+  one. Traced (`curve_parked`, seed 5, the parked van 109, 2.6 m tall, boxed `car`): first box read at 0.6 of its
+  range; after its first scale rate (0.219 /s at 13 m/s: 59.3 m; truth 59.4 m) "it stands" stood at 34.7 m +- 0.4 m;
+  the next rate refuted it by tens of sigma; it went to the floor, was given the place of the hypotheses that DRIVE
+  at every box after (where no standing thing gives that rate) and was refuted again each time: the object was a car
+  driving at 5 -> 2.5 m/s at 0.6-0.8 of its range down to 6 m. (A standing thing at r and a thing at k r closing k
+  times slower give the same picture at every moment; nothing in the object's own boxes takes that story back.)
+* **The rate was read as the depth's rate of this moment.** It is the logarithm of the depth a baseline ago (0.2-1 s,
+  along the camera's axis as it pointed then) over the depth now. On a bend of 110 m radius at 13 m/s the axis swings
+  4 degrees in 0.6 s: a standing thing reads +0.3 to +0.8 m far at 5-60 m (noise-free boxes and rates: `curve_parked`
+  +0.29 / +0.38 / +0.56 / +0.76 m at 5-10 / 10-20 / 20-40 / 40-60 m). Braking at 3 m/s^2 the car was 1.2 m/s faster
+  on average over 0.8 s than at its end: a standing car reads 3 m near at 20-40 m with a stated spread of 0.5-1.3 m.
+* **The picture's size goes with the depth along the camera's axis**, the model had the range along the line of
+  sight less the rectangle's half depth along it: a car parked 3 m beside reads 0.05-0.1 m far. Small.
+* **"Two cars' boxes in one object" was one car born as a truck.** Of the standing cars' track-frames at 5-60 m,
+  4.2 % (337 of 8082) are wider than 2.3 m or longer than 6.5 m; 114 of them are of objects that only ever took one
+  car's boxes. They are objects started by a box the detector called `truck`
+  (3 % of a car's boxes; a van's two in three): born 10 x 2.5 m, and nothing takes that back: the class vote moves
+  the HEIGHT prior (section 4), not the extent, and a camera sees of the extent a sum of length and width at a
+  heading it does not know either. (The simulator's detector never merges two cars into one box.) Objects fed by
+  several cars are wider by a little (width error p90 +0.28 to +0.47 m against +0.10 m). With the range known to a
+  few tenths of a metre the centre's error IS the extent's: a van read 10 m long for its 6 m has its centre 2 m
+  behind where it is with a stated spread of 0.3-0.7 m (of the 552 standing track-frames at 5-20 m whose centre is
+  off by more than two stated sigma, 214 are vans; the cars among the rest include those with a truck's extent and
+  those whose length the silhouette had shrunk to 2-3 m). The near face (`x_m`, `y_m`: what the boxes measure) was
+  right within its spread throughout (within 1 / 2 sigma 0.67-0.84 / 0.92-0.98).
+
+### The knobs
+
+* `scale_iter`: the standing hypothesis takes a box with a scale rate by iteration (the iterated extended Kalman
+  update: Gauss-Newton on the quadratic form the linear step minimises once; at most `scale_iter_n` 8 steps, each
+  held to a factor of two in range; the covariance from the linearisation at the result; native `r_take_iter`). The
+  hypothesis' weight is what the linear step's innovation gave it, as before.
+* `scale_exact`: a scale rate is the depth then over the depth now: per scan the car's pose at the far end of each
+  baseline, from the record of its movement (`Tracker.process`: at most eight baselines a scan, the scan's constants'
+  tail; native `r_scale_row` with `sp`, `RSens.sprev`); the object's place then is its place now less its velocity
+  times the baseline. A baseline whose pose is not given is read as before.
+* `near_axis`: the box height's and the scale rate's depth is the centre's depth less the rectangle's half depth
+  along the camera's axis (`r_h`).
+* `ext_size`: a vehicle's length and width priors follow its height (`Tracker._ext_size`,
+  `models.extent_of_height`: 4.5 x 1.8 m to 1.75 m, 6 m at 2.6 m, 9 m at 3.4 m; spread 12 % to 30 %): the class
+  vote's height until the object's numbers know its own to `ext_size_learnt` (a quarter) of that prior's variance,
+  then its own (a height not learnt moves with every box's noise and the hypotheses' weights); where
+  that says another size by `ext_size_step` the priors are exchanged in every story (native `radar_ext_prior`: the
+  old one's information out, the new one's in, as `_size` does with the height), and the centres move along the
+  line of sight by the change of the half depth: the face the camera measured stays.
+* `scale_seed` (built, measured, **not recommended**): "it stands", brought back from the floor, is opened along the
+  common factor of range and size (`scale_seed_sigma` 0.7; native `r_reopen`) and takes the box's scale rate from
+  there, iterated: it stands at the range THIS box's rate says. With the update iterated the hypothesis no longer
+  falls to the floor by its own error; what the seed then does is make an object that took a neighbour's box stand
+  again at the neighbour: +8 +- 3.0 false episodes against `scale_iter` alone on today's stream with the scale rate
+  (jumps 18 -> 23), nothing in the conflict runs.
+* The simulator's options above. Scale rates whose errors are shared (the realistic stream's) want `in_scale`
+  (section 8) beside these.
+
+### Measured (paired: the same seeds and runs for every row)
+
+Knob sets: **I** = `scale_iter`; **IX** = I + `scale_exact`; **C** = IX + `near_axis` + `ext_size` (with `in_scale`
+on the realistic stream); **C+rows** = C + `ctx_prior` + `row_ctx` + `det_chain` + `pd_learn` (with `in_app` on the
+realistic stream).
+
+Standing actors of `curve_parked` + `parked_street`, seeds 1-3, day + night (12 runs, 10 minutes of driving per row),
+every confirmed object with four sightings or more against the centre of the actor whose box it last took; bands
+10-20 / 20-30 / 30-40 m. "fleet": the world option `dims_fleet`.
+
+| stream, knobs | median error along the line of sight (m) | bias % | spread / range | centre within 1 / 2 sigma | called moving / stationary | updates with another car's box | jumps over 3 m and 2 sigma (at such an update) |
+|---|---|---|---|---|---|---|---|
+| today's, no scale rate | 1.91 / 2.69 / 3.51 | +8.9 / +11.9 / +10.2 | 0.17 / 0.17 / 0.18 | 0.61-0.76 / 0.89-0.97 | 0.143 / 0.63 | 12.0 % | 101 (53) |
+| + scale rate, base | 0.44 / 0.64 / 0.89 | +2.3 / +1.7 / -0.6 | 0.050 / 0.053 / 0.059 | 0.69-0.76 / 0.89-0.92 | 0.050 / 0.84 | 9.8 % | 47 (22) |
+| I | 0.42 / 0.61 / 0.81 | +2.5 / +1.3 / -0.1 | 0.049 / 0.051 / 0.054 | 0.69-0.78 / 0.90-0.95 | 0.034 / 0.88 | 9.5 % | 45 (30) |
+| IX | 0.34 / 0.51 / 0.74 | +2.0 / +0.8 / -0.8 | 0.052 / 0.053 / 0.056 | 0.74-0.82 / 0.91-0.95 | 0.032 / 0.89 | 9.5 % | 41 (26) |
+| C | 0.29 / 0.46 / 0.67 | +1.4 / +0.3 / -1.2 | 0.053 / 0.053 / 0.057 | 0.82-0.84 / 0.95-0.96 | 0.045 / 0.87 | 10.0 % | 54 (30) |
+| the rows set alone | 0.48 / 0.66 / 0.86 | +2.1 / +0.6 / -1.2 | 0.049 / 0.049 / 0.053 | 0.67-0.76 / 0.89-0.93 | 0.035 / 0.91 | 8.0 % | 30 (13) |
+| C+rows | 0.29 / 0.41 / 0.59 | +0.9 / -0.2 / -1.9 | 0.050 / 0.049 / 0.052 | 0.82-0.85 / 0.95-0.97 | 0.024 / 0.93 | 8.3 % | 31 (20) |
+| realistic, no scale rate | 1.85 / 2.75 / 3.25 | +6.1 / +4.8 / +3.4 | 0.18 / 0.18 / 0.18 | 0.65-0.81 / 0.90-0.96 | 0.122 / 0.63 | 8.6 % | 56 (26) |
+| + scale rate, base | 0.50 / 0.89 / 1.32 | +1.7 / -0.1 / -3.1 | 0.061 / 0.062 / 0.065 | 0.71-0.74 / 0.90-0.92 | 0.073 / 0.80 | 8.3 % | 22 (11) |
+| I | 0.47 / 0.85 / 1.22 | +2.0 / +0.2 / -1.9 | 0.059 / 0.061 / 0.061 | 0.72-0.76 / 0.92-0.93 | 0.060 / 0.83 | 8.4 % | 24 (14) |
+| C | 0.40 / 0.63 / 1.07 | -0.1 / -1.7 / -3.7 | 0.067 / 0.068 / 0.066 | 0.81-0.83 / 0.94-0.96 | 0.067 / 0.83 | 8.0 % | 29 (15) |
+| C+rows | 0.38 / 0.57 / 0.99 | +0.6 / -0.9 / -2.8 | 0.063 / 0.065 / 0.063 | 0.82-0.85 / 0.96-0.98 | 0.021 / 0.89 | 4.8 % | 15 (7) |
+| today's + scale rate, fleet, base | 0.55 / 0.71 / 1.06 | +2.4 / +0.9 / -1.7 | 0.050 / 0.053 / 0.058 | 0.62-0.73 / 0.86-0.90 | 0.089 / 0.81 | 10.0 % | 43 (20) |
+| C | 0.41 / 0.53 / 0.78 | +1.6 / +0.2 / -1.2 | 0.051 / 0.052 / 0.056 | 0.76-0.82 / 0.94-0.95 | 0.055 / 0.85 | 9.9 % | 56 (28) |
+| realistic + scale rate, fleet, base | 0.59 / 0.84 / 1.33 | +3.2 / +0.8 / -0.7 | 0.059 / 0.057 / 0.061 | 0.63-0.74 / 0.89-0.93 | 0.075 / 0.80 | 8.5 % | 51 (27) |
+| C | 0.43 / 0.64 / 1.02 | +2.2 / +0.6 / -1.6 | 0.067 / 0.061 / 0.062 | 0.78-0.85 / 0.95-0.96 | 0.058 / 0.84 | 8.0 % | 40 (23) |
+
+(The jumps are counted against the stated spread, which the knobs make smaller and `ext_size` moves centres on
+purpose; they are not fewer for the range's sake. Fewer come with the rows set.) By day, today's stream with the scale
+rate, C against the base: 0.19 / 0.29 / 0.48 m against 0.30 / 0.44 / 0.72 m, within 1 / 2 sigma 0.87-0.91 / 0.96-0.97
+against 0.75-0.80 / 0.91-0.93; at night 0.84 / 1.33 / 2.39 m against 0.94 / 1.65 / 2.48 m, 0.67-0.71 / 0.92-0.95
+against 0.59-0.64 / 0.85-0.91 (the night's rates are five times coarser, with half as many track-frames).
+
+On the fleet, objects fed by one car, 10-40 m, by the car's true height (under 1.45 / 1.45-1.55 / 1.55-1.70 /
+1.70-2.2 m), the range's bias: no scale rate +10.5 / +10.8 / +1.6 / -2.3 %; with it +0.8 / +2.9 / +0.4 / -2.9 %
+(within 1 sigma 0.69-0.85); C +0.8 / +1.9 / +0.1 / -1.3 % (within 1 / 2 sigma 0.81-0.95 / 0.98-1.00). The size is
+the object's own once a rate has ranged it; no kind's constant enters.
+
+Extent (the same frames, cars): wider than 2.3 m or longer than 6.5 m 2.2 % of the frames with the scale rate, base
+-> 0.0-0.4 % with C; the length's error at its 90 % point +0.31 to +0.40 m -> +0.11 to +0.18 m. `sim.radar_score`
+(the 11 scenarios x seeds 1-3 x day and night, today's stream with the scale rate; base -> C): length error p50 / p90
+0.54 / 2.05 -> 0.22 / 0.95 m in traffic, 0.26 / 2.19 -> 0.09 / 0.61 m in the parked streets, width p90 0.30 ->
+0.21 m there; moving actors called moving / stationary 519 / 13.9 s -> 534 / 15.3 s, standing ones called
+stationary / moving 897 / 48 s -> 944 / 40 s, id switches 163 -> 165 (+2 +- 20), time held and confirmed as before;
+on the realistic stream 529 / 11.6 -> 529 / 12.1 s, 639 / 42 -> 672 / 35 s, id switches 128 -> 120 (-8 +- 12),
+length p90 2.09 -> 1.08 m in traffic. What is not fixed: the range of an object NOT believed to stand (it is the
+height prior's under "it drives": at 30-60 m on the realistic stream those tracks read 15-16 % short, vans and
+trucks 13 %, while cars believed standing read -0.2 to -1.7 %); and with the scale rate the realistic stream's
+standing objects at night beyond 30 m (few frames) read 11-14 % short with or without the knobs.
+
+The obstacle of the vehicle conflicts (`alert_truth.py run --trace`, eight scenarios x seeds 1-6, by day; its track
+by the time to contact; base -> IX): today's stream with the scale rate, the range's median error 0.93 -> 0.54 m at
+4-3 s, 0.89 -> 0.34 m at 3-2.5 s, 0.54 -> 0.23 m at 2-1.5 s, 0.32 -> 0.17 m in the last second, its mean +0.46 to
++0.57 m long -> +0.16 to +0.23 m, within 1 sigma 0.74-0.91 -> 0.91-1.00; on the realistic stream 1.17 -> 1.17 m,
+0.85 -> 0.66 m, 0.64 -> 0.37 m, 0.29 -> 0.18 m, within 1 sigma 0.81-0.94 -> 0.94-0.98. At night nothing changes
+(it is tracked in 5-55 % of the frames: the first box and the confirmation, section 10).
+
+Through the stack (shadow mode; tools/alert_truth.py: the six streets and the two pedestrian controls x seeds 1-6
+x day and night, 96 runs; the conflicts x seeds 1-3 x day and night, of which 48 runs with a vehicle; paired, +- the
+bootstrap's spread over seeds). "imminent": false episodes that went on to imminent; "not standing": false episodes
+said of a track believed standing with less than one half; "lost / gained / later / earlier": the vehicle conflicts'
+warnings against the base of the same stream.
+
+| stream, knobs | false episodes (day / night), paired difference | false on other things in the conflict runs | vehicle conflicts warned, mean lead | half in the lane warned, lead | lost / gained / later / earlier | imminent | not standing | causes: jump / mean in lane / spread / moving futures |
+|---|---|---|---|---|---|---|---|---|
+| today's + scale rate, base | 75 (31 / 44) | 20 | 33 of 48, 2.09 s | 7 of 12, 1.90 s | | 40 | 56 | 22 / 13 / 7 / 19 |
+| I | 59 (23 / 36), -16 +- 2.6 | 17, -3 +- 2.1 | 33, 2.01 s | 7, 1.82 s | 0 / 0 / 7 / 1 | 25 | 41 | 18 / 7 / 4 / 20 |
+| IX | 62 (23 / 39), -13 +- 4.8 | 18, -2 +- 2.8 | 33, 2.05 s | 7, 1.82 s | 0 / 0 / 6 / 2 | 32 | 46 | 15 / 9 / 6 / 22 |
+| C | 71 (27 / 44), -4 +- 6.3 | 17, -3 +- 2.5 | 33, 2.06 s | 7, 1.82 s | 0 / 0 / 6 / 3 | 29 | 48 | 18 / 8 / 7 / 22 |
+| the rows set alone | 55 (29 / 26), -20 +- 7.3 | 18, -2 +- 2.8 | 34, 1.95 s | 8, 1.82 s | 1 / 2 / 6 / 1 | 31 | 38 | 14 / 12 / 5 / 12 |
+| C+rows | 55 (20 / 35), -20 +- 5.9 | 14, -6 +- 3.6 | 32, 2.05 s | 7, 1.96 s | 1 / 0 / 7 / 3 | 29 | 35 | 18 / 6 / 7 / 12 |
+| realistic + scale rate, base | 86 (42 / 44) | 28 | 37 of 48, 1.97 s | 8 of 12, 2.15 s | | 58 | 52 | 21 / 21 / 10 / 22 |
+| I | 85 (38 / 47), -1 +- 6.1 | 22, -6 +- 4.4 | 38, 1.89 s | 8, 1.93 s | 0 / 1 / 7 / 2 | 59 | 43 | 25 / 22 / 8 / 18 |
+| IX | 79 (39 / 40), -7 +- 4.6 | 23, -5 +- 5.1 | 38, 1.91 s | 8, 1.98 s | 0 / 1 / 8 / 6 | 55 | 36 | 23 / 20 / 9 / 12 |
+| IX + `in_scale` | 76 (37 / 39), -10 +- 3.4 | 23, -5 +- 3.9 | 38, 1.94 s | 8, 2.09 s | 0 / 1 / 7 / 9 | 54 | 37 | 20 / 23 / 7 / 13 |
+| C | 76 (39 / 37), -10 +- 4.0 | 23, -5 +- 4.6 | 38, 1.91 s | 8, 1.96 s | 0 / 1 / 8 / 8 | 54 | 37 | 17 / 22 / 10 / 15 |
+| the rows set alone (`in_app`, `in_scale`) | 80 (41 / 39), -6 +- 5.9 | 25, -3 +- 5.9 | 38, 1.94 s | 8, 2.04 s | 0 / 1 / 5 / 7 | 47 | 36 | 19 / 25 / 10 / 18 |
+| C+rows | 78 (38 / 40), -8 +- 4.8 | 19, -9 +- 3.4 | 40, 1.85 s | 8, 2.01 s | 0 / 3 / 9 / 8 | 54 | 34 | 18 / 19 / 13 / 15 |
+| today's + scale rate, fleet, base | 91 (41 / 50) | 32 | 36 of 48, 2.04 s | 7 of 12, 1.93 s | | 53 | 66 | 16 / 20 / 6 / 31 |
+| I | 75 (30 / 45), -16 +- 4.9 | 25, -7 +- 2.6 | 36, 2.06 s | 7, 2.09 s | 0 / 0 / 2 / 2 | 50 | 53 | 15 / 13 / 7 / 22 |
+| IX | 81 (31 / 50), -10 +- 5.3 | 31, -1 +- 4.4 | 37, 2.10 s | 8, 1.94 s | 0 / 1 / 2 / 5 | 52 | 59 | 21 / 15 / 7 / 23 |
+| C | 82 (32 / 50), -9 +- 5.5 | 29, -3 +- 3.2 | 37, 2.07 s | 8, 1.98 s | 0 / 1 / 2 / 6 | 52 | 59 | 21 / 13 / 6 / 27 |
+| C+rows | 62 (29 / 33), -29 +- 10.0 | 24, -8 +- 2.6 | 35, 2.20 s | 7, 2.09 s | 1 / 0 / 4 / 9 | 36 | 38 | 9 / 17 / 8 / 16 |
+| realistic + scale rate, fleet, base | 81 (36 / 45) | 29 | 37 of 48, 2.02 s | 8 of 12, 1.94 s | | 55 | 45 | 19 / 19 / 9 / 18 |
+| I | 73 (33 / 40), -8 +- 4.8 | 30, +1 +- 1.7 | 37, 2.09 s | 8, 2.07 s | 0 / 0 / 4 / 4 | 44 | 39 | 16 / 14 / 11 / 20 |
+| IX | 75 (34 / 41), -6 +- 3.8 | 27, -2 +- 1.3 | 37, 2.11 s | 8, 2.06 s | 0 / 0 / 3 / 5 | 44 | 37 | 12 / 15 / 16 / 20 |
+| C (`in_scale`) | 76 (37 / 39), -5 +- 5.4 | 27, -2 +- 1.3 | 36, 2.10 s | 7, 2.27 s | 1 / 0 / 5 / 6 | 43 | 33 | 20 / 14 / 15 / 14 |
+| C+rows | 85 (40 / 45), +4 +- 6.3 | 28, -1 +- 2.2 | 36, 2.22 s | 7, 2.29 s | 1 / 0 / 5 / 8 | 55 | 35 | 14 / 27 / 18 / 15 |
+| today's, no scale rate, base | 58 (21 / 37) | 21 | 32 of 48, 1.65 s | 7 of 12, 1.29 s | | 31 | 35 | 30 / 7 / 1 / 6 |
+| IX | 58, every run's episodes as they were | | | | | | | |
+| `ext_size` | 63 (26 / 37), +5 +- 7.9 | 20, -1 +- 2.6 | 32, 1.68 s | 7, 1.39 s | 0 / 0 / 1 / 5 | 37 | 41 | 29 / 9 / 3 / 8 |
+| `ext_size` + `near_axis` | 65 (27 / 38), +7 +- 8.1 | 20, -1 +- 2.2 | 32, 1.68 s | 7, 1.38 s | 0 / 0 / 2 / 4 | 40 | 43 | 28 / 8 / 3 / 10 |
+| realistic, no scale rate, base | 89 (40 / 49) | 20 | 36 of 48, 1.76 s | 8 of 12, 1.61 s | | 60 | 42 | 30 / 18 / 9 / 14 |
+| IX | 89, every run's episodes as they were | | | | | | | |
+| `ext_size` | 84 (34 / 50), -5 +- 3.7 | 22, +2 +- 1.9 | 38, 1.72 s | 8, 1.48 s | 0 / 2 / 5 / 5 | 59 | 44 | 33 / 13 / 8 / 13 |
+| `ext_size` + `near_axis` | 89 (37 / 52), +0 +- 4.0 | 21, +1 +- 2.2 | 38, 1.71 s | 8, 1.49 s | 0 / 2 / 7 / 5 | 64 | 48 | 37 / 13 / 9 / 12 |
+
+Over the four streams with a scale rate together (333 false episodes at the base; the bootstrap over seeds across
+all four): I -41 +- 10.6, IX -36 +- 11.2, C -28 +- 11.4, C+rows -53 +- 18.1. The vehicle conflicts with seeds 1-6 (96
+runs a stream), IX against the base: today's stream with the scale rate 70 -> 71 warned, mean lead 2.04 -> 1.98 s,
+2 lost (`bend_stopped_13` at night, seeds 5 and 6, 0.91 and 1.35 s before) and 3 gained, 9 later and 9 earlier,
+false episodes on other things 30 -> 22 (-8 +- 5.1); realistic (with `in_scale`) 73 -> 75, 1.99 -> 1.97 s, none lost
+and 2 gained, 9 later and 14 earlier, 36 -> 28 (-8 +- 3.6).
+
+What it says:
+* **Read right, the scale rate gives a standing vehicle's range to 0.2-0.5 m at 10-40 m by day** (0.8-2.4 m at
+  night) where the box height and the ground angle gave 1.5-3.5 m; the object's size is its own, whatever its kind
+  (the fleet's four height classes within 2 %); the stated spread holds again (within 1 / 2 sigma 0.82-0.85 /
+  0.95-0.97 with C, the near face throughout); the obstacle ahead is known to 0.2-0.3 m in its last two seconds.
+* **The false warnings fall by an eighth with the iterated update alone** (-41 +- 10.6 of 333 over four streams;
+  none of the 4 x 48 vehicle conflict warnings lost, mean lead -0.08 to +0.07 s), on today's stream clearly (-16
+  +- 2.6, -16 +- 4.9), on the realistic one within the noise (-1 +- 6.1, -8 +- 4.8). Those that go on to imminent
+  fall on today's stream (40 -> 25) and on the realistic fleet (55 -> 44), not on the other two.
+* **`scale_exact` changes no count** (+5 +- 8 against I over the four streams) and takes the later warnings back
+  (later / earlier 7 / 1 -> 6 / 2, 7 / 2 -> 8 / 6, 2 / 2 -> 2 / 5, 4 / 4 -> 3 / 5): the obstacles of the bends were
+  read far.
+* **`ext_size` and `near_axis` do not lower the warnings** (C against IX: +9 +- 6.0, -3 +- 4.7, +1 +- 3.3, +1 +-
+  4.2; without a scale rate +5 +- 7.9 and -5 +- 3.7), and C loses one half-in-the-lane warning of the realistic
+  fleet (0.54 s before, at night). They are for the extent and the centre (table above), not for the alerts.
+* **The rows set of section 10 now helps on today's stream with the scale rate** (alone -20 +- 7.3; with C -20 +-
+  5.9 and -29 +- 10.0 on the fleet; one vehicle warning lost in each, none gained, the false episodes on a track
+  not believed standing 56 -> 35) **and not on the realistic one** (-6 +- 5.9 alone, -8 +- 4.8 and +4 +- 6.3 with C).
+  Without a scale rate it was +10 +- 8 and -6 +- 8.5.
+* **What is left is association.** With every set, 33-59 of the 55-85 false episodes are on a track believed
+  standing with less than one half: an object fed by two cars of a row, or a van whose "it stands" needs a height
+  its kind's prior calls unlikely, read at the range a car driving with the traffic would have. A range that
+  resolves at the object's second box does not reach them; and a decision that waited for the range (DESIGN.md
+  17.2, `place_hold`: "the spread 9 % of the range") would now wait for a spread of 3-5 % that comes with the second
+  or third box, not with the distance: not tried here.
+
+Real drives (docs/RADAR_TRUTH.md, `tools/radar_truth_eval.py --no-gate`; the recordings carry no scale rate): the
+three scale knobs: identical (wrong verdict 3.1 of 94.0 judged s, real things never followed 8, `in_path` unreviewed
+4.73 s); `near_axis`: the same counts; `ext_size`: 2.3 of 90.2 s, never followed 9, 4.42 s (parked cars called moving
+0.4 s against 1.2 s); C: 2.3 of 90.5 s, 9, 4.42 s; C+rows: 3.5 of 93.0 s, 9, 4.94 s. What the knobs do with real scale
+rates is not known: no recording has them.
+
+Cost (this laptop; a phone's small core is 10 to 16 times slower). One scan of the tracker (`Tracker.process`,
+`parked_street`, three interleaved runs): today's stream with the scale rate 0.80-0.84 ms with the knobs off, 0.84-
+0.85 ms with IX, 0.92-0.94 ms with C (`ext_size` and `near_axis` cost nothing measurable alone, 0.83-0.85 ms; together
+with the scale knobs 0.1 ms: not traced); realistic 0.58-0.59 / 0.59-0.60 / 0.65-0.67 ms. Through the stack
+(tools/cost_bench.py, the radar per road frame, three interleaved runs; the captures carry no scale rate): dense
+simulated capture 0.983 ms at the base, 0.991-0.999 ms with the knobs off, 0.975-1.016 ms with C; recorded capture
+0.093 / 0.092-0.096 / 0.095-0.097 ms. With the knobs off every stream of the three captures is identical to the
+base's (`cost_bench.py diff`).
+
+Proposed for the car (where the detector's scale rate is on): **`scale_iter` + `scale_exact`, with `in_scale`**
+(the detector's successive rates share their baseline). `ext_size` where the centre and the extent matter more than
+0.1 ms a scan; `near_axis` with it. Not `scale_seed`. The rows set of section 10 stays what it was: a gain on
+today's stream, none shown on the realistic one, one conflict warning lost.
+
+**The defaults were not switched.** What blocks `scale_iter` (and `scale_exact` with it): (1) on the realistic stream
+with the scale rate the paired difference is not beyond its noise (I -1 +- 6.1 and -8 +- 4.8 on the fleet; IX -7 +-
+4.6 and -6 +- 3.8; with `in_scale`, a second default, -10 +- 3.4): it lowers the warnings clearly on one of the two
+streams only; (2) with seeds 1-6 IX loses two night warnings of `bend_stopped_13` on today's stream and gains three
+(none lost with seeds 1-3 on any stream); (3) on the streams without a scale rate it changes no said episode of any
+run (174 of 174 on both), yet with `scale_iter` on by default six tests fail beyond the known one: three recordings
+(tests/test_native.py `test_radar_messages_digests`, tests/test_radar_inputs.py `Golden` and `Hypotheses::test_the_
+rows_memory_is_written_down_and_restored_with_the_hypotheses`: a scan given the further inputs' constants is not the
+scan without them to the last bit), `tests/test_radar_rows.py::Knobs::test_the_scan_constants_end_where_they_did_
+with_the_knobs_off`, and two of this section's own that compare the knob with the default. No behaviour test among
+them. `ext_size`: no gain in the warnings, one real thing more never followed on the recorded drives, one half-in-
+the-lane warning lost on one stream. Nothing was loosened.
+
+Not built: the rows' order and occupancy as a constraint; a track split where its residuals turn bimodal; a robust
+update or a new object instead of a jump of a settled standing object (with the scale rate a settled standing
+object's neighbour is three of its spreads away, and the jumps that remain are of objects that have not settled);
+the scale rate's own link (a rate says that this box and one of the detector's boxes a baseline ago are one thing;
+which box that was the message does not say: with it the cars of a row would be told apart by the detector's own
+chain); a height prior with a van's tail (a van boxed `car` needs "it stands" to believe 2.6 m against
+1.6 m +- 20 %); the size learnt per kind from the scale-ranged objects (`size_learn` of section 9 with the scale
+rate and the rows set: 60 false episodes against 55 without it, nothing either way); the residual +0.1 to +0.4 m far
+of a parked car on a straight road with noise-free boxes and rates (not traced).

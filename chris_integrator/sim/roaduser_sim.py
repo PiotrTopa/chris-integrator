@@ -71,6 +71,37 @@ def spread_dims(actors, seed):
         a.L, a.W, a.H = a.L * f[0], a.W * f[1], a.H * f[2]
 
 
+# world option dims_fleet: the cars of a street are a fleet, not one model. (share, (L lo, hi), (W lo, hi), (H lo, hi))
+# of today's European passenger fleet as a detector calls it "car" (A: makers' body dimensions; small hatchbacks,
+# compacts / saloons / estates, crossovers and SUVs, car-derived vans and MPVs, large SUVs and pick-ups): mean height
+# 1.57 m, spread 0.12 m (KITTI's cars: 1.53 +- 0.14 m), width 1.81 +- 0.07 m. A car of the nominal size (DIMS) is
+# redrawn from it; an explicit size is the scenario's own and kept; trucks, people and posts get DIMS_SPREAD.
+DIMS_FLEET = ((0.20, (3.6, 4.1), (1.63, 1.75), (1.45, 1.52)),
+              (0.35, (4.3, 4.8), (1.78, 1.85), (1.42, 1.50)),
+              (0.33, (4.2, 4.7), (1.80, 1.90), (1.58, 1.70)),
+              (0.07, (4.4, 4.8), (1.80, 1.86), (1.80, 1.88)),
+              (0.05, (4.8, 5.3), (1.93, 2.00), (1.75, 1.90)))
+
+
+def fleet_dims(actors, seed):
+    """dims_fleet: every car of the nominal size takes a size of DIMS_FLEET (its length never more than the nominal
+    4.5 m + 0.3: the scenarios space their rows by the nominal length); everything else as spread_dims. A generator of
+    its own per actor (the scenario seed and the actor id; no other stream is touched)."""
+    rest = []
+    for a in actors:
+        if a.kind != "car" or (a.L, a.W, a.H) != DIMS["car"]:
+            rest.append(a)
+            continue
+        r = random.Random(int(seed) * 1_000_003 + int(a.id) * 7_919 + 15_485_863)
+        u, acc = r.random(), 0.0
+        for share, L, W, H in DIMS_FLEET:
+            acc += share
+            if u < acc:
+                break
+        a.L, a.W, a.H = min(r.uniform(*L), DIMS["car"][0] + 0.3), r.uniform(*W), r.uniform(*H)
+    spread_dims(rest, seed)
+
+
 def _plan(plan, t):
     return np.interp(t, [p[0] for p in plan], [p[1] for p in plan])
 
@@ -120,7 +151,9 @@ class ScenarioWorld(World):
             self.Lofs = np.zeros(len(self.S))
             self.lc_s0 = None
         self.actors = list(spec["actors"](self)) if spec.get("actors") else []
-        if self.world_opts.get("dims_spread"):
+        if self.world_opts.get("dims_fleet"):
+            fleet_dims(self.actors, seed)
+        elif self.world_opts.get("dims_spread"):
             spread_dims(self.actors, seed)
         self._actor_arrays()
 
@@ -443,6 +476,12 @@ ROADSIDE = dict(post_per_km=25.0, tree_per_km=15.0, hedge_per_km=6.0, lat=(4.0, 
 DETIN = dict(visible_boxes=True, roadside=ROADSIDE, flags=True, low=0.10, emb="yuv3x3", lamps=True, scale_corr=True,
              world={"dims_spread": True})   # "world": read by scenario() / ScenarioWorld (DetectorSim ignores it)
 DETIN_REID = dict(DETIN, emb="reid32+yuv3x3")
+# The detector's scale rate as the car's unit sends it (`--lights-ru-scale`): precision and coverage as measured on
+# recorded rides (docs/VISUAL_RADAR_EVAL.md). `scale_rate: "auto"` (or true) in the parameters is the day's or the
+# night's of these, by the run; the presets "scale" (today's stream + the scale rate) and "detin_scale",
+# "detin_pose_scale" (det_params_arg) say that.
+SCALE_DAY = {"px": 0.08, "rel": 0.002, "p": 0.78, "min_dt": 0.2, "max_dt": 1.0, "max_std": 0.06}
+SCALE_NIGHT = {"px": 0.45, "rel": 0.004, "p": 0.6, "min_dt": 0.2, "max_dt": 1.0, "max_std": 0.06}
 DETIN_KEYS = ("visible_boxes", "roadside", "flags", "low", "emb", "lamps", "scale_corr", "pose")
 
 # The pose head (lane viewhead; roadsense docs/ARCHITECTURE.md "Pose of a road user", contract "pose1"; how a tracker
@@ -583,15 +622,21 @@ def det_params_arg(s):
     s = s.strip()
     if s in ("detin", "detin_reid", "detin_pose"):
         return dict({"detin": DETIN, "detin_reid": DETIN_REID, "detin_pose": DETIN_POSE}[s])
+    if s in _SCALE_PRESETS:                         # ... with the detector's scale rate (SCALE_DAY / SCALE_NIGHT)
+        return dict(_SCALE_PRESETS[s](), scale_rate="auto")
     d = json.loads(s)
     if not isinstance(d, dict):
-        raise ValueError("detector parameters: a JSON object, 'detin', 'detin_reid' or 'detin_pose'")
+        raise ValueError("detector parameters: a JSON object, 'detin', 'detin_reid', 'detin_pose', 'scale', "
+                         "'detin_scale' or 'detin_pose_scale'")
     base = {}
     for k, pre in (("detin", DETIN), ("detin_reid", DETIN_REID), ("detin_pose", DETIN_POSE)):
         if d.pop(k, None):
             base = dict(pre)
     base.update(d)
     return base
+
+
+_SCALE_PRESETS = {"scale": dict, "detin_scale": lambda: DETIN, "detin_pose_scale": lambda: DETIN_POSE}
 
 FLAGS_CFG = dict(edge_px=2.0, tie_px=2.0, tie_rel=0.04, edge_hidden=0.5)   # signd RuFlagsConfig defaults
 FRAME = (1280, 720)
@@ -1261,6 +1306,8 @@ class DetectorSim:
         if env:
             self.p.update(det_params_arg(env))
         self.p.update(params or {})
+        if self.p.get("scale_rate") in (True, "auto"):
+            self.p["scale_rate"] = dict(SCALE_NIGHT if night else SCALE_DAY)
         self.seed, self.night, self.calib, self.views = seed, night, dict(calib or CALIB), views
         rng = random.Random(seed * 7 + 3)
         self.pitch_err = math.radians(self.p["pitch_err_deg"]) * (pitch_sign if pitch_sign else rng.choice((-1, 1)))
