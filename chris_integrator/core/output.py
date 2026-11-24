@@ -11,7 +11,31 @@ _SPEED_KINDS = ("speed", "standstill")
 _YAW_KINDS = ("yaw_rate", "standstill_w")
 
 
-def _health(I, g, T):
+def _by_group(I):
+    """The monitors, findings and isolations of every group, in their tables' order: the per-group lookups of
+    `_health` (each of which walked every table once per group)."""
+    pairs, selfs, nis, qf, rep = {}, {}, {}, {}, {}
+    for k, p in I.pairs.items():
+        pairs.setdefault(k[0], []).append((k, p))
+        if k[1] != k[0]:
+            pairs.setdefault(k[1], []).append((k, p))
+    for k, sc in I.selfs.items():
+        selfs.setdefault(k[0], []).append((k, sc))
+    for k, nm in I.nis.items():
+        nis.setdefault(k[0], []).append((k, nm))
+    for k, f in I.qfaults.items():
+        qf.setdefault(k[0], []).append((k, f))
+    for k in I.fdi.reported:
+        rep.setdefault(k[0], []).append(k)
+    return pairs, selfs, nis, qf, rep
+
+
+def _health(I, g, T, by=None):
+    if by is None:
+        by = _by_group(I)
+    by_pairs, by_selfs, by_nis, by_qf, by_rep = by
+    gname_ = g.name
+    nis_g = by_nis.get(gname_, ())
     age = None if g.last_t is None else max(0.0, I.now - g.last_t)
     usable = True
     reason = None
@@ -23,9 +47,7 @@ def _health(I, g, T):
         state, usable = "stale", False
     else:
         checked = suspect = False
-        for (hi, lo, q), p in I.pairs.items():
-            if g.name not in (hi, lo):
-                continue
+        for (hi, lo, q), p in by_pairs.get(gname_, ()):
             other = I.groups[lo if hi == g.name else hi]
             if p.verdict == "agree" and not other.witness and other.fault is None:
                 checked = True
@@ -36,19 +58,18 @@ def _health(I, g, T):
             if p.suspect or (p.verdict == "disagree" and (lo == g.name or not other.witness)):
                 suspect = True
                 reason = p.describe() if lo == g.name else "%s of %s disagrees" % (q, lo)
-        for (gname, q), sc in I.selfs.items():
-            if gname == g.name and sc.median is not None and sc.median > sc.c["recover_ratio"] \
-                    and sc.n >= sc.c["min_n"]:
+        for (gname, q), sc in by_selfs.get(gname_, ()):
+            if sc.median is not None and sc.median > sc.c["recover_ratio"] and sc.n >= sc.c["min_n"]:
                 suspect, reason = True, sc.describe()
-        for (gname, q), nm in I.nis.items():
-            if gname != g.name or nm.value is None:
+        for (gname, q), nm in nis_g:
+            if nm.value is None:
                 continue
             if nm.high:
                 suspect, reason = True, nm.describe() + (" (set aside)" if (gname, q) in I.ekf.quarantine else "")
             elif q in ("pos", "heading", "map_cross"):
                 checked = True             # no raw partner exists for a position: its innovations are its check
         state = "suspect" if suspect else "ok" if checked else "unchecked"
-    qf = {q: f for (gg, q), f in I.qfaults.items() if gg == g.name}
+    qf = {q: f for (gg, q), f in by_qf.get(gname_, ())}
     if qf and g.fault is None:
         # single quantities of the source are set aside; the rest of it is used
         if usable:
@@ -59,13 +80,13 @@ def _health(I, g, T):
            "age_s": None if age is None else round(age, 3), "rate_hz": round(n / 2.0, 1)}
     if qf:
         out["set_aside"] = sorted(qf)
-    rep = sorted({det for (gg, _, det) in I.fdi.reported if gg == g.name})
+    rep = sorted({det for (gg, _, det) in by_rep.get(gname_, ())})
     if rep:
         out["reported"] = rep          # detectors in report mode that name this source now (texts: `diagnostics`)
     if g.fault is not None:
         out["isolation"] = g.fault["rule"]
         out["since_s"] = None if g.fault["since"] is None else round(max(0.0, I.now - g.fault["since"]), 1)
-    nis = {q: round(nm.value, 2) for (gname, q), nm in I.nis.items() if gname == g.name and nm.value is not None}
+    nis = {q: round(nm.value, 2) for (gname, q), nm in nis_g if nm.value is not None}
     if nis:
         out["nis"] = nis
     for s in g.sources:
@@ -105,12 +126,13 @@ def _none(reason, age=None):
             "age_s": None if age is None else round(age, 3), "sources": []}
 
 
-def _quantity(I, T, sm, i, kinds, digits, scale=1.0):
+def _quantity(I, T, sm, i, kinds, digits, scale=1.0, nr=None):
+    """nr: the result of the `near` query of these kinds, when the caller has it already."""
     c = I.cfg
     if sm is None:
         return _none("no_measurement")
     x, P = sm
-    age, srcs = I.ekf.near(T, c["fresh_s"], kinds, c["max_coast_s"] + 0.01)
+    age, srcs = I.ekf.near(T, c["fresh_s"], kinds, c["max_coast_s"] + 0.01) if nr is None else nr
     if age is None or age > c["max_coast_s"]:
         why = "no_measurement"
         if any(g.fault is not None and g.last_t is not None and I.now - g.last_t <= g.stale_s
@@ -205,7 +227,9 @@ def ego_state(I, ts_mono_ns, ts_real_ns=None):
     I.seq += 1
     sm = I.ekf.at(T)
     speed = _quantity(I, T, sm, E.V, _SPEED_KINDS, 3)
-    accel = _quantity(I, T, sm, E.A, None, 3)
+    # (acceleration and grade ask the same query of every kind: asked once, the grade gets its own list)
+    nr_all = None if sm is None else I.ekf.near(T, I.cfg["fresh_s"], None, I.cfg["max_coast_s"] + 0.01)
+    accel = _quantity(I, T, sm, E.A, None, 3, nr=nr_all)
     if not speed["valid"]:
         accel = dict(accel, value=None, std=None, valid=False, reason=speed["reason"], mode="none")
     yr = _quantity(I, T, sm, E.W, _YAW_KINDS, 5)
@@ -220,7 +244,8 @@ def ego_state(I, ts_mono_ns, ts_real_ns=None):
         speed = dict(speed, std=round(max(speed["std"], 0.5 * dsp[2]), 3), mode="disputed",
                      reason="%s and %s disagree, vote pending" % (dsp[0], dsp[1]))
     pos, head = _position(I, T, sm, speed)
-    grade = _quantity(I, T, sm, E.TH, None, 4) if speed["valid"] else _none(speed["reason"])
+    grade = _quantity(I, T, sm, E.TH, None, 4, nr=None if nr_all is None else (nr_all[0], list(nr_all[1]))) \
+        if speed["valid"] else _none(speed["reason"])
     # odometer: the path length of the published speed (a consumer's distance base)
     if speed["valid"]:
         if I._odo_t is not None and 0.0 < T - I._odo_t[0] <= 1.0:
@@ -234,14 +259,16 @@ def ego_state(I, ts_mono_ns, ts_real_ns=None):
     rej = dict(I.ekf.rejected)
     # the tables (calibration, per-source health, the monitors' verdicts, findings) are rebuilt five times a
     # second and at once when anything about a fault changes; the quantities above are fresh every frame
-    key = (I.epoch, id(I.ekf), tuple(sorted((n, g.fault["rule"]) for n, g in I.groups.items() if g.fault is not None)),
-           tuple(sorted(I.qfaults)), tuple(sorted(I.disputed)), len(I.fdi.findings), len(I.fdi.events), len(I.pairs),
-           tuple(sorted(I.fdi.reported)))
+    # (built every frame: the empty tables, the usual case, skip their sorting)
+    qfs, dsps, rpt = I.qfaults, I.disputed, I.fdi.reported
+    key = (I.epoch, id(I.ekf), tuple(sorted([(n, g.fault["rule"]) for n, g in I.groups.items() if g.fault is not None])),
+           tuple(sorted(qfs)) if qfs else (), tuple(sorted(dsps)) if dsps else (), len(I.fdi.findings), len(I.fdi.events),
+           len(I.pairs), tuple(sorted(rpt)) if rpt else ())
     tb = getattr(I, "_tables", None)
     if tb is None or tb[0] != key or not (0.0 <= T - tb[1] < TABLES_S):
         tb = I._tables = (key, T, {
             "calibration": calibration(I, x, P),
-            "sources": {n: _health(I, g, T) for n, g in I.groups.items()},
+            "sources": {n: _health(I, g, T, by) for by in (_by_group(I),) for n, g in I.groups.items()},
             "checks": [p.report() for p in I.pairs.values()] + [s.report() for s in I.selfs.values()]
             + [m.report() for m in I.nis.values() if m.value is not None],
             "diagnostics": I.fdi.report(T),
