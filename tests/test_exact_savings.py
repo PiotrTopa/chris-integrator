@@ -2,6 +2,7 @@
 held here against the plain form it replaced."""
 import bisect
 import collections
+import json
 import math
 import os
 import random
@@ -133,3 +134,116 @@ def test_all_fin_is_fin_of_every_element():
         seq = [rng.choice(pool) if rng.random() < 0.15 else rng.uniform(-9, 9) for _ in range(rng.randrange(0, 12))]
         assert all_fin(seq) == all(fin(v) for v in seq), seq
     assert all_fin([]) and all_fin((1.0, 2)) and not all_fin([math.inf])
+
+
+def _same(a, b):
+    """Equal as the outputs see them: the same value and sign, NaN as NaN, None as None."""
+    if isinstance(a, float) and isinstance(b, float):
+        return (a != a and b != b) or (a == b and math.copysign(1.0, a) == math.copysign(1.0, b))
+    return a == b and type(a) is type(b)
+
+
+def test_pair_fire_window_is_the_sorted_window():
+    """monitors.Pair keeps its fire window's two value columns in sorted order as samples come and go; its stats,
+    verdicts and reports, after every sample, are those of the pair that takes win.last and sorts it (the form it
+    replaced, still the path when the evidence clock is not finite): ties of equal values of both zero signs,
+    NaN in and out of the window, steps capped by max_step_s, clocks that stand or go back, resets."""
+    from chris_integrator.core.integrator import DEFAULT_CFG as DEFAULTS
+    from chris_integrator.core.monitors import Pair, Series
+    rng = random.Random(7)
+    cfgs = [dict(DEFAULTS["pair"], **DEFAULTS["pair_quantity"]["speed"]),
+            dict(DEFAULTS["pair"], **DEFAULTS["pair_quantity"]["yaw_rate"]),
+            dict(DEFAULTS["witness"]),
+            dict(DEFAULTS["pair"], min_evidence=0.5, fire_window_s=12.0, recover_window_s=6.0, min_n=5)]
+    samples = 0
+    for trial in range(160):
+        cfg = dict(rng.choice(cfgs))
+        if rng.random() < 0.3:
+            cfg["z_bad"] = rng.choice([0.5, 1.0])
+        new, old = Pair("a", "b", "q", cfg), Pair("a", "b", "q", cfg)
+        old._fire_ok = False                     # the plain form: win.last and two sorts at every evaluation
+        ref = Series()
+        t = 100.0
+        scale = rng.choice([1.0, 5.0, 0.1])
+        for i in range(rng.randrange(50, 600)):
+            t += rng.choice([0.02, 0.05, 0.1, 0.0, 0.3, 1.0, 4.0, -0.5]) if rng.random() < 0.3 else rng.uniform(0.01, 0.06)
+            u = rng.random()
+            if u < 0.15:
+                v = rng.choice([0.0, -0.0, 0, 1.0, -1.0, 5.0])
+            elif u < 0.1525:
+                v = float("nan")
+            else:
+                v = round(rng.gauss(10.0, 3.0) * scale, rng.choice([1, 2, 6]))
+            rv = rng.choice([v, -0.0 if v == 0 else v, v * rng.choice([1.0, 1.1, 0.5, -1.0]), round(v + rng.gauss(0, 0.5), 1)])
+            if rng.random() < 0.0015:
+                rv = float("nan")
+            ref.add(t, rv, 0.3)
+            now = t + rng.choice([0.0, 0.0, 2.0])
+            sd = rng.choice([0.2, 0.5])
+            assert new.offer(t, v, sd, ref, now) == old.offer(t, v, sd, ref, now)
+            assert set(new.stats) == set(old.stats)
+            for k in new.stats:
+                assert _same(new.stats[k], old.stats[k]), (trial, i, k, new.stats[k], old.stats[k])
+            assert (new.verdict, new.suspect, new.by_cusum, new.changed_t) == (old.verdict, old.suspect, old.by_cusum, old.changed_t)
+            assert json.dumps(new.report(), sort_keys=True) == json.dumps(old.report(), sort_keys=True)
+            samples += 1
+            if rng.random() < 0.004:
+                new.reset_data()
+                old.reset_data()
+    assert samples > 40000
+
+
+def _fps_walk(q, now, window=2.0):
+    """Mixer.fps as it was: a walk from the newest arrival until the window ends."""
+    if not q:
+        return 0.0
+    n, first = 0, None
+    for t in reversed(q):
+        if now - t > window:
+            break
+        n += 1
+        first = t
+    if n < 2:
+        return 0.0
+    span = now - first
+    return round((n - 1) / span, 2) if span > 0 else 0.0
+
+
+def test_mixer_fps_is_the_walk_over_the_arrivals():
+    """Mixer.fps finds the first arrival within the window by bisection when more than a few are in it: the same
+    count and the same first arrival as the walk, over arrivals in time order (equal stamps, rounded stamps,
+    gaps, a full deque) and windows of any size, the window's edge included."""
+    from chris_integrator.mixer.mixer import Mixer
+
+    class Clock:
+        replay, t = True, 0.0
+
+        def now(self):
+            return self.t
+
+        def on_message(self, msg):
+            pass
+
+    rng = random.Random(11)
+    clock = Clock()
+    m = Mixer(clock)
+    checked = 0
+    for _ in range(4000):
+        q = m.arrivals["s"]
+        q.clear()
+        t = rng.uniform(0.0, 1e5)
+        hz = rng.choice([3.0, 10.0, 20.0, 30.0, 100.0])
+        for _ in range(rng.randrange(0, 320)):
+            t += rng.choice([0.0, 1.0 / hz, rng.uniform(0.0, 3.0)]) if rng.random() < 0.2 else rng.uniform(0.7, 1.3) / hz
+            if rng.random() < 0.5 and round(t, 3) >= (q[-1] if q else 0.0):
+                t = round(t, 3)
+            q.append(t)
+        for _ in range(5):
+            clock.t = t + rng.choice([0.0, 0.0, 0.01, 1.0, 2.0, 5.0])
+            w = rng.choice([2.0, 2.0, 0.5, 10.0, 0.0])
+            if q and rng.random() < 0.3:
+                clock.t = rng.choice(list(q)) + w            # an arrival exactly on the window's edge
+            assert _same(m.fps("s", w), _fps_walk(q, clock.t, w))
+            checked += 1
+    assert m.fps("none") == 0.0
+    assert checked == 20000
