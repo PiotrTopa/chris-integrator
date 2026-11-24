@@ -308,6 +308,7 @@ class Filter:
         ages = [None] * m
         srcs = [set() for _ in range(m)]
         js = tuple(zip(range(m), kinds_seq, srcs))
+        match = {}                         # q -> the queries whose kinds hold it, [(j, its sources)] (asked once per q)
         for e in entries[wl:wh]:
             u = e.usedq
             if not u:
@@ -315,13 +316,15 @@ class Filter:
             d = abs(e.t - T)
             inw = d <= window_s
             for q, src in u:
-                for j, kinds, sj in js:
-                    if kinds is None or q in kinds:
-                        if inw:
-                            sj.add(src)
-                        a = ages[j]
-                        if a is None or d < a:
-                            ages[j] = d
+                mj = match.get(q)
+                if mj is None:
+                    mj = match[q] = tuple((j, sj) for j, kinds, sj in js if kinds is None or q in kinds)
+                for j, sj in mj:
+                    if inw:
+                        sj.add(src)
+                    a = ages[j]
+                    if a is None or d < a:
+                        ages[j] = d
         carry = getattr(self, "carry", ())
         out = []
         for j, kinds, sj in js:
