@@ -27,6 +27,7 @@ class EgoMotion:
 
     def reset(self):
         self._at = {}            # state_at of the times asked since the last sample (one message asks a few)
+        self._pose = {}          # ... and pose_at of them
         self.t = []              # sample times
         self.s = []              # (xr, yr, psi, v, w, a, sig_v, sig_w, stands) at each time: rear axle pose
         self.frame = 0           # counts resets: objects of an older frame are meaningless
@@ -44,6 +45,8 @@ class EgoMotion:
         w = 0.0 if stands else float(w)
         if self._at:
             self._at = {}
+        if self._pose:
+            self._pose = {}
         if not self.t:
             self.t.append(t)
             self.s.append((-self.axle, 0.0, 0.0, v, w, float(a), sig_v, sig_w, bool(stands)))
@@ -105,11 +108,16 @@ class EgoMotion:
 
     def pose_at(self, t):
         """(X, Y, psi) of the car frame's origin on the ground at time t."""
-        s = self.state_at(t)
-        if s is None:
-            return None
-        xr, yr, psi = s[:3]
-        return xr + self.axle * math.cos(psi), yr + self.axle * math.sin(psi), psi
+        p = self._pose.get(t)
+        if p is None:
+            s = self.state_at(t)
+            if s is None:
+                return None
+            xr, yr, psi = s[:3]
+            p = self._pose[t] = (xr + self.axle * math.cos(psi), yr + self.axle * math.sin(psi), psi)
+            if len(self._pose) > 64:
+                self._pose = {t: p}
+        return p
 
     def velocity_at(self, t):
         """Ground velocity (vx, vy) of the car frame's origin and the yaw rate at time t."""

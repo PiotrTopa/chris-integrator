@@ -99,6 +99,8 @@ CFG = dict(
 
 
 def _fin(v):
+    if type(v) is float:                 # (the common case, without the two isinstance calls: the same answer)
+        return math.isfinite(v)
     return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
 
 
@@ -137,9 +139,10 @@ class Radar:
             return
         yr, ac, st = msg.get("yaw_rate") or {}, msg.get("accel") or {}, msg.get("standstill") or {}
         stands = bool(st.get("value"))
-        self.ego.add(ts / NS, sp["value"], yr.get("value") if yr.get("valid") and _fin(yr.get("value")) else 0.0,
-                     ac.get("value") if ac.get("valid") and _fin(ac.get("value")) else 0.0,
-                     sp.get("std") if _fin(sp.get("std")) else 0.1, yr.get("std") if _fin(yr.get("std")) else 0.003, stands)
+        yv, av, sv, yd = yr.get("value"), ac.get("value"), sp.get("std"), yr.get("std")     # (each looked up once)
+        self.ego.add(ts / NS, sp["value"], yv if yr.get("valid") and _fin(yv) else 0.0,
+                     av if ac.get("valid") and _fin(av) else 0.0,
+                     sv if _fin(sv) else 0.1, yd if _fin(yd) else 0.003, stands)
 
     def on_ego(self, msg):
         ts = msg.get("ts_mono_ns")
@@ -341,13 +344,17 @@ class Radar:
             dets = [z for z in dets if 0.5 <= z[0] <= sen.max_range and abs(z[1]) <= sen.fov]
             self._push((ts / NS, sid, sen, dets))
             return
+        rv, rmax, fov = (sr * sr, sa * sa, sv * sv), sen.max_range, sen.fov      # (the same for every detection)
         for o in objs:
-            if not isinstance(o, dict) or not (_fin(o.get("range_m")) and _fin(o.get("azimuth_deg")) and _fin(o.get("range_rate_mps"))):
+            if not isinstance(o, dict):
                 continue
-            r, az = float(o["range_m"]), math.radians(o["azimuth_deg"])
-            if r < 0.5 or r > sen.max_range or abs(az) > sen.fov:
+            r, az, rr = o.get("range_m"), o.get("azimuth_deg"), o.get("range_rate_mps")
+            if not (_fin(r) and _fin(az) and _fin(rr)):
                 continue
-            dets.append({"z": np.array([r, az, float(o["range_rate_mps"])]), "R": np.array([sr * sr, sa * sa, sv * sv]),
+            r, az = float(r), math.radians(az)
+            if r < 0.5 or r > rmax or abs(az) > fov:
+                continue
+            dets.append({"z": np.array([r, az, float(rr)]), "R": np.array(rv),
                          "attrs": {k: o[k] for k in ("class", "prob") if k in o}})
         self._push((ts / NS, sid, sen, dets))
 
@@ -378,6 +385,8 @@ class Radar:
 
     # ---- one output ---------------------------------------------------------------------------------------
     def _drain(self, T):
+        if not self.queue:
+            return
         self.queue.sort(key=lambda s: s[0])
         k = 0
         while k < len(self.queue) and self.queue[k][0] <= T + 1e-6:
@@ -414,7 +423,10 @@ class Radar:
         tr = self.tracker
         tr.manage(T)
         path = self.path
-        if path is not None and tr.cfg["road_prior"]:   # the road model's path on the ground, for the heading prior
+        # the road model's path on the ground, for the heading prior (not made within road_prior_s of the prior's
+        # last turn: Tracker.road_prior does nothing then)
+        if path is not None and tr.cfg["road_prior"] \
+                and (tr.road_t is None or not T - tr.road_t < tr.cfg["road_prior_s"]):
             pp = self.ego.pose_at(self.path_t)
             if pp is not None:
                 cp, sp = math.cos(pp[2]), math.sin(pp[2])
@@ -476,7 +488,7 @@ class Radar:
         return {"type": "radar", "api": 1, "seq": self.seq, "ts_mono_ns": ts, "frame": "car", "objects": out,
                 "ego": {"speed_mps": round(v_ego, 2), "yaw_rate_rps": round(w_ego, 4), "accel_mps2": round(es[5], 2),
                         "stands": self.ego.stands_at(T), "ground_frame": self.ego.frame},
-                "path": None if self.path is None else "plan", "sensors": sensors,
+                "path": None if path is None else "plan", "sensors": sensors,
                 "groups": [{"id": g, "kind": v["kind"], "members": v["members"]} for g, v in sorted(tr.groups.items())],
                 "counts": {"objects": len(tr.objects), "listed": len(out), "queued": len(self.queue), "dropped": self.dropped}}
 
