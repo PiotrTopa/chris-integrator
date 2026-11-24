@@ -166,9 +166,9 @@ static int dk_z_n = 0;
  * smaller over the larger component of the normal. */
 #define DK_ND 64
 static double DK_DU[DK_ND][2];               /* the directions (unit vectors) */
-static double DK_DP[DK_ND][DK_MAXS];         /* per direction: the draws' projections, the largest first */
-static unsigned short DK_DI[DK_ND][DK_MAXS]; /* ... and which draws they are */
-static int dk_d_n = 0;                       /* the number of draws the order is of */
+static double *DK_DP = NULL;                 /* per direction (DK_ND rows of dk_d_n): the draws' projections, the largest first */
+static unsigned short *DK_DI = NULL;         /* ... and which draws they are */
+static int dk_d_n = 0;                       /* the number of draws the order is of (0: there is none) */
 
 static int dk_dir(double a, double b)        /* the direction's index for the normal (a, b), not both zero */
 {
@@ -183,11 +183,23 @@ static int dk_dir(double a, double b)        /* the direction's index for the no
     return oct * 8 + sub;
 }
 
-static void dk_order(int n)
+/* the order of the first n draws; 0 when there is no memory for it (dk_pc then tests every draw) */
+static int dk_order(int n)
 {
     if (n == dk_d_n)
-        return;
+        return 1;
+    double *dp = (double *)PyMem_Realloc(DK_DP, (size_t)DK_ND * n * sizeof(double));
+    if (dp != NULL)
+        DK_DP = dp;
+    unsigned short *di = (unsigned short *)PyMem_Realloc(DK_DI, (size_t)DK_ND * n * sizeof(unsigned short));
+    if (di != NULL)
+        DK_DI = di;
+    dk_d_n = 0;
+    if (dp == NULL || di == NULL)
+        return 0;
     for (int d = 0; d < DK_ND; d++) {
+        double *P = DK_DP + (size_t)d * n;
+        unsigned short *I = DK_DI + (size_t)d * n;
         int oct = d / 8, sub = d % 8;
         double big = 1.0, small = (sub + 0.5) / 8.0, nn = sqrt(big * big + small * small);
         double a = (oct & 4 ? small : big) / nn, b = (oct & 4 ? big : small) / nn;
@@ -200,16 +212,17 @@ static void dk_order(int n)
         for (int q = 0; q < n; q++) {            /* insertion sort, the largest first */
             double pr = DK_Z[q][0] * a + DK_Z[q][1] * b;
             int r = q - 1;
-            while (r >= 0 && DK_DP[d][r] < pr) {
-                DK_DP[d][r + 1] = DK_DP[d][r];
-                DK_DI[d][r + 1] = DK_DI[d][r];
+            while (r >= 0 && P[r] < pr) {
+                P[r + 1] = P[r];
+                I[r + 1] = I[r];
                 r--;
             }
-            DK_DP[d][r + 1] = pr;
-            DK_DI[d][r + 1] = (unsigned short)q;
+            P[r + 1] = pr;
+            I[r + 1] = (unsigned short)q;
         }
     }
     dk_d_n = n;
+    return 1;
 }
 
 static void dk_draws(int n)
@@ -832,7 +845,7 @@ static double dk_pc(const DkCtx *C, int j, int k, double *t_contact)
     if (ns > DK_MAXS)
         ns = DK_MAXS;
     dk_draws(ns);
-    dk_order(ns);
+    const int ordered = dk_order(ns);
     /* the draws' footprints (extent and, where a draw comes near, the turn of its heading) */
     static double QHL[DK_MAXS], QHW[DK_MAXS], QR[DK_MAXS], QCD[DK_MAXS], QSD[DK_MAXS];
     static unsigned char qst[DK_MAXS];           /* per draw: 1 its extent is made, 2 its turn is made, 4 it has touched */
@@ -878,15 +891,15 @@ static double dk_pc(const DkCtx *C, int j, int k, double *t_contact)
             double nn = sqrt(pa * pa + pb * pb);
             if (nn * zmax + rpad < pt)
                 continue;                        /* beyond every draw's reach */
-            if (nn > 0.0 && nn < INFINITY) {
+            if (ordered && nn > 0.0 && nn < INFINITY) {
                 /* a draw that passes has z.u >= (pt - rpad) / nn = tau for the normal u = (pa, pb) / nn; along
                  * the tabulated direction ud its projection is then at least tau - max|z| |ud - u| */
                 int d = dk_dir(pa, pb);
                 double vx = DK_DU[d][0] - pa / nn, vy = DK_DU[d][1] - pb / nn, tau = (pt - rpad) / nn;
                 cut = tau - zmax * sqrt(vx * vx + vy * vy) - 1e-9 * (1.0 + fabs(tau));
                 if (cut == cut) {                /* (not a number: all draws) */
-                    cand = DK_DI[d];
-                    cproj = DK_DP[d];
+                    cand = DK_DI + (size_t)d * ns;
+                    cproj = DK_DP + (size_t)d * ns;
                 }
             }
         }
