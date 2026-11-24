@@ -163,6 +163,98 @@ def test_the_hold_is_off_by_default_and_changes_nothing_then():
     assert len(TH.ThreatModel().native_cfg()) == len(TH.ThreatModel({"place_hold": True}).native_cfg())
 
 
+# ---- a pedestrian at parked vehicles ----------------------------------------------------------------------------------
+PED_STD = (2.8, 0.15, 0.4, 0.3)
+PED_OFF = {"ped_gap": 1.0, "ped_onset": 0.0, "ped_cov": 0.0, "ped_carry": 0.0}       # each knob named, whatever its default
+
+
+def ped(x, y, vy=0.0, ps=0.9):
+    return K.obj(5, x, y, 0.0, vy, "human", ps=ps, std=PED_STD)
+
+
+def parked(i, x, y=-2.9):
+    return K.obj(i, x, y, 0.0, 0.0, ps=0.97, std=(0.8, 0.2, 0.3, 0.2), len=4.5, wid=1.8, ctr=[x + 2.25, y])
+
+
+def ped_run(scene, native, T=1.0, dt=0.05):
+    """scene(t) -> objects; the prediction at T, with the knobs of `native` on and the other pedestrian knobs off."""
+    P = Predictor(dict(C.NOCHECK, native=dict(C.NEW, **dict(PED_OFF, **native)), row_odds_max=0.0))
+    pred = None
+    for f in range(int(round(T / dt)) + 1):
+        pred = P.update(K.msg(f * dt, scene(f * dt), v=13.0), STRAIGHT)
+    return pred
+
+
+def weight(pred, oid, names):
+    return sum(p for n, p, _ in C.futs(pred, oid) if n in names)
+
+
+def test_a_pedestrian_between_parked_cars_is_likelier_about_to_step_out():
+    between = lambda t: [ped(40.0 - 13.0 * t, -2.9), parked(1, 31.0 - 13.0 * t), parked(2, 42.5 - 13.0 * t)]   # noqa: E731
+    alone = lambda t: [ped(40.0 - 13.0 * t, -2.9)]                                                              # noqa: E731
+    behind = lambda t: [ped(40.0 - 13.0 * t, -5.2), parked(1, 31.0 - 13.0 * t), parked(2, 42.5 - 13.0 * t)]   # noqa: E731
+    a0, b0 = weight(ped_run(alone, {}), 5, ("start_cross",)), weight(ped_run(between, {}), 5, ("start_cross",))
+    assert 0.02 < a0 < 0.15 and abs(a0 - b0) < 0.01, (a0, b0)   # as it was: where it stands makes no difference
+    a1, b1 = (weight(ped_run(s, {"ped_gap": 6.0}), 5, ("start_cross",)) for s in (alone, between))
+    assert abs(a1 - a0) < 1e-9 and b1 > 3.0 * b0 and 0.2 < b1 < 0.6, (a1, b1)
+    c0, c1 = (weight(ped_run(behind, n), 5, ("start_cross",)) for n in ({}, {"ped_gap": 6.0}))
+    assert abs(c1 - c0) < 1e-9                                  # on the pavement behind the cars: not in their line
+
+
+def test_a_first_step_is_read_from_the_place_before_the_velocity_shows_it():
+    # it stands for a second, then its place comes towards the road at 1.4 m/s; the tracker still says "it stands,
+    # speed 0" (as it does for a box or two)
+    def scene(t):
+        return [ped(60.0 - 13.0 * t, -2.9 + 1.4 * max(0.0, t - 1.0))]
+    cross = ("start_cross", "crossing")
+    on = {"ped_onset": 1.0}
+    assert weight(ped_run(scene, {}, T=1.8), 5, cross) < 0.15
+    w6, w8 = (weight(ped_run(scene, on, T=T), 5, cross) for T in (1.6, 1.8))
+    assert w6 > 0.4 and w8 > 0.8, (w6, w8)                     # 0.6 s after the step it is likelier than not, 0.8 s: said
+    assert weight(ped_run(scene, on, T=1.3), 5, cross) < 0.15   # 0.4 m: within what the place it stood at follows
+    # ... and its future starts walking, not a second later
+    f = dict((n, t) for n, _, t in C.futs(ped_run(scene, on, T=1.8), 5))
+    assert f["start_cross"][3, 1] - f["start_cross"][0, 1] > 0.5
+    # a pedestrian who stays where it is: the knob changes nothing at all
+    still = lambda t: [ped(60.0 - 13.0 * t, -2.9)]                                     # noqa: E731
+    a, b = ped_run(still, {}, T=1.5), ped_run(still, on, T=1.5)
+    assert np.array_equal(a.traj, b.traj, equal_nan=True) and np.array_equal(a.p0, b.p0)
+    # not a step: walking away from the road; the track's place settling at 0.3 m/s as the car closes; the track's
+    # place corrected by half a metre between two frames
+    away = lambda t: [ped(60.0 - 13.0 * t, -2.9 - 1.4 * max(0.0, t - 1.0))]            # noqa: E731
+    settle = lambda t: [ped(60.0 - 13.0 * t, -2.9 + 0.3 * max(0.0, t - 1.0))]          # noqa: E731
+    hop = lambda t: [ped(60.0 - 13.0 * t, -2.9 + (0.5 if t > 1.0 else 0.0))]           # noqa: E731
+    for sc in (away, settle, hop):
+        assert max(weight(ped_run(sc, on, T=T), 5, cross) for T in (1.2, 1.5, 1.8, 2.4, 3.0)) < 0.15
+    # boxes every 0.4 s (the place carried between them): still a step, two boxes on
+
+    def sparse(t):
+        return [ped(60.0 - 13.0 * t, -2.9 + 1.4 * max(0.0, 0.4 * int(t / 0.4 + 1e-9) - 1.0))]
+    assert weight(ped_run(sparse, on, T=1.8), 5, cross) > 0.6
+
+
+def test_a_step_out_goes_on_as_the_crossing_it_is_when_the_pedestrian_enters_the_lane():
+    # the tracker sees it walk out from 0.3 s after the step; 1.1 s after the step it is over the lane's edge
+    def scene(t):
+        mv = t > 1.3
+        return [ped(60.0 - 13.0 * t, -2.9 + 1.4 * max(0.0, t - 1.0), vy=1.4 if mv else 0.0, ps=0.05 if mv else 0.9)]
+    cross = ("start_cross", "crossing")
+    times = (1.9, 2.0, 2.1, 2.2, 2.4)
+    was = [weight(ped_run(scene, {"ped_carry": 0.0}, T=T), 5, cross) for T in times]
+    now = [weight(ped_run(scene, {"ped_carry": 1.0}, T=T), 5, cross) for T in times]
+    assert was[1] > 0.6 and was[2] < 0.3, was                  # as it was: "walks along" at the moment it is in the lane
+    assert all(b >= a - 0.01 for a, b in zip(now, now[1:])) and now[2] > 0.7, now
+    assert abs(now[0] - was[0]) < 1e-9                         # the same until then
+
+
+def test_a_crossing_future_starts_with_the_places_own_spread():
+    scene = lambda t: [ped(30.0, -2.9)]                                                # noqa: E731
+    f0 = dict((n, t) for n, _, t in C.futs(ped_run(scene, {}), 5))
+    f1 = dict((n, t) for n, _, t in C.futs(ped_run(scene, {"ped_cov": 1.0}), 5))
+    assert f0["start_cross"][0, 3] > 1.5                        # as it was: round, 2 m across the road too
+    assert f1["start_cross"][0, 3] < 0.5 and f1["start_cross"][0, 2] > 2.0, f1["start_cross"][0]
+
+
 if __name__ == "__main__":
     for k, v in list(globals().items()):
         if k.startswith("test_"):

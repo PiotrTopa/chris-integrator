@@ -116,6 +116,29 @@
                                    allowed for (motion_scale_bound) */                                                \
     X(motion_scale_rel, 0.15)   /* ... the range's relative error at least (what the tracker's ranges showed) */      \
     X(motion_scale_v, 8.0)      /* ... and the speeds of things that do move: 1 sigma (m/s) */                        \
+    X(ped_gap, 1.0)             /* a pedestrian standing between or beside parked vehicles, in their line at the     \
+                                   road's edge, is that many times likelier about to step out than one at an open    \
+                                   kerb (1: no difference) */                                                         \
+    X(ped_gap_s_m, 6.0)         /* ... a standing vehicle's end within this of it along the road */                   \
+    X(ped_onset, 0.0)           /* 1: a pedestrian's first step towards the road is read from its place (how far it   \
+                                   has come from where it stood, against what its place is known to), before the      \
+                                   tracker's velocity shows it */                                                     \
+    X(ped_onset_m, 0.3)         /* ... from this far (m) */                                                           \
+    X(ped_onset_span_m, 1.5)    /* ... a step out begun within the last second has come up to this far */            \
+    X(ped_onset_range, 1.0)     /* ... the share of the range's spread that a correction may move within that time */ \
+    X(ped_onset_tau_s, 0.7)     /* ... the place it stood at follows a slow change of the offset in this time (a      \
+                                   track's place settling as the car closes: 0.3 m/s is followed, 1.4 m/s is not) */  \
+    X(ped_onset_v_min, 0.6)     /* ... half a second on, it must have come on at this pace at least (m/s) */          \
+    X(ped_onset_v_max, 4.0)     /* ... a change of the place faster than this is the track's correction (m/s) */      \
+    X(ped_carry, 0.0)           /* 1: a pedestrian's manoeuvres are carried over the edge of a lane (the step out it  \
+                                   began goes on as the crossing it is); 0: as a vehicle's: in another lane "the     \
+                                   change that got it there is over", four fifths of "about to step out" become       \
+                                   "walks along" and half of the rest the priors, at the moment it enters the car's   \
+                                   lane */                                                                            \
+    X(ped_cov, 0.0)             /* 1: a pedestrian's crossing futures start with its place's own spread (a camera's:  \
+                                   metres along the line of sight, centimetres across it: how far into the road it   \
+                                   is, is known); 0: with a round one of the same size (a pedestrian 2.9 m from the   \
+                                   lane's middle, range known to 2.8 m, stood "in the lane" with a fifth of it) */    \
     X(std_rho, 0.0)             /* 1: where the radar gives the correlation of a place's x and y errors (`std_rho`),  \
                                    the place's covariance is that one: the needle is read along its own long axis     \
                                    (lane_step) and the futures start with it; 0: as if it were not given (the needle   \
@@ -164,9 +187,12 @@ enum { PO_X, PO_Y, PO_VX, PO_VY, PO_AX, PO_AY, PO_SX, PO_SY, PO_SVX, PO_SVY, PO_
 
 /* an object's kept state */
 enum { PS_INIT, PS_T, PS_LANE, PS_INT = PS_LANE + P_NLANE, PS_D = PS_INT + P_NM, PS_DR, PS_PDD, PS_PDR, PS_PRR, PS_V, PS_A, PS_PVV,
-       PS_PVA, PS_PAA, PS_TSTAND, PS_TMOVE, PS_LMAP, PS_TKERB, PS_TOP, PS_DIR, PS_TLANE, PS_GSTAND, PS_PSL, PS_MOVED, P_NS = 48 };
+       PS_PVA, PS_PAA, PS_TSTAND, PS_TMOVE, PS_LMAP, PS_TKERB, PS_TOP, PS_DIR, PS_TLANE, PS_GSTAND, PS_PSL, PS_MOVED, PS_DANCH,
+       PS_TON, PS_DPREV, PS_TCH, P_NS = 48 };
 /* PS_MOVED: it has been seen to move (half a second of "it moves" on end): its lane is then also what its way of
- * moving has shown over time */
+ * moving has shown over time. PS_DANCH, PS_TON, PS_DPREV, PS_TCH (a pedestrian, cfg ped_onset): the offset at which
+ * it stood, for how long it has been away from it towards the road, its offset when that last changed and how long
+ * ago that was (ped_step) */
 /* per object diagnostics (`feat`) */
 enum { PF_S, PF_D, PF_SD, PF_DC, PF_DIR, PF_LANE, PF_LEAD, PF_GAP, PF_E, PF_R, PF_A, PF_PSI, PF_STOP, PF_JDIST, PF_KERB, PF_OM, P_NF };
 /* the road */
@@ -809,6 +835,9 @@ typedef struct {
     int arm, arm_in;                /* the side road it is on (-1: none); 1: heading for the junction */
     double arm_s, arm_d, arm_hd;
     double kerb;                    /* metres inside the carriageway (negative: outside) */
+    int between;                    /* a pedestrian in the line of the parked vehicles, one of them next to it (ped_step) */
+    double onset;                   /* ... the log-likelihood ratio of "it has begun to step out" from how far its place
+                                     * has come towards the road (0: nothing) */
     int side;                       /* +1: on the left half of the road */
     double xing;                    /* distance along the road to the nearest marked crossing (inf: none) */
     int obstacle;                   /* a standing thing ahead in a cyclist's way */
@@ -1630,6 +1659,94 @@ static void context_step(PCtx *c, int i)
     }
 }
 
+/* ---- a pedestrian at parked vehicles ------------------------------------------------------------------------- */
+/* Two things a pedestrian's track says before its velocity does (cfg ped_gap, ped_onset; after every object's
+ * lane_step and feat_step).
+ *
+ * Where it stands: in the line of the vehicles parked beside the road (between two of them, or at the end of one),
+ * not behind them on the pavement. Someone standing there is about to cross or to get into a car; from behind a
+ * parked vehicle it is seen late and is in the lane after two steps. `between`: a standing vehicle on its side of
+ * the road ends within ped_gap_s_m of it along the road, and its offset lies within that vehicle's body's (0.3 m
+ * beyond its far face at most).
+ *
+ * That it has begun to move: the tracker's velocity of a pedestrian follows a step by a box or two (0.15-1.1 s on
+ * the simulator's streams); its place is the first thing a box moves. The offset at which it stood is kept
+ * (PS_DANCH: it follows the offset within ped_onset_tau_s while that stays within ped_onset_m of it, so a track's
+ * place settling at 0.3 m/s as the car closes is followed and a walk at 1.4 m/s is not); once the offset has come
+ * d > ped_onset_m towards the road, the likelihood ratio of "a step out begun within the last second" (d anywhere
+ * up to ped_onset_span_m) against "it stands" (d normal around 0 with the spread a change of the offset has) is
+ * `onset`: it lowers the share of "it stands" (predict_frame) and, among the futures in which it moves, weighs the
+ * crossing ones against walking along (intent_step). Not a step: a change faster than ped_onset_v_max between two
+ * changes of the place (the track's correction: the place it stood at goes with it), and one that half a second on
+ * has not come on at ped_onset_v_min. After 4 s away the place it has reached is where it stands. */
+static void ped_step(PCtx *c, PObj *q, double dt)
+{
+    const double *cfg = c->cfg;
+    double *st = q->st;
+    q->between = 0;
+    q->onset = 0.0;
+    if (q->grp != 2)
+        return;
+    if (cfg[PC_ped_gap] != 1.0 && q->kerb < 0.7 && q->kerb > -(cfg[PC_ped_kerb_m] + 1.0)) {
+        for (int j = 0; j < c->n && !q->between; j++) {
+            const PObj *u = c->obj + j;
+            if (u == q || u->grp != 0 || u->pstat < 0.5 || (u->d >= 0.0) != (q->d >= 0.0))
+                continue;
+            if (fabs(u->s - q->s) > 0.5 * u->len + cfg[PC_ped_gap_s_m])
+                continue;
+            if (fabs(q->d) <= fabs(u->d) + 0.5 * u->wid + 0.3 && fabs(q->d) >= fabs(u->d) - 0.5 * u->wid - 1.0)
+                q->between = 1;
+        }
+    }
+    if (!(cfg[PC_ped_onset] > 0.5))
+        return;
+    if (!(st[PS_INIT] > 0.5) || dt <= 0.0) {
+        if (!(st[PS_INIT] > 0.5)) {
+            st[PS_DANCH] = st[PS_DPREV] = q->d;
+            st[PS_TON] = st[PS_TCH] = 0.0;
+        }
+        return;
+    }
+    /* a change of the place faster than anyone runs is the track's correction, not a step: the place it stood at
+     * goes with it (the change over the time since the place last changed: between two boxes a track is carried) */
+    st[PS_TCH] += dt;
+    const double dd = q->d - st[PS_DPREV];
+    if (fabs(dd) > 0.02) {
+        if (fabs(dd) > 0.15 && fabs(dd) > cfg[PC_ped_onset_v_max] * (st[PS_TCH] > dt ? st[PS_TCH] : dt))
+            st[PS_DANCH] += dd;
+        st[PS_DPREV] = q->d;
+        st[PS_TCH] = 0.0;
+    }
+    const double d = q->side * (st[PS_DANCH] - q->d);            /* towards the road's middle: positive */
+    if (d > cfg[PC_ped_onset_m] && st[PS_TON] < 4.0) {
+        /* how well the CHANGE of its offset is known: across the line of sight (the bearing: centimetres), twice;
+         * and what a correction of its range would move it across the road (the needle's share of the offset's
+         * spread; ped_onset_range of it). Where the place was not read along a needle: the offset's whole spread */
+        double sd = q->sd_d;
+        if (q->los_n) {
+            const double along = p_sq(q->sd_d) - p_sq(q->los_sc) - 0.0225;
+            sd = sqrt(2.0 * p_sq(q->los_sc) + p_sq(cfg[PC_ped_onset_range]) * (along > 0.0 ? along : 0.0));
+        }
+        sd = hypot(sd, 0.1);
+        const double z = d / sd;
+        const double ll = -log(cfg[PC_ped_onset_span_m]) + 0.5 * z * z + log(sd * 2.5066282746310002);
+        st[PS_TON] += dt;
+        if (st[PS_TON] > 0.5 && d < cfg[PC_ped_onset_m] + cfg[PC_ped_onset_v_min] * (st[PS_TON] - 0.5)) {
+            st[PS_DANCH] = q->d;                                /* slower than anyone walks out: the track's place settling */
+            st[PS_TON] = 0.0;
+        } else if (d <= cfg[PC_ped_onset_span_m] + 2.0 * sd)
+            q->onset = p_clip(ll, 0.0, 8.0);
+        else
+            q->onset = 8.0;                                     /* further than a second's steps: it walks */
+    } else if (d > cfg[PC_ped_onset_m] || d < -cfg[PC_ped_onset_m]) {
+        st[PS_DANCH] = q->d;                                    /* it stands (or walks) somewhere else now */
+        st[PS_TON] = 0.0;
+    } else {
+        st[PS_DANCH] += (q->d - st[PS_DANCH]) * (1.0 - exp(-dt / cfg[PC_ped_onset_tau_s]));
+        st[PS_TON] = 0.0;
+    }
+}
+
 /* ---- the manoeuvres: what is possible here (prior weights) and how well each explains what is seen --------- */
 static const double P_EXIT_HZ[P_NM] = {0.15, 0.2, 0.25, 0.25, 0.2, 0.2, 0.2, 0.3, 0.05, 0.2, 0.5, 0.1, 0.5, 0.4, 0.5};
 
@@ -1686,8 +1803,10 @@ static void intent_step(PCtx *c, PObj *q, double dt, double *intent_out)
         Q[PM_STAND] = 0.6;
         double boost = (q->xing < 2.0 ? 8.0 : 1.0) * (q->jdist < 15.0 ? 3.0 : 1.0);
         double waited = q->st[PS_TKERB] / 3.0;
+        if (q->onset > 0.0)                                      /* its place has come towards the road: not "along" */
+            L[PM_KEEP] -= q->onset;
         if (near && q->kerb < 0.7) {
-            Q[PM_STARTX] = 0.03 * boost * (1.0 + (waited < 2.0 ? waited : 2.0));
+            Q[PM_STARTX] = 0.03 * boost * (1.0 + (waited < 2.0 ? waited : 2.0)) * (q->between ? cfg[PC_ped_gap] : 1.0);
             L[PM_STARTX] = st > 0.5 ? lstand
                                    : lmove + p_logn(vin, 0.5, hypot(0.5, q->sr), hypot(0.35, q->sr)) + p_logn(q->sp, 0.6, 0.6, 0.6);
         }
@@ -1848,7 +1967,13 @@ static void intent_step(PCtx *c, PObj *q, double dt, double *intent_out)
         qls += Q[m] * P_EXIT_HZ[m];
     }
     int was = (int)q->st[PS_LMAP];
-    if (!fresh && was != q->lane) {
+    const int ped_carry = q->grp == 2 && cfg[PC_ped_carry] > 0.5;
+    if (ped_carry && !fresh && !(Q[PM_STARTX] > 0.0) && Q[PM_CROSS] > 0.0) {
+        /* a pedestrian that was about to step out and is in the road now: that IS the crossing it began */
+        ip[PM_CROSS] += ip[PM_STARTX];
+        ip[PM_STARTX] = 0.0;
+    }
+    if (!fresh && was != q->lane && !ped_carry) {
         /* it is in another lane now: a change that got it there is over, what belonged to the old place is void */
         double moved = ip[PM_LCL] + ip[PM_LCR] + ip[PM_DRIFT] + ip[PM_PULL] + ip[PM_SWERVE] + ip[PM_STARTX];
         ip[PM_KEEP] += 0.8 * moved;
@@ -2192,8 +2317,12 @@ static int mode_build(PCtx *c, int i, int k, int m, PPath *tmp)
         } else {                                                /* across the road, to its far side */
             double hn = q->th + (q->side > 0 ? -0.5 * PI : 0.5 * PI);
             double hv = atan2(o[PO_VY], o[PO_VX]);
-            int moving = q->sp > 0.6 && q->pstat < 0.5;
-            if (moving && fabs(wrap_pi(hv - hn)) < 1.05)
+            /* (its place has come towards the road, its velocity not yet: it walks, at a walking pace; ped_step) */
+            const int stepped = q->onset >= 2.0 && !(q->sp > 0.6);
+            int moving = (q->sp > 0.6 && q->pstat < 0.5) || stepped;
+            if (stepped)
+                ;
+            else if (moving && fabs(wrap_pi(hv - hn)) < 1.05)
                 hn = hv;
             else if (moving && fabs(wrap_pi(hv - hn - PI)) < 1.05 && m == PM_CROSS)
                 hn = hv;                                         /* it walks off the road again */
@@ -2210,9 +2339,11 @@ static int mode_build(PCtx *c, int i, int k, int m, PPath *tmp)
             r.go = 1;
             r.a_go = 1.0;
             r.v_des = q->sp > cfg[PC_ped_v] && moving ? q->sp : cfg[PC_ped_v];
-            r.v0 = moving ? q->sp : 0.0;
-            r.pss = r.pdd = 0.5 * (p_sq(o[PO_SX]) + p_sq(o[PO_SY]));
-            r.psd = 0.0;
+            r.v0 = stepped ? cfg[PC_ped_v] : moving ? q->sp : 0.0;
+            if (!(cfg[PC_ped_cov] > 0.5)) {
+                r.pss = r.pdd = 0.5 * (p_sq(o[PO_SX]) + p_sq(o[PO_SY]));
+                r.psd = 0.0;
+            }
             if (m == PM_STARTX) {
                 r.t_start = moving ? 0.0 : cfg[PC_ped_cross_onset_s];
                 r.onset_lon_sd = moving ? 0.4 : cfg[PC_ped_cross_onset_sd_s];
@@ -3430,6 +3561,8 @@ static PyObject *n_predict_frame(PyObject *self, PyObject *args)
         q->len = q->o[PO_LEN] == q->o[PO_LEN] && q->o[PO_LEN] > 0.2 ? q->o[PO_LEN] : q->kin[PK_LEN];
         q->wid = q->o[PO_WID] == q->o[PO_WID] && q->o[PO_WID] > 0.2 ? q->o[PO_WID] : q->kin[PK_WID];
         q->cxy = p_cxy_fut(c->cfg, q->o);
+        q->between = 0;
+        q->onset = 0.0;
         q->pstat = motion_state(c->cfg, q->o, &q->minfo);
         if (c->cfg[PC_motion_scale] > 0.5 && q->grp == 0 && c->ego[PE_V] > 2.0) {
             /* only beside the car's way (its place as the track has it): there "it may stand after all" takes a
@@ -3458,6 +3591,18 @@ static PyObject *n_predict_frame(PyObject *self, PyObject *args)
             q->vprof[k] = q->vt * (1.0 - q->pstat);
         }
     }
+    if (c->cfg[PC_ped_gap] != 1.0 || c->cfg[PC_ped_onset] > 0.5)
+        for (int i = 0; i < n; i++) {
+            PObj *q = c->obj + i;
+            if (q->grp != 2)
+                continue;
+            double dt = q->st[PS_INIT] > 0.5 ? T - q->st[PS_T] : 0.0;
+            ped_step(c, q, dt);
+            if (q->onset > 0.0) {                               /* "it stands" against how far it has come */
+                const double a = q->pstat * exp(-q->onset);
+                q->pstat = a / (a + 1.0 - q->pstat);
+            }
+        }
     for (int i = 0; i < n; i++)
         context_step(c, i);
     for (int i = 0; i < n; i++) {
