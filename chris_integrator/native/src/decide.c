@@ -1612,7 +1612,8 @@ static PyObject *n_decide_draws(PyObject *self, PyObject *arg)
     X(brake) X(comb) X(comb_dir_deg) X(ttb_s) X(tts_s) X(tm_s) X(why) X(mode) X(p0) X(p) X(ego_mode) X(measure) X(pc)  \
     X(t_contact_s) X(lane) X(shown) X(pairs) X(w0) X(w) X(course) X(radar) X(cv) X(contract) X(vehicle) X(vru)         \
     X(unknown) X(stand) X(stand_path) X(cv_path) X(path) X(turn) X(none) X(information) X(caution) X(warning)          \
-    X(imminent) X(threat_number) X(time_margin) X(collision_course) X(confirmed) X(coast) X(stationary) X(moving)
+    X(imminent) X(threat_number) X(time_margin) X(collision_course) X(confirmed) X(coast) X(stationary) X(moving)   \
+    X(p_place)
 #define X(n) S_##n,
 enum { DF_STRS(X) S_N };
 #undef X
@@ -2050,6 +2051,8 @@ typedef struct {
     double trav_h, trav_sh;      /* futures.travel_heading */
     /* its futures */
     int first, nm, cv, along, row;
+    int lane_res;                /* its futures carry the lanes' weight (state 3 of the futures' rows) */
+    double p_place;              /* ... the probability of the place in the car's way (state - 3); 1 where not given */
 } DfObj;
 
 static int df_parse(PyObject *o, DfObj *q)
@@ -2616,7 +2619,9 @@ static PyObject *n_decide_frame(PyObject *self, PyObject *args)
         q->nm = 0;
         q->cv = 1;
         q->along = 0;
-        if (grid != NULL && state == 1) {         /* futures.contract_modes */
+        q->lane_res = state == 3;                 /* the futures' weights are the lanes' already (predict: lane_hyp) */
+        q->p_place = state == 3 ? hrows[3 * q->row + 2] - 3.0 : 1.0;      /* ... and the share of the place in the car's way */
+        if (grid != NULL && (state == 1 || state == 3)) {         /* futures.contract_modes */
             int first = (int)hrows[3 * q->row], cnt = (int)hrows[3 * q->row + 1];
             int two = q->nsd >= 2 && q->sdfin[0] && q->sdfin[1];
             double sx0 = two ? q->sd[0] : 1.0, sy0 = two ? q->sd[1] : 1.0;
@@ -2631,7 +2636,8 @@ static PyObject *n_decide_frame(PyObject *self, PyObject *args)
                     double *d = row + 2 + c * N;
                     int given = !isnan(a[0]);
                     if (prepend)
-                        d[0] = c == 0 ? q->x : c == 1 ? q->y : c == 2 ? sx0 : c == 3 ? sy0 : 0.0;
+                        /* (a future at one of an object's two places starts at that place, not at the radar's) */
+                        d[0] = q->lane_res && given ? a[0] : c == 0 ? q->x : c == 1 ? q->y : c == 2 ? sx0 : c == 3 ? sy0 : 0.0;
                     for (int j = 0; j < Nin; j++) {
                         double v = given ? a[j] : (c == 2 ? sx0 : c == 3 ? sy0 : 0.0);
                         if (c == 2 || c == 3)
@@ -2733,7 +2739,7 @@ static PyObject *n_decide_frame(PyObject *self, PyObject *args)
         else if (PP != NULL && tc[DX_AXIS_STANDING] > 0.5 && q->stands && !q->hfm)
             df_road_axis(&h, &sh, rh, tc[DX_AXIS_SNAP], tc[DX_AXIS_STD]);
         double w_stand = 1.0;
-        if (tc[DX_LANE_WEIGHT] > 0.5 && !(q->in_path || q->threat || !ln.has) && !(ln.sum < 0.5)) {
+        if (tc[DX_LANE_WEIGHT] > 0.5 && !(q->in_path || q->threat || !ln.has) && !(ln.sum < 0.5) && !(q->lane_res && !q->cv)) {
             double a = ln.ego + ln.cross, b = DF_MAX(tc[DX_LANE_FLOOR], a);
             w_stand = DF_MIN(1.0, b);
         }
@@ -2899,6 +2905,8 @@ static PyObject *n_decide_frame(PyObject *self, PyObject *args)
             x = PyLong_FromLong(sh);
             bad |= x == NULL || PyDict_SetItem(shown_new, q->id, x) < 0;
             bad |= df_set(r, S_shown, x) < 0 || df_setb(r, S_in_path, q->in_path ? Py_True : Py_False) < 0;
+            if (q->lane_res && !q->cv)
+                bad |= df_set(r, S_p_place, df_r(q->p_place, 3)) < 0;
             int list = lv || sh || pr >= tc[DX_LIST_MIN_P] || thw;
             if (list && pairs && !bad) {          /* threat.pairs_record */
                 PyObject *pl = PyList_New(0);

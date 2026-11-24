@@ -24,7 +24,7 @@ _NAT_KEYS = tuple(NATIVE_CFG)
 # object row (predict.c PO_*), state row, road row, band row, arm row
 (O_X, O_Y, O_VX, O_VY, O_AX, O_AY, O_SX, O_SY, O_SVX, O_SVY, O_KIND, O_PSTAT, O_LEN, O_WID, O_HDG, O_HDGSD, O_EXIST,
  O_SEEN, O_IND, O_BRAKE, O_PARKED, O_ID, O_VIS, O_MOTION, O_WITH) = range(25)
-R_W, R_Q, R_KERBL, R_KERBR, R_VLIM = range(5)
+R_W, R_Q, R_KERBL, R_KERBR, R_VLIM, R_ROWL, R_ROWR = range(7)
 L_EGO, L_LEFT, L_RIGHT, L_ONC, L_CROSS, L_PARK, L_OFF = range(7)
 F_S, F_D, F_SD, F_DC, F_DIR, F_LANE, F_LEAD, F_GAP, F_E, F_R, F_A, F_PSI, F_STOP, F_JDIST, F_KERB, F_OM = range(16)
 
@@ -47,6 +47,11 @@ DEFAULT_CFG = dict(
     park_prior=0.5,              # a strip where vehicles stand beside the outer lane, where nothing says
     park_width_m=2.5,
     learn=True,                  # learn "oncoming traffic exists" / "cars stand on this side" from the objects seen
+    # the vehicles seen standing, once their place across the road is known to row_sd_m: those beside the road on a
+    # side against those in the car's lane, over the last row_mem_s. A standing vehicle on that side whose range
+    # leaves its lane open is (beside + 1) / (in lane + 1) times likelier one of the former, at most row_odds_max
+    # (0: off)
+    row_odds_max=12.0, row_mem_s=20.0, row_sd_m=0.6,
     decimals=2,                  # of the message's positions and spreads
     selfcheck=dict(enabled=True, every_s=0.5),
     native={},                   # overrides of the native constants (predict_cfg(): modes_max, interact, joint, ...)
@@ -427,6 +432,8 @@ class Predictor:
         self.frames = self.idle_frames = 0
         self.last = None
         self._learn = {"oncoming": None, "park_left": None, "park_right": None}
+        self._row_odds = (1.0, 1.0)
+        self._stood = {}                      # object id -> (time, +1 beside the road on the left / -1 right / 0 in the lane)
         self._lane_key = self._lanes = self._lane_nopath = None
         self._ground = None
 
@@ -462,6 +469,27 @@ class Predictor:
             if st.any():
                 L[name] = min(0.9, (L[name] or self.cfg["park_prior"]) + 0.1)
 
+    def _row_count(self, T, ids, a, feat, w):
+        """(odds left, odds right): see DEFAULT_CFG `row_odds_max`. Counts each vehicle once, where it was last
+        known to stand."""
+        c = self.cfg
+        st = self._stood
+        if len(ids):
+            ok = (a[:, O_PSTAT] > 0.7) & (a[:, O_KIND] < 6) & (feat[:, F_SD] < c["row_sd_m"])
+            for i in np.flatnonzero(ok):
+                d = feat[i, F_D]
+                if abs(d) > 0.5 * w + 0.4:
+                    st[ids[i]] = (T, 1 if d > 0.0 else -1)
+                elif abs(d) < 0.5 * w - 0.2:
+                    st[ids[i]] = (T, 0)
+        for k in [k for k, v in st.items() if T - v[0] > c["row_mem_s"] or T < v[0]]:
+            del st[k]
+        n = [0, 0, 0]
+        for _, side in st.values():
+            n[side + 1] += 1
+        top = c["row_odds_max"]
+        return min(top, (n[2] + 1.0) / (n[1] + 1.0)), min(top, (n[0] + 1.0) / (n[1] + 1.0))
+
     def learned(self):
         return {k: v for k, v in self._learn.items() if v is not None}
 
@@ -493,6 +521,9 @@ class Predictor:
             self._lane_key, self._lane_nopath = key, context.get("centre") is None
             self._lanes = lane_arrays(context, self.cfg, self.right_hand, learned)
         road, bands = self._lanes
+        if self.cfg["row_odds_max"] > 1.0:
+            road = road.copy()
+            road[R_ROWL], road[R_ROWR] = self._row_odds
         centre, ameta, apts, xing, has_path = path_arrays(context)
         sig = context.get("turn_signal")
         ego = np.array([v, w, acc, 1.0 if sig == "left" else -1.0 if sig == "right" else 0.0, 1.0 if has_path else 0.0,
@@ -506,6 +537,8 @@ class Predictor:
         if n:
             self._S[idx] = st
         self._learned(a, lane, feat)
+        if self.cfg["row_odds_max"] > 1.0:
+            self._row_odds = self._row_count(T, ids, a, feat, float(road[R_W]))
         src = {"path": context.get("source") or ("given" if has_path else "kinematic"),
                "quality": round(float(road[R_Q]), 2), "arms": len(ameta), "lane_width_m": round(float(road[R_W]), 2)}
         pred = Prediction(ts, self.times, ids, sel, a, modes, traj, lane, intent, feat, ego_n, ego_out, ego_traj, stats,

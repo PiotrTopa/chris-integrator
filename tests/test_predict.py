@@ -348,7 +348,9 @@ def test_knobs():
     m, pred = K.run(Predictor(dict(NOCHECK, horizon_s=4.0, step_coarse_s=1.0)), T=1.5)
     assert pred.t[-1] == 4.0 and len(pred.t) == 13 and pred.traj.shape[2] == 13
     m, a = K.run(Predictor(dict(NOCHECK, native={"clique_max": 1.0})), T=3.0)         # groups by belief propagation
-    m, b = K.run(Predictor(NOCHECK), T=3.0)                                           # ... and by the exact search
+    # ... and by the exact search (the scene's largest group is of nine since the lanes are read from the track's
+    # place alone, 2026-11-24: one more than the default clique_max)
+    m, b = K.run(Predictor(dict(NOCHECK, native={"clique_max": 12.0})), T=3.0)
     assert b.stats[4] == 0 and a.stats[4] >= 1 and b.stats[3] > 0
     for oid in b.ids:
         i = b.index(oid)

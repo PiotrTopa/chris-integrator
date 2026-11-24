@@ -123,7 +123,9 @@ class Futures:
         modes      (K, 2 + 5 N): p0, p (NaN: not given), x, y, sx, sy, rxy (a row of NaN: not given)
         names      [K]
         rows       (R, 3): first mode, modes, state (0 no futures, 1 as the contract says, 2 not: the adapter
-                   stands in and it is counted)
+                   stands in and it is counted, 3 as the contract says and the futures carry both places the object
+                   may be in (`lane_res`: in the car's way or not; the state is 3 + the probability of the former, below 4):
+                   the lanes' weight is not applied again)
         lanes      None | [R] of the message's lane dicts (or None) | (R, 7) probabilities of LANES
         sel        {object id: row} | [row or -1 per object of the radar message]
 
@@ -223,7 +225,9 @@ def from_message(radar_msg, companion=None, cv=False):
         lane = o.get("lane", c.get("lane"))
         mr = _mode_rows(fut, n) if grid is not None and fut is not None else None
         sel.append(len(rows))
-        rows.append((k, 0 if mr is None else len(mr), 0 if fut is None else 1 if mr is not None else 2))
+        res = o.get("lane_res", c.get("lane_res"))               # its futures carry both places (predict: lane_hyp): P(in the way)
+        res = 3.0 + min(0.999, max(0.0, float(res))) if _fin(res) else 1
+        rows.append((k, 0 if mr is None else len(mr), 0 if fut is None else res if mr is not None else 2))
         lanes.append(lane if isinstance(lane, dict) else None)
         some = some or fut is not None or isinstance(lane, dict)
         if mr is not None:
