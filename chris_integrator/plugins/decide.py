@@ -1,6 +1,7 @@
 """The decision layer's plug-in face: `radar` (and the prediction's futures) in, `decide` out.
 
-In: `radar` (trigger: one decision per radar message), `radar_fut` (the prediction layer's companion message,
+In: `radar` (trigger: one decision per radar message; the stack's pace, `pace.json`, leaves out messages while
+nothing could matter: plugins/common.py `Pace`), `radar_fut` (the prediction layer's companion message,
 when it publishes one; trigger), `road` (the plan: the car's own path while no `ego_fut` is given), `ego_state`
 (the car's acceleration and yaw rate: is the driver braking or steering away), `vehicle` (brake pedal), `env`
 (the road condition: wet, snow). `radar_fut` is taken as the predictor's own object (arrays) when it runs in this
@@ -75,6 +76,9 @@ class Decide(Plugin):
         if self._pending is not None:                 # its futures never came: decided without them
             radar, self._pending = self._pending, None
             self._decide(radar, None, ctx)
+        pace = ctx.service("pace")
+        if pace is not None and not pace.due(msg):    # a message the stack's pace leaves out (plugins/common.py Pace)
+            return
         if self.cfg["futures"] == "auto" and "fut" not in msg and self._comp_t is not None \
                 and ctx.now - self._comp_t <= self.cfg["companion_wait_s"] + 1.0:
             comp = ctx.get("radar_fut")
@@ -134,7 +138,26 @@ class Decide(Plugin):
                "events": events,
                "counts": {"judged": judged, "listed": len(out_objs), "steps": model.last_n}}
         self.last = msg
+        pace = ctx.service("pace")
+        if pace is not None:
+            pace.report(ts, self._hot(recs, pace.cfg))
         ctx.emit("decide", msg)
+
+    def _hot(self, recs, pc):
+        """Could something matter soon (the stack's pace keeps the full rate then)? An object at level `hot_level` or
+        above (entry or exit), with a collision probability from `hot_p` or a headway under `thw_s`; an alert at a
+        stage, or with a level held on its way to one."""
+        for a in self.alerts.alerts.values():
+            if a.stage or a.up_since or a.challenger:
+                return True
+        hot_p, thw_s, lv = pc["hot_p"], pc["thw_s"], pc["hot_level"]
+        for r in recs:
+            if r.get("level", 0) >= lv or r.get("level_exit", 0) >= lv or (r.get("p_coll") or 0.0) >= hot_p:
+                return True
+            thw = r.get("thw_s")
+            if thw is not None and thw < thw_s:
+                return True
+        return False
 
     def _context(self, radar, ctx, T):
         """What the driver does and how fresh the sensors are: for the suppression rules."""

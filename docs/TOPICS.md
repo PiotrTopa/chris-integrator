@@ -981,3 +981,23 @@ stage warning object 17 [WARNING VEHICLE 2.6s]`).
 
 `tools/decide_replay.py CAPTURE | --scenario NAME`: what each alert would have done on a recorded drive or
 simulated scenarios: episodes, stages, lead time before the object's closest approach, false-alert candidates.
+
+### The stack's pace: which radar messages `predict` and `decide` look at (`pace.json`)
+
+`chris_integrator/plugins/common.py` `Pace`, a service of the mixer that both plug-ins ask, so they leave out the
+same messages (a decision is never made on a message whose futures were left out). `<config dir>/pace.json`:
+
+| key | default | |
+|---|---|---|
+| `mode` | `full` | `full`: every radar message. `fixed`: the low rate, whatever happens. `adaptive`: every message while something could matter, the low rate otherwise |
+| `idle_hz` | 10 | the low rate: a message is left out only when the one after it (expected one radar period later) still comes within `1 / idle_hz` + 0.01 s of the last look. At 20 radar messages a second that is every second message; a radar at 12 a second is not thinned |
+| `hold_s` | 0.5 | adaptive: the full rate is kept this long after the last sign that something could matter |
+| `hot_level`, `hot_p`, `thw_s` | 1, 0.01, 2.0 | adaptive, the decision layer's signs: an object at this level or above (entry or exit level), a collision probability from `hot_p`, a headway under `thw_s`; also any alert at a stage or with a level held on its way to one |
+| `ttc_s`, `p_threat` | 8.0, 0.02 | adaptive, the radar message's own cues (seen before anything is computed): an object with flag `in_path` or `threat`, a time to reach of at most `ttc_s`, a `p_threat` from this; an object the last looked-at message did not have and a new ground frame are looked at once |
+
+A left-out message: `predict` only carries the car's pose on (no `radar_fut`), `decide` puts nothing out; the
+alerts' holds run in the messages' time, so they do not stretch. What adaptive guarantees: a message is left out
+only when the look before it found nothing that could matter, the message shows no cue and the next one is due
+within the low rate's period; so whatever arises is first judged at most `1 / idle_hz` minus the radar's period
+later than at full rate (0.05 s at 20 messages a second), and from then on every message is judged. The pace's
+counts are in `Pace.health()` (messages, looked, and why: `interval`, `hot`, `cue`, `new`).
