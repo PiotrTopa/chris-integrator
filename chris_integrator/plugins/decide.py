@@ -44,6 +44,15 @@ class Decide(Plugin):
         pairs=False,                  # list every judged pair (explain view; larger messages)
         companion_wait_s=0.3,         # a `radar` message waits this long for its `radar_fut` once one was seen
         future=None, threat=None, alerts=None,
+        # What is hidden (off): gaps between vehicles standing beside the car's way from which someone could step
+        # out. The alert `hidden_gap` (at most caution; shadow unless configured) and the message's `gap` say where
+        # the nearest such gap is, how far its vehicles' faces are from the car's swept strip, and the speed from
+        # which the car could still stop for a pedestrian stepping out there at the worst moment (walking at
+        # ped_mps, the driver reacting in react_s and braking at decel_mps2): v_stop = 2 a (clear / v_ped - t_react).
+        # A gap counts while the car could neither stop for it nor be past before the pedestrian is in its way.
+        gaps=False,
+        gap=dict(ped_mps=1.5, react_s=1.0, decel_mps2=6.0, clear_max_m=2.0, clear_min_m=0.1, gap_min_m=0.6, seen_m=1.5,
+                 margin_mps=1.0),
     )
 
     def __init__(self, cfg=None, name=None):
@@ -51,7 +60,16 @@ class Decide(Plugin):
         c = self.cfg
         self.fcfg = dict(FU.DEFAULT_CFG, **(c.get("future") or {}))
         self.model = TH.ThreatModel(c.get("threat"), self.fcfg, c["list_min_p"])
-        self.alerts = AL.AlertSet(c.get("alerts"))
+        acfg = dict(c.get("alerts") or {})
+        self._gcfg = None
+        if c["gaps"] and hasattr(TH._ND, "decide_gaps"):         # (a native core without it: the knob does nothing)
+            import numpy as np
+            g = dict(self.DEFAULT_CFG["gap"], **(c.get("gap") or {}))
+            self._gcfg = np.array([self.model.cfg["front_m"], 0.5 * self.model.cfg["width_m"], g["ped_mps"], g["react_s"],
+                                   g["decel_mps2"], g["clear_max_m"], g["gap_min_m"], g["seen_m"], g["margin_mps"],
+                                   g["clear_min_m"]], float)
+            acfg.setdefault("hidden_gap", {})
+        self.alerts = AL.AlertSet(acfg)
         self.reset()
 
     def reset(self, reason=None):
@@ -116,6 +134,12 @@ class Decide(Plugin):
         (recs, out_objs, objs, self.shown, judged, n_cv, invalid, ego_own, _, al, at, ego_modes, horizon, _) = model.frame(
             objs_in, radar.get("ego"), H, path, road, self.shown, 1 if c["pairs"] else 0)
         actx = self._context(radar, ctx, T)
+        gap = None
+        if self._gcfg is not None:
+            if path is None and objs_in:
+                path = FU.plan_path(ctx.get("road"), ts, self.fcfg["plan_max_age_s"])
+            gap = TH._ND.decide_gaps(objs_in, actx["v"], path, self._gcfg)
+            actx["gap"] = gap
         alerts, events = self.alerts.step(T, recs, objs, actx)
         st = self.stats
         st["frames"] += 1
@@ -137,6 +161,8 @@ class Decide(Plugin):
                "primary": next((a for a in alerts if a["id"] == "obstacle_ahead" and a["stage"] > 0), None),
                "events": events,
                "counts": {"judged": judged, "listed": len(out_objs), "steps": model.last_n}}
+        if self._gcfg is not None:
+            msg["gap"] = gap
         self.last = msg
         pace = ctx.service("pace")
         if pace is not None:
@@ -148,7 +174,9 @@ class Decide(Plugin):
         above (entry or exit), with a collision probability from `hot_p` or a headway under `thw_s`; an alert at a
         stage, or with a level held on its way to one."""
         for a in self.alerts.alerts.values():
-            if a.stage or a.up_since or a.challenger:
+            # (not what is hidden between parked cars: that caution is slow by nature, the low rate judges it, and
+            # along a parked row it would hold the full rate for the whole street)
+            if a.cfg["source"] != "gap" and (a.stage or a.up_since or a.challenger):
                 return True
         hot_p, thw_s, lv = pc["hot_p"], pc["thw_s"], pc["hot_level"]
         for r in recs:

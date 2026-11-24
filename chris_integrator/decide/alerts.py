@@ -69,7 +69,8 @@ ALERT_DEFAULTS = dict(
     brake_share=0.9, brake_min_mps2=2.0,
     steer_min_mps2=1.5,
     sensor_max_age_s=1.0,
-    source="threat",                               # "threat": the threat levels | "headway": time headway
+    source="threat",                               # "threat": the threat levels | "headway": time headway |
+                                                   # "gap": what is hidden between parked vehicles (ctx["gap"])
     headway_s=(1.5, 0.9, 0.6),                     # source headway: information, caution, warning below these
     headway_exit_s=0.2,
     headway_min_mps=13.9,
@@ -79,10 +80,15 @@ ALERTS = {
     "headway": {"source": "headway", "kinds": ("vehicle",), "entry_hold_s": (2.0, 2.0, 1.0, 0.0),
                 "exit_hold_s": (1.0, 1.0, 1.0, 1.0), "min_hold_s": (1.0, 2.0, 2.0, 2.0), "latch_imminent": False},
 }
+# What is hidden (decide cfg `gaps`; not an alert unless that is on): gaps between vehicles standing beside the car's
+# way, from which someone could step out, at a speed above the one the car could still stop from (decide.c
+# decide_gaps). At most caution: it says "slower here", not "brake". Its record is the frame's `gap`.
+GAP_ALERT = {"source": "gap", "kinds": (), "entry_hold_s": (0.5, 0.5, 0.5, 0.5), "exit_hold_s": (1.0, 1.0, 1.0, 1.0),
+             "min_hold_s": (1.0, 2.0, 2.0, 2.0), "latch_imminent": False, "min_speed_mps": 3.0}
 
 
 def alert_cfg(name, cfg=None):
-    c = dict(ALERT_DEFAULTS, **ALERTS.get(name, {}))
+    c = dict(ALERT_DEFAULTS, **(GAP_ALERT if name == "hidden_gap" else ALERTS.get(name, {})))
     for k, v in (cfg or {}).items():
         c[k] = dict(c[k], **v) if isinstance(c.get(k), dict) and isinstance(v, dict) else v
     if c["mode"] not in MODES:
@@ -167,6 +173,12 @@ class Alert:
             self.reset()
             return {"id": self.name, "mode": "off", "stage": 0, "stage_name": STAGES[0], "active": False}, []
         cand = {}
+        if c["source"] == "gap":                    # one candidate: the frame's gap record (ctx["gap"])
+            g = ctx.get("gap")
+            recs = ()
+            if g is not None and (g.get("level") or g.get("level_exit")):
+                le, lx = min(2, g.get("level", 0)), min(2, g.get("level_exit", 0))
+                cand["gap"] = (le, lx, (le, -(g.get("v_stop_mps") or 0.0), 0.0), g)
         for r in recs:
             ob = objs.get(r["id"])
             if self._eligible(r, ob, T):
@@ -209,7 +221,7 @@ class Alert:
             else:
                 self.up_since.pop(L, None)
         ref = c["entry_evidence"]
-        if ref and c["source"] != "headway":
+        if ref and c["source"] == "threat":
             dt = 0.0 if self._T is None else min(0.5, max(0.0, T - self._T))
             mass = (rec.get("mass") if rec is not None else None) or (0.0,) * 4
             if c["mass_min"] is None:
@@ -268,7 +280,12 @@ class Alert:
                "object": self.primary if self.stage > 0 else None,
                "since_s": _r(T - self.since) if self.stage > 0 else None, "suppressed": sup,
                "latched": self.latched}
-        if self.stage > 0 and rec is not None:
+        if self.stage > 0 and rec is not None and c["source"] == "gap":
+            out["object"] = None
+            out["reason"] = dict(rec, v_mps=_r(ctx.get("v", 0.0), 1))
+            out["text"] = "%s GAP %s %.0f km/h" % (STAGES[self.stage].upper(), (rec.get("side") or "").upper(),
+                                                   3.6 * (rec.get("v_stop_mps") or 0.0))
+        elif self.stage > 0 and rec is not None:
             out["reason"] = self._reason(rec, le, lx)
             out["text"] = self._text(rec)
         ev = []
@@ -298,7 +315,7 @@ class Alert:
         sa, ra = ctx.get("sensor_age_s"), ctx.get("radar_age_s")
         if (sa is not None and sa > c["sensor_max_age_s"]) or (ra is not None and ra > c["sensor_max_age_s"]):
             return "sensor_degraded"
-        if rec is None or c["source"] == "headway":
+        if rec is None or c["source"] != "threat":
             return None
         req = rec.get("a_req") or {}
         ab = req.get("brake")
@@ -358,7 +375,7 @@ class AlertSet:
 
     def __init__(self, cfg=None, log_max=500):
         cfg = dict(cfg or {})
-        names = list(ALERTS) + [k for k in cfg if k not in ALERTS]
+        names = list(ALERTS) + [k for k in cfg if k not in ALERTS]              # ("hidden_gap": the decide plug-in, cfg `gaps`)
         self.alerts = {n: Alert(n, cfg.get(n)) for n in names}
         self.events = collections.deque(maxlen=log_max)
         self.counts = {n: {"raise": 0, "would_show": 0} for n in names}

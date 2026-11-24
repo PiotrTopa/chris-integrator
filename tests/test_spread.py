@@ -255,6 +255,87 @@ def test_a_crossing_future_starts_with_the_places_own_spread():
     assert f1["start_cross"][0, 3] < 0.5 and f1["start_cross"][0, 2] > 2.0, f1["start_cross"][0]
 
 
+# ---- what is hidden -----------------------------------------------------------------------------------------------------
+GCFG = np.array([2.1, 0.88, 1.5, 1.0, 6.0, 2.0, 0.6, 1.5, 1.0, 0.1])
+
+
+def gcar(i, x, y, **kw):
+    return dict({"id": i, "state": "confirmed", "x_m": x, "y_m": y, "ctr": [x + 2.25, y], "len": 4.5, "wid": 1.8,
+                 "motion": "stationary", "class": {"label": "car"}, "p_stationary": 0.95}, **kw)
+
+
+def test_gaps_between_standing_vehicles_and_the_speed_the_car_could_stop_from():
+    row = [gcar(1, 10.0, -2.9), gcar(2, 16.0, -2.9), gcar(3, 30.0, -2.9)]
+    g = ND.decide_gaps(row, 13.0, None, GCFG)
+    # the faces 2.0 m from the lane's middle: 1.12 m from the car's side; a pedestrian at 1.5 m/s is there in 0.75 s,
+    # before a driver reacting in 1 s has touched the brake: no speed is one to stop from
+    assert g["level"] == 2 and g["gaps"] == 3 and g["side"] == "right" and g["clear_m"] == 1.12 and g["v_stop_mps"] == 0.0
+    assert g["s_m"] == 14.5 and abs(g["t_reach_s"] - 12.4 / 13.0) < 0.01
+    assert ND.decide_gaps(row, 2.0, None, GCFG) is None         # at walking pace the next gap is beyond twice the stopping distance
+    wide = [gcar(1, 20.0, -4.2), gcar(2, 40.0, -4.2)]           # 2.42 m clear: beyond clear_max
+    assert ND.decide_gaps(wide, 13.0, None, GCFG) is None
+    c2 = GCFG.copy()
+    c2[5] = 3.0                                                 # ... counted: 2.42 / 1.5 = 1.61 s: stop from 2 x 6 x 0.61 = 7.4 m/s
+    g = ND.decide_gaps(wide, 13.0, None, c2)
+    assert g["level"] == 2 and g["clear_m"] == 2.42 and abs(g["v_stop_mps"] - 7.4) < 0.06 and g["s_m"] == 24.5
+    # (a gap the car is past before a pedestrian could be in its way is none: 12.4 m at 13 m/s, 1.61 s to walk)
+    assert ND.decide_gaps([gcar(1, 10.0, -4.2)], 13.0, None, c2) is None
+    assert ND.decide_gaps(wide, 7.0, None, c2) is None          # below it: nothing to say
+    assert ND.decide_gaps([gcar(1, 10.0, -2.9), gcar(2, 14.9, -2.9)], 13.0, None, GCFG)["gaps"] == 1     # bumper to bumper: one end
+    assert ND.decide_gaps([], 13.0, None, GCFG) is None
+    assert ND.decide_gaps([gcar(1, 10.0, -2.9, motion="moving", p_stationary=0.05)], 13.0, None, GCFG) is None   # it drives: no screen
+    assert ND.decide_gaps([gcar(1, 10.0, 0.0)], 13.0, None, GCFG) is None                               # in the car's way: the threat's
+
+
+def test_a_pedestrian_already_seen_at_a_gap_makes_it_no_hidden_one():
+    row = [gcar(1, 10.0, -2.9), gcar(2, 30.0, -2.9)]
+    assert ND.decide_gaps(row, 13.0, None, GCFG)["gaps"] == 2
+    seen = row + [{"id": 9, "state": "confirmed", "x_m": 15.5, "y_m": -2.9, "class": {"label": "human"}}]
+    assert ND.decide_gaps(seen, 13.0, None, GCFG)["gaps"] == 1
+    other_side = row + [{"id": 9, "state": "confirmed", "x_m": 15.5, "y_m": 2.9, "class": {"label": "human"}}]
+    assert ND.decide_gaps(other_side, 13.0, None, GCFG)["gaps"] == 2
+
+
+def test_gaps_along_a_bend_are_judged_along_the_plan():
+    # the same row along a left bend of 110 m radius, in the car frame; the plan is the bend
+    xs = [float(s) for s in range(0, 100, 5)]
+    path = ND.decide_path([C.centre(s)[0] for s in xs], [-C.centre(s)[1] for s in xs])
+    cars = []
+    for i, s in enumerate((10.0, 16.0, 30.0)):
+        x, y = C.centre(s, -2.9)
+        cx, cy = C.centre(s + 2.25, -2.9)
+        cars.append(gcar(i + 1, x, y, ctr=[cx, cy]))
+    g = ND.decide_gaps(cars, 13.0, path, GCFG)
+    assert g["level"] == 2 and g["gaps"] == 3 and abs(g["clear_m"] - 1.12) < 0.05 and abs(g["s_m"] - 14.5) < 0.3
+    assert ND.decide_gaps(cars, 13.0, None, GCFG)["clear_m"] != g["clear_m"]       # straight ahead is another street
+
+
+def test_the_gap_alert_is_a_caution_with_holds_and_never_more():
+    a = AL.Alert("hidden_gap", {})
+    assert a.cfg["source"] == "gap"
+    g = {"level": 2, "level_exit": 2, "side": "right", "s_m": 14.5, "clear_m": 1.12, "v_stop_mps": 0.0, "t_reach_s": 0.95}
+    stages = [a.step(k * 0.05, [], {}, {"v": 13.0, "gap": dict(g, level=4, level_exit=4)})[0]["stage"] for k in range(30)]
+    assert stages[5] == 0 and stages[10] == 2 and max(stages) == 2          # entered after 0.5 s, and no higher
+    out, _ = a.step(1.5, [], {}, {"v": 13.0, "gap": g})
+    assert out["object"] is None and out["reason"]["clear_m"] == 1.12 and out["reason"]["v_mps"] == 13.0
+    assert out["text"] == "CAUTION GAP RIGHT 0 km/h" and out["active"] is False and out["mode"] == "shadow"
+    left = [a.step(1.5 + k * 0.05, [], {}, {"v": 13.0, "gap": None})[0]["stage"] for k in range(1, 60)]
+    assert left[10] == 2 and left[-1] == 0                                   # held a second after the last gap, then gone
+    assert a.step(9.0, [], {}, {"v": 1.0, "gap": g})[0]["stage"] == 0
+
+
+def test_the_plug_in_has_the_alert_only_with_the_knob_and_it_does_not_hold_the_pace():
+    off, on = Decide({}), Decide({"gaps": True})
+    assert "hidden_gap" not in off.alerts.alerts and off._gcfg is None
+    assert "hidden_gap" in on.alerts.alerts and list(on._gcfg) == list(GCFG)
+    pc = {"hot_p": 0.01, "thw_s": 2.0, "hot_level": 1}
+    on.alerts.alerts["hidden_gap"].stage = 2
+    on.alerts.alerts["hidden_gap"].up_since = {1: 0.0, 2: 0.0}
+    assert on._hot([], pc) is False                             # a caution of a gap: the low rate judges it
+    on.alerts.alerts["obstacle_ahead"].stage = 1
+    assert on._hot([], pc) is True
+
+
 if __name__ == "__main__":
     for k, v in list(globals().items()):
         if k.startswith("test_"):
