@@ -3,6 +3,7 @@
 
     tools/cost_bench.py run INPUT [--tree DIR] [--ws TOPICS|none] [--no-recorder] [--limit N] [--repeat K]
                                   [--dump OUT.jsonl.gz] [--profile OUT.prof] [--json OUT.json] [--pack PACK]
+                                  [--estimator JSON]
     tools/cost_bench.py diff A.jsonl.gz B.jsonl.gz [--show N]
 
 INPUT is a capture of tools/cost_capture.py (`*.cap.gz`: the raw lines a running integrator was fed, as the
@@ -113,6 +114,9 @@ def make(a, tmp):
         with open(os.path.join(cfgdir, "recorder.json"), "w") as f:
             json.dump({"dir": os.path.join(tmp, "rec"), "max_mb": 4000, "frame_every_s": 1.0}, f)
         os.makedirs(os.path.join(tmp, "rec"))
+    if getattr(a, "estimator", None):          # the estimator's configuration (integrator.json), as JSON text
+        with open(os.path.join(cfgdir, "integrator.json"), "w") as f:
+            json.dump(json.loads(a.estimator), f)
     mapper = None
     if a.pack:
         with open(os.path.join(cfgdir, "mapper.json"), "w") as f:
@@ -353,6 +357,8 @@ def main():
     p.add_argument("--profile")
     p.add_argument("--json")
     p.add_argument("--pack")
+    p.add_argument("--estimator", help="the estimator's configuration (integrator.json) as JSON text, e.g. "
+                   "'{\"ego_motion\": {\"stand_confirm\": false}}'")
     p.add_argument("--gc", choices=("default", "off", "freeze"), default="default",
                    help="an experiment: the collector off, or everything built at start frozen (gc.freeze)")
     p = sub.add_parser("diff")

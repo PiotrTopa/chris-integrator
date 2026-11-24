@@ -51,11 +51,20 @@ class _GM2:
 
 class VehicleSim:
     """The feeder's motion as mapd relays it (`ego`), 10 Hz. Faults: `silences` [(t0, t1)] with stale first
-    samples on resume; `speed_fault` (t0, t1, factor): the speed signal and the wheels read factor x true."""
+    samples on resume; `speed_fault` (t0, t1, factor): the speed signal and the wheels read factor x true.
+
+    Ego-motion hygiene (docs/EGO_MOTION.md; each off at its default, where the messages are what they were):
+    `speed_floor` m/s: below it the speed signal and the wheels read zero and the feed says standstill, while the
+    car still rolls and turns (the reference car: 0.21); `gyro_raw`: the gyro as read (its bias and noise at
+    rest, its turn under the floor), not the zero an older relay sent at standstill; `gyro_lsb` rad/s: its
+    quantum (the reference car: 0.0044); `gyro_lag` s: the gyro's value is this old at the message's stamp;
+    `stamp_lag` s: the whole message's content is this old at its stamp (a bus stamped on arrival);
+    `accel_sigma_rest`: the accelerometers' noise while the car stands (None: as while it moves)."""
 
     def __init__(self, seed=11, hz=10.0, gyro_bias=0.0, gyro_scale=0.0, accel_bias=0.0, accel_lat_bias=0.0,
                  speed_sigma=0.015, gyro_sigma=0.003, accel_sigma=0.2, silences=(), stale_n=3, speed_fault=None,
-                 latency=0.004, wheel_scale=0.98, track=1.48, off=()):
+                 latency=0.004, wheel_scale=0.98, track=1.48, off=(), speed_floor=0.0, gyro_raw=False, gyro_lsb=0.0,
+                 gyro_lag=0.0, stamp_lag=0.0, accel_sigma_rest=None):
         self.__dict__.update(locals())
 
     def generate(self, w):
@@ -68,23 +77,32 @@ class VehicleSim:
         while t < w.t0 + w.T:
             rel = t - w.t0
             silent = any(a <= rel < b for a, b in self.silences) or any(a <= rel < b for a, b in self.off)
-            tr = w.truth_at(t)
+            tr = w.truth_at(t - self.stamp_lag) if self.stamp_lag else w.truth_at(t)
             vg = tr["v"]
             v = (1.0 + w.speed_scale) * vg
             if self.speed_fault and self.speed_fault[0] <= rel < self.speed_fault[1]:
                 v *= self.speed_fault[2]
-            still = vg == 0.0
+            rest = vg == 0.0
+            still = rest or v < self.speed_floor       # the signals read zero: what the feed calls standstill
             vm = 0.0 if still else max(0.0, v + rng.gauss(0.0, self.speed_sigma))
             wz = tr["w"]
             half = 0.5 * wz * self.track
             ws = [0.0] * 4 if still else [round(max(0.0, self.wheel_scale * (vm + sgn * half) + rng.gauss(0, 0.01)), 3)
                                           for sgn in (-1, 1, -1, 1)]
+            if still and not self.gyro_raw:
+                gy = 0.0
+            else:
+                wg = w.truth_at(t - self.stamp_lag - self.gyro_lag)["w"] if self.gyro_lag else wz
+                gy = (1.0 + self.gyro_scale) * wg + self.gyro_bias + rng.gauss(0, self.gyro_sigma)
+                if self.gyro_lsb:
+                    gy = self.gyro_lsb * round(gy / self.gyro_lsb)
+            ka = 1.0 if not rest or self.accel_sigma_rest is None else self.accel_sigma_rest / self.accel_sigma
             msg = {"type": "ego", "seq": seq, "ts_mono_ns": ns(t), "api": 1, "speed_mps": round(vm, 3), "gear": "D",
                    "reverse": False, "standstill": still, "wheel_speeds_mps": ws,
-                   "yaw_rate_rps": round(0.0 if still else (1.0 + self.gyro_scale) * wz + self.gyro_bias + rng.gauss(0, self.gyro_sigma), 5),
+                   "yaw_rate_rps": round(gy, 5),
                    "yaw_source": "yaw_rate", "turn_signal": None, "source": "vehicle", "tag": "sim-can",
-                   "accel_long_mps2": round(tr["a"] + G * math.sin(tr["th"]) + self.accel_bias + rng.gauss(0, self.accel_sigma), 3),
-                   "accel_lat_mps2": round(vg * wz + self.accel_lat_bias + rng.gauss(0, 0.3), 3)}
+                   "accel_long_mps2": round(tr["a"] + G * math.sin(tr["th"]) + self.accel_bias + ka * rng.gauss(0, self.accel_sigma), 3),
+                   "accel_lat_mps2": round(vg * wz + self.accel_lat_bias + ka * rng.gauss(0, 0.3), 3)}
             if not silent:
                 if was_silent and held is not None:
                     stale = self.stale_n

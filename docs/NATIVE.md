@@ -132,6 +132,16 @@ too, at the price of re-factorising at every mixing step of the interacting hypo
 it. `tests/test_native.py::test_radar_update_keeps_the_covariance_symmetric_and_positive` holds the property over
 random states with detections up to 1e-10 of the state's variance, many in a row.
 
+### Ego-motion hygiene: a source file of the estimator's part
+
+`chris_integrator/native/src/egomotion.c` ([EGO_MOTION.md](EGO_MOTION.md)) is included by `chris_native.c` just
+before the filter pass, which calls its `eh_eval` (the rows' measurement functions: a row's model is `(kind,
+indices, parameters)`). Its types `Stand` (the standstill, confirmed) and `Lag` (a time offset estimated outside
+the filter) are added by `egomotion_types()` in the module's init, its function `ekf_h` by the macro
+`EGOMOTION_METHODS` in the method table: three lines of `chris_native.c` besides the include and the pass's use.
+Plain IEEE arithmetic in the order written; `tests/test_ego_motion.py` holds the measurement functions to the
+last bit and the two types to frozen numbers.
+
 ### The predictor: a second source file
 
 `chris_integrator/native/src/predict.c` holds the `predict` part. It is not a second module: `chris_native.c`

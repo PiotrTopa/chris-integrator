@@ -5,7 +5,9 @@ arrives late is inserted where it belongs and the filter is run again from there
 out-of-sequence problem: the result is what it would have been had the row arrived in order). `at(T)` returns
 the Rauch-Tung-Striebel smoothed state at T over the entries newer than T (bounded look-ahead).
 
-Rows are scalar: value, variance, and `h(x) -> (prediction, indices, coefficients)` (a sparse Jacobian row).
+Rows are scalar: value, variance, and a model: native, `(kind, indices, parameters)` (core/registry.py `EH_*`:
+the filter pass computes prediction and sparse Jacobian row itself, chris_native.c `eh_eval`), or a callable
+`h(x) -> (prediction, indices, coefficients)` for a model the native core does not have.
 Noise classes: "exact" (applied as is; it anchors its quantity) and "robust" (Student-t re-weighting; beyond
 the hard gate it is not applied, but only while an exact row anchors the same quantity: a source that is
 alone is followed, never locked out). No knowledge of what the state means lives here.
@@ -21,10 +23,12 @@ from ..native import core as _C
 
 
 class Row:
-    __slots__ = ("q", "z", "var", "h", "src", "group", "robust", "wrap", "used", "rejected", "counted", "cb", "freeze")
+    __slots__ = ("q", "z", "var", "h", "model", "src", "group", "robust", "wrap", "used", "rejected", "counted", "cb", "freeze")
 
     def __init__(self, q, z, var, h, src, group, robust=False, wrap=False, cb=None, freeze=None):
-        self.q, self.z, self.var, self.h, self.src, self.group = q, z, var, h, src, group
+        self.q, self.z, self.var, self.src, self.group = q, z, var, src, group
+        # h: a native model (kind, idx, par) or a callable h(x)
+        self.h, self.model = (None, h) if type(h) is tuple else (h, None)
         self.robust, self.wrap, self.cb = robust, wrap, cb
         self.freeze = freeze               # state indices this row must not correct (Schmidt "consider" states)
         self.used = self.rejected = self.counted = False

@@ -1364,9 +1364,29 @@ for _v in (14, 25, 33):
         ALERT_SCENARIOS["stopped_%s_%d" % (_m, _v)] = sc_stopped(float(_v), _m)
 
 
+def sc_park_out_curve(seed, night):
+    """Ego-motion hygiene (docs/EGO_MOTION.md): the car leaves a parking place, 18 s of creeping at 0.15 m/s
+    through a tight turn (0.03-0.04 rad/s: under a speed sensor's floor the feed calls that a standstill), then
+    the town road of `curve_parked` (a left then a right curve, R 110 m, at 13 m/s) with cars parked along it."""
+    rng = random.Random(seed * 101 + 31)
+
+    def actors(w):
+        a = _parked_row(rng, 100, 30.0, 340.0, -1, lat=(2.6, 3.2), p_gap=0.1)
+        a += _parked_row(rng, 200, 410.0, 690.0, +1, lat=(2.6, 3.2), p_gap=0.1)
+        a += _parked_row(rng, 300, 60.0, 660.0, +1, lat=(5.5, 6.5), p_gap=0.6)
+        return a
+    return dict(T=75.0, speed=[(0, 0.15), (18, 0.15), (25, 13.0)],
+                curv=[(0, 0.9), (4.0, 0.9), (4.5, 0.0), (90, 0.0), (90, 1 / 110.0), (310, 1 / 110.0), (310, 0.0), (410, 0.0),
+                      (410, -1 / 110.0), (630, -1 / 110.0), (630, 0.0)],
+                actors=actors, lead_range_m=70.0 if night else 100.0)
+
+
+EGO_SCENARIOS = {"park_out_curve": sc_park_out_curve}
+
+
 def scenario(name, seed=1, night=False):
-    """A ScenarioWorld by name (SCENARIOS, PREDICT_SCENARIOS or ALERT_SCENARIOS)."""
-    fn = SCENARIOS.get(name) or PREDICT_SCENARIOS.get(name) or ALERT_SCENARIOS[name]
+    """A ScenarioWorld by name (SCENARIOS, PREDICT_SCENARIOS, EGO_SCENARIOS or ALERT_SCENARIOS)."""
+    fn = SCENARIOS.get(name) or PREDICT_SCENARIOS.get(name) or EGO_SCENARIOS.get(name) or ALERT_SCENARIOS[name]
     spec = fn(seed, night)
     return ScenarioWorld(spec, seed=seed, name=name, night=night)
 

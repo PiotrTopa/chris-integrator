@@ -41,7 +41,7 @@ import numpy as np
 from ..native import round                  # builtins.round (its results; the native core)
 from ..core import ego as E
 from ..core.ego import AuxState
-from ..core.registry import NS, Meas, Source, fin
+from ..core.registry import NS, Meas, Source, fin, lin
 
 
 class MapMatchSource(Source):
@@ -161,20 +161,16 @@ class MapMatchSource(Source):
             mem["held"] = "the candidate roads are too far apart"
             return alive
         ioff, iamb = self.ix["off"], self.ix["amb"]
-        i_c = np.array([E.PE, E.PN, ioff, iamb], dtype=np.intp)
-        co = np.array([nx, ny, -1.0, -spread])
         # the candidates that are not parallel hold `1 - wp` of the belief: with that probability this line says
         # nothing about the car, and the row weighs that much less
         sig = self.cross_sigma_m / math.sqrt(max(wp, 1e-3))
         out = alive + [Meas("map_cross", ts, c0 + mean, sig,
-                            lambda x: (nx * x[E.PE] + ny * x[E.PN] - x[ioff] - spread * x[iamb], i_c, co), "map.cross",
+                            lin([E.PE, E.PN, ioff, iamb], [nx, ny, -1.0, -spread]), "map.cross",
                             robust=True, local=True, consider=(iamb,))]
         span = math.radians(mt["bearing_span_deg"]) if fin(mt.get("bearing_span_deg")) else 0.0
         if straight and abs(d) < math.radians(30.0) and other < self.heading_alt_share and ctx.P[E.PSI, E.PSI] < self.heading_known ** 2:
-            i_h = np.array([E.PSI], dtype=np.intp)
-            one = np.array([1.0])
             out.append(Meas("map_heading", ts, float(x[E.PSI]) + d, math.hypot(self.heading_sigma, span),
-                            lambda x: (x[E.PSI], i_h, one), "map.heading", robust=True, local=not ctx.cfg["gnss_absolute"]))
+                            lin([E.PSI], [1.0]), "map.heading", robust=True, local=not ctx.cfg["gnss_absolute"]))
         mem["used"] = mem.get("used", 0) + 1
         return out
 
