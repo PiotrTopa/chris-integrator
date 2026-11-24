@@ -8,6 +8,10 @@
                                                        Hyp.cycle and Hyp.after with an xcfg, the hypotheses with
                                                        their rows' memory), tests/data/radar_digests_detin.json
                                                        (tests/test_radar_inputs.py replays and holds them)
+    python3 tests/data/make_radar_golden.py --parked   the radar with the parked-car knobs on (docs/RADAR.md, section
+                                                       9: sil_bearing, ctx_prior, size_learn, std_rho, path_normal):
+                                                       tests/data/radar_golden_parked.npz, radar_digests_parked.json
+                                                       (tests/test_radar_parked.py)
 
 The first writes
   tests/data/radar_golden.npz      calls of every native radar function (and of the hypotheses: Hyp.cycle,
@@ -187,15 +191,53 @@ def drives_detin(trace):
         models.NR, tracker._NR, box._NR, sensors._NR = saved
 
 
-def main_detin():
+# ---- parked cars (docs/RADAR.md, section 9): the silhouette's bearing, the street's own count, the learnt size, the
+# place's covariance in the message and the path's own normal ----
+PARKED_CFG = {"tracker": dict(sil_bearing=True, ctx_prior=True, size_learn=True), "std_rho": True, "path_normal": True}
+PARKED_RUNS = (("parked_street", 1, False), ("curve_parked", 2, True), ("adjacent", 1, False))
+
+
+def parked_run(name, seed, night, keep_steps=None):
+    from chris_integrator.sim import radar_score
+    cfg = dict(PARKED_CFG, tracker=dict(PARKED_CFG["tracker"]))
+    if keep_steps:
+        cfg["tracker"]["hyp_keep_steps"] = keep_steps
+    return radar_score.run(name, seed=seed, night=night, cfg=cfg)
+
+
+def parked_digests():
+    import hashlib
+    out = {}
+    for name, seed, night in PARKED_RUNS:
+        r = parked_run(name, seed, night)
+        out["%s:%d:%d" % (name, seed, night)] = hashlib.sha256(
+            json.dumps([f["objects"] for f in r["frames"]], sort_keys=True).encode()).hexdigest()
+    return out
+
+
+def drives_parked(trace):
+    from chris_integrator.radar import box, models, sensors, tracker
+    saved = (models.NR, tracker._NR, box._NR, sensors._NR)
+    models.NR = tracker._NR = box._NR = sensors._NR = trace
+    try:
+        for name, seed, night in PARKED_RUNS:
+            parked_run(name, seed, night, keep_steps=8)
+    finally:
+        models.NR, tracker._NR, box._NR, sensors._NR = saved
+
+
+def main_detin(parked=False):
     import radar_golden_lib as lib
     from chris_integrator.native import radar as C
     global PER_FN, DEFAULT_N
     PER_FN, DEFAULT_N = {"Hyp.cycle": 24, "Hyp.after": 6}, 0
+    if parked:
+        PER_FN = {"Hyp.cycle": 20, "Hyp.after": 4, "radar_frame": 6, "radar_stand_prior": 6, "radar_size_fit": 6}
     trace = Trace(C, lib)
-    drives_detin(trace)
+    (drives_parked if parked else drives_detin)(trace)
     cases, arrays = [], {}
-    for name in ("Hyp.cycle", "Hyp.after"):
+    for name in (("Hyp.cycle", "Hyp.after", "radar_frame", "radar_stand_prior", "radar_size_fit") if parked
+                 else ("Hyp.cycle", "Hyp.after")):
         for item in trace.kept.get(name, ()):
             if item is None:
                 continue
@@ -210,12 +252,13 @@ def main_detin():
                 return v
             cases.append(ren(case))
             arrays.update({pre + k: a for k, a in arr.items()})
-    path = os.path.join(HERE, "tests", "data", "radar_golden_detin.npz")
+    tag = "parked" if parked else "detin"
+    path = os.path.join(HERE, "tests", "data", "radar_golden_%s.npz" % tag)
     lib.save(path, cases, arrays)
     print("wrote %s: %d cases, %.0f kB" % (path, len(cases), os.path.getsize(path) / 1e3))
-    path = os.path.join(HERE, "tests", "data", "radar_digests_detin.json")
+    path = os.path.join(HERE, "tests", "data", "radar_digests_%s.json" % tag)
     with open(path, "w") as f:
-        json.dump(detin_digests(), f, indent=1, sort_keys=True)
+        json.dump(parked_digests() if parked else detin_digests(), f, indent=1, sort_keys=True)
         f.write("\n")
     print("wrote", path)
 
@@ -330,5 +373,7 @@ def main():
 if __name__ == "__main__":
     if "--detin" in sys.argv[1:]:
         main_detin()
+    elif "--parked" in sys.argv[1:]:
+        main_detin(parked=True)
     else:
         main()

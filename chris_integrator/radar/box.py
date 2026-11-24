@@ -38,6 +38,8 @@ y LEFT, origin the reference camera):
                                                     following the road as the car does: along the car's own
                                                     path, at its present offset beside it, at its present speed
 
+    std_rho                                         the correlation of the x and y place errors (-1..1; with `std`
+                                                    the place's whole covariance), with `std_rho: true`
     ctr [x, y]                                      the object's centre; x_m, y_m (and predict) are its NEAR FACE
     len, wid, hdg, ext_std [len, wid, hdg]          its rectangle: length, width (m), where its front points (rad,
                                                     car frame, left positive; held when it stands) and their 1 sigma
@@ -95,6 +97,11 @@ CFG = dict(
     # microwave radars that give several returns per object (a message may say so itself: "extended": true):
     # True (all), or the sensor ids; how near in place and in range rate two returns of one cell are
     radar_extended=False, cell_m=1.6, cell_mps=1.5, cell_margin_m=0.6,
+    # std_rho: every object carries `std_rho`, the correlation of its place's x and y errors (car axes; with `std`
+    # [x, y] the place's whole covariance: a camera's place is a needle along the line of sight). path_normal: `path_offset_m`, `on_path`, `in_path` are judged ACROSS the
+    # path where the object is (the offset times the cosine of the path's direction there; "surely in" by the
+    # place's spread across the path, from the whole covariance), not across the car's axis
+    std_rho=False, path_normal=False,
 )
 
 
@@ -208,6 +215,8 @@ class Radar:
             if _fin(o.get("occ")):
                 occ = min(max(float(o["occ"]), 0.0), 1.0)
         bpx, brel, hpxs, hrel, crel = c["bottom_px"], c["bottom_rel"], c["height_std_px"], c["height_std_rel"], c["bearing_rel"]
+        if tc["sil_bearing"]:                            # the box's middle against the silhouette's: as good as its edges
+            crel = tc["sil_bearing_rel"]
         if low:
             bpx, brel = bpx * tc["low_px"], tc["low_rel"]
             hpxs, hrel = hpxs * tc["low_px"], 1.25 * tc["low_rel"]
@@ -402,7 +411,7 @@ class Radar:
         c = self.cfg
         return (c["corridor_m"], c["corridor_rel"], c["path_max_m"], c["ttc_min_closing"], c["in_path_sigma"],
                 c["in_path_slack_m"], c["threat_ttc_s"], c["threat_min_mps"], c["with_heading_deg"], c["with_speed"][0],
-                c["with_speed"][1], c["with_min_mps"])
+                c["with_speed"][1], c["with_min_mps"], 1.0 if c["std_rho"] else 0.0, 1.0 if c["path_normal"] else 0.0)
 
     def frame(self, ts):
         """The `radar` message for time ts (ns), or None while the car's own motion is unknown."""
@@ -414,11 +423,18 @@ class Radar:
         tr = self.tracker
         tr.manage(T)
         path = self.path
-        if path is not None and tr.cfg["road_prior"]:   # the road model's path on the ground, for the heading prior
-            pp = self.ego.pose_at(self.path_t)
+        ctx = tr.cfg["ctx_prior"]
+        if ctx:
+            tr.road_path = None
+        if path is not None and (tr.cfg["road_prior"] or ctx):   # the road model's path on the ground: for the heading
+            pp = self.ego.pose_at(self.path_t)           # prior, and for where a new object is beside the road
             if pp is not None:
                 cp, sp = math.cos(pp[2]), math.sin(pp[2])
-                tr.road_prior(T, (pp[0] + cp * path[0] - sp * path[1], pp[1] + sp * path[0] + cp * path[1]))
+                gp = (pp[0] + cp * path[0] - sp * path[1], pp[1] + sp * path[0] + cp * path[1])
+                if ctx:
+                    tr.road_path = gp
+                if tr.cfg["road_prior"]:
+                    tr.road_prior(T, gp)
         X, Y, psi = self.ego.pose_at(T)
         es = self.ego.state_at(T)
         v_ego, w_ego = es[3], es[4]

@@ -4957,6 +4957,20 @@ static int rnums_get(PyObject *o, Py_ssize_t n, double *out, const char *what)
     return rows_get(o, n, 1, out, what);
 }
 
+/* ... of n numbers, or of the first nmin of them (a caller from before the later ones were added: those are 0) */
+static int rnums_get_tail(PyObject *o, Py_ssize_t nmin, Py_ssize_t n, double *out, const char *what)
+{
+    Py_ssize_t len = PySequence_Size(o);
+    if (len < 0)
+        PyErr_Clear();
+    if (len >= nmin && len < n) {
+        for (Py_ssize_t k = len; k < n; k++)
+            out[k] = 0.0;
+        return rnums_get(o, len, out, what);
+    }
+    return rnums_get(o, n, out, what);
+}
+
 /* ---- the sensors (sensors.py): what a scan measures of a state ---- */
 enum { SEN_CAMERA = 0, SEN_MICROWAVE = 1, SEN_POSITION = 2 };
 enum { K_B = 0, K_RB = 1, K_RBH = 2, K_BT = 3, K_NONE = 4, K_SCALE = 8 };
@@ -4976,6 +4990,7 @@ typedef struct {
     const struct RXc *xc;
     double grade_k;                  /* the road's vertical curvature, 1 sigma (1/m); 0: not modelled */
     int lcol;                        /* a lamp pair's colour says which end faces the camera */
+    int sil;                         /* a box's centre is the centre of the object's silhouette (r_sil_shift) */
 } RSens;
 
 /* sensors.py `Sensor.native()`: RSENS numbers */
@@ -5120,6 +5135,51 @@ static void r_near_offset(const double *e, double o0, double o1, double *g0, dou
     *g1 = t * o1 / rc;
 }
 
+/* Where the middle of a camera's box lies against the bearing of the object's centre (rad, added to it). The box
+ * bounds the object's silhouette: the picture of its rectangle (e: length, width, heading; centre (dx, dy) from the
+ * camera on the ground, the camera's axis along psi). Seen from afar the silhouette lies evenly about the centre;
+ * seen from near it does not (the near corners are broader in the picture than the far ones: a car 4.5 m long
+ * passed at 10 m, 3 m to the side: the box's middle 0.9 degrees off its centre, a tenth of its width). Taken as noise
+ * that is what limits the bearing of a near object, and with it how well the car's own travel ranges a standing
+ * thing (parallax). The box's middle is the middle of the corners' picture coordinates (tan of the bearing against
+ * the axis); a corner at or behind the camera: no shift. */
+static double r_sil_shift(const double *e, double dx, double dy, double psi)
+{
+    double c = cos(psi), s = sin(psi), ch = cos(e[2]), sh = sin(e[2]);
+    double xc = c * dx + s * dy, yc = -s * dx + c * dy;
+    double hl = 0.5 * pymax(e[0], 0.0), hw = 0.5 * pymax(e[1], 0.0);
+    /* the half axes in the camera frame */
+    double lx = hl * (c * ch + s * sh), ly = hl * (-s * ch + c * sh), wx = hw * (-c * sh + s * ch), wy = hw * (s * sh + c * ch);
+    double lo = INFINITY, hi = -INFINITY;
+    for (int k = 0; k < 4; k++) {
+        double sl = (k & 1) ? 1.0 : -1.0, sw = (k & 2) ? 1.0 : -1.0;
+        double x = xc + sl * lx + sw * wx, y = yc + sl * ly + sw * wy;
+        if (!(x > 0.5))
+            return 0.0;
+        double u = y / x;
+        if (u < lo)
+            lo = u;
+        if (u > hi)
+            hi = u;
+    }
+    return atan(0.5 * (lo + hi)) - atan2(yc, xc);
+}
+
+/* ... and what is not known of it: the variance of that shift over what is not known of the rectangle (its
+ * length, width and heading: Pe 3 x 3, the heading's variance bounded as r_reff bounds it) */
+static double r_sil_var(const double *e, const double *Pe, double dx, double dy, double psi)
+{
+    static const double step[3] = {0.2, 0.1, 0.05};
+    double s0 = r_sil_shift(e, dx, dy, psi), v = 0.0;
+    for (int k = 0; k < 3; k++) {
+        double e1[3] = {e[0], e[1], e[2]};
+        e1[k] += step[k];
+        double g = (r_sil_shift(e1, dx, dy, psi) - s0) / step[k];
+        v += g * g * (k == 2 ? pymin(Pe[8], 0.6) : Pe[4 * k]);
+    }
+    return v;
+}
+
 /* sensor.h(x, pose, det): the predicted measurement z (m) and its Jacobian H (m x N); returns m. The state's place
  * is the object's CENTRE. A camera's box stands on the road at the object's near face and its height is that
  * face's: with the object's extent e (length, width, heading; NULL: a point) the ground angle, the box height, the
@@ -5174,6 +5234,8 @@ static int r_h(const RSens *s, int kind, double sdt, const double *x, const doub
         brow[R_PX] = -dy / (rc * rc);
         brow[R_PY] = dx / (rc * rc);
         double b = wrap_pi(atan2(dy, dx) - pose[2]);
+        if (s->sil && e)                                /* the box's middle: the silhouette's (r_sil_shift) */
+            b = wrap_pi(b + r_sil_shift(e, dx, dy, pose[2]));
         double hc = s->hc;
         if (base == K_B) {
             z[0] = b;
@@ -6372,7 +6434,7 @@ enum { RK_TS, RK_XM, RK_YM, RK_STDM, RK_STAND, RK_CV, RK_CA, RK_ID, RK_STATE, RK
        RK_CLASS, RK_FLAGS, RK_POFF, RK_TTC, RK_PTHR, RK_CONS, RK_PERR, RK_ANG, RK_PRED, RK_PPATH, RK_LABEL, RK_CONF,
        RK_SOURCE, RK_VOTES, RK_ON_PATH, RK_IN_PATH, RK_THREAT, RK_PARKED, RK_WITH, RK_STATIONARY, RK_HUMAN, RK_BIKE,
        RK_MOTORBIKE, RK_LEN, RK_WID, RK_HDG, RK_EXTSTD, RK_VIS, RK_OCC, RK_OCCBY, RK_OBJECT, RK_EDGE, RK_FOV, RK_VS,
-       RK_VSSTD, RK_VSAGE, RK_GRP, RK_GRPKIND, RK_HYP, RK_CTR, RK_N };
+       RK_VSSTD, RK_VSAGE, RK_GRP, RK_GRPKIND, RK_HYP, RK_CTR, RK_COV, RK_N };
 static PyObject *rkey[RK_N + 1];
 static const char *const RKEYS[RK_N + 1] = {
     "t_s", "x_m", "y_m", "std_m", "stand", "cv", "ca", "id", "state", "exist", "age_s", "hits", "sources", "seen",
@@ -6380,7 +6442,7 @@ static const char *const RKEYS[RK_N + 1] = {
     "p_stationary", "models", "class", "flags", "path_offset_m", "ttc_s", "p_threat", "consistency", "pred_err_m",
     "angle_offset_deg", "predict", "predict_path", "label", "confidence", "source", "votes", "on_path", "in_path",
     "threat", "parked", "with_traffic", "stationary", "human", "bike", "motorbike", "len", "wid", "hdg", "ext_std",
-    "vis", "occ", "occ_by", "object", "edge", "fov", "vs", "vs_std", "vs_age_s", "grp", "grp_kind", "hyp", "ctr", NULL};
+    "vis", "occ", "occ_by", "object", "edge", "fov", "vs", "vs_std", "vs_age_s", "grp", "grp_kind", "hyp", "ctr", "std_rho", NULL};
 
 static int rkeys_init(void)
 {
@@ -6590,7 +6652,7 @@ fail:
     return NULL;
 }
 
-#define RFCFG 12                 /* corridor_m, corridor_rel, path_max_m, ttc_min_closing, in_path_sigma,
+#define RFCFG 14                 /* corridor_m, corridor_rel, path_max_m, ttc_min_closing, in_path_sigma,
                                     in_path_slack_m, threat_ttc_s, threat_min_mps, with_heading_deg, with_speed
                                     (low, high), with_min_mps */
 
@@ -6620,7 +6682,7 @@ static PyObject *n_radar_frame(PyObject *self, PyObject *args)
     RPath path = {NULL, NULL, 0, 0.0, 0.0};
     if (rkeys_init() < 0 || store_get(oS, &vS, &cap) < 0 || (rows = idx_get(orows, cap, &B)) == NULL ||
         rpar_get(opar, &par) < 0 || rnums_get(opose, 3, pose, "pose") < 0 || rnums_get(oego, 2, ego, "ego") < 0 ||
-        rnums_get(ocfg, RFCFG, cfg, "cfg") < 0)
+        rnums_get_tail(ocfg, RFCFG - 2, RFCFG, cfg, "cfg") < 0)
         goto done;
     if (!PyList_Check(ohz) && !PyTuple_Check(ohz)) {
         PyErr_SetString(PyExc_TypeError, "radar_frame: the horizons must be a list or tuple");
@@ -6727,9 +6789,21 @@ static PyObject *n_radar_frame(PyObject *self, PyObject *args)
         }
         double speed = py_hypot(vc0, vc1);
         double off = r_offset(&path, pc0, pc1);
+        double sy = sqrt(pymax(Pp[3], 0.0));
+        if (cfg[13] != 0.0 && pc0 > 0.0) {
+            /* beside the path is ACROSS the path where the object is, not across the car's axis: on a bend the
+             * path's direction there is not the car's, the offset is the distance from the path (the difference
+             * of the two lateral places times the cosine), and what is not known of it is the place's whole
+             * covariance across the path: a camera's range error, along the line of sight, lies across a path
+             * that bends away (sy alone, the car's lateral axis, called a kerbside car on a bend "surely in") */
+            double pp[3];
+            r_path_point(&path, pc0, pp);
+            double cn = cos(pp[2]), sn = sin(pp[2]);
+            off *= cn;
+            sy = sqrt(pymax(sn * sn * Pp[0] - sn * cn * (Pp[1] + Pp[2]) + cn * cn * Pp[3], 0.0));
+        }
         double lim = cfg[0] + cfg[1] * pc0;
         int on = 0.3 < pc0 && pc0 <= cfg[2] && fabs(off) <= lim;
-        double sy = sqrt(pymax(Pp[3], 0.0));
         int sure_in = on && fabs(off) + cfg[4] * sy <= lim + cfg[5];
         /* reached within threat_ttc_s at the present speeds, over every hypothesis (the object's own, at its time) */
         double p_thr = 0.0;
@@ -6861,6 +6935,14 @@ static PyObject *n_radar_frame(PyObject *self, PyObject *args)
             int oc = (int)M[M_OCC];
             PyObject *ocv = oc == 1 ? rkey[RK_OBJECT] : oc == 2 ? rkey[RK_EDGE] : oc == 3 ? rkey[RK_FOV] : Py_None;
             PyObject *by = oc == 1 && M[M_OCCBY] > 0.0 ? PyLong_FromDouble(M[M_OCCBY]) : (Py_INCREF(Py_None), Py_None);
+            /* the correlation of the place's x and y errors (car axes): `std` has the two spreads only, and a
+             * camera's place is known along the line of sight far worse than across it */
+            if (cfg[12] != 0.0) {
+                double den = sqrt(pymax(Pp[0], 0.0) * pymax(Pp[3], 0.0));
+                double rho = den > 1e-12 ? pymin(1.0, pymax(-1.0, 0.5 * (Pp[1] + Pp[2]) / den)) : 0.0;
+                if (dset(t, RK_COV, round_obj(rho, 3)) < 0)
+                    goto obj_fail;
+            }
             if (dset(t, RK_CTR, Py_BuildValue("[NN]", round_obj(ctr0, 2), round_obj(ctr1, 2))) < 0 ||
                 dset(t, RK_LEN, round_obj(e[0], 2)) < 0 || dset(t, RK_WID, round_obj(e[1], 2)) < 0 ||
                 dset(t, RK_HDG, round_obj(wrap_pi(e[2] - pose[2]), 3)) < 0 || dset(t, RK_EXTSTD, es) < 0 ||
@@ -7239,7 +7321,7 @@ enum { XC_FLAGS, XC_BOXOCC, XC_BOXOCC_M,
        XC_LOW, XC_LOW_P, XC_LOW_PRUN, XC_LOW_RUN_S, XC_LOW_EXTRA,
        XC_APP, XC_APP_KIND, XC_APP_DARK, XC_APP_BDAY, XC_APP_BNIGHT, XC_APP_GAIN, XC_APP_YDAY, XC_APP_YNIGHT, XC_APP_TAB,
        XC_LCOL = XC_APP_TAB + 16, XC_LCOL_SIG, XC_LSIZE, XC_LSEP_RATIO, XC_LSEP_REL, XC_AUX_EPS, XC_AUX_SPAN, XC_AUX_USES,
-       XC_WID, XC_WID_REL, XC_GRADE, XC_SCORR, XC_SROB, XC_SIDE, RXCFG };
+       XC_WID, XC_WID_REL, XC_GRADE, XC_SCORR, XC_SROB, XC_SIDE, XC_SIL, RXCFG };
 
 typedef struct RXc {
     double c[RXCFG];
@@ -8176,9 +8258,22 @@ static void r_reff(const RSens *sen, int kind, const double *row, const double *
 {
     memcpy(Rf, R, 4 * sizeof(double));
     int base = kind & 7;
-    if (sen->type != SEN_CAMERA || base == K_B || base == K_NONE)
+    if (sen->type != SEN_CAMERA || base == K_NONE)
         return;
     const double *x = row + RO_X, *e = row + RO_E, *Pe = row + RO_PE;
+    if (sen->sil) {
+        /* the box's middle against the centre's bearing: what is not known of the rectangle (once per row and
+         * pose: the association asks for every detection of the scan) */
+        static double key[11] = {NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN}, val;
+        double k[11] = {x[R_PX], x[R_PY], pose[0], pose[1], pose[2], e[0], e[1], e[2], Pe[0], Pe[4], Pe[8]};
+        if (memcmp(k, key, sizeof(k)) != 0) {
+            val = r_sil_var(e, Pe, x[R_PX] - pose[0], x[R_PY] - pose[1], pose[2]);
+            memcpy(key, k, sizeof(k));
+        }
+        Rf[(base == K_B || base == K_BT) ? 0 : 1] += val;
+    }
+    if (base == K_B)
+        return;
     double dx = x[R_PX] - pose[0], dy = x[R_PY] - pose[1], rc = pymax(hypot(dx, dy), 0.5), los = atan2(dy, dx), dda;
     double a = e[2] - los, d = r_half_depth(e, los, &dda), rn = pymax(rc - d, 0.5);
     double vd = 0.25 * (cos(a) * cos(a) * Pe[0] + sin(a) * sin(a) * Pe[4]) + dda * dda * pymin(Pe[8], 0.6);
@@ -11849,12 +11944,13 @@ static PyObject *hyp_cycle(PyObject *self, PyObject *args)
         (has_bias && rnums_get(obias, 5, bias, "bias") < 0) || rnums_get(occfg, 4, ccfg, "ccfg") < 0)
         goto done;
     if (oxcfg != Py_None && s.sen.type == SEN_CAMERA) {  /* the detector's further inputs (a camera's boxes) */
-        if (rnums_get(oxcfg, RXCFG, xcs.c, "xcfg") < 0)
+        if (rnums_get_tail(oxcfg, XC_SIL, RXCFG, xcs.c, "xcfg") < 0)
             goto done;
         s.xc = &xcs;
         s.sen.xc = &xcs;
         s.sen.grade_k = xcs.c[XC_GRADE];
         s.sen.lcol = xcs.c[XC_LCOL] != 0.0;
+        s.sen.sil = xcs.c[XC_SIL] != 0.0;
     }
     if (!PyList_Check(odets)) {
         PyErr_SetString(PyExc_TypeError, "Hyp.cycle: the detections must be a list");
@@ -12095,7 +12191,7 @@ static PyObject *n_radar_app_lr(PyObject *self, PyObject *args)
     double dark, gap, c[RXCFG], a[RXW], b[RXW];
     if (!PyArg_ParseTuple(args, "OdOOd", &oc, &dark, &oa, &ob, &gap))
         return NULL;
-    if (rnums_get(oc, RXCFG, c, "xcfg") < 0 || rnums_get(oa, RXW, a, "xa") < 0 || rnums_get(ob, RXW, b, "xb") < 0)
+    if (rnums_get_tail(oc, XC_SIL, RXCFG, c, "xcfg") < 0 || rnums_get(oa, RXW, a, "xa") < 0 || rnums_get(ob, RXW, b, "xb") < 0)
         return NULL;
     if (!(a[X_EN] > 0.0) || !(b[X_EN] > 0.0) || a[X_EK] != b[X_EK])
         return PyFloat_FromDouble(1.0);
@@ -12832,6 +12928,82 @@ done:
     return res;
 }
 
+/* radar_size_fit(samples, m0, v0, n0, floor_sd, max_shift) -> (mean, variance)
+ * How tall the things of one kind are, as this camera's own objects have shown it (tracker.py `_size_learn`).
+ * samples: n x 2, per object what its OWN boxes said of its height (log metres) with the prior it was given taken
+ * out: the likelihood's mean and variance (a standing thing passed by the car is ranged by the car's travel, and
+ * its box height at that range is its size). The kind's heights are N(mean, tau^2) and each sample is
+ * N(height, its variance): the mean is the weighted mean (weights 1 / (variance + tau^2), Huber's at 2 sigma: a
+ * track fed by two cars says nothing of either), tau^2 the samples' scatter beyond their own variances, both held
+ * to what was assumed before (m0, v0) with the weight of n0 objects; tau no smaller than floor_sd, the mean no
+ * further than max_shift from m0. */
+static PyObject *n_radar_size_fit(PyObject *self, PyObject *args)
+{
+    PyObject *os;
+    double m0, v0, n0, fl, mx;
+    if (!PyArg_ParseTuple(args, "Oddddd", &os, &m0, &v0, &n0, &fl, &mx))
+        return NULL;
+    Py_ssize_t n = batch_len(os);
+    if (n < 0)
+        return NULL;
+    double *v = PyMem_Malloc((size_t)(2 * n + 2) * sizeof(double));
+    if (v == NULL)
+        return PyErr_NoMemory();
+    if (rows_get(os, n, 2, v, "samples") < 0) {
+        PyMem_Free(v);
+        return NULL;
+    }
+    double mu = m0, t2 = v0;
+    for (int it = 0; it < 8; it++) {
+        double sw = n0 / v0, swm = n0 / v0 * m0, sq = n0, sqv = n0 * v0;
+        for (Py_ssize_t i = 0; i < n; i++) {
+            double var = v[2 * i + 1] + t2, d = v[2 * i] - mu, z = fabs(d) / sqrt(var), q = z > 2.0 ? 2.0 / z : 1.0;
+            sw += q / var;
+            swm += q / var * v[2 * i];
+            sq += q;
+            sqv += q * (d * d - v[2 * i + 1]);
+        }
+        mu = pymin(m0 + mx, pymax(m0 - mx, swm / sw));
+        t2 = pymax(fl * fl, sqv / sq);
+    }
+    PyMem_Free(v);
+    return Py_BuildValue("(dd)", mu, t2);
+}
+
+/* radar_stand_prior(S, rows, p) -> None
+ * What is known of an object before its own boxes can say whether it stands (tracker.py `_context`: where it was
+ * first seen, the vehicles there stand): "it stands" is believed with p at least in every row given; the moving
+ * hypotheses keep their shares of the rest; the combination after. */
+static PyObject *n_radar_stand_prior(PyObject *self, PyObject *args)
+{
+    PyObject *oS, *orows;
+    double p;
+    if (!PyArg_ParseTuple(args, "OOd", &oS, &orows, &p))
+        return NULL;
+    View vS;
+    vS.held = 0;
+    Py_ssize_t cap, n = 0, *rows = NULL;
+    PyObject *res = NULL;
+    if (store_get(oS, &vS, &cap) < 0 || (rows = idx_get(orows, cap, &n)) == NULL)
+        goto done;
+    for (Py_ssize_t k = 0; k < n; k++) {
+        double *row = (double *)vS.b.buf + rows[k] * RROW, *mu = row + RO_MU;
+        double mv = mu[1] + mu[2];
+        if (!(mu[0] < p) || !(mv > 0.0) || !(p < 1.0))
+            continue;
+        mu[1] *= (1.0 - p) / mv;
+        mu[2] *= (1.0 - p) / mv;
+        mu[0] = p;
+        r_combine(row + RO_XS, row + RO_PS, mu, row + RO_X, row + RO_P);
+    }
+    res = Py_None;
+    Py_INCREF(res);
+done:
+    PyMem_Free(rows);
+    view_drop(&vS);
+    return res;
+}
+
 /* radar_heading_prior(S, rows, axis, los, sigma, snap, mirror) -> number of rows changed
  * The road's axis at a standing vehicle's place as a prior of its heading (tracker.py `road_prior`), in every row
  * of it whose motion has not shown which end is the front. A camera's box width measures |sin a| (a: the heading
@@ -12980,6 +13152,8 @@ static PyMethodDef methods[] = {
     {"radar_group_support", n_radar_group_support, METH_VARARGS, "what a standing row says about one member"},
     {"radar_lh_prior", n_radar_lh_prior, METH_VARARGS, "an object's height prior exchanged in all its rows"},
     {"radar_heading_prior", n_radar_heading_prior, METH_VARARGS, "the road's axis as a standing vehicle's heading prior"},
+    {"radar_size_fit", n_radar_size_fit, METH_VARARGS, "a kind's height prior from what the objects' own boxes said"},
+    {"radar_stand_prior", n_radar_stand_prior, METH_VARARGS, "\"it stands\" believed at least so much in an object's rows"},
     {"radar_app_lr", n_radar_app_lr, METH_VARARGS, "the appearance likelihood ratio between two rows' remembered vectors"},
     {"radar_kbest", n_radar_kbest, METH_VARARGS, "the k cheapest assignments in order (Murty)"},
     {"radar_frame", n_radar_frame, METH_VARARGS, "the output's per-object numbers (box.py Radar.frame)"},
