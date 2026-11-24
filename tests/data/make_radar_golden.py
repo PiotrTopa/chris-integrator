@@ -269,7 +269,42 @@ def drives_rows(trace):
         models.NR, tracker._NR, box._NR, sensors._NR = saved
 
 
-def main_detin(parked=False, rows=False):
+# the range of a standing thing (docs/RADAR.md, section 11): the scale-rate knobs and the extent's prior by the height
+RANGE_CFG = {"tracker": dict(scale_iter=True, scale_seed=True, scale_exact=True, near_axis=True, ext_size=True)}
+RANGE_RUNS = (("curve_parked", 5, False, "scale"), ("stopped_brake_14", 1, False, "scale"),
+              ("parked_street", 2, True, "detin_scale"))
+
+
+def range_run(name, seed, night, det, keep_steps=None):
+    from chris_integrator.sim import radar_score, roaduser_sim
+    cfg = dict(RANGE_CFG, tracker=dict(RANGE_CFG["tracker"]))
+    if keep_steps:
+        cfg["tracker"]["hyp_keep_steps"] = keep_steps
+    return radar_score.run(name, seed=seed, night=night, cfg=cfg, det_params=roaduser_sim.det_params_arg(det))
+
+
+def range_digests():
+    import hashlib
+    out = {}
+    for name, seed, night, det in RANGE_RUNS:
+        r = range_run(name, seed, night, det)
+        out["%s:%d:%d:%s" % (name, seed, night, det)] = hashlib.sha256(
+            json.dumps([f["objects"] for f in r["frames"]], sort_keys=True).encode()).hexdigest()
+    return out
+
+
+def drives_range(trace):
+    from chris_integrator.radar import box, models, sensors, tracker
+    saved = (models.NR, tracker._NR, box._NR, sensors._NR)
+    models.NR = tracker._NR = box._NR = sensors._NR = trace
+    try:
+        for name, seed, night, det in RANGE_RUNS:
+            range_run(name, seed, night, det, keep_steps=8)
+    finally:
+        models.NR, tracker._NR, box._NR, sensors._NR = saved
+
+
+def main_detin(parked=False, rows=False, rng=False):
     import radar_golden_lib as lib
     from chris_integrator.native import radar as C
     global PER_FN, DEFAULT_N
@@ -278,11 +313,13 @@ def main_detin(parked=False, rows=False):
         PER_FN = {"Hyp.cycle": 20, "Hyp.after": 4, "radar_frame": 6, "radar_stand_prior": 6, "radar_size_fit": 6}
     if rows:
         PER_FN = {"Hyp.cycle": 28, "Hyp.after": 4}
+    if rng:
+        PER_FN = {"Hyp.cycle": 24, "Hyp.after": 2, "radar_ext_prior": 8}
     trace = Trace(C, lib)
-    (drives_rows if rows else drives_parked if parked else drives_detin)(trace)
+    (drives_range if rng else drives_rows if rows else drives_parked if parked else drives_detin)(trace)
     cases, arrays = [], {}
     for name in (("Hyp.cycle", "Hyp.after", "radar_frame", "radar_stand_prior", "radar_size_fit") if parked
-                 else ("Hyp.cycle", "Hyp.after")):
+                 else ("Hyp.cycle", "Hyp.after", "radar_ext_prior") if rng else ("Hyp.cycle", "Hyp.after")):
         for item in trace.kept.get(name, ()):
             if item is None:
                 continue
@@ -297,13 +334,14 @@ def main_detin(parked=False, rows=False):
                 return v
             cases.append(ren(case))
             arrays.update({pre + k: a for k, a in arr.items()})
-    tag = "rows" if rows else "parked" if parked else "detin"
+    tag = "range" if rng else "rows" if rows else "parked" if parked else "detin"
     path = os.path.join(HERE, "tests", "data", "radar_golden_%s.npz" % tag)
     lib.save(path, cases, arrays)
     print("wrote %s: %d cases, %.0f kB" % (path, len(cases), os.path.getsize(path) / 1e3))
     path = os.path.join(HERE, "tests", "data", "radar_digests_%s.json" % tag)
     with open(path, "w") as f:
-        json.dump(rows_digests() if rows else parked_digests() if parked else detin_digests(), f, indent=1, sort_keys=True)
+        json.dump(range_digests() if rng else rows_digests() if rows else parked_digests() if parked else detin_digests(), f,
+                  indent=1, sort_keys=True)
         f.write("\n")
     print("wrote", path)
 
@@ -422,5 +460,7 @@ if __name__ == "__main__":
         main_detin(parked=True)
     elif "--rows" in sys.argv[1:]:
         main_detin(rows=True)
+    elif "--range" in sys.argv[1:]:
+        main_detin(rng=True)
     else:
         main()

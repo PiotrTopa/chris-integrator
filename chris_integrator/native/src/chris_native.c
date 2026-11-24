@@ -4999,6 +4999,10 @@ typedef struct {
     const double *pdl;               /* the view's learnt chance of a box (Hyp.pdl), or NULL */
     double pdl_n0;
     int sil;                         /* a box's centre is the centre of the object's silhouette (r_sil_shift) */
+    int nax;                         /* the near face's depth along the camera's axis (XC_NAX) */
+    const double *sprev;             /* the car's pose at the far end of the scan's scale-rate baselines: nsprev x
+                                        (baseline s, X, Y, heading), or NULL */
+    int nsprev;
 } RSens;
 
 /* sensors.py `Sensor.native()`: RSENS numbers */
@@ -5089,11 +5093,38 @@ static int r_angle_row(const RSens *s, int kind)
     return (b == K_B || b == K_BT) ? 0 : b == K_NONE ? -1 : 1;
 }
 
-/* CameraBoxes._scale_row */
-static double r_scale_row(const double *x, const double *pose, double sdt, double *row, double near)
+/* CameraBoxes._scale_row. The detector's scale rate is the logarithm of the object's image size now over its size
+ * `sdt` ago, over sdt: of its depth then (along the camera's axis as it pointed then) over its depth now. sp NULL:
+ * read as the depth's rate now (the car's velocity and yaw rate of this moment, taken as they were over the whole
+ * baseline). sp: the car's pose at the far end of the baseline (X, Y, heading), and the two depths as they were:
+ * the object's place then is its place now less its velocity times the baseline. The two differ where the car turns
+ * or changes its speed within the baseline (up to a second): on a bend of 110 m radius at 13 m/s the camera's axis
+ * swings 4 degrees in 0.6 s and a thing 40 m ahead reads 1.3 % far; braking at 3 m/s^2 the car was 1.2 m/s faster on
+ * average over 0.8 s than it is now, and a thing that stands reads 9 % near and is refuted as standing. */
+static double r_scale_row(const double *x, const double *pose, double sdt, double *row, double near, const double *sp)
 {
     double dx = x[R_PX] - pose[0], dy = x[R_PY] - pose[1];
     double c = cos(pose[2]), s = sin(pose[2]);
+    if (sp != NULL) {
+        double dt = pymax(sdt, 1e-3), dc = c * dx + s * dy, dn = pymax(dc * near, 0.5), off = dc - dn;
+        double cp = cos(sp[2]), spn = sin(sp[2]);
+        double dpv = cp * (x[R_PX] - x[R_VX] * dt - sp[0]) + spn * (x[R_PY] - x[R_VY] * dt - sp[1]) - off;
+        double u = dpv / dn;
+        for (int k = 0; k < RN; k++)
+            row[k] = 0.0;
+        if (u < 0.05) {                                  /* (behind the camera then: no such picture) */
+            u = 0.05;
+            dpv = u * dn;
+        }
+        double near_eff = dn / pymax(dc, 1e-9);          /* d dn / d dc (1 where the depth is held at its floor: 0) */
+        if (!(dc * near > 0.5))
+            near_eff = 0.0;
+        row[R_PX] = ((cp - c * (1.0 - near_eff)) / dpv - c * near_eff / dn) / dt;
+        row[R_PY] = ((spn - s * (1.0 - near_eff)) / dpv - s * near_eff / dn) / dt;
+        row[R_VX] = -cp / dpv;
+        row[R_VY] = -spn / dpv;
+        return log(u) / dt;
+    }
     double depth = pymax((c * dx + s * dy) * near, 0.5);
     double w = pose[5];
     double rate = (c * (x[R_VX] - pose[3]) + s * (x[R_VY] - pose[4])) + w * (-s * dx + c * dy);
@@ -5272,6 +5303,8 @@ static int r_h(const RSens *s, int kind, double sdt, const double *x, const doub
             if (base != K_RB) {
                 double c = cos(pose[2]), sn = sin(pose[2]);
                 double depth = pymax((c * dx + sn * dy) * near, 0.5);
+                if (s->nax && e)                         /* the picture's size goes with the depth along the axis */
+                    depth = pymax(c * dx + sn * dy - r_half_depth(e, pose[2], NULL), 0.5);
                 H[2 * RN + R_PX] = -c / depth;
                 H[2 * RN + R_PY] = -sn / depth;
                 H[2 * RN + R_LH] = 1.0;
@@ -5285,7 +5318,18 @@ static int r_h(const RSens *s, int kind, double sdt, const double *x, const doub
             double dx = x[R_PX] - pose[0], dy = x[R_PY] - pose[1], rc = pymax(py_hypot(dx, dy), 0.5);
             near = pymax(rc - r_half_depth(e, atan2(dy, dx), NULL), 0.5) / rc;
         }
-        z[m] = r_scale_row(x, pose, sdt, H + m * RN, s->type == SEN_CAMERA ? near : 1.0);
+        if (s->nax && e && s->type == SEN_CAMERA) {
+            double dx = x[R_PX] - pose[0], dy = x[R_PY] - pose[1], dc = cos(pose[2]) * dx + sin(pose[2]) * dy;
+            if (dc > 0.5)
+                near = pymax(dc - r_half_depth(e, pose[2], NULL), 0.5) / dc;
+        }
+        const double *sp = NULL;
+        for (int k = 0; k < s->nsprev; k++)
+            if (s->sprev[4 * k] == sdt) {
+                sp = s->sprev + 4 * k + 1;
+                break;
+            }
+        z[m] = r_scale_row(x, pose, sdt, H + m * RN, s->type == SEN_CAMERA ? near : 1.0, sp);
         m++;
     }
     return m;
@@ -7342,6 +7386,7 @@ done:
  * heading against the line of sight, when, its variance), then the appearance vector's mean (in the units of its
  * kind's distance) */
 enum { X_EN, X_ET, X_EK, X_ST, X_NLAMP, X_NWID, X_LOWRUN, X_FRONT, X_LS, X_LST, X_LSR, X_SPARE, X_EMB, RXW = X_EMB + RXEMB };
+#define RSPREV 8                 /* scale-rate baselines of one scan whose far end's pose is given */
 /* the scan's xcfg */
 enum { XC_FLAGS, XC_BOXOCC, XC_BOXOCC_M,
        XC_LOW, XC_LOW_P, XC_LOW_PRUN, XC_LOW_RUN_S, XC_LOW_EXTRA,
@@ -7361,7 +7406,19 @@ enum { XC_FLAGS, XC_BOXOCC, XC_BOXOCC_M,
        /* the chance of a box learnt from the settled objects' own boxes and misses, per view and box height (on, the
         * weight of the sensor's own model in boxes, how many boxes a bin remembers); an object's existence counted
         * over the stories in which ANOTHER object took its last box too */
-       XC_PDL, XC_PDL_N0, XC_PDL_KEEP, XC_XSH, RXCFG };
+       XC_PDL, XC_PDL_N0, XC_PDL_KEEP, XC_XSH,
+       /* the range of a standing thing from the scale rate (docs/RADAR.md, section 11): the standing hypothesis takes
+        * a box with a scale rate by iteration (the most such an update iterates; 0: one linear step, as it was); a
+        * standing hypothesis brought back from the floor is opened along what a camera cannot see (1 sigma of the
+        * common factor of range and size; 0: not) and takes the box's scale rate from there, where that rate says
+        * the range at least this many times better than it was known (XC_SSEED_K) */
+       XC_SITER, XC_SSEED, XC_SSEED_K,
+       /* a box's height and its scale rate go with the DEPTH of the object's near face along the camera's axis (the
+        * half depth of its rectangle along that axis), not with its range along the line of sight (1: so) */
+       XC_NAX,
+       /* the car's own pose at the far end of each scale rate's baseline: how many baselines the scan has (0: the
+        * rate is read as the range's rate now, as it was), then per baseline (the baseline in s, X, Y, heading then) */
+       XC_SPN, XC_SPT, RXCFG = XC_SPT + 4 * RSPREV };
 /* a row's second memory (Hyp.Y; made when a scan first asks for the chain or the pose head): the detect / miss
  * chain per view of the camera (two views: the view's key, the probability that the detector has lost the object,
  * the time of that), when the row last took a ground point of the pose head, when a heading; the log odds that the
@@ -8135,7 +8192,7 @@ static double x_aux_take(const RXc *xc, double *x, double *P, const double *pose
         double span = o->span;
         double H[4 * RN] = {0}, PH[RN], S = o->R, nu;
         if (o->which == 2)                               /* the image's growth over the time since the last pair */
-            nu = o->z - r_scale_row(x, pose, o->sdt, H, o->near);
+            nu = o->z - r_scale_row(x, pose, o->sdt, H, o->near, NULL);
         else {
             double dw, h = exp(x[R_LH]), w = x_width_of(h, &dw);
             nu = o->z - (x[R_LH] - log(o->c * w));
@@ -8623,6 +8680,94 @@ static int r_take_parts(double *x, double *P, const RSens *sen, int kind, double
     return 0;
 }
 
+/* ---- the scale rate of a thing that stands is its range ----
+ * A thing that stands comes nearer at the car's own speed: its image grows at v / depth, and the rate measures the
+ * depth outright (time to contact x the car's speed), whatever its size and wherever the road lies. That function
+ * is a hyperbola. One linear step of a Kalman update from a range r0 lands at r0 (2 - r0 / r) for a true range r
+ * (0.84 r from 0.6 r, 0.75 r from half) and states the spread the rate would give AT r0: (r0 / r)^2 of the true
+ * one. A van whose first box was read as a car's (0.6 of its range) stood, after its first scale rate, at 35 m to
+ * 0.4 m for a truth of 59 m; its next scale rate then refuted "it stands" by tens of sigma, the hypothesis went to
+ * the floor for good, and the object was a car driving at 5 m/s at 0.6 of its range all the way down (the picture
+ * of a standing thing at r and of one at k r closing k times slower are the same picture at every moment: nothing
+ * in its own boxes takes that back).
+ * r_take_iter: the update iterated to the point where prior and measurement agree (Gauss-Newton on the same
+ * quadratic form the linear step minimises once: the iterated extended Kalman filter), the covariance from the
+ * linearisation there. x0, P0: the hypothesis before the detection; x: where to start (the linear step's result),
+ * replaced by the result with P. Steps are held to a factor of two in range (the hyperbola's Newton step overshoots
+ * through zero from beyond twice the true range). 0: taken; -1: no convergence or a singular step (x, P as they
+ * were). */
+static int r_take_iter(double *x, double *P, const double *x0, const double *P0, const RSens *sen, int kind, double sdt,
+                       const double *pose, const double *z, const double *Rf, const double *e, int stand, int iters)
+{
+    double xi[RN], xn[RN], Pn[RNN];
+    memcpy(xi, x, sizeof(xi));
+    int done = 0;
+    for (int it = 0; it < iters && !done; it++) {
+        double nu[4], H[4 * RN], S[16], Si[16], K[RN * 4], det;
+        int m = r_innov(sen, kind, sdt, xi, P0, pose, z, Rf, nu, H, S, e);
+        for (int r = 0; r < m; r++) {                    /* the innovation of the prior's mean, linearised at xi */
+            double acc = 0.0;
+            for (int k = 0; k < RN; k++)
+                acc += H[r * RN + k] * (x0[k] - xi[k]);
+            nu[r] -= acc;
+        }
+        if (r_inv(S, m, Si, &det) < 0)
+            return -1;
+        r_gain(P0, H, m, Si, K);
+        memcpy(xn, x0, sizeof(xn));
+        memcpy(Pn, P0, sizeof(Pn));
+        r_take(xn, Pn, K, H, Rf, nu, m, 1.0);
+        if (stand)
+            for (int k = R_VX; k <= R_AY; k++)
+                xn[k] = 0.0;
+        double dx0 = xi[R_PX] - pose[0], dy0 = xi[R_PY] - pose[1], dx1 = xn[R_PX] - pose[0], dy1 = xn[R_PY] - pose[1];
+        double r0 = hypot(dx0, dy0), r1 = hypot(dx1, dy1), dot = dx0 * dx1 + dy0 * dy1;
+        if (!isfinite(r1) || !(r0 > 1e-6))
+            return -1;
+        double f = 1.0;                                  /* the step held to a factor of two in range, ahead */
+        if (!(dot > 0.0) || r1 < 0.5 * r0)
+            f = 0.5 * r0 / pymax(hypot(dx1 - dx0, dy1 - dy0), 1e-9);
+        else if (r1 > 2.0 * r0)
+            f = r0 / pymax(hypot(dx1 - dx0, dy1 - dy0), 1e-9);
+        if (f < 1.0) {
+            for (int k = 0; k < RN; k++)
+                xn[k] = xi[k] + f * (xn[k] - xi[k]);
+        } else {
+            double mv = 0.0;
+            for (int k = 0; k < RN; k++)
+                mv = pymax(mv, fabs(xn[k] - xi[k]) / (k <= R_PY ? pymax(r0, 1.0) : 1.0));
+            done = mv < 1e-4;
+        }
+        memcpy(xi, xn, sizeof(xi));
+    }
+    if (!done)
+        return -1;
+    for (int k = 0; k < RN; k++)
+        if (!isfinite(xn[k]))
+            return -1;
+    for (int k = 0; k < RNN; k++)
+        if (!isfinite(Pn[k]))
+            return -1;
+    memcpy(x, xn, sizeof(xn));
+    memcpy(P, Pn, sizeof(Pn));
+    return 0;
+}
+
+/* (x, P) opened along what a camera's boxes of the object cannot see: the common factor of its range and its size
+ * (the place from the camera, the height, and the ground-angle offset that keeps the bottom edge where it is), by
+ * `sig` (1 sigma of the factor's logarithm, linearised). */
+static void r_reopen(const double *x, double *P, const RSens *sen, const double *pose, double sig)
+{
+    double dx = x[R_PX] - pose[0], dy = x[R_PY] - pose[1], r = pymax(hypot(dx, dy), 0.5), g[RN] = {0};
+    g[R_PX] = dx;
+    g[R_PY] = dy;
+    g[R_LH] = 1.0;
+    g[R_DP] = sen->hc * r / (r * r + sen->hc * sen->hc);
+    for (int i = 0; i < RN; i++)
+        for (int j = 0; j < RN; j++)
+            P[i * RN + j] += sig * sig * g[i] * g[j];
+}
+
 /* The row takes detection d of the sensor at `pose`: every motion hypothesis and the free estimate in full (Joseph
  * form; a hypothesis whose place is too unsure for one linearisation as a sum of parts: r_split), the hypotheses
  * weighed by how well each had predicted it (from `hold` sightings on, unless the sensor measures speed or the
@@ -8641,10 +8786,22 @@ static int r_update_full(double *row, const RSens *sen, const double *pose, cons
     int m0 = r_innov(sen, kind, sdt, row + RO_X, row + RO_P, pose, d + D_Z, Rf, nu0, H0, S0, row + RO_E);
     if (r_mahal(S0, m0, nu0, &d20, NULL) < 0)
         return -1;
+    /* the standing hypothesis and a scale rate: the update iterated (r_take_iter), and from the floor the range the
+     * rate says (below) */
+    const double *xcc = (sen->type == SEN_CAMERA && sen->xc != NULL && (kind & K_SCALE)) ? sen->xc->c : NULL;
+    int siter = xcc != NULL && cons < 2 ? (int)xcc[XC_SITER] : 0;
     for (int j = 0; j < 3; j++) {
         double *x = row + RO_XS + j * RN, *P = row + RO_PS + j * RNN;
-        if (r_take_parts(x, P, sen, kind, sdt, pose, d + D_Z, Rf, row + RO_E, rel,
-                         cons && sen->type == SEN_CAMERA && (j != R_STAND || cons >= 2), &like[j]) < 0)
+        double x0[RN], P0[RNN];
+        if (siter > 0 && j == R_STAND) {
+            memcpy(x0, x, sizeof(x0));
+            memcpy(P0, P, sizeof(P0));
+        }
+        int took = r_take_parts(x, P, sen, kind, sdt, pose, d + D_Z, Rf, row + RO_E, rel,
+                                cons && sen->type == SEN_CAMERA && (j != R_STAND || cons >= 2), &like[j]) == 0;
+        if (took && siter > 0 && j == R_STAND)
+            r_take_iter(x, P, x0, P0, sen, kind, sdt, pose, d + D_Z, Rf, row + RO_E, 1, siter);
+        if (!took)
             like[j] = 0.0;
         else if (naux)                                   /* the box's extra rows, after its others (x_aux_take) */
             like[j] *= x_aux_take(sen->xc, x, P, pose, aux, naux, cons && (j != R_STAND || cons >= 2), used);
@@ -8713,6 +8870,46 @@ static int r_update_full(double *row, const RSens *sen, const double *pose, cons
                 }
             memcpy(xj, xn, sizeof(xn));
             memcpy(Pj, Pn, sizeof(Pn));
+            if (j == R_STAND && xcc != NULL && xcc[XC_SSEED] > 0.0) {
+                /* "It stands, from where it is now": where the others have it is where a thing that DRIVES would be;
+                 * a thing that stands and gives this scale rate is at the range the rate says (the car's speed over
+                 * it), and as tall as its box is from there. The hypothesis is opened along the common factor of
+                 * range and size and takes the box's scale rate from there (iterated), where the rate says the range
+                 * well enough to be worth it (a crawl says nothing: then as it was). */
+                int ms = m0 - 1;
+                double zs[4], Hs[4 * RN], sg = xcc[XC_SSEED], gs = 0.0;
+                double dx = xj[R_PX] - pose[0], dy = xj[R_PY] - pose[1];
+                r_h(sen, K_NONE | K_SCALE, sdt, xj, pose, zs, Hs, row + RO_E);
+                gs = Hs[R_PX] * dx + Hs[R_PY] * dy;      /* the rate's change with the factor */
+                if (gs * gs * sg * sg > xcc[XC_SSEED_K] * xcc[XC_SSEED_K] * (Hs[R_PX] * Hs[R_PX] * Pj[R_PX * RN + R_PX] +
+                        2.0 * Hs[R_PX] * Hs[R_PY] * Pj[R_PX * RN + R_PY] + Hs[R_PY] * Hs[R_PY] * Pj[R_PY * RN + R_PY] + Rf[ms]) &&
+                    gs * gs > 36.0 * Rf[ms]) {
+                    double xo[RN], Po[RNN], xt[RN], Pt[RNN], nu1[4], H1[4 * RN], S1[16], K1[RN];
+                    memcpy(Po, Pj, sizeof(Po));
+                    r_reopen(xj, Po, sen, pose, sg);
+                    memcpy(xo, xj, sizeof(xo));
+                    memcpy(xt, xj, sizeof(xt));
+                    memcpy(Pt, Po, sizeof(Pt));
+                    r_innov(sen, K_NONE | K_SCALE, sdt, xt, Pt, pose, d + D_Z + ms, Rf + ms, nu1, H1, S1, row + RO_E);
+                    if (S1[0] > 0.0) {
+                        for (int k = 0; k < RN; k++) {
+                            double acc = 0.0;
+                            for (int q = 0; q < RN; q++)
+                                acc += Pt[k * RN + q] * H1[q];
+                            K1[k] = acc / S1[0];
+                        }
+                        r_take(xt, Pt, K1, H1, Rf + ms, nu1, 1, 1.0);
+                        for (int k = R_VX; k <= R_AY; k++)
+                            xt[k] = 0.0;
+                        if (r_take_iter(xt, Pt, xo, Po, sen, K_NONE | K_SCALE, sdt, pose, d + D_Z + ms, Rf + ms, row + RO_E, 1,
+                                        12) == 0) {
+                            xt[R_DP] = clamp_dp(xt[R_DP]);
+                            memcpy(xj, xt, sizeof(xt));
+                            memcpy(Pj, Pt, sizeof(Pt));
+                        }
+                    }
+                }
+            }
         }
         for (int j = 0; j < 3; j++)
             mu[j] = nm[j] / s2;
@@ -12444,6 +12641,9 @@ static PyObject *hyp_cycle(PyObject *self, PyObject *args)
         s.sen.grade_k = xcs.c[XC_GRADE];
         s.sen.lcol = xcs.c[XC_LCOL] != 0.0;
         s.sen.sil = xcs.c[XC_SIL] != 0.0;
+        s.sen.nax = xcs.c[XC_NAX] != 0.0;
+        s.sen.nsprev = (int)pymin(pymax(xcs.c[XC_SPN], 0.0), (double)RSPREV);
+        s.sen.sprev = s.sen.nsprev ? xcs.c + XC_SPT : NULL;
     }
     if (!PyList_Check(odets)) {
         PyErr_SetString(PyExc_TypeError, "Hyp.cycle: the detections must be a list");
@@ -13467,6 +13667,71 @@ done:
     return res;
 }
 
+/* radar_ext_prior(S, rows, k, a, b, px, py) -> None
+ * The prior of an object's length (k 0) or width (k 1) its rows hold, exchanged for another (tracker.py `_ext_size`):
+ * in the extent of every row the old prior's information out and the new one's in (a = 1/v1 - 1/v0, b = m1/v1 -
+ * m0/v0), as radar_lh_prior does on the height. A vehicle born from a box the detector called `truck` holds a truck's
+ * 10 x 2.5 m; a car's boxes do not take that back by themselves (a camera sees the silhouette, a sum of length and
+ * width at a heading it does not know either), and the centre of a thing whose near face is known to a few tenths
+ * of a metre lies half its believed length behind that face. What a camera at (px, py) has measured of the object is
+ * its near face: the centre of every hypothesis moves along the line of sight by the change of the half depth, so
+ * that the face stays where the boxes put it (px NaN: the places stay). */
+static PyObject *n_radar_ext_prior(PyObject *self, PyObject *args)
+{
+    PyObject *oS, *orows;
+    int k;
+    double a, b, px = NAN, py = NAN;
+    if (!PyArg_ParseTuple(args, "OOidd|dd", &oS, &orows, &k, &a, &b, &px, &py))
+        return NULL;
+    if (k < 0 || k > 1) {
+        PyErr_SetString(PyExc_ValueError, "radar_ext_prior: the length (0) or the width (1)");
+        return NULL;
+    }
+    View vS;
+    vS.held = 0;
+    Py_ssize_t cap, n = 0, *rows = NULL;
+    PyObject *res = NULL;
+    if (store_get(oS, &vS, &cap) < 0 || (rows = idx_get(orows, cap, &n)) == NULL)
+        goto done;
+    for (Py_ssize_t q = 0; q < n; q++) {
+        double *row = (double *)vS.b.buf + rows[q] * RROW, *e = row + RO_E, *Pe = row + RO_PE;
+        double p = Pe[k * 3 + k], d = 1.0 + a * p, aa = a, bb = b;
+        if (!(p > 0.0) || !isfinite(d))
+            continue;
+        if (d < 0.2) {                                   /* (the variance grows at most fivefold: r_lh_swap) */
+            double f = -0.8 / (aa * p);
+            aa *= f;
+            bb *= f;
+            d = 0.2;
+        }
+        double col[3] = {Pe[k], Pe[3 + k], Pe[6 + k]}, g = (bb - aa * e[k]) / d, e0[3] = {e[0], e[1], e[2]};
+        for (int i = 0; i < 3; i++) {
+            e[i] += col[i] * g;
+            for (int j = 0; j < 3; j++)
+                Pe[i * 3 + j] -= aa * col[i] * col[j] / d;
+        }
+        r_extent_bounds(e);
+        if (isfinite(px) && isfinite(py)) {
+            for (int j = 0; j < 5; j++) {                /* the three hypotheses, the free estimate, the combination */
+                double *x = j < 3 ? row + RO_XS + j * RN : j == 3 ? row + RO_XF : row + RO_X;
+                double dx = x[R_PX] - px, dy = x[R_PY] - py, r = hypot(dx, dy);
+                if (!(r > 1.0))
+                    continue;
+                double los = atan2(dy, dx), sh = r_half_depth(e, los, NULL) - r_half_depth(e0, los, NULL);
+                sh = pymax(sh, 1.0 - r);                 /* (not through the camera) */
+                x[R_PX] += sh * dx / r;
+                x[R_PY] += sh * dy / r;
+            }
+        }
+    }
+    res = Py_None;
+    Py_INCREF(res);
+done:
+    PyMem_Free(rows);
+    view_drop(&vS);
+    return res;
+}
+
 /* radar_size_fit(samples, m0, v0, n0, floor_sd, max_shift) -> (mean, variance)
  * How tall the things of one kind are, as this camera's own objects have shown it (tracker.py `_size_learn`).
  * samples: n x 2, per object what its OWN boxes said of its height (log metres) with the prior it was given taken
@@ -13713,6 +13978,7 @@ static PyMethodDef methods[] = {
     {"radar_groups", n_radar_groups, METH_VARARGS, "rows, queues and platoons among the objects"},
     {"radar_group_support", n_radar_group_support, METH_VARARGS, "what a standing row says about one member"},
     {"radar_lh_prior", n_radar_lh_prior, METH_VARARGS, "an object's height prior exchanged in all its rows"},
+    {"radar_ext_prior", n_radar_ext_prior, METH_VARARGS, "an object's length or width prior exchanged in all its rows"},
     {"radar_heading_prior", n_radar_heading_prior, METH_VARARGS, "the road's axis as a standing vehicle's heading prior"},
     {"radar_size_fit", n_radar_size_fit, METH_VARARGS, "a kind's height prior from what the objects' own boxes said"},
     {"radar_trunc_low", n_radar_trunc_low, METH_VARARGS, "mean and variance of a Gaussian cut below a bound"},
