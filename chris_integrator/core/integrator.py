@@ -586,8 +586,10 @@ class Integrator:
                 return False
         if role == "fuse" and not g.witness:
             sig = m.sigma * self.fdi.noise_scale(g.name, m.q)     # a noise burst: weighted by its present noise
-            self._fuse(m.t, Row(m.q, m.z, sig * sig, m.h, m.src, g.name, robust=m.robust, wrap=m.wrap,
-                                cb=m.cb, freeze=self._freeze(spec, m)))
+            # (Row's arguments by position; `_fuse` written out)
+            row = Row(m.q, m.z, sig * sig, m.h, m.src, g.name, m.robust, m.wrap, m.cb, self._freeze(spec, m))
+            if not self.ekf.insert(m.t, row):
+                self.counts["late"][row.src] = self.counts["late"].get(row.src, 0) + 1
             fused = True
         if m.mon is not None or (role == "monitor"):
             v, s = m.mon if m.mon is not None else (m.z, m.sigma)
