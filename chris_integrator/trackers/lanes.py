@@ -93,6 +93,23 @@ def _fin(v):
     return isinstance(v, (int, float)) and math.isfinite(v)
 
 
+def zero_signs(seq):
+    """((index, sign) of every element == 0): what list equality does not see (0.0 == -0.0); kept with a list a
+    cache compares by ==, so that a hit also has the same signed zeros (see same_list)."""
+    return tuple((i, math.copysign(1.0, v)) for i, v in enumerate(seq) if v == 0)
+
+
+def same_list(seq, kept, zeros):
+    """seq holds the same numbers as the kept list (== element by element, and the zeros of the same sign: the
+    float values of the two are then the same bit for bit; True == 1 and 5 == 5.0 give the same floats too)."""
+    if seq != kept:
+        return False
+    for i, sg in zeros:
+        if math.copysign(1.0, seq[i]) != sg:
+            return False
+    return True
+
+
 def _arr(v, n):
     try:
         a = np.asarray(v, float)
@@ -200,6 +217,7 @@ class RoadGeometryTracker:
         self._local = LocalEgo()    # the integrator of a tracker that is not handed an ego state (docs/DESIGN.md)
         self._map = None            # the last `map` message
         self._xl = self._xa = None  # _measure: the last distances (a copy of the list) and their array
+        self._xz = ()               # ... and the signs of its zeros (same_list)
         self._wx = None             # _message: (x, width_x) -> the slice or index array of the width points
         self._xr = None             # _message: (x, its rounded list)
         self._mbuf = None           # (n, the arrays of _measure, those of _fit) reused frame to frame
@@ -250,14 +268,14 @@ class RoadGeometryTracker:
         for ln in list(ll) + list(re):
             if isinstance(ln, dict) and isinstance(ln.get("x"), list) and len(ln["x"]) >= 4:
                 lx = ln["x"]
-                if lx == self._xl:
+                if same_list(lx, self._xl, self._xz):
                     # the model's distances are the same every frame: the array of the last frame (checked
                     # finite then; it is only read)
                     x = self._xa
                     break
                 x = _arr(lx, len(lx))
                 if x is not None:
-                    self._xl, self._xa = list(lx), x
+                    self._xl, self._xa, self._xz = list(lx), x, zero_signs(lx)
                     break
         if x is None:
             return None

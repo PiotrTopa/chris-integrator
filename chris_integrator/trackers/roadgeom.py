@@ -44,6 +44,7 @@ import numpy as np
 from ..native import round                  # builtins.round (its results; the native core)
 from ..native import core as _C
 from ..contract import LocalEgo, from_vehicle, signal
+from .lanes import same_list, zero_signs
 
 NS = 1e9
 
@@ -94,6 +95,7 @@ class RoadGeometryFusion:
             self.cfg.update(cfg)
         self._local = LocalEgo()
         self._xl = self._xa = None     # _vision: the last lanes' distances (a copy of the list) and their array
+        self._xz = ()                  # ... and the signs of its zeros (lanes.same_list)
         self.reset()
 
     def reset(self):
@@ -197,11 +199,11 @@ class RoadGeometryFusion:
         c = self.cfg
         if isinstance(lanes, dict) and isinstance(lanes.get("x"), list):
             lx = lanes["x"]
-            if lx == self._xl:
+            if same_list(lx, self._xl, self._xz):
                 x = self._xa                    # the same distances as the last frame: their array (only read)
             else:
                 x = np.asarray(lx, dtype=float)
-                self._xl, self._xa = list(lx), x
+                self._xl, self._xa, self._xz = list(lx), x, zero_signs(lx)
             ln = lanes.get("lines") or []
             if len(ln) >= 3:
                 le, ri = ln[1], ln[2]
