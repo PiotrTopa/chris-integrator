@@ -378,8 +378,15 @@ class RadarDisplay:
             place[oid] = (float(o["x_m"]) + (float(o["vx_mps"]) - v_ego) * dt,      # the car frame of now: relative motion
                           -(float(o["y_m"]) + float(o["vy_mps"]) * dt), gone)        # view frame: y right
         # the one radar object the lead is drawn from: the nearest to it in range among those in its place
-        near = [(abs(x - float(lead["x"])), oid) for oid, (x, y, _) in place.items()
-                if self._same_as_lead(x, y, lead, float((self.seen[oid]["o"].get("std") or [0.0])[0]))]
+        near = []
+        if lead is not None:                             # (_same_as_lead written out, the lead's place read once)
+            lx, ly = float(lead["x"]), float(lead["y"])
+            hw, rm, rr = c["lead_halfwidth_m"], c["lead_range_m"], c["lead_range_rel"]
+            seen = self.seen
+            for oid, (x, y, _) in place.items():
+                sx = float((seen[oid]["o"].get("std") or [0.0])[0])
+                if abs(y - ly) <= hw and abs(x - lx) <= max(rm, rr * lx, 2.0 * sx):
+                    near.append((abs(x - lx), oid))
         lead_ids = set()
         if near:
             # ... and what the radar holds twice at that place (a second object on the same vehicle, until the
@@ -477,9 +484,15 @@ class RadarDisplay:
         # there): the lead stands for them
         lead_ids, lead_obj = set(), None
         if lead is not None:
-            near = [(abs(x - float(lead["x"])), oid) for oid, (x, y, gone) in place.items()
-                    if gone is None and self.ar[oid]["o"].get("state") != "memory"
-                    and self._same_as_lead(x, y, lead, float((self.ar[oid]["o"].get("std") or [0.0])[0]))]
+            near = []                                    # (_same_as_lead written out, the lead's place read once)
+            lx, ly = float(lead["x"]), float(lead["y"])
+            hw, rm, rr = c["lead_halfwidth_m"], c["lead_range_m"], c["lead_range_rel"]
+            ar = self.ar
+            for oid, (x, y, gone) in place.items():
+                if gone is None and ar[oid]["o"].get("state") != "memory":
+                    sx = float((ar[oid]["o"].get("std") or [0.0])[0])
+                    if abs(y - ly) <= hw and abs(x - lx) <= max(rm, rr * lx, 2.0 * sx):
+                        near.append((abs(x - lx), oid))
             if near:
                 first = min(near)[1]
                 lead_obj = self.ar[first]["o"]
@@ -499,12 +512,16 @@ class RadarDisplay:
             raw = (o.get("class") or {}).get("label") if isinstance(o.get("class"), dict) else None
             if raw in ("bike", "motorbike") and o.get("motion") != "moving" and "on_path" not in fl:
                 continue                                 # a riderless two-wheeler beside the road
-            e = {"id": "ru:%d" % oid, "x": _r1(x), "y": _r1(y)}
+            # (_r1 written out for the floats here: round to 0.1, no "-0.0")
+            rx, ry = round(x, 1), round(y, 1)
+            e = {"id": "ru:%d" % oid, "x": 0.0 if rx == 0 else rx, "y": 0.0 if ry == 0 else ry}
             gx, gy = float(o.get("vx_mps") or 0.0), -float(o.get("vy_mps") or 0.0)
             if math.hypot(gx, gy) >= 0.5:
-                e["gx"], e["gy"] = _r1(gx), _r1(gy)
+                rx, ry = round(gx, 1), round(gy, 1)
+                e["gx"], e["gy"] = 0.0 if rx == 0 else rx, 0.0 if ry == 0 else ry
             sd = o.get("std") or (0.0, 0.0)
-            e["sd"] = _r1(max(float(sd[0]), float(sd[1])))
+            rx = round(max(float(sd[0]), float(sd[1])), 1)
+            e["sd"] = 0.0 if rx == 0 else rx
             if st != "confirmed":
                 e["st"] = st
                 e["ago"] = _r1(min((o.get("seen") or {"": 0.0}).values()) + max(T - s["t"], 0.0))
