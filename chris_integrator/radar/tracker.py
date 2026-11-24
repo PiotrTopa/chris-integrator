@@ -464,6 +464,7 @@ class Tracker:
         self._labs = {}              # a detection's class as given -> (vehicle / person / not known, models.kinb)
         self._ranges = {}            # sensor id -> it measures range (a microwave radar, a position)
         self._snap = None            # (the list of objects, `look` of them): see `looked`
+        self._memrows = {}           # sensor id -> the map's entries of confirmed objects as the native core reads them
 
     def look(self, objs):
         """Several objects' numbers at once, as lists (the upkeep and the message read every object once per
@@ -625,11 +626,11 @@ class Tracker:
             st["dets"] += len(dets)
         elif type(dets) is not list:
             dets = list(dets)
-        mem = self.unexplained.get(src)
-        rows = None
-        if mem:
-            real = self.real_ids
-            rows = [(len(zz), zz[0], zz[1], zz[2] if len(zz) > 2 else 0.0, oid) for (_, _, zz, oid) in mem if oid in real] or None
+        rows = self._memrows.get(src, False)             # the map's entries as rows, made anew when the map changed
+        if rows is False:
+            mem, real = self.unexplained.get(src), self.real_ids
+            rows = self._memrows[src] = [(len(zz), zz[0], zz[1], zz[2] if len(zz) > 2 else 0.0, oid)
+                                         for (_, _, zz, oid) in mem or () if oid in real] or None
         g, bw = c["gate"], c["map_bw"]
         acfg = (g.get(1, 16.0), g.get(2, 16.0), g.get(3, 16.0), g.get(4, 16.0), c["feat_sigma"], c["feat_same"],
                 c["feat_span"], bw[0], bw[1], bw[2], c["feat_max_s"], c["common_min"], c["common_pair"],
@@ -684,6 +685,7 @@ class Tracker:
             times.popleft()
         while memq and memq[0][0] < t - c["map_s"]:
             memq.popleft()
+            self._memrows.pop(src, None)
         for h, j in births:
             d = dets[j]
             o = Obj(self.next_id, h, t, src, sensor.coast_s, store)
@@ -702,6 +704,7 @@ class Tracker:
                 # the map lives in the space of the ground angle, the bearing and the log height: a box with a
                 # scale-rate row enters without it, a box cut at the bottom (its rows are another space) not at all
                 memq.append((t, kb, np.asarray(d["z"], float)[:len(kb)], o.id))
+                self._memrows.pop(src, None)
             self.objects.append(o)
             self.by_h[h] = o
             st["started"] += 1
@@ -813,6 +816,7 @@ class Tracker:
                     if exist >= c["confirm_exist"] and hits >= c["confirm_hits"] and r[OT_INMAP]:
                         o.state = "confirmed"
                         self.real_ids.add(o.id)
+                        self._memrows.clear()
                         self._score_learn(o.scores, True)
                         o.scores = []
                 else:
@@ -842,6 +846,7 @@ class Tracker:
             self._drop(o)
         if len(self.real_ids) > 4096:
             self.real_ids = {o.id for o in keep if o.state != "tentative"}
+            self._memrows.clear()
         self._merge(T)
         self._register(T)
         self._groups(T, pose)

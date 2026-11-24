@@ -321,7 +321,7 @@ seconds. Two mechanisms, both in the measurement model, neither in the hypothese
    **Change:** the pitch's fast part is a Gauss-Markov process (`pitch_gm_deg` 0.5 while driving, 0.1 standing,
    `pitch_gm_tau_s` 1 s) kept per camera beside the slow bias: what the last scan's common angle (`h_common`)
    found of it is carried to the next scan with its memory, taken out of the scan's ground angles, and what it no
-   longer says is their variance (`Hyp.scan`; `Tracker.bias[src]` is now `[slow, variance, fast, variance, time]`).
+   longer says is their variance (`Hyp.cycle`; `Tracker.bias[src]` is now `[slow, variance, fast, variance, time]`).
    A scan with enough settled objects still measures its own common angle and takes it out, as before.
 2. **A bearing linearised over a place that is not known (4.1 s).** A new object's moving hypotheses carry a
    velocity prior of 12 to 15 m/s along the car's heading; a second later that is tens of metres of place, and
