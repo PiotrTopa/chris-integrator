@@ -25,12 +25,17 @@ def looks(p, msgs):
 
 
 class Rule(unittest.TestCase):
-    def test_full_is_every_message_and_the_default(self):
-        p = Pace()
+    def test_full_is_every_message_and_the_default_is_adaptive(self):
+        # the default since 2026-11-24 (was `full`): adaptive, with the careful signs (a collision probability from
+        # 0.01, a hold of 0.5 s). docs/TOPICS.md has what was measured: no warning's time in the straight collision
+        # scenarios, one of 63 by one frame in the bends, 2 of 95 false episodes fewer; the looser signs (levels only,
+        # hold 0.3 s) save more and lost one warning of 63 in the bends
+        self.assertEqual((Pace.DEFAULT_CFG["mode"], Pace.DEFAULT_CFG["hot_p"], Pace.DEFAULT_CFG["hold_s"]), ("adaptive", 0.01, 0.5))
+        p = Pace({"mode": "full"})
         self.assertEqual(p.cfg["mode"], "full")
         msgs = [radar(0.05 * k) for k in range(40)]
         self.assertEqual(len(looks(p, msgs)), 40)
-        self.assertEqual(Pace({"mode": "nonsense"}).cfg["mode"], "full")
+        self.assertEqual(Pace({"mode": "nonsense"}).cfg["mode"], "full")              # not understood: nothing left out
 
     def test_one_answer_per_message(self):
         p = Pace({"mode": "fixed"})

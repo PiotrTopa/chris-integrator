@@ -171,7 +171,7 @@ class Pace:
     rate), and from that judgement on every message is judged: the alerts' holds run in time, so a stage is
     entered at most that much later. (The prediction's filters see fewer frames while nothing matters;
     their evidence is weighed in time. What it costs in warnings' times and false warnings: docs/TOPICS.md.)"""
-    DEFAULT_CFG = dict(mode="full", idle_hz=10.0, hold_s=0.5, hot_level=1, hot_p=0.01, thw_s=2.0, ttc_s=8.0,
+    DEFAULT_CFG = dict(mode="adaptive", idle_hz=10.0, hold_s=0.5, hot_level=1, hot_p=0.01, thw_s=2.0, ttc_s=8.0,
                        p_threat=0.02)
 
     def __init__(self, cfg=None):
