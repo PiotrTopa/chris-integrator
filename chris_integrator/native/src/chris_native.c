@@ -7842,6 +7842,17 @@ typedef struct {
 } XAux;
 #define XAUX 3
 
+/* What the scan's own boxes hide of a leaf (x_box_cover), kept so that a box can be left out: in the story "the
+ * leaf took box j", box j is the leaf's own and hides nothing of it. Per bearing sample of the leaf's silhouette
+ * the most a box hides, which box, and the most another one hides; the cover by tracked objects, the factor for the
+ * field's edge, the sensor's own probability, the low list's share. */
+typedef struct {
+    int on;
+    double best[5], second[5];
+    int bj[5];
+    double cover_obj, pe, psen, klo, incov;
+} XBox;
+
 /* The extra rows detection d gives this leaf (row; xr: its memory), at most two. Both are rulers: a size of the
  * object that the detection does not know, seen from its distance.
  *
@@ -8094,6 +8105,7 @@ typedef struct {
     int *ok;
     double *qs, *dets, *lk;
     const RXc *xc;                   /* the detector's further inputs, or NULL */
+    const XBox *bx;                  /* what the scan's boxes hide of the leaf at hand, or NULL */
 } RAs;
 
 /* what does not depend on the object: each detection's density of "something else" (sensors.py density; the
@@ -8300,6 +8312,18 @@ static void ras_row(const RAs *q, const double *row, double pd, double pdlo, dou
                 const RXc *xc = q->xc;
                 const double *xr = x_of(xc, row);
                 double pdj = d[D_LOW] != 0.0 ? pdlo : pd, Fx = 1.0;
+                if (q->bx != NULL && q->bx->on) {
+                    /* the scan's boxes hide the leaf: all of them in the story "not reported" (pd), all but this one
+                     * in the story "it took this box" */
+                    const XBox *bx = q->bx;
+                    double cv = 0.0, c0 = cfg[14], c1 = cfg[15], fl = cfg[16];
+                    for (int p = 0; p < 5; p++)
+                        cv += 0.2 * (bx->bj[p] == (int)j ? bx->second[p] : bx->best[p]);
+                    cv = pymax(cv, bx->cover_obj);
+                    double vj = (cv <= c0 ? 1.0 : cv >= c1 ? fl : 1.0 - (1.0 - fl) * (cv - c0) / (c1 - c0)) * bx->pe;
+                    double pj = bx->psen * vj;
+                    pdj = d[D_LOW] != 0.0 ? pymax(0.0, bx->klo * (bx->incov * vj - pj)) : pj;
+                }
                 if (xc->c[XC_APP] != 0.0 && d[D_HASEMB] != 0.0 && xr[X_EN] > 0.0 && xr[X_EK] == xc->c[XC_APP_KIND])
                     Fx *= x_app_lr(xc->c, xc->dark, x_emb_dist(xc->E + (size_t)j * RXEMB, xr + X_EMB), xc->t - xr[X_ET]);
                 XAux aux[XAUX];
@@ -9527,6 +9551,7 @@ typedef struct {
     int nocc;
     RXc *xc;                         /* the detector's further inputs, or NULL */
     double *lpdlo;                   /* per leaf: the probability of a box in the low-score list */
+    XBox *xb;                        /* per leaf: what the scan's own boxes hide of it (NULL: not asked) */
 } Scan;
 
 static double r_phi(double x)
@@ -9562,7 +9587,7 @@ static void r_outline(const Scan *s, const double *row, Occ *o)
  * counts as nearer as far as its bottom lies below the leaf's by more than XC_BOXOCC_M of what is not known of the
  * difference (the leaf's own box, a little lower than predicted, must not make the leaf's miss free). The cover:
  * the leaf's silhouette at five bearings, each hidden as far as a nearer box holds it across and up the leaf's box. */
-static double x_box_cover(const Scan *s, int a, const Occ *me)
+static double x_box_cover(const Scan *s, int a, const Occ *me, XBox *bx)
 {
     const double *row = s->A + (Py_ssize_t)s->lrow[a] * RROW, *x = row + RO_X, *P = row + RO_P;
     double dx = x[R_PX] - s->pose[0], dy = x[R_PY] - s->pose[1], rc = pymax(hypot(dx, dy), 0.5), los = atan2(dy, dx);
@@ -9570,10 +9595,14 @@ static double x_box_cover(const Scan *s, int a, const Occ *me)
     double ux = dx / rc, uy = dy / rc, vr = ux * ux * P[0] + 2.0 * ux * uy * P[1] + uy * uy * P[RN + 1];
     double pb = atan2(hc, rn) + s->sen.bias + x[R_DP], vpb = g * g * pymax(vr, 0.0) + P[R_DP * RN + R_DP];
     double h = exp(x[R_LH]) / rn, pt = pb - h, m = s->xc->c[XC_BOXOCC_M], cover = 0.0;
+    for (int p = 0; p < 5; p++) {
+        bx->best[p] = bx->second[p] = 0.0;
+        bx->bj[p] = -1;
+    }
     if (!(h > 1e-6) || !(me->hw > 0.0))
         return 0.0;
     for (int p = 0; p < 5; p++) {
-        double beta = me->b + me->hw * (-0.8 + 0.4 * p), hid = 0.0;
+        double beta = me->b + me->hw * (-0.8 + 0.4 * p);
         for (Py_ssize_t j = 0; j < s->nd; j++) {
             const double *d = s->D + (size_t)j * RDET;
             if (!(d[D_W] > 0.0) || isnan(d[D_TOP]) || isnan(d[D_BOT]))
@@ -9582,6 +9611,8 @@ static double x_box_cover(const Scan *s, int a, const Occ *me)
             if (base == K_NONE)
                 continue;
             double hw = 0.5 * d[D_W], sg = pymin(sqrt(d[D_R + br] + me->sb * me->sb), 0.35 * hw) + 1e-4;
+            if (fabs(d[D_Z + br] - beta) > hw + 3.5 * sg)
+                continue;
             double in = r_phi((d[D_Z + br] + hw - beta) / sg) - r_phi((d[D_Z + br] - hw - beta) / sg);
             if (!(in > 1e-3))
                 continue;
@@ -9592,10 +9623,14 @@ static double x_box_cover(const Scan *s, int a, const Occ *me)
                 bot = pymax(bot, pb);
             double up = pymin(1.0, pymax(0.0, (pymin(pb, bot) - pymax(pt, d[D_TOP])) / h));
             double v = in * up * near;
-            if (v > hid)
-                hid = v;
+            if (v > bx->best[p]) {
+                bx->second[p] = bx->best[p];
+                bx->best[p] = v;
+                bx->bj[p] = (int)j;
+            } else if (v > bx->second[p])
+                bx->second[p] = v;
         }
-        cover += 0.2 * hid;
+        cover += 0.2 * bx->best[p];
     }
     return cover;
 }
@@ -9647,8 +9682,11 @@ static double r_visible(Scan *s, int a, double cx, double cy)
                 by = s->occ[q].id;
             }
     }
-    if (s->xc != NULL && s->xc->c[XC_BOXOCC] != 0.0 && s->sen.type == SEN_CAMERA && s->nd > 0) {
-        double cb = x_box_cover(s, a, &me);              /* behind a box of this scan (an object or not yet one) */
+    XBox *bx = NULL;
+    if (s->xc != NULL && s->xc->c[XC_BOXOCC] != 0.0 && s->sen.type == SEN_CAMERA && s->nd > 0 && s->xb != NULL) {
+        bx = &s->xb[a];
+        bx->cover_obj = cover;
+        double cb = x_box_cover(s, a, &me, bx);          /* behind a box of this scan (an object or not yet one) */
         if (cb > cover) {
             cover = cb;
             by = 0.0;
@@ -9673,6 +9711,10 @@ static double r_visible(Scan *s, int a, double cx, double cy)
         pe = f >= 0.9 ? 1.0 : f <= 0.4 ? fl : fl + (1.0 - fl) * (f - 0.4) / 0.5;
     }
     double vis = pv * pe;
+    if (bx != NULL) {
+        bx->pe = pe;
+        bx->on = 1;
+    }
     M[M_VIS] = vis;
     if (pv < 0.5 && pv <= pe) {
         M[M_OCC] = 1.0;
@@ -9716,7 +9758,7 @@ static void h_ratios(Scan *s)
         double dx = x[R_PX] - s->pose[0], dy = x[R_PY] - s->pose[1];
         double cx = cph * dx + sph * dy, cy = -sph * dx + cph * dy;
         double vis = r_visible(s, a, cx, cy);
-        double pd = r_p_detect(&s->sen, cx, cy, x) * vis;
+        double psen = r_p_detect(&s->sen, cx, cy, x), pd = psen * vis;
         s->lpd[a] = pd;
         s->lcov[a] = r_coverage(&s->sen, cx, cy);
         if (s->lcov[a] <= 0.0)
@@ -9735,8 +9777,16 @@ static void h_ratios(Scan *s)
             double k = (M[M_HITS] >= 2.0 && s->t - M[M_THIT] <= c[XC_LOW_RUN_S]) ? c[XC_LOW_PRUN] : c[XC_LOW_P];
             pdlo = pymax(0.0, k * (q - pd));
             s->lmiss[a] = log(pymax(1.0 - r * (pd + pdlo), 1e-12));
+            if (s->xb != NULL)
+                s->xb[a].klo = k;
         }
         s->lpdlo[a] = pdlo;
+        s->as.bx = NULL;
+        if (s->xb != NULL && s->xb[a].on) {
+            s->xb[a].psen = psen;
+            s->xb[a].incov = s->lcov[a] > 0.0 ? 1.0 : 0.0;
+            s->as.bx = &s->xb[a];
+        }
         double lbw = NAN;
         if (M[M_HITS] >= 2.0 && (int)M[M_BOXS] == s->src && s->t - M[M_BOXT] <= s->acfg[10] && !isnan(M[M_BOXW]))
             lbw = M[M_BOXW];
@@ -10314,6 +10364,14 @@ static int scan_core(Hyp *H, Scan *sc, Py_ssize_t cap, const Py_ssize_t *th, Py_
             sc->xc->X = H->X;
             sc->xc->A = sc->A;
             sc->xc->t = t;
+            if (sc->xc->c[XC_BOXOCC] != 0.0) {
+                sc->xb = (XBox *)ar_get(&sc->ar, nlz * sizeof(XBox));
+                if (sc->xb == NULL) {
+                    PyErr_NoMemory();
+                    return -1;
+                }
+                memset(sc->xb, 0, nlz * sizeof(XBox));
+            }
         }
         sc->as.loc = sc->as.lam0 + ndz;
         sc->as.qs = sc->as.loc + ndz;

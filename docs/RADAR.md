@@ -461,3 +461,119 @@ with the simulator's static radar clutter).
 Not built: a group as an estimated object of its own (a shared velocity for a platoon, a pitch between the slots
 of a row from which a hidden slot could be predicted, births along a row: section 5's open case); groups do not
 constrain moving members.
+
+## 8. The detector's further inputs
+
+The class detector (roadsense-signs `signd`, roadsense `docs/ARCHITECTURE.md`, "Detection inputs for a tracker") can
+send more per box than its edges, class and score: which edges are hidden, a second list of boxes below the class
+threshold, an appearance vector, a vehicle's lamp pair in the dark, where a scale rate came from. All of it is
+optional there and off by default. This section is the tracker's half: what each input does here. Every one is a
+knob of `radar.tracker` (`tracker.CFG`, the `in_*` knobs and `grade_k`), **off by default**; with all of them off a
+scan is, bit for bit, what it was (the detector's fields are passed on by `core/roadusers.from_lights` and not
+read). The arithmetic is in the native core (`chris_native.c`, "The detector's further inputs"); `Hyp.cycle` takes
+the scan's constants for it as an optional last argument (`xcfg`), and the hypotheses keep a small memory beside
+every row (`Hyp.X`: how the object looks, its last lamp pair, how often a ruler's prior was used, when it last took
+a scale rate), copied where a row is copied, so that every story has its own.
+
+The proposal these follow is roadsense `docs/lanes/detin-consumption-design.md`. Where the tracker as it is asked for
+something else than the proposal, it is said below ("against the proposal").
+
+### Flags (`in_flags`, `in_box_occl`)
+The hidden edges of a box are `E = clip + trunc + occ_edges` (cut by the view, by the frame, under a nearer box).
+* **Rows** (`radar/box.py`): a hidden bottom gives no ground angle (kind `b` / `bt`), a hidden top no box height
+  (`rb`), a hidden side no width for the extent and no aspect; a box covered by a tenth or more teaches no extent
+  either (a pedestrian merged with a neighbour, a car half behind another: the boxes that taught a person 3 m of
+  length). Covered with no edge hidden: the height row's spread times `1 + occ`.
+* **A box with one side hidden is the visible part of the object** (`x_det_leaf`): its centre is not the object's.
+  The hidden part's width is what the leaf's silhouette at its range has beyond the box; the box centre is moved by
+  half of that towards the hidden side, and that half is its added spread. (Against the proposal, which only widens
+  the bearing's variance: the side is known, so the error has a sign.)
+* **The scan's own boxes hide** (`in_box_occl`, `x_box_cover`): section 3 knows settled objects as occluders. A box
+  of this scan, tracked or not, first list or low, hides what stands behind it: nearer as the detector orders two
+  boxes (the bottom edge lower; a bottom cut by the view or the frame lower than it shows), as far as the leaf's own
+  bottom edge is known (`box_occl_margin`). In the story "the leaf took box j" box j is the leaf's own and hides
+  nothing of it; in the story "not reported" every box hides. So an object behind a van that was boxed a moment ago
+  for the first time is not held to its missing box.
+* Not built: the detector's `occ_by` (an index into the message) is not carried into the message's `occ_by`.
+
+### The low-score list (`in_low`)
+`objects_low`: the boxes between the detector's floor and the class threshold. They enter the same scan as a second
+kind of detection (no second pass: the hypotheses weigh all stories at once). For a leaf with existence r:
+
+    in the first list    pd                      weight  r pd l(z) F / lam(z)
+    in the low list      pdlo = k (vis - pd)     weight  r pdlo l(z) F / lam_low(z)
+    in neither           1 - pd - pdlo           weight  1 - r (pd + pdlo)
+
+`k` is `low_p` (0.4: of what the first list misses on BDD100K, 41 % is in the low list at a floor of 0.10), and
+`low_p_run` (0.7) for an object the first list had within `low_run_s` (the detector misses in runs, and on rides a
+low box lay on the object in 68-100 % of such passes). `lam_low`: `low_false_per_scan` low boxes on nothing per scan
+at least, followed upwards from the scans themselves. A low box starts nothing (no birth, not in the map of
+unexplained boxes), confirms nothing (no sighting counted, existence gains the least a detection gains and no
+score), does not teach the extent, the camera's size limit or the scan's common pitch; its edges are sloppier
+(`low_px`, `low_rel`), its class votes with `low_weight`. An object whose last `low_coast` sightings are all low is
+put out as `coast`. A scan in which a visible object is in neither list tells against it more than a plain miss did.
+
+### The appearance vector (`in_app`, `in_reid`)
+A leaf remembers the mean of its object's vectors (`app_gain`; only whole, uncovered first-list boxes teach it; a
+vector of another kind starts it anew). A pairing of a box with a leaf is weighed by
+
+    F_app = clamp( p_same(d | gap) / p_other(d),  1 / B,  B )
+
+d the distance between the box's vector and the memory (the kind's own distance), gap the time since the memory was
+refreshed, `p_same` / `p_other` the measured log-normal fits (`app_tables`: roadsense
+`docs/lanes/detin-emb-distances.json`; the fit at the gap, the 1 s fit below 1 s). The ratio of two log-normals is a
+parabola in ln d that turns round in the fits' tails; beyond its turning point it is held (monotone). B (`app_bound`)
+is 8 by day and 3 at night; day and night are mixed in the logarithm by how dark the scene is, which the tracker
+reads off the vectors' own luma cells (`app_y_day`, `app_y_night`; or told: `app_dark`). No memory, no vector, a
+kind without a table, two kinds: the factor is 1.
+* **Re-identification** (`in_reid`): an object dropped by the upkeep goes into a gallery (its id, place, velocity,
+  memory) for `reid_s`. An object born where a dropped one could be by now (its last velocity carried on, unsure by
+  that velocity; `reid_gate`) takes the dropped one's id, age and class vote when its first vector says so `reid_lr`
+  times likelier than not and twice likelier than the next candidate. It is tentative again until its own boxes
+  confirm it.
+
+### The lamp pair (`in_lamp_colour`, `in_lamp_size`)
+* **Colour**: red, the rear faces the camera; white, the front. For the extent: which end is the front, where the
+  object's motion has not shown it (turned when two more boxes say the other end than say this one: a colour is
+  wrong now and then), and the heading along the line of sight to `lamp_colour_deg` and no better however often
+  (like the road's axis). For a birth with white lamps: both moving stories start from the car's speed reversed
+  (an oncoming vehicle; "it stands" keeps its share).
+* **Separation: a ruler** (`x_aux_rows`). `ln(sep / f) = ln(S |cos a|) - ln depth`, S the lamp separation
+  (`lamp_sep_ratio` of the leaf's width; unknown to `lamp_sep_rel`). **Against the proposal**, which makes S a
+  state like the object's height, S is not a state here; its prior is used as what it is, one piece of information:
+  the k-th use of the ruler takes the prior's variance times 2^(k+1) (a half, a quarter, ... of its information;
+  `ruler_uses` times at most), so that all uses together never count the prior more than once. What the pair says
+  beyond its prior is how the range CHANGES from one pair to the next, and that needs no constant: the separation
+  against the leaf's last one is a scale rate over the time between them, a row like the detector's own (not taken
+  where the box's scale rate already comes from the lamp pair: `scale_src`). The two together are the exact
+  decomposition of "a size with an unknown constant" (y_k = u_k + c + e_k is equivalent to y_0 with the prior of c,
+  and the differences y_k - y_{k-1}); what is given up against a state for S is the memory of S across a gap of
+  more than 1.2 s between pairs. What is gained: no ninth state, no double counting of a prior, and a wrong pair
+  (one in ten is found on other blobs) costs two rows, not a corrupted constant.
+* Both rows are taken as mixtures: with `ruler_eps` the number is not the object's and says nothing; taken only
+  where it is likelier the object's than not. They are scalar rows processed after the box's other rows (in the
+  update: per motion hypothesis, with the size and the angle offset held where they are held; in the pairing: on the
+  leaf as a whole, as the likelihood of the extra rows given the others).
+
+### The width of an axial view (`in_width`)
+The same ruler with the box width: `ln w = ln(L |sin a| + W |cos a|) - ln depth` for a vehicle whose both sides
+are in the picture and uncovered. The silhouette's mean and variance are taken over what is not known of the heading
+(the folded normal: at the axis the silhouette has a kink, the length comes in with the first power of the
+heading's spread), of the width (never taken as known better than `width_rel`: the leaf learnt its width from these
+same boxes) and of the length. Not used where the silhouette is not known to a third, nor where the length is the
+larger part of it. **Against the proposal** ("a car 1.8 m, 10 %: half the height prior's 20 %"): that holds only
+where the heading is known to a few degrees; a car whose heading is known to 0.1 rad has a silhouette known to 15 %.
+
+### The road's vertical curvature (`grade_k`)
+With a vertical curvature k the ground at distance x lies k x^2 / 2 off the plane under the car, and the ground
+angle is off by k x / 2. **Against the proposal** (a variance term on the row): that error is not noise from box
+to box, it is the object's own offset and the same in the next box, so as row noise it would be averaged away over
+the object's boxes. It goes where the tracker already has such an offset: the state `dp` is born unknown by
+`grade_k` x / 2 on top (`r_birth`), and walks by `grade_k` dr / 2 when the range changes by dr (`h_step`).
+
+### The scale rate (`in_scale`)
+* Successive values of one object share most of their baseline (a value is the mean rate over `scale_dt_s`, a new
+  one comes every 0.2-0.4 s): the variance times the baseline over the time since this leaf's previous scale row,
+  where that is shorter (`x_det_leaf`).
+* `scale_src` "lamps": Huber's weight at `scale_lamps_k` sigma on the leaf's own innovation (the variance raised
+  until the innovation is that many sigma).
