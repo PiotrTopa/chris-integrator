@@ -66,7 +66,7 @@ ALERT_DEFAULTS = dict(
     # for the rest of its holds. (With no record the suppression rules have nothing to judge: on a bend the driver's
     # steering suppressed a stage, the object left, and the held stage was then said without an object: 2-7 of
     # the said episodes of a set of the simulator's streets.) False: as before
-    unsaid_needs_object=False,
+    unsaid_needs_object=True,
     # an object whose velocity is not observed yet (the radar's verdict unknown, its velocity's 1 sigma above
     # this, whichever futures are judged): its "it stands" is near the radar's prior, not evidence; it raises at
     # most `immature_max_stage` until p_stationary has moved to `immature_stand_p` (a lead appearing far ahead

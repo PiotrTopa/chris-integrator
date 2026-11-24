@@ -384,7 +384,7 @@ def test_a_stage_suppressed_all_along_is_not_said_once_its_object_is_gone():
             o, _ = a.step(T, [rec] if T < 0.5 else [], ob, {"v": 13.0, "a_lat": 2.0 if T < steer_until else 0.0})
             out.append((o["stage"], o["suppressed"], o["object"]))
         return out
-    was = run({}, 0.7)
+    was = run({"unsaid_needs_object": False}, 0.7)
     assert (3, None, None) in was                               # as it was: the held stage said without an object
     now = run({"unsaid_needs_object": True}, 0.7)
     assert all(s[1] is not None for s in now if s[0] > 0) and (3, "object_gone", None) in now
@@ -392,7 +392,7 @@ def test_a_stage_suppressed_all_along_is_not_said_once_its_object_is_gone():
     # a stage that WAS said keeps its holds as before, object or not
     said = run({"unsaid_needs_object": True}, 0.3)
     assert (3, None, 1) in said and (3, None, None) in said and not any(s[1] == "object_gone" for s in said)
-    assert said == run({}, 0.3)
+    assert said == run({"unsaid_needs_object": False}, 0.3)
     # information shown first (below show_from: nothing said), then a warning while the driver steers away: not said
     a = AL.Alert("obstacle_ahead", {"unsaid_needs_object": True})
     out = []
