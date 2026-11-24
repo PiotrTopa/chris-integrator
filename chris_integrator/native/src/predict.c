@@ -120,7 +120,7 @@
                                    road's edge, is that many times likelier about to step out than one at an open    \
                                    kerb (1: no difference) */                                                         \
     X(ped_gap_s_m, 6.0)         /* ... a standing vehicle's end within this of it along the road */                   \
-    X(ped_onset, 0.0)           /* 1: a pedestrian's first step towards the road is read from its place (how far it   \
+    X(ped_onset, 1.0)           /* 1: a pedestrian's first step towards the road is read from its place (how far it   \
                                    has come from where it stood, against what its place is known to), before the      \
                                    tracker's velocity shows it */                                                     \
     X(ped_onset_m, 0.3)         /* ... from this far (m) */                                                           \
@@ -130,7 +130,7 @@
                                    track's place settling as the car closes: 0.3 m/s is followed, 1.4 m/s is not) */  \
     X(ped_onset_v_min, 0.6)     /* ... half a second on, it must have come on at this pace at least (m/s) */          \
     X(ped_onset_v_max, 4.0)     /* ... a change of the place faster than this is the track's correction (m/s) */      \
-    X(ped_carry, 0.0)           /* 1: a pedestrian's manoeuvres are carried over the edge of a lane (the step out it  \
+    X(ped_carry, 1.0)           /* 1: a pedestrian's manoeuvres are carried over the edge of a lane (the step out it  \
                                    began goes on as the crossing it is); 0: as a vehicle's: in another lane "the     \
                                    change that got it there is over", four fifths of "about to step out" become       \
                                    "walks along" and half of the rest the priors, at the moment it enters the car's   \
