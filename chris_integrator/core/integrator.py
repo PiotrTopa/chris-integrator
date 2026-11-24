@@ -594,10 +594,16 @@ class Integrator:
         return fused
 
     def _freeze(self, spec, m):
-        f = self._foreign(spec) if m.local else None
-        if m.consider:
+        if not m.consider:
+            return self._foreign(spec) if m.local else None
+        # (a pure function of the source, `local` and the consider indices, all fixed per source and row kind: made
+        # once and shared by the rows, as `_foreign`'s array is; the filter only reads it. Dropped with the model.)
+        key = (spec.id, bool(m.local), tuple(m.consider))
+        f = self._foreign_ix.get(key)
+        if f is None:
+            f = self._foreign(spec) if m.local else None
             c = np.array(list(m.consider), dtype=np.intp)
-            f = c if f is None else np.concatenate([f, c])
+            f = self._foreign_ix[key] = c if f is None else np.concatenate([f, c])
         return f
 
     def _aux_ix(self):
