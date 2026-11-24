@@ -1613,7 +1613,7 @@ static PyObject *n_decide_draws(PyObject *self, PyObject *arg)
     X(t_contact_s) X(lane) X(shown) X(pairs) X(w0) X(w) X(course) X(radar) X(cv) X(contract) X(vehicle) X(vru)         \
     X(unknown) X(stand) X(stand_path) X(cv_path) X(path) X(turn) X(none) X(information) X(caution) X(warning)          \
     X(imminent) X(threat_number) X(time_margin) X(collision_course) X(confirmed) X(coast) X(stationary) X(moving)   \
-    X(p_place)
+    X(p_place) X(hold) X(act_s) X(res_s) X(held)
 #define X(n) S_##n,
 enum { DF_STRS(X) S_N };
 #undef X
@@ -1640,8 +1640,11 @@ enum {
 /* the threat model's cfg beyond the evaluation's (threat.py DEFAULT_CFG) */
 enum {
     DX_BRAKE_SHARE = DC_NC, DX_STEER_SHARE, DX_SPEED_FADE, DX_TURN_R, DX_HDG_RES, DX_AXIS_STANDING, DX_AXIS_SNAP,
-    DX_AXIS_STD, DX_LANE_AXIS_P, DX_LANE_WEIGHT, DX_LANE_FLOOR, DX_STAND_MOVE, DX_LIST_MIN_P, DX_NC
+    DX_AXIS_STD, DX_LANE_AXIS_P, DX_LANE_WEIGHT, DX_LANE_FLOOR, DX_STAND_MOVE, DX_LIST_MIN_P, DX_NC,
+    /* further constants, read where the array reaches them (an array of DX_NC numbers: all off) */
+    DX_HOLD = DX_NC, DX_HOLD_DECEL, DX_HOLD_REL, DX_HOLD_SIGMA, DX_HOLD_P, DX_HOLD_LEVEL, DX_NX
 };
+#define DX_GET(tc, ntc, i, absent) ((ntc) > (i) ? (tc)[i] : (absent))
 #define DF_G 9.81
 
 /* classes: prior footprint (length, width, 1 sigma of each) and the threshold set (0 vehicle, 1 vru, 2 unknown) */
@@ -2813,6 +2816,51 @@ static PyObject *n_decide_frame(PyObject *self, PyObject *args)
             const DfObj *q = &Q[m];
             const double *oo = OO + (size_t)m * DK_OF;
             int lv = (int)oo[DO_LE], lx = (int)oo[DO_LX];
+            /* A standing vehicle at one of two places along its needle (lane_res), the one in the car's way not
+             * sure (cfg place_hold). It is at ONE of them, it does not move, and the car learns which as it closes:
+             * the range's spread shrinks with the range (to `place_hold_range_rel` of it), so the two places,
+             * |rA - rB| apart on the ground, are told apart (place_hold_sigma spreads between them) once the car is
+             * within |rA - rB| / (sigma rel) of their middle: in t_res. The driver must act, at the latest, when
+             * comfortable braking (place_hold_decel) after the reaction time still stops short of the place in the
+             * way: in t_act, from the time of contact with that place's footprint (inflated) on the car's futures.
+             * While t_res <= t_act the decision can wait for the range and costs nothing: the object's entry level
+             * is held at place_hold_level. Once acting cannot wait, the level is what the masses say, as before. A
+             * car that is in the lane has no second place (no lane_res, or p_place at or above place_hold_p); a level
+             * carried by a future in which the object moves is not held. */
+            double h_act = NAN, h_res = NAN;
+            int held = 0;
+            if (DX_GET(tc, ntc, DX_HOLD, 0.0) > 0.5 && q->lane_res && !q->cv && q->p_place < DX_GET(tc, ntc, DX_HOLD_P, 1.0)) {
+                int ka = -1, kb = -1;
+                for (int i = 0; i < q->nm; i++) {
+                    if (ka < 0 && PyUnicode_CompareWithASCIIString(mname[q->first + i], "stopped") == 0)
+                        ka = q->first + i;
+                    if (kb < 0 && PyUnicode_CompareWithASCIIString(mname[q->first + i], "parked") == 0)
+                        kb = q->first + i;
+                }
+                if (ka >= 0 && kb >= 0) {
+                    const double *A = MD + (size_t)ka * wM + 2, *B = MD + (size_t)kb * wM + 2;
+                    const double ra = hypot(A[0], A[N]), rb = hypot(B[0], B[N]), vv = v0 > 0.5 ? v0 : 0.5;
+                    double tcon = INFINITY;
+                    for (int j = 0; j < E; j++) {
+                        const double *p = PO + ((size_t)ka * E + j) * DK_PF;
+                        if (p[DP_W0] >= tc[DC_PMIN] && p[DP_TTCI] < tcon)
+                            tcon = p[DP_TTCI];
+                    }
+                    const double rel = DX_GET(tc, ntc, DX_HOLD_REL, 0.09), sg = DX_GET(tc, ntc, DX_HOLD_SIGMA, 2.0);
+                    const double dec = DX_GET(tc, ntc, DX_HOLD_DECEL, 3.0);
+                    h_res = (0.5 * (ra + rb) - fabs(ra - rb) / (sg * rel)) / vv;
+                    if (h_res < 0.0)
+                        h_res = 0.0;
+                    h_act = tcon - vv / (2.0 * dec) - 0.5 * tc[DC_TAUB] - tc[DC_TREACT];     /* inf: no contact within the horizon */
+                    const int cap = (int)DX_GET(tc, ntc, DX_HOLD_LEVEL, 1.0);
+                    /* only where the place in the way is what carries the level (not a future in which it moves) */
+                    const int best = (int)oo[DO_BEST];
+                    if (isfinite(tcon) && best >= 0 && q->first + best / E == ka && h_res <= h_act && lv > cap) {
+                        held = 1;
+                        lv = cap;
+                    }
+                }
+            }
             PyObject *pc = df_r(oo[DO_PC], 3);
             if (pc == NULL) {
                 bad = 1;
@@ -2916,6 +2964,15 @@ static PyObject *n_decide_frame(PyObject *self, PyObject *args)
             bad |= df_set(r, S_shown, x) < 0 || df_setb(r, S_in_path, q->in_path ? Py_True : Py_False) < 0;
             if (q->lane_res && !q->cv)
                 bad |= df_set(r, S_p_place, df_r(q->p_place, 3)) < 0;
+            if (!isnan(h_res)) {                  /* (None for act_s: no contact with the place in the way within the horizon) */
+                PyObject *hd = PyDict_New();
+                if (hd == NULL || df_set(hd, S_act_s, df_r(h_act, 2)) < 0 || df_set(hd, S_res_s, df_r(h_res, 2)) < 0 ||
+                    df_setb(hd, S_held, held ? Py_True : Py_False) < 0) {
+                    Py_XDECREF(hd);
+                    bad = 1;
+                } else
+                    bad |= df_set(r, S_hold, hd) < 0;
+            }
             int list = lv || sh || pr >= tc[DX_LIST_MIN_P] || thw;
             if (list && pairs && !bad) {          /* threat.pairs_record */
                 PyObject *pl = PyList_New(0);

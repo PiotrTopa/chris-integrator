@@ -119,6 +119,50 @@ def test_a_pedestrians_futures_keep_the_spread_they_had():
         assert C.futs(pred, 1)[0][0] == "wait" and C.futs(pred, 1)[0][2][0, 4] == 0.0
 
 
+# ---- the hold of a standing vehicle of two places ---------------------------------------------------------------------
+def two_places(x_way, x_beside, p_way, v=13.0):
+    n = 12
+    t = [0.5 * (k + 1) for k in range(n)]
+    o = K.obj(1, x_way, 0.0, 0.0, 0.0, ps=0.95, std=(6.0, 0.2, 0.3, 0.2))
+
+    def fut(name, p, x, y):
+        return {"p": p, "p0": p, "m": name, "x": [x] * n, "y": [y] * n, "sx": [1.0] * n, "sy": [0.2] * n, "rxy": [0.0] * n}
+    o["fut"] = [fut("stopped", p_way, x_way, 0.0), fut("parked", 1.0 - p_way, x_beside, -2.9)]
+    o["lane"] = {"ego": p_way, "left": 0.0, "right": 0.0, "onc": 0.0, "cross": 0.0, "park": 1.0 - p_way, "off": 0.0}
+    o["lane_res"] = p_way
+    m = K.msg(0.0, [o], v=v)
+    m["fut"] = {"t": t}
+    return m
+
+
+def test_the_hold_waits_while_comfortable_braking_can_and_no_longer():
+    # at 8 m/s caution (time margin 1.5 s) begins 3.6 s before the place in the way, braking at 3 m/s^2 after the
+    # reaction time is due 2.9 s before: 0.7 s in which the range may still say which place it is. (At 13 m/s that
+    # window is 0.2 s, from 15 m/s on there is none: 1.5 s - v (1 / 2 a_comfortable - 1 / 2 a_full).)
+    off, on = TH.ThreatModel(), TH.ThreatModel({"place_hold": True})
+    far = two_places(28.5, 40.0, 0.5, v=8.0)                   # 3.3 s away
+    a, b = off.explain(far).records[0], on.explain(far).records[0]
+    assert a["level"] == 2 and "hold" not in a, a
+    assert b["level"] == 1 and b["level_exit"] == a["level_exit"] >= 2 and b["hold"]["held"] is True, b
+    assert b["hold"]["res_s"] == 0.0 and 0.0 < b["hold"]["act_s"] < 0.6 and b["mass"] == a["mass"]
+    near = two_places(23.5, 35.0, 0.5, v=8.0)                  # 2.7 s away: comfortable braking is due: the masses' word
+    c = on.explain(near).records[0]
+    assert c["level"] >= 2 and c["hold"]["held"] is False and c["hold"]["act_s"] < 0.0, c
+    sure = two_places(28.5, 40.0, 0.95, v=8.0)                 # in the car's way with 0.95: no second place to wait for
+    assert "hold" not in on.explain(sure).records[0] and on.explain(sure).records[0]["level"] >= 2
+    close = two_places(28.5, 29.5, 0.5, v=8.0)                 # 1 m apart: at 9 % of the range not told apart before 5.6 m
+    d = on.explain(close).records[0]
+    assert d["level"] >= 2 and d["hold"]["held"] is False and d["hold"]["res_s"] > d["hold"]["act_s"], d
+    fast = two_places(52.0, 64.0, 0.5, v=13.0)                 # 13 m/s: by the time caution begins, braking is nearly due
+    assert off.explain(fast).records[0]["level"] == 1 and off.explain(two_places(50.0, 62.0, 0.5)).records[0]["level"] == 2
+    assert on.explain(two_places(50.0, 62.0, 0.5)).records[0]["hold"]["held"] is False
+
+
+def test_the_hold_is_off_by_default_and_changes_nothing_then():
+    assert TH.DEFAULT_CFG["place_hold"] is False
+    assert len(TH.ThreatModel().native_cfg()) == len(TH.ThreatModel({"place_hold": True}).native_cfg())
+
+
 if __name__ == "__main__":
     for k, v in list(globals().items()):
         if k.startswith("test_"):
