@@ -136,6 +136,7 @@ static double dk_halton(long i, int base)
 }
 
 static double DK_Z[DK_MAXS][5];
+static double DK_RZ[DK_MAXS];        /* the largest |(z0, z1)| of the draws up to this one */
 static int dk_z_n = 0;
 
 static void dk_draws(int n)
@@ -143,9 +144,12 @@ static void dk_draws(int n)
     static const int base[5] = {2, 3, 5, 7, 11};
     if (n <= dk_z_n)
         return;
-    for (int i = dk_z_n; i < n; i++)
+    for (int i = dk_z_n; i < n; i++) {
         for (int k = 0; k < 5; k++)
             DK_Z[i][k] = dk_qnorm(dk_halton(i + 1, base[k]));
+        double rz = sqrt(DK_Z[i][0] * DK_Z[i][0] + DK_Z[i][1] * DK_Z[i][1]);
+        DK_RZ[i] = i > 0 && DK_RZ[i - 1] > rz ? DK_RZ[i - 1] : rz;
+    }
     dk_z_n = n;
 }
 
@@ -343,6 +347,8 @@ static void dk_interp_idx(const DkGrid *g, double tau, int *i0, double *f)
 
 typedef struct {               /* one ego mode, sampled: pose and the path by arc length */
     double *x, *y, *th, *v, *s;   /* per step */
+    DkRect *er;                   /* per step: the car's footprint there (dk_ego_rect of x, y, th) */
+    double *exx, *exy, *eyy;      /* per step of the horizon: the car's own covariance there (dk_ego_cov) */
     double *ps, *px, *py, *pth;   /* the path: per grid point arc length, position, heading */
     int np;
 } DkEgo;
@@ -467,11 +473,10 @@ typedef struct {
  * spread of 1 m) cannot be kept by any demand and says nothing about a collision to come: the inflation is scaled
  * down (the same share over the whole horizon) until the inflated footprint is clear of the car now; none where the
  * footprint as it is touches the car now. */
-static void dk_pair_prep(DkCtx *C, int j, int k)
+static double dk_pair_prep(DkCtx *C, int j, int k)
 {
     const DkEgo *e = &C->eg[j];
-    DkRect er, r;
-    dk_ego_rect(C->cfg, e->x[0], e->y[0], e->th[0], &er);
+    DkRect er = e->er[0], r;
     double f = 1.0;
     dk_obj_rect(C->cfg, &C->ob[k], 0, 0.0, 0.0, 0.0, 1.0, &r);
     if (dk_sep(&er, &r) < 0.0) {
@@ -491,7 +496,15 @@ static void dk_pair_prep(DkCtx *C, int j, int k)
             f = lo;
         }
     }
-    for (int i = 0; i < C->g.n; i++)
+    for (int i = 0; i < C->g.nh; i++)            /* the horizon; its extension where an evasion is simulated */
+        dk_obj_rect(C->cfg, &C->ob[k], i, 0.0, 0.0, 0.0, f, &C->tgt[i]);
+    return f;
+}
+
+/* ... and over the horizon's extension (dk_clear follows an evasion that far): only a pair on a collision course */
+static void dk_pair_ext(DkCtx *C, int k, double f)
+{
+    for (int i = C->g.nh; i < C->g.n; i++)
         dk_obj_rect(C->cfg, &C->ob[k], i, 0.0, 0.0, 0.0, f, &C->tgt[i]);
 }
 
@@ -513,6 +526,7 @@ static int dk_clear(const DkCtx *C, int j, int k, double ts, double a_long, doub
     int hint = 0, still = 0;
     double x = 0.0, y = 0.0, th = 0.0;
     double Re = 0.5 * (cfg[DC_FRONT] + cfg[DC_REAR]) + cfg[DC_HALFW];
+    DkRect er;                                   /* the car's footprint at (x, y, th): dk_ego_rect, once per pose */
     for (int i = 0; i < n; i++) {
         double tau = i * dt;
         if (i <= i0) {
@@ -526,6 +540,7 @@ static int dk_clear(const DkCtx *C, int j, int k, double ts, double a_long, doub
             th = e->th[i];
             s = e->s[i];
             v = e->v[i];
+            er = e->er[i];
         } else {
             double ap = (e->v[i] - e->v[i - 1]) / dt;        /* the mode's own acceleration */
             double rb = tb > 0.0 ? (tau - ts) / tb : 1.0, rs = tsr > 0.0 ? (tau - ts) / tsr : 1.0;
@@ -557,16 +572,12 @@ static int dk_clear(const DkCtx *C, int j, int k, double ts, double a_long, doub
                 y = py + nn * cos(pth);
                 th = pth + atan2(nd, v > 0.5 ? v : 0.5);
                 still = (v == 0.0 && nd == 0.0);
+                dk_ego_rect(cfg, x, y, th, &er);
             }
         }
         const DkRect *tg = &C->tgt[i];
-        double ox = 0.5 * (cfg[DC_FRONT] - cfg[DC_REAR]);
-        double ecx = x + ox * cos(th), ecy = y + ox * sin(th);
-        double ddx = tg->cx - ecx, ddy = tg->cy - ecy, RR = Re + tg->hl + tg->hw;
-        DkRect er;
+        double ddx = tg->cx - er.cx, ddy = tg->cy - er.cy, RR = Re + tg->hl + tg->hw;
         int near = ddx * ddx + ddy * ddy <= RR * RR;
-        if (near || others)
-            dk_ego_rect(cfg, x, y, th, &er);
         if (near && dk_sep(&er, tg) < 0.0) {
             if (t_hit)
                 *t_hit = tau;
@@ -657,6 +668,7 @@ static double dk_pc(const DkCtx *C, int j, int k, double *t_contact)
     const double *cfg = C->cfg;
     const DkEgo *e = &C->eg[j];
     const DkObj *o = &C->ob[k];
+    const DkRect *ER = e->er;
     int n = C->g.nh;
     double dt = C->g.dt;
     *t_contact = NAN;
@@ -664,18 +676,15 @@ static double dk_pc(const DkCtx *C, int j, int k, double *t_contact)
     double Ro0 = sqrt((o->hl + 3.0 * o->sdl) * (o->hl + 3.0 * o->sdl) + (o->hw + 3.0 * o->sdw) * (o->hw + 3.0 * o->sdw));
     double He = 0.5 * (cfg[DC_FRONT] + cfg[DC_REAR]), Re = sqrt(He * He + cfg[DC_HALFW] * cfg[DC_HALFW]);
     int any = 0;
-    static double L11[DK_MAXSIM], L21[DK_MAXSIM], L22[DK_MAXSIM];
-    static DkRect ER[DK_MAXSIM];
+    static double L11[DK_MAXSIM], L21[DK_MAXSIM], L22[DK_MAXSIM], DD[DK_MAXSIM];
     static unsigned char live[DK_MAXSIM];
     for (int i = 0; i < n; i++) {
-        double esxx, esxy, esyy;
-        dk_ego_cov(cfg, i * dt, e->th[i], &esxx, &esxy, &esyy);
-        double sxx = o->sxx[i] + esxx, sxy = o->sxy[i] + esxy, syy = o->syy[i] + esyy;
-        dk_ego_rect(cfg, e->x[i], e->y[i], e->th[i], &ER[i]);
+        double sxx = o->sxx[i] + e->exx[i], sxy = o->sxy[i] + e->exy[i], syy = o->syy[i] + e->eyy[i];
         double tr = 0.5 * (sxx + syy), dd = sqrt(0.25 * (sxx - syy) * (sxx - syy) + sxy * sxy);
         double lmax = tr + dd;
         double dx = o->cx[i] - ER[i].cx, dy = o->cy[i] - ER[i].cy;
-        double gap = sqrt(dx * dx + dy * dy) - (Ro0 + Re);
+        DD[i] = sqrt(dx * dx + dy * dy);
+        double gap = DD[i] - (Ro0 + Re);
         live[i] = !(gap > cfg[DC_PRUNE] * sqrt(lmax > 0.0 ? lmax : 0.0));
         if (live[i])
             any = 1;
@@ -696,12 +705,10 @@ static double dk_pc(const DkCtx *C, int j, int k, double *t_contact)
                 continue;
             DkRect orr;
             dk_obj_rect(cfg, o, i, 0.0, 0.0, 0.0, 0.0, &orr);
-            double esxx, esxy, esyy;
-            dk_ego_cov(cfg, i * dt, e->th[i], &esxx, &esxy, &esyy);
             double c = orr.c, s = orr.s, a2 = 0.25 * o->sdl * o->sdl, b2 = 0.25 * o->sdw * o->sdw;
-            double sxx = o->sxx[i] + esxx + a2 * c * c + b2 * s * s;
-            double syy = o->syy[i] + esyy + a2 * s * s + b2 * c * c;
-            double sxy = o->sxy[i] + esxy + (a2 - b2) * c * s;
+            double sxx = o->sxx[i] + e->exx[i] + a2 * c * c + b2 * s * s;
+            double syy = o->syy[i] + e->eyy[i] + a2 * s * s + b2 * c * c;
+            double sxy = o->sxy[i] + e->exy[i] + (a2 - b2) * c * s;
             double p = dk_inst_prob(&ER[i], &orr, o->cx[i], o->cy[i], sxx, sxy, syy);
             pin[i] = p;
             if (p > best)
@@ -720,8 +727,9 @@ static double dk_pc(const DkCtx *C, int j, int k, double *t_contact)
     if (ns > DK_MAXS)
         ns = DK_MAXS;
     dk_draws(ns);
-    int hits = 0;
-    static double th_hit[DK_MAXS];
+    /* the draws' footprints (extent and, where a draw comes near, the turn of its heading) */
+    static double QHL[DK_MAXS], QHW[DK_MAXS], QR[DK_MAXS];
+    double rmax = 0.0;
     for (int q = 0; q < ns; q++) {
         const double *z = DK_Z[q];
         double hl = o->hl + 0.5 * o->sdl * z[2], hw = o->hw + 0.5 * o->sdw * z[3];
@@ -729,18 +737,65 @@ static double dk_pc(const DkCtx *C, int j, int k, double *t_contact)
             hl = 0.05;
         if (hw < 0.05)
             hw = 0.05;
-        double dh = o->sdh * z[4], cd = cos(dh), sd = sin(dh);
-        double R = sqrt(hl * hl + hw * hw) + Re;
-        for (int i = 0; i < n; i++) {
-            if (!live[i])
+        QHL[q] = hl;
+        QHW[q] = hw;
+        QR[q] = sqrt(hl * hl + hw * hw) + Re;
+        if (!(QR[q] <= rmax))
+            rmax = QR[q] > rmax ? QR[q] : INFINITY;      /* (not a number: no step is left out) */
+    }
+    /* Which (draw, step) can touch at all, decided before the draw is placed. The draw moves the object's centre
+     * by e = L z; with u the unit vector from the object's mean centre to the car's (their distance D), the moved
+     * centre is at least D - e.u = D - (pa z0 + pb z1) from the car's, so where that exceeds the two bounding
+     * circles (the test below: R) the draw is clear at that step, and the test below would say so. Only such
+     * (draw, step) are left out, with a margin (1e-9 of the numbers' sizes: a million times their rounding), and a
+     * step no draw can reach (|e.u| <= |(pa, pb)| max |z|) is left out for all: the hits and their times are the
+     * same draws' at the same steps. */
+    static int LI[DK_MAXSIM];
+    static double PA[DK_MAXSIM], PB[DK_MAXSIM], PT[DK_MAXSIM];
+    int nl = 0;
+    const double zmax = DK_RZ[ns - 1] * (1.0 + 1e-9), rpad = rmax * (1.0 + 1e-9);
+    for (int i = 0; i < n; i++) {
+        if (!live[i])
+            continue;
+        double pa = 0.0, pb = 0.0, pt = -INFINITY, D = DD[i];
+        if (D > 0.0 && D < INFINITY) {
+            double ux = (ER[i].cx - o->cx[i]) / D, uy = (ER[i].cy - o->cy[i]) / D;
+            pa = L11[i] * ux + L21[i] * uy;
+            pb = L22[i] * uy;
+            pt = D - 1e-9 * (1.0 + fabs(o->cx[i]) + fabs(o->cy[i]) + fabs(ER[i].cx) + fabs(ER[i].cy) +
+                             8.0 * (fabs(pa) + fabs(pb)));
+            if (sqrt(pa * pa + pb * pb) * zmax + rpad < pt)
+                continue;                        /* beyond every draw's reach */
+        }
+        PA[nl] = pa;
+        PB[nl] = pb;
+        PT[nl] = pt;
+        LI[nl++] = i;
+    }
+    int hits = 0;
+    static double th_hit[DK_MAXS];
+    for (int q = 0; q < ns; q++) {
+        const double *z = DK_Z[q];
+        const double z0 = z[0], z1 = z[1], hl = QHL[q], hw = QHW[q], R = QR[q], rq = R * (1.0 + 1e-9);
+        double cd = 0.0, sd = 0.0;
+        int turned = 0;
+        for (int m = 0; m < nl; m++) {
+            if (PA[m] * z0 + PB[m] * z1 + rq < PT[m])
                 continue;
-            double ex = L11[i] * z[0], ey = L21[i] * z[0] + L22[i] * z[1];
+            int i = LI[m];
+            double ex = L11[i] * z0, ey = L21[i] * z0 + L22[i] * z1;
             DkRect orr;
             orr.cx = o->cx[i] + ex;
             orr.cy = o->cy[i] + ey;
             double dx = orr.cx - ER[i].cx, dy = orr.cy - ER[i].cy;
             if (dx * dx + dy * dy > R * R)
                 continue;
+            if (!turned) {
+                double dh = o->sdh * z[4];
+                cd = cos(dh);
+                sd = sin(dh);
+                turned = 1;
+            }
             orr.c = o->c[i] * cd - o->s[i] * sd;
             orr.s = o->s[i] * cd + o->c[i] * sd;
             orr.hl = hl;
@@ -773,13 +828,12 @@ static double dk_first_contact(const DkCtx *C, int j, int k, int infl, double *s
     int n = C->g.nh;
     double best = 1e300, tc = NAN;
     for (int i = 0; i < n; i++) {
-        DkRect er, orr;
-        dk_ego_rect(C->cfg, e->x[i], e->y[i], e->th[i], &er);
+        DkRect orr;
         if (infl)
             orr = C->tgt[i];
         else
             dk_obj_rect(C->cfg, &C->ob[k], i, 0.0, 0.0, 0.0, 0.0, &orr);
-        double sp = dk_sep(&er, &orr);
+        double sp = dk_sep(&e->er[i], &orr);
         if (sp < best)
             best = sp;
         if (sp < 0.0 && isnan(tc)) {
@@ -858,19 +912,34 @@ static int dk_eval(const double *t, int N, const double *EG, int E, const double
     int n = nh + (int)floor((cfg[DC_HEXT] > 0.0 ? cfg[DC_HEXT] : 0.0) / dt + 1e-9);
     if (n > DK_MAXSIM)
         n = DK_MAXSIM;
-    /* storage: per ego mode 5 n + 4 N, per object mode 7 n */
-    size_t need = (size_t)E * (5 * n + 4 * N) + (size_t)K * 7 * n;
+    /* storage: per ego mode 5 n + 3 nh + 4 N, per object mode 7 n; the steps' places on the grid 3 n */
+    size_t need = (size_t)E * (5 * n + 3 * nh + 4 * N) + (size_t)K * 7 * n + (size_t)3 * n;
     buf = (double *)PyMem_Malloc((need ? need : 1) * sizeof(double));
-    ibuf = (int *)PyMem_Malloc((size_t)(M + K + 1) * sizeof(int));
+    ibuf = (int *)PyMem_Malloc(((size_t)(M + 2 * K + 1) + (size_t)2 * n) * sizeof(int));
     eg = (DkEgo *)PyMem_Malloc((size_t)E * sizeof(DkEgo));
     ob = (DkObj *)PyMem_Malloc((size_t)(K ? K : 1) * sizeof(DkObj));
-    rects = (DkRect *)PyMem_Malloc((size_t)(M + 1) * n * sizeof(DkRect));
+    rects = (DkRect *)PyMem_Malloc((size_t)(M + 1 + E) * n * sizeof(DkRect));
     if (!buf || !ibuf || !eg || !ob || !rects) {
         PyErr_NoMemory();
         goto done;
     }
     double *w = buf;
     DkGrid g = {n, nh, dt, t, N};
+    /* every future is read at the same times: step i's place on the grid (dk_interp_idx of t[0] + i dt) and, for
+     * an object's direction of travel, the place a second later (the grid's end at most), worked out once */
+    int *I0 = ibuf + M + 2 * K + 1, *J0 = I0 + n;
+    double *FI = w, *FJ = w + n, *TJ = w + 2 * n;        /* TJ: the later time less the step's (the travel's time) */
+    w += 3 * n;
+    for (int i = 0; i < n; i++) {
+        double tau = t[0] + i * dt;
+        dk_interp_idx(&g, tau, &I0[i], &FI[i]);
+        double tau2 = tau + 1.0 < t[N - 1] ? tau + 1.0 : t[N - 1];
+        TJ[i] = tau2 - tau;
+        J0[i] = 0;
+        FJ[i] = 0.0;
+        if (TJ[i] > 0.2)
+            dk_interp_idx(&g, tau2, &J0[i], &FJ[i]);
+    }
     /* the ego modes */
     for (int j = 0; j < E; j++) {
         const double *row = EG + (size_t)j * (1 + 3 * N);
@@ -878,6 +947,8 @@ static int dk_eval(const double *t, int N, const double *EG, int E, const double
         DkEgo *e = &eg[j];
         e->x = w; e->y = w + n; e->th = w + 2 * n; e->v = w + 3 * n; e->s = w + 4 * n; w += 5 * n;
         e->ps = w; e->px = w + N; e->py = w + 2 * N; e->pth = w + 3 * N; w += 4 * N;
+        e->exx = w; e->exy = w + nh; e->eyy = w + 2 * nh; w += 3 * nh;
+        e->er = rects + (size_t)(M + 1 + j) * n;
         e->np = N;
         double s = 0.0, h = 0.0;
         int seen = 0;
@@ -900,9 +971,8 @@ static int dk_eval(const double *t, int N, const double *EG, int E, const double
             e->pth[i] = h;
         }
         for (int i = 0; i < n; i++) {
-            double tau = t[0] + i * dt, f;
-            int i0;
-            dk_interp_idx(&g, tau, &i0, &f);
+            const double f = FI[i];
+            const int i0 = I0[i];
             e->x[i] = X[i0] + f * (X[i0 + 1] - X[i0]);
             e->y[i] = Y[i0] + f * (Y[i0 + 1] - Y[i0]);
             e->v[i] = V[i0] + f * (V[i0 + 1] - V[i0]);
@@ -911,24 +981,48 @@ static int dk_eval(const double *t, int N, const double *EG, int E, const double
             e->s[i] = e->ps[i0] + f * (e->ps[i0 + 1] - e->ps[i0]);
             double dx = X[i0 + 1] - X[i0], dy = Y[i0 + 1] - Y[i0];
             e->th[i] = (dx * dx + dy * dy > 0.0025) ? atan2(dy, dx) : e->pth[i0];
+            /* the mode's footprint and (within the horizon) its own covariance at the step: the same for every
+             * object mode it is judged against */
+            dk_ego_rect(cfg, e->x[i], e->y[i], e->th[i], &e->er[i]);
+            if (i < nh)
+                dk_ego_cov(cfg, i * dt, e->th[i], &e->exx[i], &e->exy[i], &e->eyy[i]);
         }
     }
     /* the object modes */
-    int *mode_obj = ibuf, *top = ibuf + K;
+    int *mode_obj = ibuf, *top = ibuf + K, *used = ibuf + K + M + 1;
+    for (int k = 0; k < K; k++)
+        used[k] = 0;
     for (int m = 0; m < M; m++) {
         const double *hd = OH + (size_t)m * ohw;
         int k0 = (int)hd[0], nk = (int)hd[1];
         top[m] = -1;
         double bestp = -1.0;
+        /* the modes that are read: one judged against a mode of the car (the pairs' weights, below) and the
+         * object's most probable one (the others' check of an evasion); the rest are not sampled */
         for (int k = k0; k < k0 + nk && k < K; k++) {
             if (k < 0)
                 continue;
-            mode_obj[k] = m;
             const double *row = MD + (size_t)k * (2 + 5 * N);
             if (row[0] > bestp) {
                 bestp = row[0];
                 top[m] = k;
             }
+            for (int j = 0; j < E; j++) {
+                double pe = EG[(size_t)j * (1 + 3 * N)];
+                double w0 = row[0] * pe, wc = row[1] * pe;
+                if (w0 >= cfg[DC_PMIN] || wc >= cfg[DC_PMIN])
+                    used[k] = 1;
+            }
+        }
+        if (top[m] >= 0)
+            used[top[m]] = 1;
+        for (int k = k0; k < k0 + nk && k < K; k++) {
+            if (k < 0)
+                continue;
+            mode_obj[k] = m;
+            if (!used[k])
+                continue;
+            const double *row = MD + (size_t)k * (2 + 5 * N);
             const double *X = row + 2, *Y = row + 2 + N, *SX = row + 2 + 2 * N, *SY = row + 2 + 3 * N, *RR = row + 2 + 4 * N;
             DkObj *o = &ob[k];
             o->cx = w; o->cy = w + n; o->c = w + 2 * n; o->s = w + 3 * n; o->sxx = w + 4 * n; o->sxy = w + 5 * n;
@@ -948,18 +1042,17 @@ static int dk_eval(const double *t, int N, const double *EG, int E, const double
              * first quarter second, a prepended "now") turned a car parked beside the path across it, its centre
              * offset swung by 90 degrees onto the path (parked_street object 400, move_off, pc 1.0). */
             double offb_x = 0.0, offb_y = 0.0;           /* the reference point to the centre, in the body frame */
+            double c = 1.0, s = 0.0;                     /* cos, sin of the step's heading */
             for (int i = 0; i < n; i++) {
-                double tau = t[0] + i * dt, f;
-                int i0;
-                dk_interp_idx(&g, tau, &i0, &f);
+                const double f = FI[i];
+                const int i0 = I0[i];
                 double x = X[i0] + f * (X[i0 + 1] - X[i0]), y = Y[i0] + f * (Y[i0 + 1] - Y[i0]);
-                double tau2 = tau + 1.0 < t[N - 1] ? tau + 1.0 : t[N - 1], hm = NAN;
-                if (tau2 - tau > 0.2) {
-                    double f2;
-                    int j0;
-                    dk_interp_idx(&g, tau2, &j0, &f2);
+                double hm = NAN;
+                if (TJ[i] > 0.2) {
+                    const double f2 = FJ[i];
+                    const int j0 = J0[i];
                     double mx = X[j0] + f2 * (X[j0 + 1] - X[j0]) - x, my = Y[j0] + f2 * (Y[j0 + 1] - Y[j0]) - y;
-                    if (mx * mx + my * my > DK_HMOVE * DK_HMOVE * (tau2 - tau) * (tau2 - tau))
+                    if (mx * mx + my * my > DK_HMOVE * DK_HMOVE * TJ[i] * TJ[i])
                         hm = atan2(my, mx);
                 }
                 double h;
@@ -971,8 +1064,11 @@ static int dk_eval(const double *t, int N, const double *EG, int E, const double
                     if (fabs(dh) > 0.5 * M_PI)
                         h = remainder(h + M_PI, 2.0 * M_PI);
                 }
+                if (i == 0 || h != hprev || signbit(h) != signbit(hprev)) {      /* a held heading keeps its cos, sin */
+                    c = cos(h);
+                    s = sin(h);
+                }
                 hprev = h;
-                double c = cos(h), s = sin(h);
                 if (i == 0 && cfg[DC_REF] > 0.5 && ohw == DK_OHC && hd[9] > 0.5 && isfinite(hd[10]) &&
                     isfinite(hd[11])) {
                     /* the radar said where the centre is: its offset from the reference point, held in the body
@@ -1066,7 +1162,7 @@ static int dk_eval(const double *t, int N, const double *EG, int E, const double
                     continue;
                 }
                 double tcon;
-                dk_pair_prep(&C, j, k);
+                const double infl = dk_pair_prep(&C, j, k);
                 pp[DP_PC] = dk_pc(&C, j, k, &tcon);
                 pp[DP_TCON] = tcon;
                 double sep;
@@ -1081,6 +1177,7 @@ static int dk_eval(const double *t, int N, const double *EG, int E, const double
                     pp[DP_BTN] = pp[DP_STN] = pp[DP_TN] = 0.0;
                 } else {
                     pp[DP_COURSE] = 1.0;
+                    dk_pair_ext(&C, k, infl);
                     double ab = dk_required(&C, j, k, 0.0, amax);
                     double al = dk_required(&C, j, k, M_PI / 2, amax), ar = dk_required(&C, j, k, -M_PI / 2, amax);
                     /* the share of the friction ellipse a demand a in direction phi uses */
