@@ -41,6 +41,20 @@ class SecondRadar(unittest.TestCase):
                    if {"radar_front", "radar_fl"} <= set(k["sources"]) and k["state"] != "tentative")
         self.assertGreater(both, 500)                   # tracks fed by both radars exist
 
+    def test_without_objects_the_scans_still_give_the_cars_own_velocity(self):
+        """`"objects": false` (the default where the radar box runs: it tracks the scans): no radar detection reaches
+        the object layer, the car's own velocity and the mount calibration are what they were, number for number."""
+        cfg = {"sources": [dict(s, objects=False) for s in CFG2["sources"]]}
+        sens = default_sensors() + [RadarSim(), RadarSim("radar_fl", FL, seed=52, misalign_deg=-0.8, with_mount=False)]
+        r = Run(sensors=sens, seed=1, integ=Integrator(cfg), keep_tracks=True)
+        self.assertEqual(len(self.r.rows), len(r.rows))
+        self.assertEqual([(row.get("dv"), row.get("dw")) for row in r.rows], [(row.get("dv"), row.get("dw")) for row in self.r.rows])
+        self.assertEqual(r.es["calibration"]["radar_fl"]["dyaw"], self.r.es["calibration"]["radar_fl"]["dyaw"])
+        self.assertEqual(r.es["sources"]["radar_front"]["state"], "ok")
+        self.assertFalse(any({"radar_front", "radar_fl"} & set(k["sources"]) for t, tr in r.tracks for k in tr["tracks"]))
+        self.assertFalse({"radar_front", "radar_fl"} & set(r.tracks[-1][1]["sensors"]))
+        self.assertTrue(any(ld["present"] for t, ld, _ in r.leads))          # the road model's lead is tracked as before
+
 
 if __name__ == "__main__":
     unittest.main()

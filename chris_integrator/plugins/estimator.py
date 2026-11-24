@@ -18,11 +18,15 @@ class Estimator(Plugin):
                Out("tracks", "estimate", "frame", doc="one multi-target track list in the car frame"),
                Out("lead", "decision", "frame", doc="the track on the path"))
 
-    def __init__(self, cfg=None, name=None, sources=None, tick=("ego",), feedback=("map",), stream_of=None):
+    def __init__(self, cfg=None, name=None, sources=None, tick=("ego",), feedback=("map",), stream_of=None,
+                 radar_objects=True):
         """sources: Source objects instead of the default registration. tick: streams whose samples drive the
         outputs while no camera frames arrive. feedback: inputs produced downstream of this box. stream_of:
-        {message type: stream} where a source's message type is carried by a stream of another name."""
+        {message type: stream} where a source's message type is carried by a stream of another name.
+        radar_objects: the default registration's range-sensor scans are also tracked by this box's object layer
+        (False where the radar box runs: it tracks them, and here they give the car's own velocity only)."""
         self._sources, self.tick, self.feedback = sources, tuple(tick), tuple(feedback)
+        self.radar_objects = bool(radar_objects)
         self.stream_of = dict(self.STREAM_OF if stream_of is None else stream_of)
         super().__init__(cfg, name)
         self.saved = None
@@ -32,7 +36,7 @@ class Estimator(Plugin):
     def _new(self):
         cfg = dict(self.cfg)
         if cfg.get("sources") is None:               # a car that feeds range-sensor scans gets them fused; a camera's
-            cfg["sources"] = [{"kind": "radar", "id": "*"},       # road users annotate the tracks with a class
+            cfg["sources"] = [{"kind": "radar", "id": "*", "objects": self.radar_objects},   # road users annotate the tracks with a class
                               {"kind": "road_users", "id": "*"}]
         self.integ = Integrator(cfg, sources=self._sources)
         types = [self.FRAME] + sorted(self.stream_of.get(t, t) for t in self.integ.by_type if t != self.FRAME)
