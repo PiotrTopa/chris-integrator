@@ -149,7 +149,7 @@ the adjacent car a cut-in with 0.97.) A car parked 2.7 m to
 the side read 0.4 to 0.8 m nearer the path than its side as it was passed, and a long one beside the car was put at
 the origin itself (the half depth clamped to the range): the decision layer's `obstacle_ahead` warned on parked
 cars at "contact" (parked_street: near-face lateral error under 8 m 0.35 m median, inward). The decision layer
-draws the footprint from `ctr` less `x_m`, `y_m` (decide/futures.py `centre_offset`), not from the line of sight.
+draws the footprint from `ctr` less `x_m`, `y_m` (native/src/decide.c `df_parse`: the centre's offset), not from the line of sight.
 
 **A floored hypothesis is re-seeded.** The motion hypotheses are weighed by how well each predicted a detection
 and none is ever ruled out (`mu_floor`). A hypothesis held at the floor used to keep its own old story: "it

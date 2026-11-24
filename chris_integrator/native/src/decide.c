@@ -16,7 +16,11 @@
  *   a level per pair and per object                  from per-class thresholds (entry and exit sets), weighted by
  *                                                    the modes' probabilities (unconditioned and conditioned)
  *
- * It is included by chris_native.c (one translation unit) and uses its buffer helpers. Frame: the car frame of the
+ * and, around that evaluation, the frame (decide_frame, below): the radar message's objects and the futures of its
+ * time in, the records of the `decide` message out.
+ *
+ * It is included by chris_native.c (one translation unit) and uses its buffer helpers; its functions are
+ * DECIDE_METHODS (the end of this file). Frame: the car frame of the
  * output time held fixed on the ground (x forward, y left, m); the car starts at the origin, heading 0.
  *
  * decide_eval(t[N], ego[E, 1+3N], ohdr[M, 10 | 12], modes[K, 2+5N], cfg[NC], thr[S*2*4*3], out_pair[K*E, PF], out_obj[M, OF])
@@ -826,34 +830,17 @@ static int dk_level(const double *thr, int set, int exit, double course, double 
     return L;
 }
 
-static PyObject *n_decide_eval(PyObject *self, PyObject *args)
+/* the evaluation of one frame (the arrays of the file's head; N >= 2, E >= 1): 0 and the steps of the horizon and
+ * of the simulation, or -1 with an exception set */
+static int dk_eval(const double *t, int N, const double *EG, int E, const double *OH, int ohw, int M, const double *MD,
+                   int K, const double *cfg, const double *thr, int nsets, double *PO, double *OO, int *nh_out, int *n_out)
 {
-    PyObject *ot, *oe, *oh, *om, *oc, *othr, *opair, *oobj;
-    if (!PyArg_ParseTuple(args, "OOOOOOOO", &ot, &oe, &oh, &om, &oc, &othr, &opair, &oobj))
-        return NULL;
-    View vt, ve, vh, vm, vc, vthr, vp, vo;
-    vt.held = ve.held = vh.held = vm.held = vc.held = vthr.held = vp.held = vo.held = 0;
-    PyObject *res = NULL;
+    int rc = -1;
     double *buf = NULL;
     int *ibuf = NULL;
     DkEgo *eg = NULL;
     DkObj *ob = NULL;
     DkRect *rects = NULL;
-    if (view_get(ot, &vt, 0, 'd', 1, "decide_eval t") < 0 || view_get(oe, &ve, 0, 'd', 2, "decide_eval ego") < 0 ||
-        view_get(oh, &vh, 0, 'd', 2, "decide_eval ohdr") < 0 || view_get(om, &vm, 0, 'd', 2, "decide_eval modes") < 0 ||
-        view_get(oc, &vc, 0, 'd', 1, "decide_eval cfg") < 0 || view_get(othr, &vthr, 0, 'd', 1, "decide_eval thr") < 0 ||
-        view_get(opair, &vp, 1, 'd', 2, "decide_eval out_pair") < 0 || view_get(oobj, &vo, 1, 'd', 2, "decide_eval out_obj") < 0)
-        goto done;
-    int N = (int)vt.b.shape[0], E = (int)ve.b.shape[0], M = (int)vh.b.shape[0], K = (int)vm.b.shape[0];
-    const double *t = DATA(vt), *EG = DATA(ve), *OH = DATA(vh), *MD = DATA(vm), *cfg = DATA(vc), *thr = DATA(vthr);
-    double *PO = DATA(vp), *OO = DATA(vo);
-    const int ohw = (int)vh.b.shape[1];
-    if (N < 2 || N > DK_MAXN || E < 1 || vc.b.shape[0] < DC_NC || ve.b.shape[1] != 1 + 3 * N ||
-        (vh.b.shape[1] != DK_OH && vh.b.shape[1] != DK_OHC) || vm.b.shape[1] != 2 + 5 * N || vp.b.shape[0] != (Py_ssize_t)K * E ||
-        vp.b.shape[1] != DK_PF || vo.b.shape[0] != M || vo.b.shape[1] != DK_OF) {
-        PyErr_SetString(PyExc_ValueError, "decide_eval: arrays of the documented shapes are needed");
-        goto done;
-    }
     for (int i = 1; i < N; i++)
         if (!(t[i] > t[i - 1])) {
             PyErr_SetString(PyExc_ValueError, "decide_eval: the times must increase");
@@ -871,7 +858,6 @@ static PyObject *n_decide_eval(PyObject *self, PyObject *args)
     int n = nh + (int)floor((cfg[DC_HEXT] > 0.0 ? cfg[DC_HEXT] : 0.0) / dt + 1e-9);
     if (n > DK_MAXSIM)
         n = DK_MAXSIM;
-    int nsets = (int)(vthr.b.shape[0] / 24);
     /* storage: per ego mode 5 n + 4 N, per object mode 7 n */
     size_t need = (size_t)E * (5 * n + 4 * N) + (size_t)K * 7 * n;
     buf = (double *)PyMem_Malloc((need ? need : 1) * sizeof(double));
@@ -1213,13 +1199,43 @@ static PyObject *n_decide_eval(PyObject *self, PyObject *args)
         if (oo[DO_SEP] == INFINITY)
             oo[DO_SEP] = NAN;
     }
-    res = Py_BuildValue("(ii)", nh, n);
+    *nh_out = nh;
+    *n_out = n;
+    rc = 0;
 done:
     PyMem_Free(buf);
     PyMem_Free(ibuf);
     PyMem_Free(eg);
     PyMem_Free(ob);
     PyMem_Free(rects);
+    return rc;
+}
+
+static PyObject *n_decide_eval(PyObject *self, PyObject *args)
+{
+    PyObject *ot, *oe, *oh, *om, *oc, *othr, *opair, *oobj;
+    if (!PyArg_ParseTuple(args, "OOOOOOOO", &ot, &oe, &oh, &om, &oc, &othr, &opair, &oobj))
+        return NULL;
+    View vt, ve, vh, vm, vc, vthr, vp, vo;
+    vt.held = ve.held = vh.held = vm.held = vc.held = vthr.held = vp.held = vo.held = 0;
+    PyObject *res = NULL;
+    if (view_get(ot, &vt, 0, 'd', 1, "decide_eval t") < 0 || view_get(oe, &ve, 0, 'd', 2, "decide_eval ego") < 0 ||
+        view_get(oh, &vh, 0, 'd', 2, "decide_eval ohdr") < 0 || view_get(om, &vm, 0, 'd', 2, "decide_eval modes") < 0 ||
+        view_get(oc, &vc, 0, 'd', 1, "decide_eval cfg") < 0 || view_get(othr, &vthr, 0, 'd', 1, "decide_eval thr") < 0 ||
+        view_get(opair, &vp, 1, 'd', 2, "decide_eval out_pair") < 0 || view_get(oobj, &vo, 1, 'd', 2, "decide_eval out_obj") < 0)
+        goto done;
+    int N = (int)vt.b.shape[0], E = (int)ve.b.shape[0], M = (int)vh.b.shape[0], K = (int)vm.b.shape[0];
+    if (N < 2 || N > DK_MAXN || E < 1 || vc.b.shape[0] < DC_NC || ve.b.shape[1] != 1 + 3 * N ||
+        (vh.b.shape[1] != DK_OH && vh.b.shape[1] != DK_OHC) || vm.b.shape[1] != 2 + 5 * N || vp.b.shape[0] != (Py_ssize_t)K * E ||
+        vp.b.shape[1] != DK_PF || vo.b.shape[0] != M || vo.b.shape[1] != DK_OF) {
+        PyErr_SetString(PyExc_ValueError, "decide_eval: arrays of the documented shapes are needed");
+        goto done;
+    }
+    int nh, n;
+    if (dk_eval(DATA(vt), N, DATA(ve), E, DATA(vh), (int)vh.b.shape[1], M, DATA(vm), K, DATA(vc), DATA(vthr),
+                (int)(vthr.b.shape[0] / 24), DATA(vp), DATA(vo), &nh, &n) == 0)
+        res = Py_BuildValue("(ii)", nh, n);
+done:
     view_drop(&vt);
     view_drop(&ve);
     view_drop(&vh);
@@ -1267,3 +1283,1425 @@ static PyObject *n_decide_draws(PyObject *self, PyObject *arg)
     }
     return out;
 }
+
+/* ====================================================================================================
+ * The frame: a radar message's objects and the futures of its time in, the decision's records out
+ * ====================================================================================================
+ * decide_frame is what the plug-in calls once per radar message (chris_integrator/decide/frame.py): it reads the
+ * radar's objects (the message's dicts), takes the contract's futures as arrays (decide/futures.py `Futures`) or
+ * builds the degraded ones (an object without futures: constant velocity, along the path where it drives along it;
+ * the car without its own: its motion now and the plan), sets each footprint (extent, heading, centre, the lanes'
+ * weight of a standing mode), evaluates (dk_eval) and writes the records of the objects worth listing.
+ *
+ * The arithmetic is the Python's it replaced (2026-11-24), in its order: numpy's elementwise steps, numpy.interp
+ * (df_interp), Python's float `%` and `**` (the C library's fmod and pow), its sum() of floats (compensated:
+ * df_sum), math.hypot (CPython's own: df_hypot), numpy.hypot and atan2 / sin / cos (the C library's). tests/test_decide_port.py holds it to the messages recorded before. */
+
+#define DF_STRS(X)                                                                                                     \
+    X(state) X(id) X(x_m) X(y_m) X(vx_mps) X(vy_mps) X(std) X(p_stationary) X(flags) X(motion) X(class) X(label)       \
+    X(len) X(wid) X(hdg) X(len_std) X(std_len) X(wid_std) X(std_wid) X(hdg_std) X(std_hdg) X(ext_std) X(heading_rad)   \
+    X(speed_mps) X(ctr) X(value) X(v) X(accel_mps2) X(yaw_rate_rps) X(parked) X(in_path) X(threat) X(ego) X(cross)     \
+    X(left) X(right) X(onc) X(park) X(off) X(level) X(level_name) X(level_exit) X(level_cond) X(p_coll)                \
+    X(p_coll_cond) X(ttc_s) X(thw_s) X(sep_m) X(kind) X(size) X(size_src) X(fut) X(mass) X(btn) X(stn) X(tn) X(a_req)  \
+    X(brake) X(comb) X(comb_dir_deg) X(ttb_s) X(tts_s) X(tm_s) X(why) X(mode) X(p0) X(p) X(ego_mode) X(measure) X(pc)  \
+    X(t_contact_s) X(lane) X(shown) X(pairs) X(w0) X(w) X(course) X(radar) X(cv) X(contract) X(vehicle) X(vru)         \
+    X(unknown) X(stand) X(stand_path) X(cv_path) X(path) X(turn) X(none) X(information) X(caution) X(warning)          \
+    X(imminent) X(threat_number) X(time_margin) X(collision_course) X(confirmed) X(coast) X(stationary) X(moving)
+#define X(n) S_##n,
+enum { DF_STRS(X) S_N };
+#undef X
+#define X(n) #n,
+static const char *const DF_STR[S_N] = {DF_STRS(X)};
+#undef X
+static PyObject *df_s[S_N];
+
+static int df_strings(void)
+{
+    if (df_s[S_N - 1] != NULL)
+        return 0;
+    for (int i = 0; i < S_N; i++)
+        if (df_s[i] == NULL && (df_s[i] = PyUnicode_InternFromString(DF_STR[i])) == NULL)
+            return -1;
+    return 0;
+}
+
+/* the futures' cfg (decide/futures.py DEFAULT_CFG, as frame.py packs it) */
+enum {
+    FC_SPEED_CAP, FC_VSTD_CAP, FC_STILL_VSTD, FC_ALONG_PATH, FC_MODES_RADAR, FC_STAND_MIN, FC_ALONG_HDG_DEG,
+    FC_ALONG_MIN, FC_EGO_PATH_P, FC_EGO_A_LO, FC_EGO_A_HI, FC_N
+};
+/* the threat model's cfg beyond the evaluation's (threat.py DEFAULT_CFG) */
+enum {
+    DX_BRAKE_SHARE = DC_NC, DX_STEER_SHARE, DX_SPEED_FADE, DX_TURN_R, DX_HDG_RES, DX_AXIS_STANDING, DX_AXIS_SNAP,
+    DX_AXIS_STD, DX_LANE_AXIS_P, DX_LANE_WEIGHT, DX_LANE_FLOOR, DX_STAND_MOVE, DX_LIST_MIN_P, DX_NC
+};
+#define DF_G 9.81
+
+/* classes: prior footprint (length, width, 1 sigma of each) and the threshold set (0 vehicle, 1 vru, 2 unknown) */
+enum { DF_CAR, DF_VAN, DF_TRUCK, DF_BUS, DF_TRAM, DF_HUMAN, DF_BIKE, DF_MOTORBIKE, DF_OTHER };
+static const double DF_SIZE[9][4] = {{4.5, 1.8, 0.4, 0.1},  {5.2, 2.0, 0.5, 0.15},  {9.0, 2.5, 3.0, 0.15},
+                                     {12.0, 2.55, 1.5, 0.1}, {25.0, 2.65, 5.0, 0.1}, {0.6, 0.6, 0.15, 0.15},
+                                     {1.8, 0.7, 0.2, 0.15},  {2.1, 0.85, 0.2, 0.15}, {4.2, 1.8, 1.0, 0.3}};
+static const int DF_SET[9] = {0, 0, 0, 0, 0, 1, 1, 1, 2};
+static const struct {
+    const char *name;
+    int cls;
+} DF_LABELS[] = {{"car", DF_CAR},         {"van", DF_VAN},           {"truck", DF_TRUCK},     {"bus", DF_BUS},
+                 {"tram", DF_TRAM},       {"human", DF_HUMAN},       {"bike", DF_BIKE},       {"motorbike", DF_MOTORBIKE},
+                 {"person", DF_HUMAN},    {"pedestrian", DF_HUMAN},  {"bicycle", DF_BIKE},    {"cyclist", DF_BIKE},
+                 {"rider", DF_BIKE},      {"motorcycle", DF_MOTORBIKE}, {"motor", DF_MOTORBIKE}, {"lorry", DF_TRUCK},
+                 {"coach", DF_BUS},       {"train", DF_TRAM},        {NULL, 0}};
+
+/* Python's and numpy's small steps, as they compute them */
+static volatile double df_two = 2.0;
+#define DF_POW2(x) pow((x), df_two)            /* float ** 2: the C library's pow (the compiler must not fold it) */
+#define DF_MAX(a, b) ((b) > (a) ? (b) : (a))   /* max(a, b) */
+#define DF_MIN(a, b) ((b) < (a) ? (b) : (a))   /* min(a, b) */
+
+/* math.hypot(a, b) as CPython computes it (3.11 on: mathmodule.c vector_norm, the squares summed without error and
+ * the root corrected once): not always the C library's hypot in the last bit */
+static double df_hypot(double a, double b)
+{
+    double v[2] = {fabs(a), fabs(b)}, max = v[0] > v[1] ? v[0] : v[1];
+    if (isinf(v[0]) || isinf(v[1]))
+        return INFINITY;
+    if (isnan(v[0]) || isnan(v[1]))
+        return NAN;
+    if (max == 0.0)
+        return max;
+    int max_e;
+    frexp(max, &max_e);
+    if (max_e < -1023)
+        return 2.2250738585072014e-308 * df_hypot(a / 2.2250738585072014e-308, b / 2.2250738585072014e-308);
+    double scale = ldexp(1.0, -max_e), csum = 1.0, frac1 = 0.0, frac2 = 0.0;
+    for (int i = 0; i < 2; i++) {
+        double x = v[i] * scale, hi = x * x, lo = fma(x, x, -hi);
+        double sm = csum + hi, sl = (csum - sm) + hi;
+        csum = sm;
+        frac1 += lo;
+        frac2 += sl;
+    }
+    double h = sqrt(csum - 1.0 + (frac1 + frac2));
+    double hi = -h * h, lo = fma(-h, h, -hi), sm = csum + hi, sl = (csum - sm) + hi;
+    csum = sm;
+    frac1 += lo;
+    frac2 += sl;
+    double x = csum - 1.0 + (frac1 + frac2);
+    h += x / (2.0 * h);
+    return h / scale;
+}
+
+static double df_mod(double a, double b)       /* float a % b */
+{
+    double m = fmod(a, b);
+    if (m != 0.0) {
+        if ((b < 0.0) != (m < 0.0))
+            m += b;
+    } else
+        m = copysign(0.0, b);
+    return m;
+}
+
+/* Python's sum() of floats: the first as it is, the further ones compensated (Neumaier; CPython from 3.12), an int
+ * added as it is */
+typedef struct {
+    double hi, lo;
+    int started;
+} DfSum;
+
+static void df_sum_add(DfSum *s, double x, int is_int)
+{
+    if (is_int || !s->started) {
+        s->hi += x;
+        if (!is_int)
+            s->started = 1;
+        return;
+    }
+    double t = s->hi + x;
+    if (fabs(s->hi) >= fabs(x))
+        s->lo += (s->hi - t) + x;
+    else
+        s->lo += (x - t) + s->hi;
+    s->hi = t;
+}
+
+static double df_sum(const DfSum *s)
+{
+    return (s->lo != 0.0 && isfinite(s->lo)) ? s->hi + s->lo : s->hi;
+}
+
+static PyObject *df_get(PyObject *d, int key)   /* d.get(key): borrowed, NULL where absent */
+{
+    PyObject *v = PyDict_GetItemWithError(d, df_s[key]);
+    if (v == NULL)
+        PyErr_Clear();
+    return v;
+}
+
+#define df_fin py_fin                           /* _fin(v): an int or a float (no bool), finite (predict.c) */
+
+/* float(v or 0.0) */
+static int df_num0(PyObject *v, double *out)
+{
+    *out = 0.0;
+    if (v == NULL || v == Py_None)
+        return 0;
+    double d = PyFloat_AsDouble(v);
+    if (d == -1.0 && PyErr_Occurred())
+        return -1;
+    *out = d == 0.0 ? 0.0 : d;
+    return 0;
+}
+
+/* float(d.get(key, 0.0)) */
+static int df_numd(PyObject *d, int key, double *out)
+{
+    PyObject *v = df_get(d, key);
+    *out = 0.0;
+    if (v == NULL)
+        return 0;
+    double x = PyFloat_AsDouble(v);
+    if (x == -1.0 && PyErr_Occurred())
+        return -1;
+    *out = x;
+    return 0;
+}
+
+static int df_is(PyObject *v, int key)          /* v == "<key>" */
+{
+    return v != NULL && (v == df_s[key] || (PyUnicode_Check(v) && PyUnicode_CompareWithASCIIString(v, DF_STR[key]) == 0));
+}
+
+/* the first `max` items of a list / tuple: values and whether each is _fin; its length (0: not such a sequence) */
+static Py_ssize_t df_seq(PyObject *v, double *out, int *fin, int max)
+{
+    if (v == NULL || !(PyList_Check(v) || PyTuple_Check(v)))
+        return 0;
+    Py_ssize_t n = PySequence_Size(v);
+    for (int i = 0; i < max && i < n; i++) {
+        PyObject *it = PyList_Check(v) ? PyList_GetItem(v, i) : PyTuple_GetItem(v, i);
+        fin[i] = df_fin(it, &out[i]);
+    }
+    return n;
+}
+
+/* futures._vs: a value with its 1 sigma: a number + `<k>_std`, a [value, std] pair, or a {"value" / "v", "std"} */
+static void df_vs(PyObject *o, int key, int k_std, int std_k, double *val, int *has, double *sd, int *has_sd)
+{
+    *has = *has_sd = 0;
+    PyObject *v = df_get(o, key);
+    if (v == NULL)
+        return;
+    if (PyList_Check(v) || PyTuple_Check(v)) {
+        double q[2];
+        int f[2] = {0, 0};
+        if (df_seq(v, q, f, 2) == 2 && f[0]) {
+            *val = q[0];
+            *has = 1;
+            if (f[1]) {
+                *sd = q[1];
+                *has_sd = 1;
+            }
+        }
+        return;
+    }
+    if (PyDict_Check(v)) {
+        PyObject *x = df_get(v, S_value);
+        if (x == NULL)
+            x = df_get(v, S_v);
+        *has = df_fin(x, val);
+        *has_sd = df_fin(df_get(v, S_std), sd);
+        return;
+    }
+    if (df_fin(v, val)) {
+        *has = 1;
+        PyObject *x = df_get(o, k_std);
+        if (x == NULL)
+            x = df_get(o, std_k);
+        *has_sd = df_fin(x, sd);
+    }
+}
+
+static int df_class(PyObject *cls)              /* classvote.norm_label of the class's label, as an index */
+{
+    if (cls == NULL || !PyDict_Check(cls))
+        return DF_OTHER;
+    PyObject *lab = df_get(cls, S_label);
+    if (lab == NULL || !PyUnicode_Check(lab))
+        return DF_OTHER;
+    Py_ssize_t n;
+    const char *s = PyUnicode_AsUTF8AndSize(lab, &n);
+    if (s == NULL) {
+        PyErr_Clear();
+        return DF_OTHER;
+    }
+    while (n > 0 && (*s == ' ' || (*s >= '\t' && *s <= '\r'))) {
+        s++;
+        n--;
+    }
+    while (n > 0 && (s[n - 1] == ' ' || (s[n - 1] >= '\t' && s[n - 1] <= '\r')))
+        n--;
+    char b[16];
+    if (n <= 0 || n >= (Py_ssize_t)sizeof(b))
+        return DF_OTHER;
+    for (Py_ssize_t i = 0; i < n; i++)
+        b[i] = (char)(s[i] >= 'A' && s[i] <= 'Z' ? s[i] + 32 : s[i]);
+    b[n] = 0;
+    for (int i = 0; DF_LABELS[i].name; i++)
+        if (strcmp(b, DF_LABELS[i].name) == 0)
+            return DF_LABELS[i].cls;
+    return DF_OTHER;
+}
+
+/* a buffer of float64: an array (any shape) or bytes; its numbers */
+static int df_buf(PyObject *o, View *v, const double **p, Py_ssize_t *n, const char *what)
+{
+    v->held = 0;
+    if (PyObject_GetBuffer(o, &v->b, PyBUF_C_CONTIGUOUS | PyBUF_FORMAT) < 0)
+        return -1;
+    v->held = 1;
+    const char *f = v->b.format ? v->b.format : "B";
+    if (*f == '@' || *f == '=' || *f == '<')
+        f++;
+    int ok = (f[0] == 'd' && f[1] == 0 && v->b.itemsize == 8) ||
+             ((f[0] == 'B' || f[0] == 'c' || f[0] == 'b') && f[1] == 0 && v->b.len % 8 == 0);
+    if (!ok) {
+        view_drop(v);
+        PyErr_Format(PyExc_TypeError, "decide: %s: float64 numbers (an array or bytes) are needed", what);
+        return -1;
+    }
+    *p = (const double *)v->b.buf;
+    *n = v->b.len / 8;
+    return 0;
+}
+
+/* ---- the path: the road model's plan as a polyline ---- */
+typedef struct {
+    int n;
+    const double *px, *py, *ps;
+    double *hd, *mid;            /* per segment: its direction; the arc length of its middle */
+    double c0, s0, c1, s1;
+} DfPath;
+
+/* numpy.interp(x, xp, fp) for one x (xp ascending, n >= 2) */
+static double df_interp(double x, const double *xp, const double *fp, int n)
+{
+    if (isnan(x))
+        return x;
+    if (x > xp[n - 1])
+        return fp[n - 1];
+    if (x < xp[0])
+        return fp[0];
+    int lo = 0, hi = n;
+    while (lo < hi) {
+        int m = (lo + hi) >> 1;
+        if (x >= xp[m])
+            lo = m + 1;
+        else
+            hi = m;
+    }
+    int j = lo - 1;
+    if (j == n - 1 || xp[j] == x)
+        return fp[j];
+    double slope = (fp[j + 1] - fp[j]) / (xp[j + 1] - xp[j]);
+    double r = slope * (x - xp[j]) + fp[j];
+    if (isnan(r)) {
+        r = slope * (x - xp[j + 1]) + fp[j + 1];
+        if (isnan(r) && fp[j] == fp[j + 1])
+            r = fp[j];
+    }
+    return r;
+}
+
+/* futures._along: the point of the polyline at arc length s (beyond its ends: along the end segments), the
+ * direction there */
+static void df_along(const DfPath *P, double s, double *x, double *y, double *h)
+{
+    int n = P->n;
+    *x = df_interp(s, P->ps, P->px, n);
+    *y = df_interp(s, P->ps, P->py, n);
+    *h = n > 2 ? df_interp(s, P->mid, P->hd, n - 1) : P->hd[0];
+    if (s < P->ps[0]) {
+        *x = P->px[0] + (s - P->ps[0]) * P->c0;
+        *y = P->py[0] + (s - P->ps[0]) * P->s0;
+    }
+    if (s > P->ps[n - 1]) {
+        *x = P->px[n - 1] + (s - P->ps[n - 1]) * P->c1;
+        *y = P->py[n - 1] + (s - P->ps[n - 1]) * P->s1;
+    }
+}
+
+/* futures._project: (arc length, signed offset left) of a point on the polyline: the nearest segment */
+static void df_project(const DfPath *P, double x, double y, double *s, double *off)
+{
+    int n = P->n, have = 0;
+    double bd = 0.0, bs = 0.0, bo = 0.0;
+    for (int i = 0; i < n - 1; i++) {
+        double ax = P->px[i], ay = P->py[i], ex = P->px[i + 1] - ax, ey = P->py[i + 1] - ay;
+        double L2 = ex * ex + ey * ey;
+        if (L2 <= 1e-12)
+            continue;
+        double f = ((x - ax) * ex + (y - ay) * ey) / L2;
+        double lo = i == 0 ? -INFINITY : 0.0, hi = i == n - 2 ? INFINITY : 1.0;
+        double m = DF_MAX(lo, f), fc = DF_MIN(hi, m);
+        double qx = ax + fc * ex, qy = ay + fc * ey;
+        double d2 = DF_POW2(x - qx) + DF_POW2(y - qy);
+        if (!have || d2 < bd) {
+            double L = sqrt(L2);
+            have = 1;
+            bd = d2;
+            bs = P->ps[i] + fc * L;
+            bo = ((x - ax) * (-ey) + (y - ay) * ex) / L;
+        }
+    }
+    *s = have ? bs : 0.0;
+    *off = have ? bo : 0.0;
+}
+
+/* decide_path(x, y): the plan's line (x forward, y RIGHT as the road model gives it) as (px, py, ps) in the car
+ * frame (y left), each bytes of float64, from the car (a first point at x = 0 where the line starts ahead); None
+ * where it is not a line (fewer than two points, a number that is none, x going back, shorter than 5 m) */
+static PyObject *n_decide_path(PyObject *self, PyObject *args)
+{
+    PyObject *ox, *oy, *res = NULL, *bx = NULL, *by = NULL, *bs = NULL;
+    if (!PyArg_ParseTuple(args, "OO", &ox, &oy))
+        return NULL;
+    if (!(PyList_Check(ox) || PyTuple_Check(ox)) || !(PyList_Check(oy) || PyTuple_Check(oy)))
+        Py_RETURN_NONE;
+    Py_ssize_t n = PySequence_Size(ox);
+    if (n < 2 || n != PySequence_Size(oy))
+        Py_RETURN_NONE;
+    bx = PyBytes_FromStringAndSize(NULL, (n + 1) * 8);
+    by = PyBytes_FromStringAndSize(NULL, (n + 1) * 8);
+    bs = PyBytes_FromStringAndSize(NULL, (n + 1) * 8);
+    if (!bx || !by || !bs)
+        goto done;
+    double *px = (double *)PyBytes_AsString(bx) + 1, *py = (double *)PyBytes_AsString(by) + 1;
+    for (Py_ssize_t i = 0; i < n; i++) {
+        PyObject *a = PyList_Check(ox) ? PyList_GetItem(ox, i) : PyTuple_GetItem(ox, i);
+        PyObject *b = PyList_Check(oy) ? PyList_GetItem(oy, i) : PyTuple_GetItem(oy, i);
+        double u = PyFloat_AsDouble(a), w = (u == -1.0 && PyErr_Occurred()) ? 0.0 : PyFloat_AsDouble(b);
+        if (PyErr_Occurred()) {
+            PyErr_Clear();
+            goto none;
+        }
+        px[i] = u;
+        py[i] = -w;
+        if (!isfinite(u) || !isfinite(w) || (i > 0 && !(px[i] - px[i - 1] >= 0.0)))
+            goto none;
+    }
+    if (px[n - 1] < 5.0)
+        goto none;
+    Py_ssize_t m = n;
+    if (px[0] > 0.0) {                           /* from the car */
+        px--;
+        py--;
+        px[0] = 0.0;
+        py[0] = py[1];
+        m = n + 1;
+    }
+    double *ps = (double *)PyBytes_AsString(bs), acc = 0.0;
+    ps[0] = 0.0;
+    for (Py_ssize_t i = 1; i < m; i++) {
+        acc += hypot(px[i] - px[i - 1], py[i] - py[i - 1]);
+        ps[i] = acc;
+    }
+    {
+        PyObject *cx = PyBytes_FromStringAndSize((const char *)px, m * 8), *cy = PyBytes_FromStringAndSize((const char *)py, m * 8);
+        PyObject *cs = PyBytes_FromStringAndSize((const char *)ps, m * 8);
+        if (cx && cy && cs)
+            res = PyTuple_Pack(3, cx, cy, cs);
+        Py_XDECREF(cx);
+        Py_XDECREF(cy);
+        Py_XDECREF(cs);
+    }
+    goto done;
+none:
+    res = Py_None;
+    Py_INCREF(res);
+done:
+    Py_XDECREF(bx);
+    Py_XDECREF(by);
+    Py_XDECREF(bs);
+    return res;
+}
+
+/* ---- a radar object as the decision reads it ---- */
+typedef struct {
+    PyObject *o, *id;            /* borrowed */
+    double x, y;                 /* float(x_m), float(y_m): 0 where absent */
+    double sd[4];                /* `std`, as far as it reaches */
+    int sdfin[4];
+    Py_ssize_t nsd;
+    int motion;                  /* 1 stationary, -1 moving, 0 neither */
+    int parked, in_path, threat, ps_fin;
+    double ps, vx, vy;           /* vx, vy: the finite value or 0 */
+    double L, W, sL, sW, h, sh;  /* futures.extent: h, sh NaN where not known */
+    int cls, src_radar;
+    int has_ctr;
+    double cdx, cdy;             /* futures.centre_offset */
+    int stands, hfm;             /* futures.stands, heading_from_motion */
+    double trav_h, trav_sh;      /* futures.travel_heading */
+    /* its futures */
+    int first, nm, cv, along, row;
+} DfObj;
+
+static int df_parse(PyObject *o, DfObj *q)
+{
+    q->o = o;
+    q->id = df_get(o, S_id);
+    if (q->id == NULL)
+        q->id = Py_None;
+    if (df_numd(o, S_x_m, &q->x) < 0 || df_numd(o, S_y_m, &q->y) < 0)
+        return -1;
+    PyObject *sd = df_get(o, S_std);
+    q->sdfin[0] = q->sdfin[1] = q->sdfin[2] = q->sdfin[3] = 0;
+    q->nsd = df_seq(sd, q->sd, q->sdfin, 4);
+    PyObject *mo = df_get(o, S_motion);
+    q->motion = df_is(mo, S_stationary) ? 1 : df_is(mo, S_moving) ? -1 : 0;
+    PyObject *fl = df_get(o, S_flags);
+    q->parked = q->in_path = q->threat = 0;
+    if (fl != NULL && fl != Py_None && (PyList_Check(fl) || PyTuple_Check(fl))) {
+        if ((q->parked = PySequence_Contains(fl, df_s[S_parked])) < 0 || (q->in_path = PySequence_Contains(fl, df_s[S_in_path])) < 0 ||
+            (q->threat = PySequence_Contains(fl, df_s[S_threat])) < 0)
+            return -1;
+    }
+    q->ps = 0.0;
+    q->ps_fin = df_fin(df_get(o, S_p_stationary), &q->ps);
+    PyObject *ovx = df_get(o, S_vx_mps), *ovy = df_get(o, S_vy_mps);
+    q->vx = q->vy = 0.0;
+    df_fin(ovx, &q->vx);
+    df_fin(ovy, &q->vy);
+    /* futures.extent */
+    q->cls = df_class(df_get(o, S_class));
+    const double *sz = DF_SIZE[q->cls];
+    double L, W, sL, sW, h, sh;
+    int hL, hW, hsL, hsW, hh, hsh;
+    df_vs(o, S_len, S_len_std, S_std_len, &L, &hL, &sL, &hsL);
+    df_vs(o, S_wid, S_wid_std, S_std_wid, &W, &hW, &sW, &hsW);
+    df_vs(o, S_hdg, S_hdg_std, S_std_hdg, &h, &hh, &sh, &hsh);
+    if (!hsh && hh) {                             /* the radar's 1 sigma of len, wid, hdg: the heading's */
+        double es[3];
+        int ef[3] = {0, 0, 0};
+        if (df_seq(df_get(o, S_ext_std), es, ef, 3) >= 3 && ef[2]) {
+            sh = es[2];
+            hsh = 1;
+        }
+    }
+    q->src_radar = hL && hW;
+    q->L = hL && 0.1 <= L && L <= 40.0 ? L : sz[0];
+    q->W = hW && 0.1 <= W && W <= 5.0 ? W : sz[1];
+    q->sL = hsL && sL >= 0.0 ? sL : sz[2];
+    q->sW = hsW && sW >= 0.0 ? sW : sz[3];
+    /* the radar's direction of travel: where the speed stands clear of its spread */
+    double hr = 0.0, sp = 0.0;
+    int hr_fin = df_fin(df_get(o, S_heading_rad), &hr);
+    int sv_ok = q->nsd >= 4 && q->sdfin[2] && q->sdfin[3];
+    double sv = sv_ok ? DF_MAX(q->sd[2], q->sd[3]) : 0.0;
+    if (!df_fin(df_get(o, S_speed_mps), &sp)) {
+        double a, b;
+        if (df_num0(ovx, &a) < 0 || df_num0(ovy, &b) < 0)
+            return -1;
+        sp = df_hypot(a, b);
+    }
+    double lim = sv_ok ? 2.0 * sv : INFINITY;
+    q->hfm = hr_fin && sp >= DF_MAX(2.0, lim);
+    q->trav_h = hr;
+    q->trav_sh = atan2(sv, DF_MAX(sp, 1e-6));
+    if (!hh && q->hfm) {
+        h = hr;
+        hh = 1;
+    }
+    q->h = hh ? h : NAN;
+    q->sh = hsh ? sh : NAN;
+    /* futures.centre_offset */
+    q->has_ctr = 0;
+    double c[2], xm, ym;
+    int cf[2] = {0, 0};
+    if (df_seq(df_get(o, S_ctr), c, cf, 2) == 2 && cf[0] && cf[1] && df_fin(df_get(o, S_x_m), &xm) && df_fin(df_get(o, S_y_m), &ym)) {
+        q->cdx = c[0] - xm;
+        q->cdy = c[1] - ym;
+        q->has_ctr = df_hypot(q->cdx, q->cdy) <= 25.0;
+    }
+    q->stands = q->motion == -1 ? 0 : (q->motion == 1 || q->parked || (q->ps_fin && q->ps >= 0.5));
+    return 0;
+}
+
+/* futures.cv_future: one constant-velocity mode into a row (p0, p, x, y, sx, sy, rxy); 1 where it follows the path */
+static int df_cv(const DfObj *q, int stationary, const double *t, int N, const double *fc, const DfPath *P, double *row)
+{
+    double sd[4], vx, vy, svx, svy, cap = fc[FC_VSTD_CAP];
+    for (int i = 0; i < 4; i++)
+        sd[i] = i < q->nsd && q->sdfin[i] ? q->sd[i] : 1.0;
+    if (stationary) {
+        vx = vy = 0.0;
+        svx = svy = fc[FC_STILL_VSTD];
+    } else {
+        vx = q->vx;
+        vy = q->vy;
+        double sp = df_hypot(vx, vy);
+        if (sp > fc[FC_SPEED_CAP]) {
+            vx = vx * fc[FC_SPEED_CAP] / sp;
+            vy = vy * fc[FC_SPEED_CAP] / sp;
+        }
+        svx = DF_MIN(sd[2], cap);
+        svy = DF_MIN(sd[3], cap);
+    }
+    double *X = row + 2, *Y = X + N, *SX = Y + N, *SY = SX + N, *R = SY + N;
+    double a0 = DF_POW2(sd[0]), a1 = DF_POW2(sd[1]);
+    row[0] = row[1] = 1.0;
+    for (int i = 0; i < N; i++) {
+        double u = svx * t[i], w = svy * t[i];
+        SX[i] = sqrt(a0 + u * u);
+        SY[i] = sqrt(a1 + w * w);
+        X[i] = q->x + vx * t[i];
+        Y[i] = q->y + vy * t[i];
+        R[i] = 0.0;
+    }
+    if (P != NULL && fc[FC_ALONG_PATH] > 0.5 && df_hypot(vx, vy) >= fc[FC_ALONG_MIN]) {
+        double s0, off, hx, hy, h0;
+        df_project(P, q->x, q->y, &s0, &off);
+        df_along(P, s0, &hx, &hy, &h0);
+        double dv = atan2(vy, vx) - h0;
+        dv = df_mod(dv + M_PI, 2.0 * M_PI) - M_PI;
+        double lim = fc[FC_ALONG_HDG_DEG] * (M_PI / 180.0);
+        if (fabs(dv) <= lim || fabs(dv) >= M_PI - lim) {
+            double va = df_hypot(vx, vy) * (fabs(dv) <= lim ? 1.0 : -1.0);
+            for (int i = 0; i < N; i++) {
+                double cx, cy, ch;
+                df_along(P, s0 + va * t[i], &cx, &cy, &ch);
+                X[i] = cx - off * sin(ch);
+                Y[i] = cy + off * cos(ch);
+            }
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static PyObject *df_round(double v, int n)       /* round(v, n) */
+{
+    int ok;
+    double r = round_fast(v, n, &ok);
+    if (ok)
+        return PyFloat_FromDouble(r);
+    PyObject *a = Py_BuildValue("(di)", v, n), *res = NULL;
+    if (a != NULL) {
+        res = PyObject_CallObject(builtin_round, a);
+        Py_DECREF(a);
+    }
+    return res;
+}
+
+static PyObject *df_r(double v, int n)           /* threat._r: None where it is no number */
+{
+    if (!isfinite(v))
+        Py_RETURN_NONE;
+    return df_round(v, n);
+}
+
+static int df_set(PyObject *d, int key, PyObject *v)      /* d[key] = v; takes v */
+{
+    if (v == NULL)
+        return -1;
+    int rc = PyDict_SetItem(d, df_s[key], v);
+    Py_DECREF(v);
+    return rc;
+}
+
+static int df_setb(PyObject *d, int key, PyObject *v)     /* d[key] = v; v borrowed */
+{
+    return v == NULL ? -1 : PyDict_SetItem(d, df_s[key], v);
+}
+
+static const int DF_LEVEL_NAME[5] = {S_none, S_information, S_caution, S_warning, S_imminent};
+static const int DF_LANE_KEY[7] = {S_ego, S_left, S_right, S_onc, S_cross, S_park, S_off};
+
+/* what the prediction's lane probabilities say of one object: the mass, P(ego), P(cross), P(a lane along the road) */
+typedef struct {
+    int has;
+    double sum, ego, cross, along;
+    PyObject *dict;              /* the message's own dict (borrowed), or NULL: from the array */
+    const double *arr;
+} DfLane;
+
+static void df_lane(PyObject *lanes, const double *larr, Py_ssize_t nl, int row, DfLane *ln)
+{
+    DfSum all = {0.0, 0.0, 0}, al = {0.0, 0.0, 0};
+    ln->has = 0;
+    ln->dict = NULL;
+    ln->arr = NULL;
+    ln->sum = ln->ego = ln->cross = ln->along = 0.0;
+    if (row < 0)
+        return;
+    if (larr != NULL) {
+        if (row >= nl)
+            return;
+        const double *a = larr + 7 * row;
+        ln->has = 1;
+        ln->arr = a;
+        for (int i = 0; i < 7; i++)
+            if (isfinite(a[i])) {
+                df_sum_add(&all, a[i], 0);
+                if (i < 4)
+                    df_sum_add(&al, a[i], 0);
+            }
+        ln->ego = isfinite(a[0]) ? a[0] : 0.0;
+        ln->cross = isfinite(a[4]) ? a[4] : 0.0;
+        ln->sum = df_sum(&all);
+        ln->along = df_sum(&al);
+        return;
+    }
+    if (lanes == NULL || !PyList_Check(lanes) || row >= PyList_Size(lanes))
+        return;
+    PyObject *d = PyList_GetItem(lanes, row);
+    if (d == NULL || !PyDict_Check(d))
+        return;
+    ln->has = 1;
+    ln->dict = d;
+    Py_ssize_t pos = 0;
+    PyObject *k, *v;
+    double x;
+    while (PyDict_Next(d, &pos, &k, &v))
+        if (df_fin(v, &x))
+            df_sum_add(&all, x, PyLong_Check(v));
+    df_fin(df_get(d, S_ego), &ln->ego);
+    df_fin(df_get(d, S_cross), &ln->cross);
+    static const int AL[4] = {S_ego, S_left, S_right, S_onc};
+    for (int i = 0; i < 4; i++) {
+        v = df_get(d, AL[i]);
+        if (df_fin(v, &x))
+            df_sum_add(&al, x, PyLong_Check(v));
+    }
+    ln->sum = df_sum(&all);
+    ln->along = df_sum(&al);
+}
+
+/* futures.road_axis: a heading taken to the road's axis (either direction) where it is within snap of it */
+static void df_road_axis(double *h, double *sh, double road, double snap, double sd)
+{
+    if (!isfinite(*h)) {
+        *h = road;
+        *sh = sd;
+        return;
+    }
+    double d = df_mod(*h - road + M_PI / 2.0, M_PI) - M_PI / 2.0;
+    if (fabs(d) > snap)
+        return;
+    *h = *h - d;
+    *sh = isfinite(*sh) ? DF_MIN(*sh, sd) : sd;
+}
+
+/* decide_frame(objects, ego, futures, path, t_own, fcfg, tcfg, thr, mu, shown, opt)
+ *   objects   the radar message's `objects` (a list of dicts) or None
+ *   ego       the radar message's `ego` (a dict) or None
+ *   futures   None, or (t, ego, ego_names, ego_given, modes, names, rows, lanes, sel) of decide/futures.py Futures
+ *   path      None, or (px, py, ps) of decide_path
+ *   t_own     the grid of the degraded futures (no grid in `futures`)
+ *   fcfg, tcfg, thr   the futures' constants (FC_*), the threat model's (DC_*, DX_*; V0, A0 and the available
+ *             accelerations are set here), the thresholds
+ *   mu        the road's friction
+ *   shown     {object id: the level shown}: the frame before
+ *   opt       1: every judged pair in the listed records (`pairs`); 2: every judged object gets a record, and the
+ *             arrays are returned (tests, tools)
+ * -> (records, listed, objects by id, shown, judged, cv, invalid, ego_own, steps, a_long, a_lat, ego_modes,
+ *     horizon, detail)
+ *   records   the dicts of decide.objects[] of the objects that matter to a consumer or an alert (a level or an
+ *             exit level, a collision probability from list_min_p, a headway); listed: those the message lists,
+ *             in its order; objects by id: {id: radar object} of the records
+ *   steps     of the horizon (its simulation's), -1 where nothing was judged
+ *   detail    None, or {"t", "ego", "ohdr", "modes", "pair", "obj": bytes of float64; "names", "ego_names",
+ *             "src": lists} */
+static PyObject *n_decide_frame(PyObject *self, PyObject *args)
+{
+    PyObject *objects, *ego, *fut, *path, *ot, *ofc, *otc, *othr, *shown;
+    double mu;
+    int opt;
+    if (!PyArg_ParseTuple(args, "OOOOOOOOdO!i", &objects, &ego, &fut, &path, &ot, &ofc, &otc, &othr, &mu, &PyDict_Type,
+                          &shown, &opt))
+        return NULL;
+    if (df_strings() < 0)
+        return NULL;
+    View vt, vfc, vtc, vthr, vg, veg, vmd, vrw, vln, vpx, vpy, vps;
+    vt.held = vfc.held = vtc.held = vthr.held = vg.held = veg.held = vmd.held = vrw.held = vln.held = vpx.held = vpy.held = vps.held = 0;
+    PyObject *res = NULL, *recs = NULL, *listed = NULL, *byid = NULL, *shown_new = NULL, *ego_modes = NULL, *detail = NULL;
+    double *mem = NULL;
+    DfObj *Q = NULL;
+    PyObject **mname = NULL, **ename = NULL, **lrec = NULL;
+    const double *t_own, *fc, *tc, *thr, *grid = NULL, *hego = NULL, *hmodes = NULL, *hrows = NULL, *hlanes = NULL;
+    Py_ssize_t n_own, nfc, ntc, nthr, ng = 0, nheg = 0, nhm = 0, nhr = 0, nhl = 0;
+    PyObject *h_enames = NULL, *h_names = NULL, *h_lanes = NULL, *h_sel = NULL;
+    int ego_given = 0;
+    if (df_buf(ot, &vt, &t_own, &n_own, "t_own") < 0 || df_buf(ofc, &vfc, &fc, &nfc, "fcfg") < 0 ||
+        df_buf(otc, &vtc, &tc, &ntc, "tcfg") < 0 || df_buf(othr, &vthr, &thr, &nthr, "thr") < 0)
+        goto done;
+    if (nfc < FC_N || ntc < DX_NC || nthr < 24 || nthr % 24) {
+        PyErr_SetString(PyExc_ValueError, "decide_frame: the constants' arrays are too short");
+        goto done;
+    }
+    if (fut != Py_None) {
+        if (!PyTuple_Check(fut) || PyTuple_Size(fut) != 9) {
+            PyErr_SetString(PyExc_TypeError, "decide_frame: futures: the nine fields of Futures");
+            goto done;
+        }
+        PyObject *f_t = PyTuple_GetItem(fut, 0), *f_ego = PyTuple_GetItem(fut, 1), *f_lanes = PyTuple_GetItem(fut, 7);
+        h_enames = PyTuple_GetItem(fut, 2);
+        ego_given = PyObject_IsTrue(PyTuple_GetItem(fut, 3));
+        h_names = PyTuple_GetItem(fut, 5);
+        h_sel = PyTuple_GetItem(fut, 8);
+        if (f_t != Py_None && df_buf(f_t, &vg, &grid, &ng, "futures t") < 0)
+            goto done;
+        if (f_ego != Py_None && df_buf(f_ego, &veg, &hego, &nheg, "futures ego") < 0)
+            goto done;
+        if (df_buf(PyTuple_GetItem(fut, 4), &vmd, &hmodes, &nhm, "futures modes") < 0 ||
+            df_buf(PyTuple_GetItem(fut, 6), &vrw, &hrows, &nhr, "futures rows") < 0)
+            goto done;
+        if (f_lanes != Py_None) {
+            if (PyList_Check(f_lanes))
+                h_lanes = f_lanes;
+            else if (df_buf(f_lanes, &vln, &hlanes, &nhl, "futures lanes") < 0)
+                goto done;
+        }
+        if (grid != NULL && ng < 1)
+            grid = NULL;
+        if (!PyList_Check(h_names) || !PyList_Check(h_enames) || !(PyDict_Check(h_sel) || PyList_Check(h_sel)) ||
+            (grid != NULL && (nhm % (2 + 5 * ng) || nheg % (1 + 3 * ng) || PyList_Size(h_names) < nhm / (2 + 5 * ng) ||
+                              PyList_Size(h_enames) < nheg / (1 + 3 * ng))) || nhr % 3 || nhl % 7) {
+            PyErr_SetString(PyExc_ValueError, "decide_frame: futures: array sizes do not fit together");
+            goto done;
+        }
+    }
+    DfPath P;
+    P.n = 0;
+    P.hd = NULL;
+    if (path != Py_None) {
+        Py_ssize_t a, b, c;
+        if (!PyTuple_Check(path) || PyTuple_Size(path) != 3 || df_buf(PyTuple_GetItem(path, 0), &vpx, &P.px, &a, "path x") < 0 ||
+            df_buf(PyTuple_GetItem(path, 1), &vpy, &P.py, &b, "path y") < 0 || df_buf(PyTuple_GetItem(path, 2), &vps, &P.ps, &c, "path s") < 0)
+            goto done;
+        if (a < 2 || a != b || a != c) {
+            PyErr_SetString(PyExc_ValueError, "decide_frame: path: three arrays of one length, two points at least");
+            goto done;
+        }
+        P.n = (int)a;
+    }
+    /* the grid: the contract's (now put before it where it starts later), or the degraded futures' own */
+    const int prepend = grid != NULL && grid[0] > 1e-9;
+    const int Nin = (int)ng, N = grid != NULL ? Nin + prepend : (int)n_own;
+    if (N < 1 || N > DK_MAXN) {
+        PyErr_SetString(PyExc_ValueError, "decide_frame: a grid of 1 to 512 times is needed");
+        goto done;
+    }
+    /* the objects judged: confirmed and coast */
+    Py_ssize_t no = objects != Py_None && PyList_Check(objects) ? PyList_Size(objects) : 0;
+    int M = 0;
+    for (Py_ssize_t i = 0; i < no; i++) {
+        PyObject *o = PyList_GetItem(objects, i);
+        if (PyDict_Check(o)) {
+            PyObject *st = df_get(o, S_state);
+            M += df_is(st, S_confirmed) || df_is(st, S_coast);
+        }
+    }
+    PyObject *eg_d = ego != Py_None && PyDict_Check(ego) && PyDict_Size(ego) > 0 ? ego : NULL;
+    double e_speed = 0.0, e_yaw = 0.0, e_acc = 0.0;
+    if (eg_d != NULL && (df_num0(df_get(eg_d, S_speed_mps), &e_speed) < 0 || df_num0(df_get(eg_d, S_yaw_rate_rps), &e_yaw) < 0 ||
+                         df_num0(df_get(eg_d, S_accel_mps2), &e_acc) < 0))
+        goto done;
+    /* threat.available: the braking and the lateral acceleration a driver can get */
+    const double v0 = DF_MAX(0.0, e_speed);
+    double fade = DF_MAX(0.5, 1.0 - tc[DX_SPEED_FADE] * DF_MAX(0.0, v0));
+    double a_long = mu * DF_G * tc[DX_BRAKE_SHARE] * fade, a_lat = mu * DF_G * tc[DX_STEER_SHARE] * fade;
+    {
+        double vr = DF_MAX(v0, 0.5), cap = DF_POW2(vr) / tc[DX_TURN_R];
+        a_lat = DF_MIN(a_lat, cap);
+        a_lat = DF_MAX(a_lat, 0.05);
+    }
+    recs = PyList_New(0);
+    listed = PyList_New(0);
+    byid = PyDict_New();
+    shown_new = PyDict_New();
+    ego_modes = PyList_New(0);
+    if (!recs || !listed || !byid || !shown_new || !ego_modes)
+        goto done;
+    int n_cv = 0, invalid = 0, ego_own = 0, steps = -1;
+    double horizon = grid != NULL ? grid[Nin - 1] : t_own[N - 1];
+    if (M == 0) {                                 /* nothing to judge: the car's futures are not made */
+        ego_own = !(fut != Py_None && ego_given);
+        goto out;
+    }
+    if (N < 2) {
+        PyErr_SetString(PyExc_ValueError, "decide_eval: arrays of the documented shapes are needed");
+        goto done;
+    }
+    /* storage: the grid, the path's segments, the car's modes, the objects' modes, the results */
+    int Emax = hego != NULL && grid != NULL ? (int)(nheg / (1 + 3 * Nin)) : 0;
+    if (Emax < 2)
+        Emax = 2;
+    Py_ssize_t Kmax = 0;
+    Q = (DfObj *)PyMem_Calloc((size_t)M, sizeof(DfObj));
+    if (Q == NULL) {
+        PyErr_NoMemory();
+        goto done;
+    }
+    {
+        int m = 0;
+        for (Py_ssize_t i = 0; i < no; i++) {
+            PyObject *o = PyList_GetItem(objects, i);
+            if (!PyDict_Check(o))
+                continue;
+            PyObject *st = df_get(o, S_state);
+            if (!(df_is(st, S_confirmed) || df_is(st, S_coast)))
+                continue;
+            DfObj *q = &Q[m++];
+            if (df_parse(o, q) < 0)
+                goto done;
+            q->row = -1;
+            if (fut != Py_None) {
+                if (PyDict_Check(h_sel)) {
+                    PyObject *r = PyDict_GetItemWithError(h_sel, q->id);
+                    if (r == NULL && PyErr_Occurred())
+                        goto done;
+                    if (r != NULL)
+                        q->row = (int)PyLong_AsLong(r);
+                } else if (i < PyList_Size(h_sel))
+                    q->row = (int)PyLong_AsLong(PyList_GetItem(h_sel, i));
+                if (q->row == -1 && PyErr_Occurred())
+                    goto done;
+                if (q->row >= nhr / 3)
+                    q->row = -1;
+            }
+            int cnt = q->row >= 0 ? (int)hrows[3 * q->row + 1] : 0;
+            Kmax += cnt > 2 ? cnt : 2;
+        }
+    }
+    const int wE = 1 + 3 * N, wM = 2 + 5 * N;
+    size_t need = (size_t)N + 2 * (size_t)(P.n > 0 ? P.n : 1) + (size_t)Emax * wE + (size_t)Kmax * (wM + 2) +
+                  (size_t)M * DK_OHC + (size_t)Kmax * Emax * DK_PF + (size_t)M * DK_OF + DX_NC;
+    mem = (double *)PyMem_Malloc(need * sizeof(double));
+    mname = (PyObject **)PyMem_Malloc((size_t)(Kmax + 1) * sizeof(PyObject *));
+    ename = (PyObject **)PyMem_Malloc((size_t)Emax * sizeof(PyObject *));
+    if (!mem || !mname || !ename) {
+        PyErr_NoMemory();
+        goto done;
+    }
+    double *w = mem;
+    double *t = w;
+    w += N;
+    if (grid != NULL) {
+        if (prepend)
+            t[0] = 0.0;
+        for (int i = 0; i < Nin; i++)
+            t[i + prepend] = grid[i];
+    } else
+        for (int i = 0; i < N; i++)
+            t[i] = t_own[i];
+    const DfPath *PP = NULL;
+    if (P.n > 0) {
+        P.hd = w;
+        P.mid = w + P.n;
+        w += 2 * P.n;
+        for (int i = 0; i < P.n - 1; i++) {
+            P.hd[i] = atan2(P.py[i + 1] - P.py[i], P.px[i + 1] - P.px[i]);
+            P.mid[i] = 0.5 * (P.ps[i + 1] + P.ps[i]);
+        }
+        P.c0 = cos(P.hd[0]);
+        P.s0 = sin(P.hd[0]);
+        P.c1 = cos(P.hd[P.n - 2]);
+        P.s1 = sin(P.hd[P.n - 2]);
+        PP = &P;
+    }
+    /* ---- the car's futures: the contract's, else its own from its motion now and the plan ---- */
+    double *EG = w;
+    w += (size_t)Emax * wE;
+    int E = 0;
+    if (grid != NULL && hego != NULL) {
+        E = (int)(nheg / (1 + 3 * Nin));
+        DfSum sum = {0.0, 0.0, 0};
+        for (int j = 0; j < E; j++) {
+            const double *src = hego + (size_t)j * (1 + 3 * Nin);
+            double *row = EG + (size_t)j * wE, p = isfinite(src[0]) ? DF_MIN(1.0, DF_MAX(0.0, src[0])) : 1.0 / E;
+            row[0] = p;
+            df_sum_add(&sum, p, 0);
+            for (int q = 0; q < 3; q++) {
+                double *d = row + 1 + q * N;
+                if (prepend)
+                    d[0] = q == 2 ? e_speed : 0.0;
+                for (int i = 0; i < Nin; i++) {
+                    double v = src[1 + q * Nin + i];
+                    d[i + prepend] = q == 2 ? ((v >= 0.0 || isnan(v)) ? v : 0.0) : v;
+                }
+            }
+            ename[j] = PyList_GetItem(h_enames, j);
+        }
+        double sp = df_sum(&sum);
+        if (E > 0 && sp > 0.0)
+            for (int j = 0; j < E; j++)
+                EG[(size_t)j * wE] = EG[(size_t)j * wE] / sp;
+        else
+            E = 0;
+    }
+    if (E == 0) {                                 /* futures.ego_futures */
+        ego_own = 1;
+        double w0 = e_yaw, lo = fc[FC_EGO_A_LO], hi = fc[FC_EGO_A_HI];
+        double am = DF_MAX(lo, e_acc), a0 = DF_MIN(hi, am);
+        double t_stop = a0 < 0.0 ? v0 / -a0 : INFINITY, half = 0.5 * a0;
+        double s_stop = a0 < 0.0 ? v0 * t_stop + half * t_stop * t_stop : 0.0;
+        double k = v0 > 0.5 ? w0 / v0 : 0.0;
+        E = PP != NULL ? 2 : 1;
+        double *turn = EG + (size_t)(E - 1) * wE, *pth = EG;
+        double s0 = 0.0, off0 = 0.0;
+        if (PP != NULL) {
+            df_project(PP, 0.0, 0.0, &s0, &off0);
+            pth[0] = fc[FC_EGO_PATH_P];
+            turn[0] = 1.0 - fc[FC_EGO_PATH_P];
+            ename[0] = df_s[S_path];
+            ename[1] = df_s[S_turn];
+        } else {
+            turn[0] = 1.0;
+            ename[0] = df_s[S_turn];
+        }
+        for (int i = 0; i < N; i++) {
+            double ti = t[i], vv = v0 + a0 * ti, v = (0.0 >= vv) ? 0.0 : vv;
+            double s = (a0 < 0.0 && !(ti <= t_stop)) ? s_stop : v0 * ti + half * ti * ti;
+            double psi = k * s;
+            if (fabs(k) > 1e-6) {
+                turn[1 + i] = sin(psi) / k;
+                turn[1 + N + i] = (1.0 - cos(psi)) / k;
+            } else {
+                turn[1 + i] = s;
+                turn[1 + N + i] = 0.0;
+            }
+            turn[1 + 2 * N + i] = v;
+            if (PP != NULL) {
+                /* the plan's line from the car's own place: its offset at the car taken out over the first 2 s */
+                double cx, cy, ch, f = 1.0 - ti / 2.0;
+                df_along(PP, s0 + s, &cx, &cy, &ch);
+                f = f < 0.0 ? 0.0 : (f > 1.0 ? 1.0 : f);
+                pth[1 + i] = cx - (-off0) * f * sin(ch);
+                pth[1 + N + i] = cy + (-off0) * f * cos(ch);
+                pth[1 + 2 * N + i] = v;
+            }
+        }
+    }
+    for (int j = 0; j < E; j++) {                 /* the message's ego_modes: [name, round(p, 3)] */
+        PyObject *pr = df_round(EG[(size_t)j * wE], 3), *pair = pr ? PyList_New(2) : NULL;
+        if (pair == NULL) {
+            Py_XDECREF(pr);
+            goto done;
+        }
+        Py_INCREF(ename[j]);
+        PyList_SetItem(pair, 0, ename[j]);
+        PyList_SetItem(pair, 1, pr);
+        int rc = PyList_Append(ego_modes, pair);
+        Py_DECREF(pair);
+        if (rc < 0)
+            goto done;
+    }
+    /* ---- the objects' futures ---- */
+    double *MD = w;
+    w += (size_t)Kmax * wM;
+    double *pn = w;                               /* per mode: p0, p as normalised (before the lanes' weight) */
+    w += (size_t)Kmax * 2;
+    int K = 0;
+    for (int m = 0; m < M; m++) {
+        DfObj *q = &Q[m];
+        int state = q->row >= 0 ? (int)hrows[3 * q->row + 2] : 0;
+        q->first = K;
+        q->nm = 0;
+        q->cv = 1;
+        q->along = 0;
+        if (grid != NULL && state == 1) {         /* futures.contract_modes */
+            int first = (int)hrows[3 * q->row], cnt = (int)hrows[3 * q->row + 1];
+            int two = q->nsd >= 2 && q->sdfin[0] && q->sdfin[1];
+            double sx0 = two ? q->sd[0] : 1.0, sy0 = two ? q->sd[1] : 1.0;
+            DfSum sum0 = {0.0, 0.0, 0}, sumc = {0.0, 0.0, 0};
+            if (first < 0 || cnt < 0 || (Py_ssize_t)(first + cnt) * (2 + 5 * Nin) > nhm)
+                cnt = 0;
+            for (int i = 0; i < cnt; i++) {
+                const double *src = hmodes + (size_t)(first + i) * (2 + 5 * Nin);
+                double *row = MD + (size_t)(K + i) * wM;
+                for (int c = 0; c < 5; c++) {
+                    const double *a = src + 2 + c * Nin;
+                    double *d = row + 2 + c * N;
+                    int given = !isnan(a[0]);
+                    if (prepend)
+                        d[0] = c == 0 ? q->x : c == 1 ? q->y : c == 2 ? sx0 : c == 3 ? sy0 : 0.0;
+                    for (int j = 0; j < Nin; j++) {
+                        double v = given ? a[j] : (c == 2 ? sx0 : c == 3 ? sy0 : 0.0);
+                        if (c == 2 || c == 3)
+                            v = fabs(v);
+                        else if (c == 4)
+                            v = v < -0.99 ? -0.99 : (v > 0.99 ? 0.99 : v);
+                        d[j + prepend] = v;
+                    }
+                }
+                double p = isfinite(src[1]) ? DF_MIN(1.0, DF_MAX(0.0, src[1])) : 1.0 / cnt;
+                double p0 = isfinite(src[0]) ? DF_MIN(1.0, DF_MAX(0.0, src[0])) : p;
+                pn[2 * (K + i)] = p0;
+                pn[2 * (K + i) + 1] = p;
+                df_sum_add(&sum0, p0, 0);
+                df_sum_add(&sumc, p, 0);
+                mname[K + i] = PyList_GetItem(h_names, first + i);
+            }
+            double s0 = df_sum(&sum0), sc = df_sum(&sumc);
+            if (cnt > 0 && s0 > 0.0 && sc > 0.0) {
+                for (int i = 0; i < cnt; i++) {
+                    pn[2 * (K + i)] = pn[2 * (K + i)] / s0;
+                    pn[2 * (K + i) + 1] = pn[2 * (K + i) + 1] / sc;
+                }
+                q->nm = cnt;
+                q->cv = 0;
+            }
+        }
+        if (q->cv) {                              /* futures.cv_futures: the degraded adapter */
+            if (state != 0)
+                invalid++;
+            n_cv++;
+            double ps = q->ps;
+            int one = fc[FC_MODES_RADAR] < 0.5;
+            if (!one) {
+                if (q->motion == 1 || q->parked)
+                    ps = 1.0;
+                else if (q->motion == -1)
+                    ps = 0.0;
+                else if (!q->ps_fin)
+                    one = 1;
+            }
+            double *r0 = MD + (size_t)K * wM, *r1 = r0 + wM;
+            if (one) {
+                int st = q->motion == 1;
+                int ap = df_cv(q, st, t, N, fc, PP, r0);
+                mname[K] = df_s[st ? (ap ? S_stand_path : S_stand) : (ap ? S_cv_path : S_cv)];
+                q->along = ap;
+                q->nm = 1;
+            } else {
+                ps = DF_MIN(1.0, DF_MAX(0.0, ps));
+                if (ps >= 1.0 - fc[FC_STAND_MIN] || ps <= fc[FC_STAND_MIN]) {
+                    int st = ps >= 1.0 - fc[FC_STAND_MIN];
+                    int ap = df_cv(q, st, t, N, fc, PP, r0);
+                    mname[K] = df_s[st ? (ap ? S_stand_path : S_stand) : (ap ? S_cv_path : S_cv)];
+                    q->along = ap;
+                    q->nm = 1;
+                } else {
+                    int a = df_cv(q, 1, t, N, fc, PP, r0), b = df_cv(q, 0, t, N, fc, PP, r1);
+                    mname[K] = df_s[a ? S_stand_path : S_stand];
+                    mname[K + 1] = df_s[b ? S_cv_path : S_cv];
+                    r0[0] = r0[1] = ps;
+                    r1[0] = r1[1] = 1.0 - ps;
+                    q->along = a || b;
+                    q->nm = 2;
+                }
+            }
+            for (int i = 0; i < q->nm; i++) {
+                pn[2 * (K + i)] = MD[(size_t)(K + i) * wM];
+                pn[2 * (K + i) + 1] = MD[(size_t)(K + i) * wM + 1];
+            }
+        }
+        K += q->nm;
+    }
+    /* ---- threat.evaluate: each footprint, the lanes' weight of the standing modes ---- */
+    double *OH = w;
+    w += (size_t)M * DK_OHC;
+    for (int m = 0; m < M; m++) {
+        DfObj *q = &Q[m];
+        DfLane ln;
+        df_lane(h_lanes, hlanes, nhl / 7, q->row, &ln);
+        double h = q->h, sh = q->sh, rh = 0.0;
+        if (PP != NULL) {                         /* the path's direction at its place */
+            double s, off, x, y;
+            df_project(PP, q->x, q->y, &s, &off);
+            df_along(PP, s, &x, &y, &rh);
+        }
+        if (isfinite(h) && (isfinite(sh) && sh > tc[DX_HDG_RES])) {       /* a box heading the radar did not resolve */
+            if (q->hfm) {
+                h = q->trav_h;
+                sh = q->trav_sh;
+            } else if (PP != NULL) {
+                sh = NAN;
+                df_road_axis(&h, &sh, rh, M_PI, tc[DX_AXIS_STD]);
+            }
+        } else if (!isfinite(h) && PP != NULL)
+            h = rh;
+        else if (PP != NULL && DF_SET[q->cls] == 0 && (ln.along >= tc[DX_LANE_AXIS_P] || q->along))
+            df_road_axis(&h, &sh, rh, M_PI, tc[DX_AXIS_STD]);
+        else if (PP != NULL && tc[DX_AXIS_STANDING] > 0.5 && q->stands && !q->hfm)
+            df_road_axis(&h, &sh, rh, tc[DX_AXIS_SNAP], tc[DX_AXIS_STD]);
+        double w_stand = 1.0;
+        if (tc[DX_LANE_WEIGHT] > 0.5 && !(q->in_path || q->threat || !ln.has) && !(ln.sum < 0.5)) {
+            double a = ln.ego + ln.cross, b = DF_MAX(tc[DX_LANE_FLOOR], a);
+            w_stand = DF_MIN(1.0, b);
+        }
+        double *hd = OH + (size_t)m * DK_OHC;
+        hd[0] = q->first;
+        hd[1] = q->nm;
+        hd[2] = q->L;
+        hd[3] = q->W;
+        hd[4] = q->sL;
+        hd[5] = q->sW;
+        hd[6] = h;
+        hd[7] = sh;
+        hd[8] = DF_SET[q->cls];
+        hd[9] = q->has_ctr ? 1.0 : 0.0;
+        hd[10] = q->has_ctr ? q->cdx : 0.0;
+        hd[11] = q->has_ctr ? q->cdy : 0.0;
+        for (int i = 0; i < q->nm; i++) {
+            double *row = MD + (size_t)(q->first + i) * wM;
+            const double *X = row + 2, *Y = X + N;
+            double f = 1.0;
+            if (w_stand < 1.0) {                  /* futures.mode_stands */
+                double far = hypot(X[0] - X[0], Y[0] - Y[0]);
+                for (int j = 1; j < N; j++) {
+                    double d = hypot(X[j] - X[0], Y[j] - Y[0]);
+                    if (d > far || isnan(d))
+                        far = d;
+                }
+                if (far < tc[DX_STAND_MOVE])
+                    f = w_stand;
+            }
+            row[0] = pn[2 * (q->first + i)] * f;
+            row[1] = pn[2 * (q->first + i) + 1] * f;
+        }
+    }
+    double *cfg = w;
+    w += DX_NC;
+    for (int i = 0; i < DC_NC; i++)
+        cfg[i] = tc[i];
+    cfg[DC_V0] = v0;
+    cfg[DC_A0] = e_acc;
+    cfg[DC_ALONG] = a_long;
+    cfg[DC_ALAT] = a_lat;
+    double *PO = w, *OO = w + (size_t)K * E * DK_PF;
+    {
+        int nsim;
+        if (dk_eval(t, N, EG, E, OH, DK_OHC, M, MD, K, cfg, thr, (int)(nthr / 24), PO, OO, &steps, &nsim) < 0)
+            goto done;
+    }
+    /* ---- the records (threat.object_record) of the objects that matter, the level shown, the list ---- */
+    {
+        const int all = (opt & 2) != 0, pairs = (opt & 1) != 0;
+        int nlist = 0;
+        lrec = (PyObject **)PyMem_Calloc((size_t)M + 1, sizeof(PyObject *));
+        double *lkey = (double *)PyMem_Malloc((size_t)(2 * M + 1) * sizeof(double));
+        if (lrec == NULL || lkey == NULL) {
+            PyMem_Free(lkey);
+            PyErr_NoMemory();
+            goto done;
+        }
+        int bad = 0;
+        for (int m = 0; m < M && !bad; m++) {
+            const DfObj *q = &Q[m];
+            const double *oo = OO + (size_t)m * DK_OF;
+            int lv = (int)oo[DO_LE], lx = (int)oo[DO_LX];
+            PyObject *pc = df_r(oo[DO_PC], 3);
+            if (pc == NULL) {
+                bad = 1;
+                break;
+            }
+            double pr = pc == Py_None ? 0.0 : PyFloat_AsDouble(pc);
+            int thw = isfinite(oo[DO_THW]);
+            if (!(all || lv > 0 || lx > 0 || pr >= tc[DX_LIST_MIN_P] || thw)) {
+                Py_DECREF(pc);
+                continue;
+            }
+            PyObject *r = PyDict_New(), *x;
+            if (r == NULL) {
+                Py_DECREF(pc);
+                bad = 1;
+                break;
+            }
+            const double *ms = pn + 2 * q->first;
+            bad |= df_setb(r, S_id, q->id) < 0 || df_set(r, S_level, PyLong_FromLong(lv)) < 0 ||
+                   df_setb(r, S_level_name, df_s[DF_LEVEL_NAME[lv < 0 || lv > 4 ? 0 : lv]]) < 0 ||
+                   df_set(r, S_level_exit, PyLong_FromLong(lx)) < 0 || df_set(r, S_level_cond, PyLong_FromLong((int)oo[DO_LC])) < 0;
+            bad |= df_set(r, S_p_coll, pc) < 0;
+            bad |= df_set(r, S_p_coll_cond, df_r(oo[DO_PCC], 3)) < 0 || df_set(r, S_ttc_s, df_r(oo[DO_TTC], 2)) < 0 ||
+                   df_set(r, S_thw_s, df_r(oo[DO_THW], 2)) < 0 || df_set(r, S_sep_m, df_r(oo[DO_SEP], 2)) < 0 ||
+                   df_setb(r, S_kind, df_s[DF_SET[q->cls] == 0 ? S_vehicle : DF_SET[q->cls] == 1 ? S_vru : S_unknown]) < 0;
+            x = PyList_New(2);
+            if (x != NULL) {
+                PyObject *a = df_r(q->L, 1), *b = df_r(q->W, 1);
+                if (a == NULL || b == NULL) {
+                    Py_XDECREF(a);
+                    Py_XDECREF(b);
+                    Py_CLEAR(x);
+                } else {
+                    PyList_SetItem(x, 0, a);
+                    PyList_SetItem(x, 1, b);
+                }
+            }
+            bad |= df_set(r, S_size, x) < 0 || df_setb(r, S_size_src, df_s[q->src_radar ? S_radar : S_class]) < 0 ||
+                   df_setb(r, S_fut, df_s[q->cv ? S_cv : S_contract]) < 0;
+            x = PyList_New(4);
+            for (int l = 0; x != NULL && l < 4; l++) {
+                PyObject *a = df_r(oo[DO_ME + l], 3);
+                if (a == NULL)
+                    Py_CLEAR(x);
+                else
+                    PyList_SetItem(x, l, a);
+            }
+            bad |= df_set(r, S_mass, x) < 0;
+            int b = (int)oo[DO_BEST];
+            if (b >= 0) {
+                int km = b / E, j = b % E;
+                const double *p = PO + ((size_t)(q->first + km) * E + j) * DK_PF;
+                PyObject *ar = PyDict_New(), *why = PyDict_New();
+                if (ar == NULL || why == NULL) {
+                    Py_XDECREF(ar);
+                    Py_XDECREF(why);
+                    bad = 1;
+                } else {
+                    bad |= df_set(r, S_btn, df_r(p[DP_BTN], 2)) < 0 || df_set(r, S_stn, df_r(p[DP_STN], 2)) < 0 ||
+                           df_set(r, S_tn, df_r(p[DP_TN], 2)) < 0;
+                    bad |= df_set(ar, S_brake, df_r(p[DP_AB], 2)) < 0 || df_set(ar, S_left, df_r(p[DP_AL], 2)) < 0 ||
+                           df_set(ar, S_right, df_r(p[DP_AR], 2)) < 0 || df_set(ar, S_comb, df_r(p[DP_AC], 2)) < 0 ||
+                           df_set(ar, S_comb_dir_deg, df_r(p[DP_DIR] * (180.0 / M_PI), 0)) < 0;
+                    bad |= df_set(r, S_a_req, ar) < 0;
+                    bad |= df_set(r, S_ttb_s, df_r(p[DP_TTB], 2)) < 0 || df_set(r, S_tts_s, df_r(p[DP_TTS], 2)) < 0 ||
+                           df_set(r, S_tm_s, df_r(p[DP_TM], 2)) < 0;
+                    int me = (int)oo[DO_WHY];
+                    bad |= df_setb(why, S_mode, mname[q->first + km]) < 0 || df_set(why, S_p0, df_r(ms[2 * km], 3)) < 0 ||
+                           df_set(why, S_p, df_r(ms[2 * km + 1], 3)) < 0 || df_setb(why, S_ego_mode, ename[j]) < 0 ||
+                           df_setb(why, S_measure, df_s[me == 1 ? S_threat_number : me == 2 ? S_time_margin : S_collision_course]) < 0 ||
+                           df_set(why, S_pc, df_r(p[DP_PC], 3)) < 0 || df_set(why, S_t_contact_s, df_r(p[DP_TCON], 2)) < 0;
+                    bad |= df_set(r, S_why, why) < 0;
+                }
+            } else {
+                bad |= df_set(r, S_btn, PyFloat_FromDouble(0.0)) < 0 || df_set(r, S_stn, PyFloat_FromDouble(0.0)) < 0 ||
+                       df_set(r, S_tn, PyFloat_FromDouble(0.0)) < 0 || df_setb(r, S_a_req, Py_None) < 0 ||
+                       df_setb(r, S_ttb_s, Py_None) < 0 || df_setb(r, S_tts_s, Py_None) < 0 || df_setb(r, S_tm_s, Py_None) < 0 ||
+                       df_setb(r, S_why, Py_None) < 0;
+            }
+            DfLane ln;
+            df_lane(h_lanes, hlanes, nhl / 7, q->row, &ln);
+            if (ln.has && ln.dict != NULL)
+                bad |= df_setb(r, S_lane, ln.dict) < 0;
+            else if (ln.has) {
+                PyObject *d = PyDict_New();
+                for (int i = 0; d != NULL && i < 7; i++)
+                    if (df_set(d, DF_LANE_KEY[i], PyFloat_FromDouble(ln.arr[i])) < 0)
+                        Py_CLEAR(d);
+                bad |= df_set(r, S_lane, d) < 0;
+            }
+            /* the level shown: up at the entry level, down below the exit level (hysteresis) */
+            long sh = 0;
+            PyObject *was = PyDict_GetItemWithError(shown, q->id);
+            if (was == NULL && PyErr_Occurred())
+                bad = 1;
+            else if (was != NULL)
+                sh = PyLong_AsLong(was);
+            sh = lv > sh ? lv : (lx < sh ? lx : sh);
+            x = PyLong_FromLong(sh);
+            bad |= x == NULL || PyDict_SetItem(shown_new, q->id, x) < 0;
+            bad |= df_set(r, S_shown, x) < 0 || df_setb(r, S_in_path, q->in_path ? Py_True : Py_False) < 0;
+            int list = lv || sh || pr >= tc[DX_LIST_MIN_P] || thw;
+            if (list && pairs && !bad) {          /* threat.pairs_record */
+                PyObject *pl = PyList_New(0);
+                for (int km = 0; pl != NULL && km < q->nm; km++)
+                    for (int j = 0; pl != NULL && j < E; j++) {
+                        const double *p = PO + ((size_t)(q->first + km) * E + j) * DK_PF;
+                        if (!(p[DP_W0] > 0.0 || p[DP_WC] > 0.0))
+                            continue;
+                        PyObject *d = PyDict_New();
+                        int e = d == NULL || df_setb(d, S_mode, mname[q->first + km]) < 0 || df_setb(d, S_ego_mode, ename[j]) < 0 ||
+                                df_set(d, S_w0, df_r(p[DP_W0], 3)) < 0 || df_set(d, S_w, df_r(p[DP_WC], 3)) < 0 ||
+                                df_set(d, S_pc, df_r(p[DP_PC], 3)) < 0 || df_setb(d, S_course, p[DP_COURSE] > 0.5 ? Py_True : Py_False) < 0 ||
+                                df_set(d, S_tn, df_r(p[DP_TN], 2)) < 0 || df_set(d, S_btn, df_r(p[DP_BTN], 2)) < 0 ||
+                                df_set(d, S_stn, df_r(p[DP_STN], 2)) < 0 || df_set(d, S_tm_s, df_r(p[DP_TM], 2)) < 0 ||
+                                df_set(d, S_ttc_s, df_r(p[DP_TTC], 2)) < 0 ||
+                                df_set(d, S_level, PyLong_FromLong(isfinite(p[DP_LE]) ? (long)p[DP_LE] : 0)) < 0 ||
+                                PyList_Append(pl, d) < 0;
+                        Py_XDECREF(d);
+                        if (e)
+                            Py_CLEAR(pl);
+                    }
+                bad |= df_set(r, S_pairs, pl) < 0;
+            }
+            bad |= PyList_Append(recs, r) < 0 || PyDict_SetItem(byid, q->id, q->o) < 0;
+            if (list && !bad) {                   /* the message's order: by level, then by collision probability */
+                int at = nlist++;
+                while (at > 0 && (lkey[2 * (at - 1)] < lv || (lkey[2 * (at - 1)] == lv && lkey[2 * (at - 1) + 1] < pr))) {
+                    lrec[at] = lrec[at - 1];
+                    lkey[2 * at] = lkey[2 * (at - 1)];
+                    lkey[2 * at + 1] = lkey[2 * (at - 1) + 1];
+                    at--;
+                }
+                lrec[at] = r;
+                lkey[2 * at] = lv;
+                lkey[2 * at + 1] = pr;
+            }
+            Py_DECREF(r);
+        }
+        PyMem_Free(lkey);
+        for (int i = 0; i < nlist && !bad; i++)
+            bad |= PyList_Append(listed, lrec[i]) < 0;
+        if (bad) {
+            if (!PyErr_Occurred())
+                PyErr_SetString(PyExc_RuntimeError, "decide_frame: a record could not be made");
+            goto done;
+        }
+        if (all) {
+            PyObject *names = PyList_New(K), *enames = PyList_New(E), *src = PyList_New(M);
+            if (names && enames && src) {
+                for (int k = 0; k < K; k++) {
+                    Py_INCREF(mname[k]);
+                    PyList_SetItem(names, k, mname[k]);
+                }
+                for (int j = 0; j < E; j++) {
+                    Py_INCREF(ename[j]);
+                    PyList_SetItem(enames, j, ename[j]);
+                }
+                for (int m = 0; m < M; m++) {
+                    PyObject *s = df_s[Q[m].cv ? S_cv : S_contract];
+                    Py_INCREF(s);
+                    PyList_SetItem(src, m, s);
+                }
+                detail = Py_BuildValue("{s:y#,s:y#,s:y#,s:y#,s:y#,s:y#,s:y#,s:O,s:O,s:O}", "t", (const char *)t, (Py_ssize_t)N * 8,
+                                       "ego", (const char *)EG, (Py_ssize_t)E * wE * 8, "ohdr", (const char *)OH,
+                                       (Py_ssize_t)M * DK_OHC * 8, "modes", (const char *)MD, (Py_ssize_t)K * wM * 8, "pair",
+                                       (const char *)PO, (Py_ssize_t)K * E * DK_PF * 8, "obj", (const char *)OO,
+                                       (Py_ssize_t)M * DK_OF * 8, "p", (const char *)pn, (Py_ssize_t)K * 2 * 8, "names", names,
+                                       "ego_names", enames, "src", src);
+            }
+            Py_XDECREF(names);
+            Py_XDECREF(enames);
+            Py_XDECREF(src);
+            if (detail == NULL)
+                goto done;
+        }
+    }
+out:
+    res = Py_BuildValue("(OOOOiiiiiddOdO)", recs, listed, byid, shown_new, M, n_cv, invalid, ego_own, steps, a_long, a_lat,
+                        ego_modes, horizon, detail ? detail : Py_None);
+done:
+    PyMem_Free(mem);
+    PyMem_Free(Q);
+    PyMem_Free(mname);
+    PyMem_Free(ename);
+    PyMem_Free(lrec);
+    Py_XDECREF(recs);
+    Py_XDECREF(listed);
+    Py_XDECREF(byid);
+    Py_XDECREF(shown_new);
+    Py_XDECREF(ego_modes);
+    Py_XDECREF(detail);
+    view_drop(&vt);
+    view_drop(&vfc);
+    view_drop(&vtc);
+    view_drop(&vthr);
+    view_drop(&vg);
+    view_drop(&veg);
+    view_drop(&vmd);
+    view_drop(&vrw);
+    view_drop(&vln);
+    view_drop(&vpx);
+    view_drop(&vpy);
+    view_drop(&vps);
+    return res;
+}
+
+#define DECIDE_METHODS                                                                                                 \
+    {"decide_eval", n_decide_eval, METH_VARARGS, "the decision layer's threat measures per object, mode and ego mode (decide.c)"},   \
+    {"decide_inst_prob", n_decide_inst_prob, METH_VARARGS, "the exact probability that two footprints overlap at one time (decide.c)"}, \
+    {"decide_draws", n_decide_draws, METH_O, "the decision layer's fixed standard-normal draws (decide.c)"},          \
+    {"decide_path", n_decide_path, METH_VARARGS, "the road model's plan as the decision layer's path polyline (decide.c)"}, \
+    {"decide_frame", n_decide_frame, METH_VARARGS, "one radar message's decision: futures, footprints, threat, records (decide.c)"},

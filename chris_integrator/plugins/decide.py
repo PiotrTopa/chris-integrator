@@ -3,7 +3,8 @@
 In: `radar` (trigger: one decision per radar message), `radar_fut` (the prediction layer's companion message,
 when it publishes one; trigger), `road` (the plan: the car's own path while no `ego_fut` is given), `ego_state`
 (the car's acceleration and yaw rate: is the driver braking or steering away), `vehicle` (brake pedal), `env`
-(the road condition: wet, snow). Out: `decide` (docs/TOPICS.md): per judged object its threat measures and level
+(the road condition: wet, snow). `radar_fut` is taken as the predictor's own object (arrays) when it runs in this
+process, as the message otherwise (a recording, another process): the same numbers either way. Out: `decide` (docs/TOPICS.md): per judged object its threat measures and level
 with the reasoning, and every alert's stage, mode and reasons.
 
 Futures (cfg `futures`): "auto" the contract's fields in `radar` or `radar_fut`, else the degraded adapter per
@@ -22,9 +23,14 @@ def _fin(v):
     return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
 
 
+def _stamp(m):
+    """`ts_mono_ns` of a `radar_fut`: the message, or the predictor's own object (in process)."""
+    return m.get("ts_mono_ns") if m.__class__ is dict else m.ts_mono_ns
+
+
 class Decide(Plugin):
     name = "decide"
-    inputs = (In("radar", trigger=True), In("radar_fut", trigger=True, optional=True),
+    inputs = (In("radar", trigger=True), In("radar_fut", trigger=True, optional=True, native=True),
               In("road", optional=True), In("ego_state", optional=True), In("vehicle", optional=True),
               In("env", optional=True))
     outputs = (Out("decide", "decision", "frame",
@@ -43,7 +49,7 @@ class Decide(Plugin):
         super().__init__(cfg, name)
         c = self.cfg
         self.fcfg = dict(FU.DEFAULT_CFG, **(c.get("future") or {}))
-        self.model = TH.ThreatModel(c.get("threat"))
+        self.model = TH.ThreatModel(c.get("threat"), self.fcfg, c["list_min_p"])
         self.alerts = AL.AlertSet(c.get("alerts"))
         self.reset()
 
@@ -53,7 +59,8 @@ class Decide(Plugin):
         self._ts = None
         self._comp_t = None               # when a `radar_fut` was last seen (s, bus)
         self._pending = None
-        self.shown = {}                   # object id -> the level shown (hysteresis between entry and exit)
+        self.shown = {}                   # object id -> the level shown (hysteresis between entry and exit; the
+                                          # objects with a record: decide.c)
         self.stats = {"frames": 0, "cv_objects": 0, "contract_objects": 0, "invalid_futures": 0, "ego_own": 0}
         self.last = None
 
@@ -61,7 +68,7 @@ class Decide(Plugin):
     def on_input(self, stream, msg, ctx):
         if stream == "radar_fut":
             self._comp_t = ctx.now
-            if self._pending is not None and self._pending.get("ts_mono_ns") == msg.get("ts_mono_ns"):
+            if self._pending is not None and self._pending.get("ts_mono_ns") == _stamp(msg):
                 radar, self._pending = self._pending, None
                 self._decide(radar, msg, ctx)
             return
@@ -71,7 +78,7 @@ class Decide(Plugin):
         if self.cfg["futures"] == "auto" and "fut" not in msg and self._comp_t is not None \
                 and ctx.now - self._comp_t <= self.cfg["companion_wait_s"] + 1.0:
             comp = ctx.get("radar_fut")
-            if comp is not None and comp.get("ts_mono_ns") == msg.get("ts_mono_ns"):
+            if comp is not None and _stamp(comp) == msg.get("ts_mono_ns"):
                 self._decide(msg, comp, ctx)
             else:
                 self._pending = msg                   # its futures follow
@@ -89,58 +96,43 @@ class Decide(Plugin):
         self._ts = ts
         T = ts / NS
         objs_in = radar.get("objects") or ()
+        if objs_in.__class__ is not list:
+            objs_in = list(objs_in)
         path = FU.plan_path(ctx.get("road"), ts, self.fcfg["plan_max_age_s"]) if objs_in else None
         if c["futures"] == "cv":
-            radar = {k: v for k, v in radar.items() if k not in ("fut", "ego_fut")}
-            radar["objects"] = [{k: v for k, v in o.items() if k != "fut"} for o in radar.get("objects") or ()]
-            comp = None
-        F = FU.build(radar, self.fcfg, path, comp)
-        road = TH.road_from_env(ctx.get("env")) if self.model.cfg["road_from_env"] else None
-        res, info = self.model.evaluate(F, radar.get("ego") or {}, road)
-        recs, out_objs = [], []
-        for o, ms, src, orow, prow, ext in res:
-            r = TH.object_record(o, ms, src, orow, prow, ext, F)
-            # the level shown for this object: up at the entry level, down below the exit level (hysteresis)
-            sh = self.shown.get(r["id"], 0)
-            sh = r["level"] if r["level"] > sh else (min(sh, r["level_exit"]) if r["level_exit"] < sh else sh)
-            self.shown[r["id"]] = sh
-            r["shown"] = sh
-            r["in_path"] = "in_path" in (o.get("flags") or ())
-            recs.append(r)
-            if r["level"] or sh or (r["p_coll"] or 0.0) >= c["list_min_p"] or r["thw_s"] is not None:
-                if c["pairs"]:
-                    r["pairs"] = TH.pairs_record(ms, prow, F)
-                out_objs.append(r)
-        live = {r["id"] for r in recs}
-        for k in [k for k in self.shown if k not in live]:
-            del self.shown[k]
-        objs = {o.get("id"): o for o in radar.get("objects") or () if isinstance(o, dict)}
+            H = FU.from_message(radar, None, cv=True)
+        elif comp is not None and comp.__class__ is not dict:
+            H = comp.handoff()                        # the predictor in this process: its arrays, no message
+        else:
+            H = FU.from_message(radar, comp)
+        model = self.model
+        road = TH.road_from_env(ctx.get("env")) if model.cfg["road_from_env"] else None
+        # the native core: the futures on one grid, each footprint, the threat, the records of the objects that
+        # matter (`recs`: to an alert or to the list; `out_objs`: the list, in its order) and the level shown
+        (recs, out_objs, objs, self.shown, judged, n_cv, invalid, ego_own, _, al, at, ego_modes, horizon, _) = model.frame(
+            objs_in, radar.get("ego"), H, path, road, self.shown, 1 if c["pairs"] else 0)
         actx = self._context(radar, ctx, T)
         alerts, events = self.alerts.step(T, recs, objs, actx)
         st = self.stats
         st["frames"] += 1
-        n_cv = sum(1 for _, _, s, *_ in res if s == "cv")
         st["cv_objects"] += n_cv
-        st["contract_objects"] += len(res) - n_cv
-        st["invalid_futures"] += F.degraded["invalid"]
-        st["ego_own"] += 1 if F.degraded["ego"] else 0
+        st["contract_objects"] += judged - n_cv
+        st["invalid_futures"] += invalid
+        st["ego_own"] += ego_own
         self.seq += 1
-        out_objs.sort(key=lambda r: (-r["level"], -(r["p_coll"] or 0.0)))
-        al, at = info["a_avail_mps2"]
         msg = {"type": "decide", "api": 1, "seq": self.seq, "ts_mono_ns": ts, "ts_real_ns": radar.get("ts_real_ns"),
                "radar_seq": radar.get("seq"), "frame": "car",
                "ego": {"speed_mps": round(float((radar.get("ego") or {}).get("speed_mps") or 0.0), 2),
-                       "a_avail_mps2": [round(al, 2), round(at, 2)], "road": info["road"],
-                       "t_react_s": round(info["t_react_s"], 2), "driver": {k: (round(v, 2) if _fin(v) else v) for k, v in
-                                                                           actx.items() if k in ("a_long", "a_lat", "brake")}},
-               "futures": {"objects": "cv" if n_cv == len(res) and res else ("contract" if not n_cv else "mixed"),
-                           "cv": n_cv, "invalid": F.degraded["invalid"], "ego": "own" if F.degraded["ego"] else "contract",
-                           "ego_modes": [[m[0], round(m[1], 3)] for m in F.ego if m[2] is not None],
-                           "horizon_s": round(float(F.t[-1]), 2)},
+                       "a_avail_mps2": [round(al, 2), round(at, 2)], "road": road or model.cfg["road"],
+                       "t_react_s": round(model.t_react, 2), "driver": {k: (round(v, 2) if _fin(v) else v) for k, v in
+                                                                        actx.items() if k in ("a_long", "a_lat", "brake")}},
+               "futures": {"objects": "cv" if n_cv == judged and judged else ("contract" if not n_cv else "mixed"),
+                           "cv": n_cv, "invalid": invalid, "ego": "own" if ego_own else "contract",
+                           "ego_modes": ego_modes, "horizon_s": round(horizon, 2)},
                "objects": out_objs, "alerts": alerts,
                "primary": next((a for a in alerts if a["id"] == "obstacle_ahead" and a["stage"] > 0), None),
                "events": events,
-               "counts": {"judged": len(res), "listed": len(out_objs), "steps": self.model.last_n}}
+               "counts": {"judged": judged, "listed": len(out_objs), "steps": model.last_n}}
         self.last = msg
         ctx.emit("decide", msg)
 

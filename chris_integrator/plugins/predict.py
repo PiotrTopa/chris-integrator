@@ -66,7 +66,9 @@ class Predict(Plugin):
         b.ego.add(T, float(eg.get("speed_mps") or 0.0), float(eg.get("yaw_rate_rps") or 0.0))
         pred = b.update(msg, cb.build(T, b.ego))
         if pred is not None:
-            ctx.emit("radar_fut", pred.message(msg))
+            # as an object: `decide` takes the arrays; the message is made only for who reads it (a subscriber, a
+            # recording)
+            ctx.emit_lazy("radar_fut", pred, lambda: pred.message(msg), ts)
 
     def reset(self, reason=None):
         self._ts = None

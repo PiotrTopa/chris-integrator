@@ -17,11 +17,9 @@ it is scored by the native core (`predict_score`) and folded into running statis
         futures, and how many of them were right: the one that fitted best, or as good as it (mean error within
         0.3 m + 10 %: two futures that are the same path are both right); `brier`
 
-The cost is a few array operations per kept batch in the frames in which a sample time comes round, and one
-native call per object when a batch ends.
+The cost is one native call per kept batch in the frames in which a sample time comes round, and one when a batch
+ends (Python keeps the list of batches).
 """
-import math
-
 import numpy as np
 
 from .. import native as _native
@@ -29,7 +27,6 @@ from .. import native as _native
 _N = _native.predict
 HORIZONS = (1.0, 2.0, 3.0, 5.0, 8.0)
 GROUPS = ("vehicle", "cyclist", "pedestrian", "all")
-_COLS = [0, 1, 3, 4, 5]                   # of predict_score's row: min_ade, min_fde, top_fde, nll, maha2
 
 
 class SelfCheck:
@@ -48,7 +45,7 @@ class SelfCheck:
         self.n = np.zeros((4, nh))
         self.sums = np.zeros((4, nh, 5))          # min_ade, min_fde, top_fde, nll, maha2
         self.cal = np.zeros((10, 2))              # futures in the bin, of them the best-fitting one
-        self.brier = [0.0, 0]
+        self.brier = np.zeros(2)                  # the sum of (p - right)^2 over the futures, their number
         self.scored = 0
 
     def update(self, T, pred, ego):
@@ -59,21 +56,17 @@ class SelfCheck:
             self.batches = []
             self._next = None
         times = self.times
-        index = ground = None
+        ground = None
         keep = []
         grid = self._grid
         for b in self.batches:
             dt = T - b["T"]
             k = grid.get(int(dt * 20.0 + 0.5), -1) if dt < times[-1] + 0.1 else -1     # the sample this frame is (20 a second)
             if k >= 0 and pred is not None and abs(times[k] - dt) <= 0.03 and not b["done"][k]:
-                if index is None:
-                    index = {i: j for j, i in enumerate(pred.ids) if pred.seen[j]}
+                if ground is None:
                     ground = ego.to_ground(pred.xy, T)          # where the objects are now, on the ground
-                rows = [(r, index[i]) for r, i in enumerate(b["ids"]) if i in index]
-                if rows:
-                    r, j = zip(*rows)
-                    b["actual"][r, k] = ground[j, :]
-                    b["valid"][r, k] = 1.0
+                # the batch's objects that this frame sees: their places into its sample k
+                _N.predict_check_take(b["ids"], pred.sel, pred._objs, ground, b["actual"], b["valid"], k)
                 b["done"][k] = True
             if dt > times[-1] + 0.2:
                 b["actual"] = ego.from_ground(b["actual"], b["T"])     # into the frame the futures were given in
@@ -86,46 +79,25 @@ class SelfCheck:
             sel = np.flatnonzero(pred.seen)
             if len(sel):
                 nt = len(times)
-                self.batches.append({"T": T, "ids": [pred.ids[i] for i in sel], "kind": pred.kind[sel],
-                                     "nm": pred.n_modes[sel], "p": pred.p[sel].copy(), "traj": pred.traj[sel].copy(),
+                self.batches.append({"T": T, "ids": [pred.ids[i] for i in sel], "kind": pred.kind[sel].astype(float),
+                                     "nm": pred.n_modes[sel].astype(float), "p": pred.p[sel].copy(), "traj": pred.traj[sel].copy(),
                                      "actual": np.zeros((len(sel), nt, 2)), "valid": np.zeros((len(sel), nt)),
                                      "done": [False] * nt})
 
     def _score(self, b):
-        nt = len(self.times)
-        out = np.zeros((nt + 2, 6))
-        for r in range(len(b["ids"])):
-            val = b["valid"][r]
-            if val.sum() < self.cfg["min_seen"]:
-                continue
-            nm = int(b["nm"][r])
-            p = np.ascontiguousarray(b["p"][r, :nm])
-            win, pw = _N.predict_score(np.ascontiguousarray(b["traj"][r, :nm]), p, np.ascontiguousarray(b["actual"][r]),
-                                       np.ascontiguousarray(val), out)
-            self.add(int(b["kind"][r]), out, val, p, win)
+        """A batch whose horizon has passed: each prediction seen often enough against what its object did, into the
+        statistics (predict.c predict_score_batch: predict_score and predict_score_add per prediction)."""
+        self.scored += _N.predict_score_batch(b["traj"], b["nm"], b["p"], np.ascontiguousarray(b["actual"]), b["valid"],
+                                              b["kind"], float(self.cfg["min_seen"]), self.hk, self.n, self.sums, self.cal,
+                                              self.brier)
 
     def add(self, kind, out, val, p, win):
-        """One scored prediction into the statistics (also the offline tool's entry, with the truth as `actual`)."""
-        g = 2 if kind == 7 else 1 if kind == 6 else 0
+        """One scored prediction into the statistics (the offline tool's entry, with the truth as `actual`): out:
+        predict_score's rows with its two further rows; per horizon the sums of the scores (by kind of road user
+        and for all), and the calibration: per future its probability's bin, whether it was right, the Brier sum."""
         self.scored += 1
-        hk = self.hk
-        ok = val[hk] > 0.5
-        if ok.any():
-            rows = np.where(ok[:, None], out[hk][:, _COLS], 0.0)
-            self.n[g] += ok
-            self.n[3] += ok
-            self.sums[g] += rows
-            self.sums[3] += rows
-        if len(p) >= 2 and win >= 0:
-            ade = out[-2:].ravel()[:len(p)]
-            best = ade[win]
-            for m, pm in enumerate(p):
-                hit = m == win or ade[m] <= 1.1 * best + 0.3
-                bin_ = min(9, int(pm * 10.0))
-                self.cal[bin_, 0] += 1
-                self.cal[bin_, 1] += hit
-                self.brier[0] += (pm - hit) ** 2
-                self.brier[1] += 1
+        _N.predict_score_add(int(kind), out, np.ascontiguousarray(val, float), np.ascontiguousarray(p, float), int(win),
+                             self.hk, self.n, self.sums, self.cal, self.brier)
 
     def stats(self):
         out = {"scored": self.scored, "pending": len(self.batches), "horizons_s": [float(self.times[k]) for k in self.hk]}

@@ -16,7 +16,7 @@ import logging
 import time
 
 from ..native import round                  # builtins.round (its results; the native core)
-from .bus import Bus, StreamSpec
+from .bus import Bus, Envelope, StreamSpec
 
 log = logging.getLogger("chris_integrator.mixer")
 
@@ -79,7 +79,9 @@ class _Ctx:
         e = self._m.bus.latest.get(name)
         if e is None or (frame and (self._env is None or e.ts != self._env.ts)):
             return None
-        return e.msg
+        if e.__class__ is Envelope:
+            return e.msg
+        return e.obj if name in self._slot.native else e.msg      # a lazy envelope: the object where it is taken
 
     def emit(self, name, msg, line=None):
         if name not in self._slot.writes:
@@ -88,6 +90,16 @@ class _Ctx:
         s.out_n += 1
         s.out_t = self.now
         self._m.publish(name, msg, s.name, line)
+
+    def emit_lazy(self, name, obj, make, ts):
+        """Publish a result as an object (`obj`; `ts`: its `ts_mono_ns`) whose message `make()` builds when
+        someone reads it: plug-ins that declared the input `native` take `obj` (bus.LazyEnvelope)."""
+        if name not in self._slot.writes:
+            raise MixerError("plug-in %s emits %s without declaring it" % (self._slot.name, name))
+        s = self._slot
+        s.out_n += 1
+        s.out_t = self.now
+        self._m.publish(name, None, s.name, None, (obj, make, ts))
 
     def service(self, name):
         return self._m.services.get(name)
@@ -98,6 +110,7 @@ class _Slot:
         self.plugin, self.name, self.enabled = plugin, plugin.name, enabled
         self.reads = {i.name for i in plugin.inputs}
         self.writes = {o.name for o in plugin.outputs}
+        self.native = {i.name for i in plugin.inputs if getattr(i, "native", False)}
         self.calls = self.errors = self.out_n = 0
         self.cpu = 0.0
         self.max_ms = 0.0
@@ -246,11 +259,11 @@ class Mixer:
         self._subs = subs
 
     # ---- running -------------------------------------------------------------------------------------
-    def publish(self, stream, msg, source, line=None):
+    def publish(self, stream, msg, source, line=None, lazy=None):
         spec = self.bus.streams.get(stream)
         if spec is None:
             raise MixerError("stream %s was not declared (by %s)" % (stream, source))
-        env = self.bus.put(stream, msg, source, line)
+        env = self.bus.put(stream, msg, source, line) if lazy is None else self.bus.put_lazy(stream, *lazy, source)
         self.arrivals[stream].append(env.t_arr)
         taps = self._tap_of.get(stream)
         if taps is None:                   # which output channels take this stream: worked out once per stream
@@ -288,7 +301,8 @@ class Mixer:
         t0 = time.perf_counter()
         self._child.append(0.0)
         try:
-            slot.plugin.on_input(env.stream, env.msg, ctx)
+            slot.plugin.on_input(env.stream, env.msg if env.__class__ is Envelope or env.stream not in slot.native
+                                 else env.obj, ctx)
         except MixerError:
             raise
         except Exception as e:

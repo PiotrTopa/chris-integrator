@@ -149,7 +149,7 @@ class Alert:
 
     # ---- one frame --------------------------------------------------------------------------------------------
     def step(self, T, recs, objs, ctx):
-        """T (s), recs: the judged objects' records (threat.object_record), objs: radar objects by id, ctx: {"v",
+        """T (s), recs: the judged objects' records (decide.objects[]: native decide_frame), objs: radar objects by id, ctx: {"v",
         "a_long", "a_lat", "sensor_age_s", "radar_age_s"}. Returns (output dict, [events])."""
         c = self.cfg
         if c["mode"] == "off":

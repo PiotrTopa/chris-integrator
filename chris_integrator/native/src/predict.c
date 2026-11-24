@@ -3050,25 +3050,11 @@ done:
  * log-likelihood of the place under the futures' mixture, and the squared Mahalanobis distance to the future
  * that was nearest in the end (2 on average when the stated spread is right). The winner is that future. With two
  * more rows in `out`, they take every future's mean error (the first 12 futures). */
-static PyObject *n_predict_score(PyObject *self, PyObject *args)
+/* the scoring of one prediction (predict_score's rows into out; more: the further rows too): the winner (-1: never
+ * seen), its probability into *pw */
+static int score_one(const double *t, int K, Py_ssize_t nt, const double *p, const double *act, const double *val, double *out,
+                     int more, double *pw)
 {
-    PyObject *ot, *op, *oa, *ov, *oo;
-    View vt, vp, va, vv, vo;
-    Py_ssize_t rt, K, ra, nt, ro;
-    PyObject *res = NULL;
-    vt.held = vp.held = va.held = vv.held = vo.held = 0;
-    if (!PyArg_ParseTuple(args, "OOOOO", &ot, &op, &oa, &ov, &oo))
-        return NULL;
-    if (pview(ot, &vt, 0, 6, &rt, "traj") < 0 || pview(op, &vp, 0, 1, &K, "p") < 0 || pview(oa, &va, 0, 2, &ra, "actual") < 0
-        || pview(ov, &vv, 0, 1, &nt, "valid") < 0 || pview(oo, &vo, 1, 6, &ro, "out") < 0)
-        goto done;
-    if (K < 1 || K > 64 || nt < 1 || rt != K * nt || ra != nt || (ro != nt && ro != nt + 2)) {
-        PyErr_SetString(PyExc_ValueError, "predict_score: array sizes do not fit together");
-        goto done;
-    }
-    const double *t = (const double *)vt.b.buf, *p = (const double *)vp.b.buf, *act = (const double *)va.b.buf;
-    const double *val = (const double *)vv.b.buf;
-    double *out = (double *)vo.b.buf;
     double cum[64], last[64];
     int top = 0, cnt = 0, win = 0;
     for (int m = 0; m < K; m++) {
@@ -3120,10 +3106,33 @@ static PyObject *n_predict_score(PyObject *self, PyObject *args)
             out[6 * k + 5] = (zx * zx - 2.0 * r * zx * zy + zy * zy) / (1.0 - r * r);
         }
     }
-    if (ro > nt)                                                 /* a further row: every future's mean error */
+    if (more)                                                    /* a further row: every future's mean error */
         for (int m = 0; m < 12; m++)
             out[6 * nt + m] = cnt > 0 && m < K ? cum[m] / cnt : NAN;
-    res = Py_BuildValue("(id)", cnt > 0 ? win : -1, cnt > 0 ? p[win] : 0.0);
+    *pw = cnt > 0 ? p[win] : 0.0;
+    return cnt > 0 ? win : -1;
+}
+
+static PyObject *n_predict_score(PyObject *self, PyObject *args)
+{
+    PyObject *ot, *op, *oa, *ov, *oo;
+    View vt, vp, va, vv, vo;
+    Py_ssize_t rt, K, ra, nt, ro;
+    PyObject *res = NULL;
+    vt.held = vp.held = va.held = vv.held = vo.held = 0;
+    if (!PyArg_ParseTuple(args, "OOOOO", &ot, &op, &oa, &ov, &oo))
+        return NULL;
+    if (pview(ot, &vt, 0, 6, &rt, "traj") < 0 || pview(op, &vp, 0, 1, &K, "p") < 0 || pview(oa, &va, 0, 2, &ra, "actual") < 0
+        || pview(ov, &vv, 0, 1, &nt, "valid") < 0 || pview(oo, &vo, 1, 6, &ro, "out") < 0)
+        goto done;
+    if (K < 1 || K > 64 || nt < 1 || rt != K * nt || ra != nt || (ro != nt && ro != nt + 2)) {
+        PyErr_SetString(PyExc_ValueError, "predict_score: array sizes do not fit together");
+        goto done;
+    }
+    double pw;
+    int win = score_one((const double *)vt.b.buf, (int)K, nt, (const double *)vp.b.buf, (const double *)va.b.buf,
+                        (const double *)vv.b.buf, (double *)vo.b.buf, ro > nt, &pw);
+    res = Py_BuildValue("(id)", win, pw);
 done:
     view_drop(&vt);
     view_drop(&vp);
@@ -3133,31 +3142,335 @@ done:
     return res;
 }
 
-/* predict_futs(traj (n, P_KMAX, nt, 6), modes (n, 5, P_KMAX), names, decimals) -> [[future, ...] per object]
- * The message form of the futures: {"p", "p0", "m", "x", "y", "sx", "sy", "rxy", "v"}, numbers rounded as
- * round_lists rounds them (rint(v * 10^d) / 10^d; p and p0 to three decimals). */
-static PyObject *n_predict_futs(PyObject *self, PyObject *args)
+/* ====================================================================================================
+ * The radar message in, the `radar_fut` message out, the self-check's sums: the predictor's glue
+ * ==================================================================================================== */
+#define PK_STRS(X)                                                                                                     \
+    X(x_m) X(y_m) X(vx_mps) X(vy_mps) X(ax_mps2) X(ay_mps2) X(std) X(class) X(label) X(p_stationary) X(len) X(wid)     \
+    X(hdg) X(hdg_std) X(exist) X(state) X(indicator) X(brake_lights) X(vis) X(flags) X(motion) X(ctr) X(id)            \
+    X(tentative) X(memory) X(left) X(right) X(parked) X(occluded) X(hidden) X(stationary) X(moving) X(with_traffic)    \
+    X(oncoming) X(objects) X(type) X(radar_fut) X(fut) X(t) X(ego_fut) X(modes) X(fut_ctx) X(lane) X(intent) X(p)      \
+    X(p0) X(m) X(x) X(y) X(sx) X(sy) X(rxy) X(v)
+#define X(n) K_##n,
+enum { PK_STRS(X) K_N };
+#undef X
+#define X(n) #n,
+static const char *const PK_STR[K_N] = {PK_STRS(X)};
+#undef X
+static PyObject *pk_s[K_N];
+
+static int pk_strings(void)
 {
-    PyObject *ot, *om, *names, *res = NULL;
-    int dec;
-    View vt, vm;
-    Py_ssize_t rt, n;
-    static const char *const KEYS[6] = {"x", "y", "sx", "sy", "rxy", "v"};
-    vt.held = vm.held = 0;
-    if (!PyArg_ParseTuple(args, "OOO!i", &ot, &om, &PyTuple_Type, &names, &dec))
+    if (pk_s[K_N - 1] != NULL)
+        return 0;
+    for (int i = 0; i < K_N; i++)
+        if (pk_s[i] == NULL && (pk_s[i] = PyUnicode_InternFromString(PK_STR[i])) == NULL)
+            return -1;
+    return 0;
+}
+
+static PyObject *pk_get(PyObject *d, int key)   /* d.get(key): borrowed, NULL where absent */
+{
+    PyObject *v = PyDict_GetItemWithError(d, pk_s[key]);
+    if (v == NULL)
+        PyErr_Clear();
+    return v;
+}
+
+/* Python's `_fin(v)`: an int or a float (no bool), finite; its value */
+static int py_fin(PyObject *v, double *out)
+{
+    if (v == NULL)
+        return 0;
+    if (PyFloat_Check(v)) {
+        double d = PyFloat_AsDouble(v);
+        if (!isfinite(d))
+            return 0;
+        *out = d;
+        return 1;
+    }
+    if (PyLong_Check(v) && !PyBool_Check(v)) {
+        double d = PyLong_AsDouble(v);
+        if (d == -1.0 && PyErr_Occurred()) {
+            PyErr_Clear();
+            return 0;
+        }
+        *out = d;
+        return 1;
+    }
+    return 0;
+}
+
+static int pk_is(PyObject *v, int key)          /* v == "<key>" */
+{
+    return v != NULL && (v == pk_s[key] || (PyUnicode_Check(v) && PyUnicode_CompareWithASCIIString(v, PK_STR[key]) == 0));
+}
+
+/* float(v) of a present value, `absent` where it is None or not there; -1 with an exception where it is no number */
+static int pk_num(PyObject *v, double absent, double *out)
+{
+    if (v == NULL || v == Py_None) {
+        *out = absent;
+        return 0;
+    }
+    *out = PyFloat_AsDouble(v);
+    return *out == -1.0 && PyErr_Occurred() ? -1 : 0;
+}
+
+static int pk_or0(PyObject *v, double *out)      /* float(v or 0.0) */
+{
+    *out = 0.0;
+    if (v == NULL || v == Py_None)
+        return 0;
+    int t = PyObject_IsTrue(v);
+    if (t <= 0)
+        return t;
+    *out = PyFloat_AsDouble(v);
+    return *out == -1.0 && PyErr_Occurred() ? -1 : 0;
+}
+
+/* predict_pack(objects, tentative, objects_max) -> (rows, ids, objects taken, {id: row})
+ * A radar message's objects as predict_frame reads them (P_NO numbers each: PO_*): those with a place (x_m, y_m
+ * finite numbers) that are not tentative (or all, `tentative`), the nearest `objects_max` where there are more (in
+ * order of distance). rows: bytes of float64 (n, P_NO). A row with a number that is none among its first twelve is
+ * made harmless (no motion, wide spreads, p_stationary one half); spreads are 0.05 at least. */
+static const char *const PK_KIND[8] = {"car", "van", "truck", "bus", "tram", "motorbike", "bike", "human"};
+
+static PyObject *n_predict_pack(PyObject *self, PyObject *args)
+{
+    PyObject *objects, *res = NULL, *rows = NULL, *ids = NULL, *taken = NULL, *sel = NULL;
+    int tentative, omax;
+    PyObject **pick = NULL;
+    double *dist = NULL;
+    if (!PyArg_ParseTuple(args, "Opi", &objects, &tentative, &omax))
         return NULL;
-    if (pview(ot, &vt, 0, 6, &rt, "traj") < 0 || pview(om, &vm, 0, 5 * P_KMAX, &n, "modes") < 0)
-        goto done;
-    if (dec < 0 || dec > 9 || (n > 0 && rt % (n * P_KMAX) != 0) || (n > 0 && rt / (n * P_KMAX) < 1)) {
-        PyErr_SetString(PyExc_ValueError, "predict_futs: array sizes do not fit together");
+    if (pk_strings() < 0)
+        return NULL;
+    Py_ssize_t no = objects != Py_None && PyList_Check(objects) ? PyList_Size(objects) : 0, n = 0;
+    pick = (PyObject **)PyMem_Malloc((size_t)(no + 1) * sizeof(PyObject *));
+    dist = (double *)PyMem_Malloc((size_t)(no + 1) * sizeof(double));
+    if (!pick || !dist) {
+        PyErr_NoMemory();
         goto done;
     }
-    Py_ssize_t nt = n > 0 ? rt / (n * P_KMAX) : 0, nn = PyTuple_Size(names);
-    const double *t = (const double *)vt.b.buf, *M = (const double *)vm.b.buf;
-    double sc = POW10[dec];
-    res = PyList_New(n);
-    if (res == NULL)
+    for (Py_ssize_t i = 0; i < no; i++) {
+        PyObject *o = PyList_GetItem(objects, i);
+        double x, y;
+        if (!PyDict_Check(o) || !py_fin(pk_get(o, K_x_m), &x) || !py_fin(pk_get(o, K_y_m), &y))
+            continue;
+        if (!tentative && pk_is(pk_get(o, K_state), K_tentative))
+            continue;
+        pick[n] = o;
+        dist[n++] = x * x + y * y;
+    }
+    if (n > omax && omax >= 0) {                  /* the nearest (a stable order, as sorted()) */
+        for (Py_ssize_t i = 1; i < n; i++) {
+            PyObject *o = pick[i];
+            double d = dist[i];
+            Py_ssize_t j = i;
+            while (j > 0 && dist[j - 1] > d) {
+                pick[j] = pick[j - 1];
+                dist[j] = dist[j - 1];
+                j--;
+            }
+            pick[j] = o;
+            dist[j] = d;
+        }
+        n = omax;
+    }
+    rows = PyBytes_FromStringAndSize(NULL, n * P_NO * (Py_ssize_t)sizeof(double));
+    ids = PyList_New(n);
+    taken = PyList_New(n);
+    sel = PyDict_New();
+    if (!rows || !ids || !taken || !sel)
         goto done;
+    double *A = (double *)PyBytes_AsString(rows);
+    for (Py_ssize_t i = 0; i < n; i++) {
+        PyObject *o = pick[i], *v;
+        double *a = A + i * P_NO;
+        int bad = 0;
+        bad |= pk_num(pk_get(o, K_x_m), 0.0, &a[PO_X]) < 0 || pk_num(pk_get(o, K_y_m), 0.0, &a[PO_Y]) < 0;
+        bad |= pk_or0(pk_get(o, K_vx_mps), &a[PO_VX]) < 0 || pk_or0(pk_get(o, K_vy_mps), &a[PO_VY]) < 0 ||
+               pk_or0(pk_get(o, K_ax_mps2), &a[PO_AX]) < 0 || pk_or0(pk_get(o, K_ay_mps2), &a[PO_AY]) < 0;
+        if (bad)
+            goto done;
+        v = pk_get(o, K_std);                     /* std = o.get("std") or (2, 1, 2, 1) */
+        int given = v != NULL && v != Py_None ? PyObject_IsTrue(v) : 0;
+        if (given < 0)
+            goto done;
+        if (given) {
+            for (int q = 0; q < 4; q++) {
+                PyObject *it = PySequence_GetItem(v, q);
+                if (it == NULL)
+                    goto done;
+                a[PO_SX + q] = PyFloat_AsDouble(it);
+                Py_DECREF(it);
+                if (a[PO_SX + q] == -1.0 && PyErr_Occurred())
+                    goto done;
+            }
+        } else {
+            a[PO_SX] = 2.0;
+            a[PO_SY] = 1.0;
+            a[PO_SVX] = 2.0;
+            a[PO_SVY] = 1.0;
+        }
+        a[PO_KIND] = 8.0;
+        v = pk_get(o, K_class);
+        if (v != NULL && v != Py_None) {
+            int t = PyObject_IsTrue(v);
+            if (t < 0)
+                goto done;
+            if (t) {
+                if (!PyDict_Check(v)) {
+                    PyErr_SetString(PyExc_TypeError, "predict_pack: an object's class is not a dict");
+                    goto done;
+                }
+                PyObject *lab = pk_get(v, K_label);
+                if (lab != NULL && PyUnicode_Check(lab))
+                    for (int q = 0; q < 8; q++)
+                        if (PyUnicode_CompareWithASCIIString(lab, PK_KIND[q]) == 0) {
+                            a[PO_KIND] = q;
+                            break;
+                        }
+            }
+        }
+        PyObject *hd = pk_get(o, K_hdg), *hs = pk_get(o, K_hdg_std), *h0 = NULL, *h1 = NULL;
+        if (hd != NULL && PyList_CheckExact(hd)) {                 /* [value, std] */
+            Py_ssize_t hn = PyList_Size(hd);
+            if (hn < 1) {
+                PyErr_SetString(PyExc_IndexError, "predict_pack: an empty hdg");
+                goto done;
+            }
+            h0 = PyList_GetItem(hd, 0);
+            h1 = hn > 1 ? PyList_GetItem(hd, 1) : NULL;
+            hd = h0;
+            hs = h1;
+        }
+        if (pk_num(pk_get(o, K_p_stationary), 0.5, &a[PO_PSTAT]) < 0 || pk_num(pk_get(o, K_len), NAN, &a[PO_LEN]) < 0 ||
+            pk_num(pk_get(o, K_wid), NAN, &a[PO_WID]) < 0 || pk_num(hd, NAN, &a[PO_HDG]) < 0 || pk_num(hs, NAN, &a[PO_HDGSD]) < 0 ||
+            pk_num(pk_get(o, K_exist), 1.0, &a[PO_EXIST]) < 0)
+            goto done;
+        a[PO_SEEN] = pk_is(pk_get(o, K_state), K_memory) ? 0.0 : 1.0;
+        v = pk_get(o, K_indicator);
+        a[PO_IND] = v == NULL || v == Py_None ? NAN : pk_is(v, K_left) ? 1.0 : pk_is(v, K_right) ? -1.0 : 0.0;
+        v = pk_get(o, K_brake_lights);
+        if (v == NULL || v == Py_None)
+            a[PO_BRAKE] = NAN;
+        else {
+            int t = PyObject_IsTrue(v);
+            if (t < 0)
+                goto done;
+            a[PO_BRAKE] = t ? 1.0 : 0.0;
+        }
+        PyObject *fl = pk_get(o, K_flags);
+        int parked = 0, with = 0;
+        if (fl != NULL && fl != Py_None) {
+            int t = PyObject_IsTrue(fl);
+            if (t < 0)
+                goto done;
+            if (t) {
+                int w1, w2;
+                if ((parked = PySequence_Contains(fl, pk_s[K_parked])) < 0 || (w1 = PySequence_Contains(fl, pk_s[K_with_traffic])) < 0 ||
+                    (w2 = PySequence_Contains(fl, pk_s[K_oncoming])) < 0)
+                    goto done;
+                with = w1 || w2;
+            }
+        }
+        a[PO_PARKED] = parked ? 1.0 : 0.0;
+        a[PO_ID] = (double)i;
+        v = pk_get(o, K_vis);
+        if (v == NULL || v == Py_None)
+            a[PO_VIS] = NAN;
+        else {
+            int f = pk_is(v, K_occluded) || pk_is(v, K_hidden);
+            if (!f && (f = PyObject_RichCompareBool(v, Py_False, Py_EQ)) < 0)
+                goto done;
+            a[PO_VIS] = f ? 0.0 : 1.0;
+        }
+        v = pk_get(o, K_motion);
+        a[PO_MOTION] = pk_is(v, K_stationary) ? 1.0 : pk_is(v, K_moving) ? -1.0 : 0.0;
+        a[PO_WITH] = with ? 1.0 : 0.0;
+        a[PO_CX] = a[PO_CY] = NAN;
+        v = pk_get(o, K_ctr);                     /* the centre: a list or a tuple of two finite numbers */
+        if (v != NULL && (PyList_CheckExact(v) || PyTuple_CheckExact(v)) && PySequence_Size(v) == 2) {
+            double c0, c1;
+            PyObject *i0 = PyList_CheckExact(v) ? PyList_GetItem(v, 0) : PyTuple_GetItem(v, 0);
+            PyObject *i1 = PyList_CheckExact(v) ? PyList_GetItem(v, 1) : PyTuple_GetItem(v, 1);
+            if (py_fin(i0, &c0) && py_fin(i1, &c1)) {
+                a[PO_CX] = c0;
+                a[PO_CY] = c1;
+            }
+        }
+        int fin = 1;
+        for (int q = 0; q < 12; q++)
+            fin &= isfinite(a[q]);
+        if (!fin) {                               /* a number that is none: the object's row is made harmless */
+            a[PO_VX] = a[PO_VY] = a[PO_AX] = a[PO_AY] = 0.0;
+            a[PO_SX] = 2.0;
+            a[PO_SY] = 1.0;
+            a[PO_SVX] = 2.0;
+            a[PO_SVY] = 1.0;
+            a[PO_PSTAT] = 0.5;
+        }
+        for (int q = PO_SX; q <= PO_SVY; q++)
+            if (!(a[q] >= 0.05 || isnan(a[q])))
+                a[q] = 0.05;
+        PyObject *id = pk_get(o, K_id), *ix = PyLong_FromSsize_t(i);
+        if (id == NULL)
+            id = Py_None;
+        if (ix == NULL || PyDict_SetItem(sel, id, ix) < 0) {
+            Py_XDECREF(ix);
+            goto done;
+        }
+        Py_DECREF(ix);
+        Py_INCREF(id);
+        PyList_SetItem(ids, i, id);
+        Py_INCREF(o);
+        PyList_SetItem(taken, i, o);
+    }
+    res = PyTuple_Pack(4, rows, ids, taken, sel);
+done:
+    PyMem_Free(pick);
+    PyMem_Free(dist);
+    Py_XDECREF(rows);
+    Py_XDECREF(ids);
+    Py_XDECREF(taken);
+    Py_XDECREF(sel);
+    return res;
+}
+
+/* ---- the message form (Prediction.message and its parts) ---- */
+static PyObject *pm_list(const double *v, Py_ssize_t n, Py_ssize_t stride, double sc)     /* [rint(v * sc) / sc ...] */
+{
+    PyObject *l = PyList_New(n);
+    for (Py_ssize_t j = 0; l != NULL && j < n; j++) {
+        PyObject *f = PyFloat_FromDouble(sc > 0.0 ? rint(v[j * stride] * sc) / sc : v[j * stride]);
+        if (f == NULL)
+            Py_CLEAR(l);
+        else
+            PyList_SetItem(l, j, f);
+    }
+    return l;
+}
+
+static int pm_set(PyObject *d, PyObject *key, PyObject *v)       /* d[key] = v; takes v */
+{
+    if (v == NULL)
+        return -1;
+    int rc = PyDict_SetItem(d, key, v);
+    Py_DECREF(v);
+    return rc;
+}
+
+/* the futures of every object: [[{"p", "p0", "m", "x", "y", "sx", "sy", "rxy", "v"}, ...], ...] */
+static PyObject *pm_futs(const double *t, const double *M, Py_ssize_t n, Py_ssize_t nt, PyObject *names, int dec)
+{
+    static const int KEYS[6] = {K_x, K_y, K_sx, K_sy, K_rxy, K_v};
+    Py_ssize_t nn = PyTuple_Size(names);
+    double sc = POW10[dec];
+    PyObject *res = PyList_New(n);
+    if (res == NULL)
+        return NULL;
     for (Py_ssize_t i = 0; i < n; i++) {
         const double *m = M + i * 5 * P_KMAX;
         int nm = (int)m[0];
@@ -3173,49 +3486,608 @@ static PyObject *n_predict_futs(PyObject *self, PyObject *args)
                 goto fail;
             PyList_SetItem(row, k, d);
             int code = (int)m[2 * P_KMAX + k];
-            PyObject *v = PyFloat_FromDouble(rint(m[3 * P_KMAX + k] * 1000.0) / 1000.0);
-            if (v == NULL || PyDict_SetItemString(d, "p", v) < 0) {
-                Py_XDECREF(v);
+            if (pm_set(d, pk_s[K_p], PyFloat_FromDouble(rint(m[3 * P_KMAX + k] * 1000.0) / 1000.0)) < 0 ||
+                pm_set(d, pk_s[K_p0], PyFloat_FromDouble(rint(m[4 * P_KMAX + k] * 1000.0) / 1000.0)) < 0)
                 goto fail;
-            }
-            Py_DECREF(v);
-            v = PyFloat_FromDouble(rint(m[4 * P_KMAX + k] * 1000.0) / 1000.0);
-            if (v == NULL || PyDict_SetItemString(d, "p0", v) < 0) {
-                Py_XDECREF(v);
-                goto fail;
-            }
-            Py_DECREF(v);
-            if (code < 0 || code >= nn || PyDict_SetItemString(d, "m", PyTuple_GetItem(names, code)) < 0) {
+            if (code < 0 || code >= nn || PyDict_SetItem(d, pk_s[K_m], PyTuple_GetItem(names, code)) < 0) {
                 if (!PyErr_Occurred())
-                    PyErr_SetString(PyExc_ValueError, "predict_futs: a name code without a name");
+                    PyErr_SetString(PyExc_ValueError, "predict: a name code without a name");
                 goto fail;
             }
             const double *tr = t + ((size_t)i * P_KMAX + k) * nt * 6;
-            for (int q = 0; q < 6; q++) {
-                PyObject *l = PyList_New(nt);
-                if (l == NULL)
+            for (int q = 0; q < 6; q++)
+                if (pm_set(d, pk_s[KEYS[q]], pm_list(tr + q, nt, 6, sc)) < 0)
                     goto fail;
-                for (Py_ssize_t j = 0; j < nt; j++) {
-                    PyObject *f = PyFloat_FromDouble(rint(tr[6 * j + q] * sc) / sc);
-                    if (f == NULL) {
-                        Py_DECREF(l);
-                        goto fail;
-                    }
-                    PyList_SetItem(l, j, f);
-                }
-                int rc = PyDict_SetItemString(d, KEYS[q], l);
-                Py_DECREF(l);
-                if (rc < 0)
-                    goto fail;
-            }
         }
     }
-    goto done;
+    return res;
 fail:
-    Py_CLEAR(res);
+    Py_DECREF(res);
+    return NULL;
+}
+
+/* {lane name: probability to three decimals} of object i */
+static PyObject *pm_lane(const double *L, PyObject *lanes)
+{
+    PyObject *d = PyDict_New();
+    for (int q = 0; d != NULL && q < P_NLANE; q++)
+        if (pm_set(d, PyTuple_GetItem(lanes, q), PyFloat_FromDouble(rint(L[q] * 1000.0) / 1000.0)) < 0)
+            Py_CLEAR(d);
+    return d;
+}
+
+/* {manoeuvre name: probability} of an object: the intent filter's slots under the names its futures are published
+ * with (a slot without a future keeps its slot name); three decimals, what rounds to nothing left out */
+static PyObject *pm_intent(const double *I, const double *m, PyObject *names, PyObject *slots)
+{
+    PyObject *d = PyDict_New(), *named[P_NM];
+    int nm = (int)m[0];
+    Py_ssize_t nn = PyTuple_Size(names);
+    if (d == NULL)
+        return NULL;
+    for (int s = 0; s < P_NM; s++)
+        named[s] = NULL;
+    for (int k = 0; k < nm && k < P_KMAX; k++) {
+        int slot = (int)m[P_KMAX + k], code = (int)m[2 * P_KMAX + k];
+        if (slot >= 0 && slot < P_NM && code >= 0 && code < nn)
+            named[slot] = PyTuple_GetItem(names, code);
+    }
+    for (int s = 0; s < P_NM; s++) {
+        double v = rint(I[s] * 1000.0) / 1000.0;
+        if (!(v > 0.0005))
+            continue;
+        PyObject *key = named[s] != NULL ? named[s] : PyTuple_GetItem(slots, s);
+        if (named[s] != NULL) {                   /* (named.get(s) or SLOTS[s]) */
+            int t = PyObject_IsTrue(named[s]);
+            if (t < 0)
+                goto fail;
+            if (!t)
+                key = PyTuple_GetItem(slots, s);
+        }
+        PyObject *was = PyDict_GetItemWithError(d, key), *val;
+        if (was == NULL && PyErr_Occurred())
+            goto fail;
+        if (was != NULL) {
+            double sum = PyFloat_AsDouble(was) + v;
+            int ok;
+            double r = round_fast(sum, 3, &ok);
+            if (ok)
+                val = PyFloat_FromDouble(r);
+            else {
+                PyObject *a = Py_BuildValue("(di)", sum, 3);
+                val = a ? PyObject_CallObject(builtin_round, a) : NULL;
+                Py_XDECREF(a);
+            }
+        } else
+            val = PyFloat_FromDouble(v);
+        if (pm_set(d, key, val) < 0)
+            goto fail;
+    }
+    return d;
+fail:
+    Py_DECREF(d);
+    return NULL;
+}
+
+/* {"modes": [{"p", "m", "x", "y", "v"}, ...]}: the car's own futures */
+static PyObject *pm_ego(const double *EO, const double *ET, int ego_n, Py_ssize_t nt, PyObject *names, int dec)
+{
+    PyObject *d = PyDict_New(), *l = PyList_New(ego_n);
+    Py_ssize_t nn = PyTuple_Size(names);
+    double sc = POW10[dec];
+    static const int KEYS[3] = {K_x, K_y, K_v};
+    if (d == NULL || l == NULL)
+        goto fail;
+    for (int k = 0; k < ego_n; k++) {
+        PyObject *m = PyDict_New();
+        if (m == NULL)
+            goto fail;
+        PyList_SetItem(l, k, m);
+        int code = (int)EO[2 * k + 1];
+        if (pm_set(m, pk_s[K_p], PyFloat_FromDouble(rint(EO[2 * k] * 1000.0) / 1000.0)) < 0)
+            goto fail;
+        if (code < 0 || code >= nn || PyDict_SetItem(m, pk_s[K_m], PyTuple_GetItem(names, code)) < 0) {
+            if (!PyErr_Occurred())
+                PyErr_SetString(PyExc_ValueError, "predict: a name code without a name");
+            goto fail;
+        }
+        for (int q = 0; q < 3; q++)
+            if (pm_set(m, pk_s[KEYS[q]], pm_list(ET + (size_t)k * nt * 3 + q, nt, 3, sc)) < 0)
+                goto fail;
+    }
+    if (PyDict_SetItem(d, pk_s[K_modes], l) < 0)
+        goto fail;
+    Py_DECREF(l);
+    return d;
+fail:
+    Py_XDECREF(d);
+    Py_XDECREF(l);
+    return NULL;
+}
+
+/* predict_message(radar_msg, sel, t, traj, modes, lane, intent, ego_out, ego_traj, ego_n, names, lanes, slots,
+ *                 decimals, source, part) -> the `radar_fut` message (part 0), or a part of it for the Prediction's
+ * accessors: 1 the futures of every object, 2 their lane dicts, 3 their intent dicts, 4 `ego_fut`.
+ * The message: the radar message of the same stamp with the prediction added: top level `fut` {"t"}, `ego_fut`
+ * {"modes"}, `fut_ctx` (source); per object of `sel` ({id: row}) `fut` [modes], `lane`, `intent`; the other objects
+ * are passed on as they are. Numbers rounded as round_lists rounds them (rint(v * 10^d) / 10^d; probabilities to
+ * three decimals). */
+static PyObject *n_predict_message(PyObject *self, PyObject *args)
+{
+    PyObject *radar, *sel, *o[7], *names, *lanes, *slots, *source, *res = NULL;
+    PyObject *futs = NULL, *out = NULL, *objs = NULL;
+    int ego_n, dec, part;
+    View v[7];
+    Py_ssize_t rows[7];
+    static const int WIDTH[7] = {1, 6, 5 * P_KMAX, P_NLANE, P_NM, 2, 3};
+    static const char *const WHAT[7] = {"t", "traj", "modes", "lane", "intent", "ego_out", "ego_traj"};
+    for (int i = 0; i < 7; i++)
+        v[i].held = 0;
+    if (!PyArg_ParseTuple(args, "OOOOOOOOOiO!O!O!iOi", &radar, &sel, &o[0], &o[1], &o[2], &o[3], &o[4], &o[5], &o[6], &ego_n,
+                          &PyTuple_Type, &names, &PyTuple_Type, &lanes, &PyTuple_Type, &slots, &dec, &source, &part))
+        return NULL;
+    if (pk_strings() < 0)
+        return NULL;
+    for (int i = 0; i < 7; i++)
+        if (pview(o[i], &v[i], 0, WIDTH[i], &rows[i], WHAT[i]) < 0)
+            goto done;
+    Py_ssize_t nt = rows[0], n = rows[2];
+    if (dec < 0 || dec > 9 || nt < 1 || rows[1] != n * P_KMAX * nt || rows[3] != n || rows[4] != n || ego_n < 0 ||
+        ego_n > rows[5] || rows[6] < ego_n * nt || PyTuple_Size(lanes) != P_NLANE || PyTuple_Size(slots) != P_NM) {
+        PyErr_SetString(PyExc_ValueError, "predict_message: array sizes do not fit together");
+        goto done;
+    }
+    const double *T = (const double *)v[0].b.buf, *TR = (const double *)v[1].b.buf, *M = (const double *)v[2].b.buf;
+    const double *LN = (const double *)v[3].b.buf, *IN = (const double *)v[4].b.buf, *EO = (const double *)v[5].b.buf;
+    const double *ET = (const double *)v[6].b.buf;
+    if (part == 4) {
+        res = pm_ego(EO, ET, ego_n, nt, names, dec);
+        goto done;
+    }
+    if (part == 2 || part == 3) {
+        res = PyList_New(n);
+        for (Py_ssize_t i = 0; res != NULL && i < n; i++) {
+            PyObject *d = part == 2 ? pm_lane(LN + i * P_NLANE, lanes) : pm_intent(IN + i * P_NM, M + i * 5 * P_KMAX, names, slots);
+            if (d == NULL)
+                Py_CLEAR(res);
+            else
+                PyList_SetItem(res, i, d);
+        }
+        goto done;
+    }
+    futs = pm_futs(TR, M, n, nt, names, dec);
+    if (futs == NULL)
+        goto done;
+    if (part == 1) {
+        res = futs;
+        futs = NULL;
+        goto done;
+    }
+    if (!PyDict_Check(radar) || !PyDict_Check(sel)) {
+        PyErr_SetString(PyExc_TypeError, "predict_message: the radar message and the objects' rows: dicts");
+        goto done;
+    }
+    out = PyDict_Copy(radar);
+    PyObject *ro = PyDict_GetItemWithError(radar, pk_s[K_objects]);
+    Py_ssize_t no = ro != NULL && ro != Py_None && PyList_Check(ro) ? PyList_Size(ro) : 0;
+    objs = PyList_New(no);
+    if (out == NULL || objs == NULL)
+        goto done;
+    for (Py_ssize_t j = 0; j < no; j++) {
+        PyObject *ob = PyList_GetItem(ro, j), *item = NULL;
+        if (PyDict_Check(ob)) {
+            PyObject *id = PyDict_GetItemWithError(ob, pk_s[K_id]);
+            PyObject *row = PyDict_GetItemWithError(sel, id != NULL ? id : Py_None);
+            if (row == NULL && PyErr_Occurred())
+                goto done;
+            if (row != NULL) {
+                Py_ssize_t i = PyLong_AsSsize_t(row);
+                if (i < 0 || i >= n) {
+                    if (!PyErr_Occurred())
+                        PyErr_SetString(PyExc_IndexError, "predict_message: an object's row beyond the arrays");
+                    goto done;
+                }
+                item = PyDict_Copy(ob);
+                if (item == NULL || PyDict_SetItem(item, pk_s[K_fut], PyList_GetItem(futs, i)) < 0 ||
+                    pm_set(item, pk_s[K_lane], pm_lane(LN + i * P_NLANE, lanes)) < 0 ||
+                    pm_set(item, pk_s[K_intent], pm_intent(IN + i * P_NM, M + i * 5 * P_KMAX, names, slots)) < 0) {
+                    Py_XDECREF(item);
+                    goto done;
+                }
+            }
+        }
+        if (item == NULL) {
+            item = ob;
+            Py_INCREF(item);
+        }
+        PyList_SetItem(objs, j, item);
+    }
+    {
+        PyObject *ft = PyDict_New();
+        if (ft == NULL || pm_set(ft, pk_s[K_t], pm_list(T, nt, 1, 0.0)) < 0) {
+            Py_XDECREF(ft);
+            goto done;
+        }
+        if (PyDict_SetItem(out, pk_s[K_type], pk_s[K_radar_fut]) < 0 || PyDict_SetItem(out, pk_s[K_objects], objs) < 0 ||
+            pm_set(out, pk_s[K_fut], ft) < 0 || pm_set(out, pk_s[K_ego_fut], pm_ego(EO, ET, ego_n, nt, names, dec)) < 0 ||
+            PyDict_SetItem(out, pk_s[K_fut_ctx], source) < 0)
+            goto done;
+    }
+    res = out;
+    out = NULL;
+done:
+    Py_XDECREF(futs);
+    Py_XDECREF(out);
+    Py_XDECREF(objs);
+    for (int i = 0; i < 7; i++)
+        view_drop(&v[i]);
+    return res;
+}
+
+/* ---- the self-check's sums ---- */
+static volatile double pp_two = 2.0;             /* x ** 2 of Python: the C library's pow, not folded */
+
+/* one scored prediction into the statistics (selfcheck.py SelfCheck.add): out: predict_score's rows (nt + 2, 6),
+ * val (nt), p (K), win; hk: the horizons' sample indices; n (4, nh), sums (4, nh, 5), cal (10, 2), brier (2) */
+static void score_add(int kind, const double *out, Py_ssize_t nt, const double *val, const double *p, int K, int win,
+                      const Py_ssize_t *hk, int nh, double *n, double *sums, double *cal, double *brier)
+{
+    static const int COLS[5] = {0, 1, 3, 4, 5};   /* min_ade, min_fde, top_fde, nll, maha2 */
+    int g = kind == 7 ? 2 : kind == 6 ? 1 : 0;
+    for (int h = 0; h < nh; h++) {
+        if (!(val[hk[h]] > 0.5))
+            continue;
+        n[g * nh + h] += 1.0;
+        n[3 * nh + h] += 1.0;
+        for (int c = 0; c < 5; c++) {
+            double x = out[hk[h] * 6 + COLS[c]];
+            sums[(g * nh + h) * 5 + c] += x;
+            sums[(3 * nh + h) * 5 + c] += x;
+        }
+    }
+    if (K >= 2 && win >= 0) {
+        const double *ade = out + nt * 6;         /* the two further rows: every future's mean error */
+        double best = ade[win];
+        for (int m = 0; m < K && m < 12; m++) {
+            int hit = m == win || ade[m] <= 1.1 * best + 0.3;
+            double b10 = p[m] * 10.0;
+            int bin = b10 >= 9.0 ? 9 : (b10 > 0.0 ? (int)b10 : 0);
+            cal[2 * bin] += 1.0;
+            cal[2 * bin + 1] += hit;
+            brier[0] += pow(p[m] - hit, pp_two);
+            brier[1] += 1.0;
+        }
+    }
+}
+
+/* predict_score_add(kind, out (nt + 2, 6), val (nt), p (K), win, hk, n (4, nh), sums (4, nh, 5), cal (10, 2),
+ *                   brier (2)): one scored prediction into the self-check's statistics (in place) */
+static PyObject *n_predict_score_add(PyObject *self, PyObject *args)
+{
+    PyObject *oo, *ov, *op, *ohk, *on, *os, *oc, *ob, *res = NULL;
+    int kind, win;
+    View vo, vv, vp, vn, vs, vc, vb;
+    Py_ssize_t ro, nt, K, rn, rs, rc, rb, hk[16];
+    vo.held = vv.held = vp.held = vn.held = vs.held = vc.held = vb.held = 0;
+    if (!PyArg_ParseTuple(args, "iOOOiO!OOOO", &kind, &oo, &ov, &op, &win, &PyList_Type, &ohk, &on, &os, &oc, &ob))
+        return NULL;
+    if (pview(oo, &vo, 0, 6, &ro, "out") < 0 || pview(ov, &vv, 0, 1, &nt, "valid") < 0 || pview(op, &vp, 0, 1, &K, "p") < 0 ||
+        pview(on, &vn, 1, 1, &rn, "n") < 0 || pview(os, &vs, 1, 5, &rs, "sums") < 0 || pview(oc, &vc, 1, 2, &rc, "cal") < 0 ||
+        pview(ob, &vb, 1, 2, &rb, "brier") < 0)
+        goto done;
+    Py_ssize_t nh = PyList_Size(ohk);
+    if (nh > 16 || ro != nt + 2 || rn != 4 * nh || rs != 4 * nh || rc != 10 || rb != 1 || win >= K) {
+        PyErr_SetString(PyExc_ValueError, "predict_score_add: array sizes do not fit together");
+        goto done;
+    }
+    for (Py_ssize_t h = 0; h < nh; h++) {
+        hk[h] = PyLong_AsSsize_t(PyList_GetItem(ohk, h));
+        if (hk[h] < 0 || hk[h] >= nt) {
+            if (!PyErr_Occurred())
+                PyErr_SetString(PyExc_IndexError, "predict_score_add: a horizon beyond the samples");
+            goto done;
+        }
+    }
+    score_add(kind, (const double *)vo.b.buf, nt, (const double *)vv.b.buf, (const double *)vp.b.buf, (int)K, win, hk, (int)nh,
+              (double *)vn.b.buf, (double *)vs.b.buf, (double *)vc.b.buf, (double *)vb.b.buf);
+    res = Py_None;
+    Py_INCREF(res);
+done:
+    view_drop(&vo);
+    view_drop(&vv);
+    view_drop(&vp);
+    view_drop(&vn);
+    view_drop(&vs);
+    view_drop(&vc);
+    view_drop(&vb);
+    return res;
+}
+
+/* predict_check_take(ids, sel, objs (n, P_NO), ground (n, 2), actual (R, nt, 2), valid (R, nt), k) -> taken
+ * A kept batch of predictions takes where its objects are now (sample k of its times): for each of its ids that
+ * this frame has (`sel`: {id: row of objs}) and sees (PO_SEEN), the place on the ground. */
+static PyObject *n_predict_check_take(PyObject *self, PyObject *args)
+{
+    PyObject *ids, *sel, *oobj, *og, *oa, *ov, *res = NULL;
+    Py_ssize_t k, n, ng, ra, rv;
+    View vobj, vg, va, vv;
+    vobj.held = vg.held = va.held = vv.held = 0;
+    if (!PyArg_ParseTuple(args, "O!O!OOOOn", &PyList_Type, &ids, &PyDict_Type, &sel, &oobj, &og, &oa, &ov, &k))
+        return NULL;
+    if (pview(oobj, &vobj, 0, P_NO, &n, "objs") < 0 || pview(og, &vg, 0, 2, &ng, "ground") < 0 ||
+        pview(oa, &va, 1, 2, &ra, "actual") < 0 || pview(ov, &vv, 1, 1, &rv, "valid") < 0)
+        goto done;
+    Py_ssize_t R = PyList_Size(ids), nt = R > 0 ? rv / R : 0;
+    if (ng != n || (R > 0 && (rv % R || ra != rv || k < 0 || k >= nt))) {
+        PyErr_SetString(PyExc_ValueError, "predict_check_take: array sizes do not fit together");
+        goto done;
+    }
+    const double *O = (const double *)vobj.b.buf, *G = (const double *)vg.b.buf;
+    double *A = (double *)va.b.buf, *V = (double *)vv.b.buf;
+    long taken = 0;
+    for (Py_ssize_t r = 0; r < R; r++) {
+        PyObject *row = PyDict_GetItemWithError(sel, PyList_GetItem(ids, r));
+        if (row == NULL) {
+            if (PyErr_Occurred())
+                goto done;
+            continue;
+        }
+        Py_ssize_t j = PyLong_AsSsize_t(row);
+        if (j < 0 || j >= n) {
+            if (PyErr_Occurred())
+                goto done;
+            continue;
+        }
+        if (!(O[j * P_NO + PO_SEEN] > 0.5))
+            continue;
+        A[(r * nt + k) * 2] = G[2 * j];
+        A[(r * nt + k) * 2 + 1] = G[2 * j + 1];
+        V[r * nt + k] = 1.0;
+        taken++;
+    }
+    res = PyLong_FromLong(taken);
+done:
+    view_drop(&vobj);
+    view_drop(&vg);
+    view_drop(&va);
+    view_drop(&vv);
+    return res;
+}
+
+/* predict_score_batch(traj (R, P_KMAX, nt, 6), nm (R), p (R, P_KMAX), actual (R, nt, 2), valid (R, nt), kind (R),
+ *                     min_seen, hk, n, sums, cal, brier) -> predictions scored
+ * A kept batch whose horizon has passed: every prediction that was seen at min_seen of its samples at least is
+ * scored against what its object did (predict_score) and folded into the statistics (predict_score_add). */
+static PyObject *n_predict_score_batch(PyObject *self, PyObject *args)
+{
+    PyObject *o[10], *ohk, *res = NULL;
+    double min_seen, *out = NULL;
+    View v[10];
+    Py_ssize_t rows[10], hk[16];
+    static const int WIDTH[10] = {6, 1, P_KMAX, 2, 1, 1, 1, 5, 2, 2};
+    static const int WR[10] = {0, 0, 0, 0, 0, 0, 1, 1, 1, 1};
+    static const char *const WHAT[10] = {"traj", "nm", "p", "actual", "valid", "kind", "n", "sums", "cal", "brier"};
+    for (int i = 0; i < 10; i++)
+        v[i].held = 0;
+    if (!PyArg_ParseTuple(args, "OOOOOOdO!OOOO", &o[0], &o[1], &o[2], &o[3], &o[4], &o[5], &min_seen, &PyList_Type, &ohk, &o[6],
+                          &o[7], &o[8], &o[9]))
+        return NULL;
+    for (int i = 0; i < 10; i++)
+        if (pview(o[i], &v[i], WR[i], WIDTH[i], &rows[i], WHAT[i]) < 0)
+            goto done;
+    Py_ssize_t R = rows[1], nt = R > 0 ? rows[4] / R : 0, nh = PyList_Size(ohk);
+    if (nh > 16 || rows[2] != R || rows[5] != R || (R > 0 && (rows[4] % R || rows[3] != rows[4] || rows[0] != R * P_KMAX * nt)) ||
+        rows[6] != 4 * nh || rows[7] != 4 * nh || rows[8] != 10 || rows[9] != 1) {
+        PyErr_SetString(PyExc_ValueError, "predict_score_batch: array sizes do not fit together");
+        goto done;
+    }
+    for (Py_ssize_t h = 0; h < nh; h++) {
+        hk[h] = PyLong_AsSsize_t(PyList_GetItem(ohk, h));
+        if (hk[h] < 0 || hk[h] >= nt) {
+            if (!PyErr_Occurred())
+                PyErr_SetString(PyExc_IndexError, "predict_score_batch: a horizon beyond the samples");
+            goto done;
+        }
+    }
+    out = (double *)PyMem_Calloc((size_t)(nt + 2) * 6, sizeof(double));
+    if (out == NULL) {
+        PyErr_NoMemory();
+        goto done;
+    }
+    const double *TR = (const double *)v[0].b.buf, *NM = (const double *)v[1].b.buf, *P = (const double *)v[2].b.buf;
+    const double *ACT = (const double *)v[3].b.buf, *VAL = (const double *)v[4].b.buf, *KIND = (const double *)v[5].b.buf;
+    long scored = 0;
+    for (Py_ssize_t r = 0; r < R; r++) {
+        const double *val = VAL + r * nt;
+        double seen = 0.0;
+        for (Py_ssize_t k = 0; k < nt; k++)
+            seen += val[k];
+        int K = (int)NM[r];
+        if (seen < min_seen)
+            continue;
+        if (K < 1 || K > P_KMAX) {
+            PyErr_SetString(PyExc_ValueError, "predict_score: array sizes do not fit together");
+            goto done;
+        }
+        double pw;
+        int win = score_one(TR + (size_t)r * P_KMAX * nt * 6, K, nt, P + r * P_KMAX, ACT + r * nt * 2, val, out, 1, &pw);
+        score_add((int)KIND[r], out, nt, val, P + r * P_KMAX, K, win, hk, (int)nh, (double *)v[6].b.buf, (double *)v[7].b.buf,
+                  (double *)v[8].b.buf, (double *)v[9].b.buf);
+        scored++;
+    }
+    res = PyLong_FromLong(scored);
+done:
+    PyMem_Free(out);
+    for (int i = 0; i < 10; i++)
+        view_drop(&v[i]);
+    return res;
+}
+
+/* predict_futs(traj (n, P_KMAX, nt, 6), modes (n, 5, P_KMAX), names, decimals) -> [[future, ...] per object]
+ * The message form of the futures: {"p", "p0", "m", "x", "y", "sx", "sy", "rxy", "v"}, numbers rounded as
+ * round_lists rounds them (rint(v * 10^d) / 10^d; p and p0 to three decimals). */
+static PyObject *n_predict_futs(PyObject *self, PyObject *args)
+{
+    PyObject *ot, *om, *names, *res = NULL;
+    int dec;
+    View vt, vm;
+    Py_ssize_t rt, n;
+    vt.held = vm.held = 0;
+    if (!PyArg_ParseTuple(args, "OOO!i", &ot, &om, &PyTuple_Type, &names, &dec))
+        return NULL;
+    if (pk_strings() < 0 || pview(ot, &vt, 0, 6, &rt, "traj") < 0 || pview(om, &vm, 0, 5 * P_KMAX, &n, "modes") < 0)
+        goto done;
+    if (dec < 0 || dec > 9 || (n > 0 && rt % (n * P_KMAX) != 0) || (n > 0 && rt / (n * P_KMAX) < 1)) {
+        PyErr_SetString(PyExc_ValueError, "predict_futs: array sizes do not fit together");
+        goto done;
+    }
+    res = pm_futs((const double *)vt.b.buf, (const double *)vm.b.buf, n, n > 0 ? rt / (n * P_KMAX) : 0, names, dec);
 done:
     view_drop(&vt);
     view_drop(&vm);
+    return res;
+}
+
+/* predict_handoff(traj (n, P_KMAX, nt, 6), modes (n, 5, P_KMAX), lane (n, 7), ego_out (P_EMODES, 2),
+ *                 ego_traj (P_EMODES, nt, 3), ego_n, names, decimals)
+ *   -> (modes, names, rows, lanes, ego | None, ego_names, ego_v_bad)
+ * The prediction as the decision layer takes it in process (chris_integrator/decide/futures.py `Futures`), with the
+ * numbers the `radar_fut` message would carry (predict_futs, Prediction.ego_fut, lane_dict: rint(v * 10^d) / 10^d,
+ * probabilities and lanes to three decimals), so a decision is the same from the arrays and from the message:
+ *   modes   bytes of float64 rows (2 + 5 nt): p0, p, x[nt], y[nt], sx[nt], sy[nt], rxy[nt], of the objects whose
+ *           futures are whole (every number finite), in the objects' order
+ *   names   their manoeuvre names
+ *   rows    bytes of float64 (n, 3): first mode, modes, state (1: futures as the contract says; 2: not)
+ *   lanes   bytes of float64 (n, 7)
+ *   ego     bytes of float64 rows (1 + 3 nt): p, x, y, v of the car's futures; None without one, or where a place
+ *           is not finite
+ *   ego_v_bad  1 where a speed of the car's futures is not finite (the caller derives it from the places) */
+static PyObject *n_predict_handoff(PyObject *self, PyObject *args)
+{
+    PyObject *ot, *om, *ol, *oeo, *oet, *names, *res = NULL;
+    PyObject *bm = NULL, *lnames = NULL, *br = NULL, *bl = NULL, *be = NULL, *enames = NULL;
+    int dec, ego_n;
+    View vt, vm, vl, veo, vet;
+    Py_ssize_t rt, n, nl, neo, ret;
+    vt.held = vm.held = vl.held = veo.held = vet.held = 0;
+    if (!PyArg_ParseTuple(args, "OOOOOiO!i", &ot, &om, &ol, &oeo, &oet, &ego_n, &PyTuple_Type, &names, &dec))
+        return NULL;
+    if (pview(ot, &vt, 0, 6, &rt, "traj") < 0 || pview(om, &vm, 0, 5 * P_KMAX, &n, "modes") < 0 ||
+        pview(ol, &vl, 0, 7, &nl, "lane") < 0 || pview(oeo, &veo, 0, 2, &neo, "ego_out") < 0 ||
+        pview(oet, &vet, 0, 3, &ret, "ego_traj") < 0)
+        goto done;
+    if (dec < 0 || dec > 9 || (n > 0 && (rt % (n * P_KMAX) != 0 || rt / (n * P_KMAX) < 1)) || nl != n || ego_n < 0 || ego_n > neo || (neo > 0 && ret % neo != 0)) {
+        PyErr_SetString(PyExc_ValueError, "predict_handoff: array sizes do not fit together");
+        goto done;
+    }
+    Py_ssize_t nt = n > 0 ? rt / (n * P_KMAX) : (neo > 0 ? ret / neo : 0), nn = PyTuple_Size(names);
+    if (ego_n > 0 && ret / neo != nt) {
+        PyErr_SetString(PyExc_ValueError, "predict_handoff: the car's futures and the objects' differ in length");
+        goto done;
+    }
+    const double *t = (const double *)vt.b.buf, *M = (const double *)vm.b.buf, *LN = (const double *)vl.b.buf;
+    const double *EO = (const double *)veo.b.buf, *ET = (const double *)vet.b.buf;
+    const double sc = POW10[dec];
+    const Py_ssize_t w = 2 + 5 * nt;
+    Py_ssize_t K = 0;
+    for (Py_ssize_t i = 0; i < n; i++) {
+        int nm = (int)M[i * 5 * P_KMAX];
+        K += nm > 0 && nm <= P_KMAX ? nm : 0;
+    }
+    bm = PyBytes_FromStringAndSize(NULL, K * w * (Py_ssize_t)sizeof(double));
+    br = PyBytes_FromStringAndSize(NULL, n * 3 * (Py_ssize_t)sizeof(double));
+    bl = PyBytes_FromStringAndSize(NULL, n * 7 * (Py_ssize_t)sizeof(double));
+    lnames = PyList_New(0);
+    enames = PyList_New(0);
+    if (!bm || !br || !bl || !lnames || !enames)
+        goto done;
+    double *MO = (double *)PyBytes_AsString(bm), *RO = (double *)PyBytes_AsString(br), *LO = (double *)PyBytes_AsString(bl);
+    Py_ssize_t k_out = 0;
+    for (Py_ssize_t i = 0; i < n; i++) {
+        const double *m = M + i * 5 * P_KMAX;
+        int nm = (int)m[0], ok = nm > 0 && nm <= P_KMAX;
+        for (int q = 0; q < 7; q++)
+            LO[7 * i + q] = rint(LN[7 * i + q] * 1000.0) / 1000.0;
+        for (int k = 0; ok && k < nm; k++) {
+            const double *tr = t + ((size_t)i * P_KMAX + k) * nt * 6;
+            double *row = MO + (k_out + k) * w;
+            row[0] = rint(m[4 * P_KMAX + k] * 1000.0) / 1000.0;
+            row[1] = rint(m[3 * P_KMAX + k] * 1000.0) / 1000.0;
+            for (int q = 0; q < 5 && ok; q++)
+                for (Py_ssize_t j = 0; j < nt; j++) {
+                    double v = rint(tr[6 * j + q] * sc) / sc;
+                    if (!isfinite(v)) {
+                        ok = 0;
+                        break;
+                    }
+                    row[2 + q * nt + j] = v;
+                }
+            int code = (int)m[2 * P_KMAX + k];
+            if (code < 0 || code >= nn) {
+                PyErr_SetString(PyExc_ValueError, "predict_handoff: a name code without a name");
+                goto done;
+            }
+        }
+        RO[3 * i] = (double)k_out;
+        RO[3 * i + 1] = ok ? (double)nm : 0.0;
+        RO[3 * i + 2] = ok ? 1.0 : 2.0;
+        if (ok) {
+            for (int k = 0; k < nm; k++)
+                if (PyList_Append(lnames, PyTuple_GetItem(names, (int)m[2 * P_KMAX + k])) < 0)
+                    goto done;
+            k_out += nm;
+        }
+    }
+    if (k_out < K) {                               /* an object's futures were not whole: the rows written are fewer */
+        PyObject *cut = PyBytes_FromStringAndSize(PyBytes_AsString(bm), k_out * w * (Py_ssize_t)sizeof(double));
+        if (cut == NULL)
+            goto done;
+        Py_DECREF(bm);
+        bm = cut;
+    }
+    int ego_ok = ego_n > 0, v_bad = 0;
+    if (ego_ok) {
+        const Py_ssize_t we = 1 + 3 * nt;
+        be = PyBytes_FromStringAndSize(NULL, ego_n * we * (Py_ssize_t)sizeof(double));
+        if (be == NULL)
+            goto done;
+        double *E = (double *)PyBytes_AsString(be);
+        for (int k = 0; k < ego_n; k++) {
+            double *row = E + k * we;
+            row[0] = rint(EO[2 * k] * 1000.0) / 1000.0;
+            for (Py_ssize_t j = 0; j < nt; j++)
+                for (int q = 0; q < 3; q++) {
+                    double v = rint(ET[((size_t)k * nt + j) * 3 + q] * sc) / sc;
+                    if (!isfinite(v)) {
+                        if (q == 2)
+                            v_bad = 1;
+                        else
+                            ego_ok = 0;
+                    }
+                    row[1 + q * nt + j] = v;
+                }
+            int code = (int)EO[2 * k + 1];
+            if (code < 0 || code >= nn) {
+                PyErr_SetString(PyExc_ValueError, "predict_handoff: a name code without a name");
+                goto done;
+            }
+            if (PyList_Append(enames, PyTuple_GetItem(names, code)) < 0)
+                goto done;
+        }
+    }
+    res = Py_BuildValue("(OOOOOOi)", bm, lnames, br, bl, ego_ok ? be : Py_None, enames, v_bad);
+done:
+    Py_XDECREF(bm);
+    Py_XDECREF(lnames);
+    Py_XDECREF(br);
+    Py_XDECREF(bl);
+    Py_XDECREF(be);
+    Py_XDECREF(enames);
+    view_drop(&vt);
+    view_drop(&vm);
+    view_drop(&vl);
+    view_drop(&veo);
+    view_drop(&vet);
     return res;
 }
 
@@ -3224,4 +4096,10 @@ done:
     {"predict_names", n_predict_names, METH_NOARGS, "(manoeuvre names, lane names, intent slots, array widths)"},     \
     {"predict_frame", n_predict_frame, METH_VARARGS, "one frame of the predictor: lanes, intents, futures"},          \
     {"predict_futs", n_predict_futs, METH_VARARGS, "the futures' message form: per object a list of dicts"},      \
+    {"predict_handoff", n_predict_handoff, METH_VARARGS, "the prediction as the decision layer takes it in process"}, \
+    {"predict_pack", n_predict_pack, METH_VARARGS, "a radar message's objects as predict_frame reads them"},        \
+    {"predict_message", n_predict_message, METH_VARARGS, "the radar_fut message of a prediction, or a part of it"},  \
+    {"predict_check_take", n_predict_check_take, METH_VARARGS, "a kept batch takes where its objects are now"},      \
+    {"predict_score_batch", n_predict_score_batch, METH_VARARGS, "a kept batch scored into the self-check's sums"},  \
+    {"predict_score_add", n_predict_score_add, METH_VARARGS, "one scored prediction into the self-check's sums"},    \
     {"predict_score", n_predict_score, METH_VARARGS, "a past prediction against what the object did"},

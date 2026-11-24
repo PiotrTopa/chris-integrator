@@ -572,7 +572,10 @@ decision layer reads them. One message per `radar` message, **at the same `ts_mo
 as it was, with the fields below added. A companion message and not fields of `radar` itself because of its size
 (about 1.3 kB per future: 4-8 kB per object against 0.7 kB of the radar's own object): `radar` stays as it was for
 every consumer that does not want futures, and `radar_fut` is serialised only for a consumer that subscribes to
-it (neither is in the socket's default list nor recorded). `{"enabled": false}` in `predict.json` (or
+it (neither is in the socket's default list nor recorded): the predictor puts its result on the bus as arrays, the
+message is made (native `predict_message`) when the first reader asks for it, and the decision layer in the same
+process takes the arrays themselves, with the message's rounded numbers (`Prediction.handoff`; from a recording or
+another process it reads the message: the same decision either way). `{"enabled": false}` in `predict.json` (or
 `{"disable": ["predict"]}` in `mixer.json`) leaves the box out; the `radar` message is the same either way.
 
 Frame: **the car frame of the message's time, held fixed on the ground** (x forward, y LEFT, metres; origin the
@@ -657,7 +660,9 @@ the cost knobs `modes_max` (6), `mode_p_min` (0.02), `interact` (1; 0: no car fo
 
 **Cost**, measured on the reference phone (Pocophone F1, one small core, `nice taskset -c 1`, the daemon stopped;
 `tools/predict_eval.py cost`, 2026-11-23; ms per radar message: `update` = context arrays + native frame +
-self-check, `message` = the dicts of `radar_fut`, `dumps` = its JSON text, paid only for a subscriber):
+self-check, `message` = the dicts of `radar_fut`, `dumps` = its JSON text, both paid only for a subscriber; the
+table is from before the predictor's glue and the message moved into the native core on 2026-11-24 and has not been
+measured on the phone since):
 
 | objects | update | message | dumps | futures | bytes |
 |---|---|---|---|---|---|
@@ -896,7 +901,8 @@ the moment), with `exist` not falling. `exist` is the probability over all hypot
 `chris_integrator/decide` with its plug-in `chris_integrator/plugins/decide.py`: one message per `radar` message
 (the radar's rate; `rate_hz` caps it), in the car frame of that message's time held fixed on the ground. For the
 car against every object the radar lists as confirmed or coast, over the object's predicted futures (the
-prediction layer's modes with a position covariance per time, contract in `chris_integrator/decide/futures.py`;
+prediction layer's modes with a position covariance per time, contract in `chris_integrator/decide/futures.py`,
+taken as arrays from a predictor in the same process and read out of `radar_fut` / `radar` otherwise;
 without them, degraded, the radar's own two hypotheses as constant-velocity modes) and the car's own futures (the
 contract's `ego_fut`; without it, the road model's plan at the present acceleration and the present turn):
 
