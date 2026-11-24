@@ -121,14 +121,18 @@ def _median(a):
 _FIT_PAR = {}                   # the constants of `_fit` as the native function takes them, per configuration
 
 
-def _fit(c, x, zs, zy, prob, y, p):
+def _fit(c, x, zs, zy, prob, y, p, out=None):
     """(r, gate, nu, jumps, nsigs): measurement noise (the deviations scaled and floored, lines and edges with
     their own constants, inflated for a weak frame), the gate points (all of them when none lies in gate_x), the
     innovation of every line, and how well the frame fits each track over the gate (mean absolute innovation;
-    the same in sigmas)."""
+    the same in sigmas). out: (r, nu, gate, jumps, nsigs) arrays of the right shapes to fill (the native function
+    writes every element) instead of new ones."""
     n = x.shape[0]
-    r, nu = np.empty((N_LINES, n)), np.empty((N_LINES, n))
-    gate, jumps, nsigs = np.empty(n, bool), np.empty(N_LINES), np.empty(N_LINES)
+    if out is None:
+        r, nu = np.empty((N_LINES, n)), np.empty((N_LINES, n))
+        gate, jumps, nsigs = np.empty(n, bool), np.empty(N_LINES), np.empty(N_LINES)
+    else:
+        r, nu, gate, jumps, nsigs = out
     key = (c["r_floor"], c["r_scale"], c["edge_r_floor"], c["edge_r_scale"], c["gate_x"][0], c["gate_x"][1],
            c["on_conf"], c["low_prob_inflate"])
     par = _FIT_PAR.get(key)
@@ -198,6 +202,7 @@ class RoadGeometryTracker:
         self._xl = self._xa = None  # _measure: the last distances (a copy of the list) and their array
         self._wx = None             # _message: (x, width_x) -> the slice or index array of the width points
         self._xr = None             # _message: (x, its rounded list)
+        self._mbuf = None           # (n, the arrays of _measure, those of _fit) reused frame to frame
         self.reset()
 
     # ---- life cycle ------------------------------------------------------
@@ -259,7 +264,15 @@ class RoadGeometryTracker:
         n = len(x)
         srcs = [ll[i] if i < N_LANE and i < len(ll) else re[i - N_LANE] if i >= N_LANE and i - N_LANE < len(re) else None
                 for i in range(N_LINES)]
-        y, s, prob, ok = np.empty((N_LINES, n)), np.empty((N_LINES, n)), np.empty(N_LINES), np.empty(N_LINES, bool)
+        # the frame's arrays: the same ones every frame while n stays (the native function writes every element;
+        # nothing keeps them past the frame: rows taken into a track are copied)
+        b = self._mbuf
+        if b is None or b[0] != n:
+            b = self._mbuf = (n, (np.empty((N_LINES, n)), np.empty((N_LINES, n)), np.empty(N_LINES),
+                                  np.empty(N_LINES, bool)),
+                              (np.empty((N_LINES, n)), np.empty((N_LINES, n)), np.empty(n, bool), np.empty(N_LINES),
+                               np.empty(N_LINES)))
+        y, s, prob, ok = b[1]
         _C.lanes_measure(srcs, x, c["edge_std_x"][0], c["edge_std_x"][1], c["edge_std_bad"], c["edge_std_good"],
                          y, s, prob, ok)
         return x, y, s, prob, ok
@@ -310,7 +323,7 @@ class RoadGeometryTracker:
 
         a = 1.0 - math.exp(-dt / c["conf_tau_s"]) if dt > 0 else 1.0
         # measurement noise, and how well this frame fits every track, for all lines at once
-        r, gate, nu_all, jumps, nsigs = _fit(c, x, zs, zy, prob, self.y, self.p)
+        r, gate, nu_all, jumps, nsigs = _fit(c, x, zs, zy, prob, self.y, self.p, self._mbuf[2])
         upd = []
         probs, oks, jumps, nsigs = prob.tolist(), ok.tolist(), jumps.tolist(), nsigs.tolist()   # (the same values)
 
