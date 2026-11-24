@@ -336,6 +336,21 @@ def test_the_plug_in_has_the_alert_only_with_the_knob_and_it_does_not_hold_the_p
     assert on._hot([], pc) is True
 
 
+# ---- a pedestrian's entry holds --------------------------------------------------------------------------------------------
+def test_a_pedestrians_entry_hold_is_its_own_where_configured():
+    def entered(cfg, kind):
+        a = AL.Alert("obstacle_ahead", cfg)
+        rec = {"id": 1, "kind": kind, "level": 3, "level_exit": 3, "mass": [0.9] * 4, "p_coll": 0.9, "tm_s": 0.5,
+               "a_req": {"brake": 3.0, "left": 2.0, "right": 2.0}, "why": {}}
+        ob = {1: {"id": 1, "state": "confirmed", "exist": 1.0, "motion": "moving", "p_stationary": 0.05, "flags": []}}
+        for k in range(20):
+            if a.step(k * 0.05, [rec], ob, {"v": 13.0})[0]["stage"] >= 3:
+                return round(k * 0.05, 2)
+    assert entered({}, "vru") == 0.1 and entered({}, "vehicle") == 0.1
+    quick = {"entry_hold_vru_s": (0.1, 0.1, 0.0, 0.0)}
+    assert entered(quick, "vru") == 0.0 and entered(quick, "vehicle") == 0.1
+
+
 if __name__ == "__main__":
     for k, v in list(globals().items()):
         if k.startswith("test_"):

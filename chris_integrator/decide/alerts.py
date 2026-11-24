@@ -38,6 +38,9 @@ ALERT_DEFAULTS = dict(
     show_from=2,                                   # mode on: active from this stage (caution)
     kinds=("vehicle", "vru", "unknown"),
     entry_hold_s=(0.3, 0.2, 0.1, 0.0),             # per stage 1..4: the level must hold this long to enter
+    # ... for a pedestrian or a cyclist (None: the same). Someone stepping out is in the lane a second and a half
+    # after the first step: two tenths of that are a fifth of the warning there can be
+    entry_hold_vru_s=None,
     exit_hold_s=(0.5, 0.6, 0.8, 1.0),              # ... and be below the stage this long to leave it
     min_hold_s=(0.5, 1.0, 1.5, 2.0),               # a stage is shown at least this long
     # Entry by evidence (0: by time alone, as before). A level is entered once the conflict's probability mass at it
@@ -249,8 +252,11 @@ class Alert:
             doubt = False
         self._T = T
         new = self.stage
+        hold = c["entry_hold_s"]
+        if c["entry_hold_vru_s"] is not None and rec is not None and rec.get("kind") == "vru":
+            hold = c["entry_hold_vru_s"]
         for L in range(4, self.stage, -1):
-            if L in self.up_since and (self.ev.get(L, 0.0) if doubt else T - self.up_since[L]) >= c["entry_hold_s"][L - 1] - 1e-9:
+            if L in self.up_since and (self.ev.get(L, 0.0) if doubt else T - self.up_since[L]) >= hold[L - 1] - 1e-9:
                 new = L
                 break
         if new > self.stage:
