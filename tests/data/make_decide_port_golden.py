@@ -71,7 +71,11 @@ def record_inputs(name, seed, night, t_from, t_to):
     return json.loads(json.dumps(rows))        # as they are stored
 
 
-def replay(rows, decide_cfg=None, lazy=False):
+GOLDEN_SAMPLES = 256        # the draws of the collision probability when the golden was recorded (the default then;
+                            # 128 since 2026-11-24: tests/test_decide_port.py holds what that changes)
+
+
+def replay(rows, decide_cfg=None, lazy=False, samples=GOLDEN_SAMPLES):
     """The stored inputs through `predict` and `decide` alone: ([radar_fut messages], [decide messages]).
     lazy: `radar_fut` has no consumer but `decide` (its message is then never built on the way)."""
     from chris_integrator.mixer import MessageClock, Mixer, StreamSpec
@@ -80,7 +84,7 @@ def replay(rows, decide_cfg=None, lazy=False):
     m = Mixer(MessageClock())
     ch = m.add_input("golden", [StreamSpec(s, "raw", "sample") for s in INPUTS])
     m.add(Predict())
-    m.add(Decide(dict(decide_cfg or {}, rate_hz=1000.0)))
+    m.add(Decide(dict(decide_cfg or {}, rate_hz=1000.0, **({"threat": {"samples": samples}} if samples else {}))))
     fut, dec = [], []
     m.add_output("out", lambda e: (fut if e.stream == "radar_fut" else dec).append(e.msg),
                  streams=("decide",) if lazy else ("radar_fut", "decide"))

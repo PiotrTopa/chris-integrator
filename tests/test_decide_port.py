@@ -100,7 +100,7 @@ class Golden(unittest.TestCase):
                 m = Mixer(MessageClock())
                 names = [s for s in G.INPUTS] + ["radar_fut"]
                 ch = m.add_input("golden", [StreamSpec(s, "raw", "sample") for s in names])
-                m.add(Decide({"rate_hz": 1000.0}))
+                m.add(Decide({"rate_hz": 1000.0, "threat": {"samples": G.GOLDEN_SAMPLES}}))    # (as recorded)
                 dec = []
                 m.add_output("out", lambda e: dec.append(e.msg), streams=("decide",))
                 fut = iter(json.loads(json.dumps(G.replay(c["inputs"])[0])))
@@ -114,6 +114,32 @@ class Golden(unittest.TestCase):
                         ch.deliver(stream, msg)
                 self.same(dec, c["decide"], "%s: decide from radar_fut %s" % (
                     c["scenario"], "as the companion" if companion else "in place of radar"))
+
+    def test_what_128_draws_change_against_the_recorded_256(self):
+        """The default went from 256 to 128 draws of the collision probability (2026-11-24). The golden is the 256's
+        (G.GOLDEN_SAMPLES pins them in the replays above); here the default's messages against them, frozen: no
+        alert's stage in any message, the collision probability by 0.028 at most (0.0036 on average over the listed
+        objects), the level of three object records of 786."""
+        from chris_integrator.decide import threat as TH
+        self.assertEqual(TH.DEFAULT_CFG["samples"], 128)
+        msgs = stages = recs = levels = 0
+        worst = total = 0.0
+        for c in self.g["cases"]:
+            _, d256 = G.replay(c["inputs"])
+            _, d128 = G.replay(c["inputs"], samples=None)
+            self.assertEqual(len(d256), len(d128))
+            for a, b in zip(d256, d128):
+                msgs += 1
+                stages += [x["stage"] for x in a["alerts"]] != [x["stage"] for x in b["alerts"]]
+                oa, ob = {o["id"]: o for o in a["objects"]}, {o["id"]: o for o in b["objects"]}
+                for i in set(oa) | set(ob):
+                    recs += 1
+                    pa, pb = (oa.get(i) or {}).get("p_coll") or 0.0, (ob.get(i) or {}).get("p_coll") or 0.0
+                    worst, total = max(worst, abs(pa - pb)), total + abs(pa - pb)
+                    levels += (oa.get(i) or {}).get("level", 0) != (ob.get(i) or {}).get("level", 0)
+        self.assertEqual((msgs, stages, recs, levels), (511, 0, 786, 3))
+        self.assertLessEqual(worst, 0.028 + 1e-9)
+        self.assertLessEqual(total / recs, 0.0037)
 
 
 class Handoff(unittest.TestCase):
