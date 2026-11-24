@@ -27,6 +27,7 @@ when one lane holds at least `commit_p` of it: "unknown" is a valid answer, a wr
 
 No I/O and no wall clock in here; times come from the messages (CLOCK_MONOTONIC ns).
 """
+import bisect
 import math
 
 from ..native import round                  # builtins.round (its results; the native core)
@@ -94,10 +95,32 @@ def _norm(p):
     return [v / s for v in p]
 
 
+_WIN = {}                       # (lo, hi) -> (a copy of the last xs, the indices of its points within lo..hi)
+
+
 def _at(xs, ys, lo, hi):
-    """Mean of ys over lo <= x <= hi (None when nothing there)."""
+    """Mean of ys over lo <= x <= hi (None when nothing there). The points within the window are a function of
+    xs (the same distances every frame): found once and kept per window; the mean is taken over the same values
+    in the same order as `_at_scan`."""
     if not xs or not ys:
         return None
+    w = _WIN.get((lo, hi))
+    if w is None or w[0] != xs:
+        try:
+            w = _WIN[(lo, hi)] = (list(xs), [i for i, x in enumerate(xs) if lo <= x <= hi])
+        except TypeError:                       # a point that does not compare (beyond ys, it would not count)
+            return _at_scan(xs, ys, lo, hi)
+        if len(_WIN) > 16:
+            _WIN.clear()
+    idx = w[1]
+    n = len(ys)
+    if n < len(w[0]):
+        idx = [i for i in idx if i < n]         # (zip: the points beyond ys do not count)
+    v = [y for i in idx if (y := ys[i]) is not None]
+    return sum(v) / len(v) if v else None
+
+
+def _at_scan(xs, ys, lo, hi):
     v = [y for x, y in zip(xs, ys) if lo <= x <= hi and y is not None]
     return sum(v) / len(v) if v else None
 
@@ -119,6 +142,7 @@ class EgoLaneEstimator:
         self.turn = None
         self.c_hist = []            # (t, centre of the ego lane from the tracked inner lines) of the last seconds
         self.c_block = 0            # no lane change is read before this time (refractory)
+        self.c_mono = True          # the times in c_hist do not go back
         self.last_change = None     # {"dir": "left"|"right", "ts": ns}
         self.evidence = {}
         self.evidence_side = None
@@ -341,10 +365,21 @@ class EgoLaneEstimator:
         if ya is None or yb is None or not 0.6 * w <= yb - ya <= 1.5 * w:
             return None
         cur = 0.5 * (ya + yb)
+        if not h:
+            self.c_mono = True
+        elif ts < h[-1][0]:
+            self.c_mono = False
         h.append((ts, cur))
         if ts < self.c_block:
             return None
-        win = [v for t, v in h[:-1] if (ts - t) / NS <= c["change_window_s"]]
+        cw = c["change_window_s"]
+        if self.c_mono:
+            # the times rise: the entries within the window are a run at the end, found by bisection (the same
+            # test on each entry, the same entries in the same order)
+            j = bisect.bisect_left(h, True, 0, len(h) - 1, key=lambda e: (ts - e[0]) / NS <= cw)
+            win = [v for t, v in h[j:-1]]
+        else:
+            win = [v for t, v in h[:-1] if (ts - t) / NS <= cw]
         if len(win) < 3:
             return None
         hi, lo = max(win), min(win)
