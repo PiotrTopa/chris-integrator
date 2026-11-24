@@ -974,8 +974,10 @@ futures: 78 runs; then the ten true-conflict scenarios, seeds 1-3, day and night
 | detin_pose, +pose, first build | 69 (34 / 35), -14 +- 7 | 4 / 9 | 21 / 20 / 5 / 4 | 23, 2.20 s | 15, 1.44 s |
 
 Real drives (docs/RADAR_TRUTH.md, `tools/radar_truth_eval.py --no-gate`; the recordings carry no pose, flags or
-vectors): base: wrong verdict 3.1 of 94.0 judged s, real things never followed 8, `in_path` unreviewed 4.73 s; +shared
-(first build): 2.7 of 93.3 s, 9, 4.94 s; with `sil_bearing`: 1.1 of 92.2 s, 9, 4.90 s. One knob at a time on
+vectors): base: wrong verdict 3.1 of 94.0 judged s, real things never followed 8, `in_path` unreviewed 4.73 s; rows:
+3.5 of 93.0 s, 9, 4.73 s (parked cars called stationary 32.8 s against 34.5 s, moving 1.6 s against 1.2 s);
++shared: 3.5 of 93.3 s, 9, 4.73 s; +shared (first build): 2.7 of 93.3 s, 9, 4.94 s; with `sil_bearing`: 1.1 of
+92.2 s, 9, 4.90 s. The two night drives do not show the simulator's gain: nothing there is better with the rows set. One knob at a time on
 `ctx_prior`: `row_ctx` as the base; `det_chain` 3.5 of 93.7 s, 8; `pd_learn` 1.9 of 90.9 s, 9, 4.42 s;
 `exist_shared` 3.1 of 92.4 s, 10.
 

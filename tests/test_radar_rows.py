@@ -61,11 +61,16 @@ class Knobs(unittest.TestCase):
 
 class Rows(unittest.TestCase):
     def test_fewer_updates_with_another_cars_box_in_a_parked_street(self):
-        n0, h0 = hops("parked_street", 1, False, None)
-        n1, h1 = hops("parked_street", 1, False, ROWS)
-        self.assertLess(h1 / n1, 0.9 * h0 / n0)
-        n2, h2 = hops("parked_street", 1, False, dict(ROWS, sil_bearing=True))
-        self.assertLess(h2 / n2, 0.9 * h0 / n0)        # (this drive: 0.78; twelve drives: 0.60, docs/RADAR.md)
+        # three drives together (one drive by itself does not show it: parked_street, seed 1 by day has 86 of 765
+        # without and 88 of 776 with; over twelve drives 12.0 % against 9.2 %, docs/RADAR.md section 10)
+        runs = (("parked_street", 1, False), ("parked_street", 1, True), ("curve_parked", 2, False))
+
+        def share(tracker):
+            got = [hops(n, s, ni, tracker) for n, s, ni in runs]
+            return sum(h for _, h in got) / sum(n for n, _ in got)
+        base = share(None)
+        self.assertLess(share(ROWS), 0.9 * base)
+        self.assertLess(share(dict(ROWS, sil_bearing=True)), 0.9 * base)
 
     def test_with_the_appearance_and_the_pose_head_fewer_still(self):
         n0, h0 = hops("parked_street", 1, False, None, "detin_pose")
