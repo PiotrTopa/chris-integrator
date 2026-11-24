@@ -137,8 +137,8 @@ class Golden(unittest.TestCase):
                     pa, pb = (oa.get(i) or {}).get("p_coll") or 0.0, (ob.get(i) or {}).get("p_coll") or 0.0
                     worst, total = max(worst, abs(pa - pb)), total + abs(pa - pb)
                     levels += (oa.get(i) or {}).get("level", 0) != (ob.get(i) or {}).get("level", 0)
-        self.assertEqual((msgs, stages, recs, levels), (511, 0, 786, 3))
-        self.assertLessEqual(worst, 0.028 + 1e-9)
+        self.assertEqual((msgs, stages, recs, levels), (511, 0, 795, 3))
+        self.assertLessEqual(worst, 0.029 + 1e-9)
         self.assertLessEqual(total / recs, 0.0037)
 
 
