@@ -11468,7 +11468,42 @@ done:
     return res;
 }
 
+/* Hyp.sync(table, objects) -> None: what the hypotheses say of each object now, into its row of the table: its
+ * primary row, the probabilities that it exists and that the primary's story is the true one, its leaves, whether it
+ * is in the best story. A scan writes these for the objects that took part; an object taken out (Hyp.drop) settles
+ * its cluster anew, which may name another leaf of a cluster-mate its primary: then the table follows. */
+static PyObject *hyp_sync(PyObject *self, PyObject *args)
+{
+    Hyp *H = (Hyp *)self;
+    PyObject *oT, *otr, *res = NULL;
+    if (!PyArg_ParseTuple(args, "OO", &oT, &otr))
+        return NULL;
+    View vT;
+    vT.held = 0;
+    Py_ssize_t trows, n = 0, *th = NULL;
+    if (tab_get(oT, &vT, ROTW, &trows, NULL, "table") < 0 || (th = idx_get(otr, trows, &n)) == NULL)
+        goto done;
+    for (Py_ssize_t k = 0; k < n; k++) {
+        if (th[k] >= H->ntr || !H->tr[th[k]].alive)
+            continue;
+        const HTrack *tr = &H->tr[th[k]];
+        double *T = (double *)vT.b.buf + th[k] * ROTW;
+        T[ROT_SLOT] = (double)tr->primary;
+        T[ROT_PE] = tr->pe;
+        T[ROT_PP] = tr->pp;
+        T[ROT_NLEAF] = (double)tr->nleaf;
+        T[ROT_INMAP] = tr->in_map ? 1.0 : 0.0;
+    }
+    res = Py_None;
+    Py_INCREF(res);
+done:
+    PyMem_Free(th);
+    view_drop(&vT);
+    return res;
+}
+
 static PyMethodDef hyp_methods[] = {
+    {"sync", hyp_sync, METH_VARARGS, "the objects' primaries and probabilities as the hypotheses hold them, into the table"},
     {"history", hyp_history, METH_VARARGS, "an object's trajectory, smoothed as far as the smoother reaches"},
     {"cycle", hyp_cycle, METH_VARARGS, "one scan of the tracker: its objects in, what the scan did to them out"},
     {"after", hyp_after, METH_VARARGS, "after a scan's sightings: predictions checked and written down, trajectories, the smoothed past"},

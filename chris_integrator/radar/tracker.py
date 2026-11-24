@@ -971,8 +971,10 @@ class Tracker:
                 if q.h in dead:
                     self.by_h.pop(q.h, None)
             self.objects = [q for q in self.objects if q.h not in dead]
-        for q in self.objects:                           # their primaries may have changed
-            pass
+        # the cluster it was of is settled anew: another leaf of a cluster-mate may be its primary now, and what the
+        # hypotheses say of its existence has changed; the objects' rows of the table follow
+        self.hyp.sync(self.store.tab, [q.h for q in self.objects])
+        self._snap = None
 
     def _life(self, T, pose, scan, slots, tb, rec, lasts):
         """Per object: (p_still, its combined state finite, and for one out of every field (not tentative) where
