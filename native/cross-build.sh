@@ -46,6 +46,7 @@ cp chris_integrator/native/_chris_native.abi3.so /out/\$tag/
   echo \"source sha256: \$(sha256sum chris_integrator/native/src/chris_native.c | cut -d' ' -f1)\"
   echo \"source sha256 (predict.c, included): \$(sha256sum chris_integrator/native/src/predict.c | cut -d' ' -f1)\"
   echo \"source sha256 (decide.c, included): \$(sha256sum chris_integrator/native/src/decide.c | cut -d' ' -f1)\"
+  echo \"source sha256 (egomotion.c, included): \$(sha256sum chris_integrator/native/src/egomotion.c | cut -d' ' -f1)\"
   echo \"binary sha256: \$(sha256sum chris_integrator/native/_chris_native.abi3.so | cut -d' ' -f1)\"
 } > /out/\$tag/BUILD.txt
 st=0
