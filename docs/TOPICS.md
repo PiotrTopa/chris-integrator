@@ -911,6 +911,11 @@ none renamed or removed. Per object:
 ```jsonc
 "x_m": 31.2, "y_m": 0.3,          // as before: the object's NEAR FACE (the point of it nearest the car)
 "ctr": [33.4, 0.3],               // its centre (car frame)
+"std_rho": 0.93,                  // optional (radar `std_rho: true`; off by default): the correlation of the x and y
+                                  // errors of the place (car axes); with `std`[0], `std`[1] the place's covariance
+                                  // [[sx^2, rho sx sy], [rho sx sy, sy^2]]: a camera's place is a needle along the
+                                  // line of sight. With radar `path_normal: true` `path_offset_m`, `on_path`,
+                                  // `in_path` are judged across the path where the object is (docs/RADAR.md, 9)
 "len": 4.4, "wid": 1.8,           // m: the rectangle's length and width
 "hdg": 0.02,                      // rad, car frame, left positive: where its front points; held when it stands
                                   //   (heading_rad stays the direction of travel, null below 1 m/s)
