@@ -348,12 +348,12 @@ class Radar:
         es = self.ego.state_at(T)
         v_ego, w_ego = es[3], es[4]
         slots, tb, rec = tr.looked()                     # the objects' numbers in the tracker's arrays
+        shown = tr.objects
         if not c["tentative"]:
-            keep = [o.state != "tentative" for o in tr.objects]
-            slots, tb, rec = ([v for v, k in zip(q, keep) if k] for q in (slots, tb, rec))
-            shown = [o for o, k in zip(tr.objects, keep) if k]
-        else:
-            shown = tr.objects
+            keep = [o.state != "tentative" for o in shown]
+            if not all(keep):
+                slots, tb, rec = ([v for v, k in zip(q, keep) if k] for q in (slots, tb, rec))
+                shown = [o for o, k in zip(shown, keep) if k]
         # the objects of the message in one native call (chris_native.c `radar_frame`): each one taken to now and
         # to the horizons, in the car frame; on the path (inside its corridor) or not; "it stands in the way" (the
         # strongest thing the radar says: the place inside the corridor beyond what its own uncertainty could

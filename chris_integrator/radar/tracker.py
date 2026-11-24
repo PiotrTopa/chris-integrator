@@ -464,6 +464,11 @@ class Tracker:
         if not objs:
             return [], [], []
         s = self.store
+        if len(objs) < 8:                                # (a few objects: one by one costs less than numpy's indexing)
+            tab, a = s.tab, s.a
+            tb = [tab[o.h, :OT_NCHK].tolist() for o in objs]
+            slots = [int(r[OT_SLOT]) for r in tb]
+            return slots, tb, [a[k, _MO:_MO + M_RANGE_T + 1].tolist() for k in slots]
         tb = s.tab[[o.h for o in objs], :OT_NCHK]
         slots = tb[:, OT_SLOT].astype(np.intp)
         return slots.tolist(), tb.tolist(), s.a[slots, _MO:_MO + M_RANGE_T + 1].tolist()
