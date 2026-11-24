@@ -101,12 +101,13 @@ def _native_par(cfg):
     return e[1]
 
 
-def size_prior(shares):
+def size_prior(shares, over=None):
     """The prior of an object's height (lh: log metres) from what the class detector has said of it: {label: share}
     (the class vote's tallies, any scale). Each label's kind gives its height and spread; a detector that calls the
     same van `car` in one frame and `truck` in the next has not said which, so the prior is the mixture of the kinds
     by their shares, as one Gaussian (its mean and variance; the spread between the kinds included). Labels that
-    are not a kind count as not known (`KIN[None]`). Returns (mean, variance)."""
+    are not a kind count as not known (`KIN[None]`). over: {label: (mean, variance)} where the tracker has learnt a
+    kind's heights from its own objects (tracker.py `_size_learn`). Returns (mean, variance)."""
     tot = sum(v for v in shares.values() if v > 0.0)
     if tot <= 0.0:
         k = KIN[None]
@@ -117,8 +118,10 @@ def size_prior(shares):
         if w <= 0.0:
             continue
         k = KIN.get(lab, KIN[None])
-        lm = math.log(k["h"])
-        parts.append((w / tot, lm, k["h_rel"] ** 2))
+        lm, vv = math.log(k["h"]), k["h_rel"] ** 2
+        if over and lab in over:
+            lm, vv = over[lab]
+        parts.append((w / tot, lm, vv))
         m += w / tot * lm
     for w, lm, vv in parts:
         v2 += w * (vv + (lm - m) ** 2)

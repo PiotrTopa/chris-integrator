@@ -678,3 +678,124 @@ is 10 to 16 times slower): 0.30 ms with the knobs off; each knob but one adds 0.
 (more detections); the four recommended together 0.30 ms; everything on 0.46 ms. With the knobs off the whole stack
 on the recorded captures costs what it did (tools/cost_bench.py: 1.461 -> 1.462 ms per road frame on the real
 capture, 6.42 -> 6.44 ms on the dense simulated one; outputs identical).
+
+## 9. Parked cars: what the tracker's own arrays said, and five knobs (2026-11-24)
+
+All five are **off by default** (with them off every scan and every message is what it was: the goldens and digests
+of tests/test_native.py and tests/test_radar_inputs.py; the calls with an `xcfg` or a frame configuration of the
+earlier length are taken as before). Recorded with them on: `tests/data/make_radar_golden.py --parked`
+(tests/test_radar_parked.py).
+
+### What was found (plain and realistic stream, `curve_parked` + `parked_street`, seeds 1-3, day and night)
+Every 0.1 s every confirmed object against the actor whose box it last took (the lane's scratch tool on
+tools/radar_trace.py: 8881 / 6535 standing track-frames).
+
+* **The range's stated spread is what the boxes hold, not a filter loss.** At its sightings the standing hypothesis
+  of a track fed by one car states 8-10 % of the range at 15-40 m, and a batch fit of all its boxes under "it
+  stands" with the same variances gives 7-10 %: the filter is within a tenth of the information. The 17-20 % "at
+  every distance" of all track-frames is three things: (1) the simulator's detector boxes a car 14 times in a pass
+  but only 3 times under 25 m and 2 under 15 m, so a near car is mostly carried on from its last far box, with a
+  spread of 1.5-2.5 m that stays while the range shrinks; (2) tracks are young: 43 % (plain) of the standing
+  track-frames are of objects fed by more than one car; (3) the bearing of a near box was taken as noise of a tenth
+  of its width.
+* **"Parked cars are called moving" is the row, not the scale.** Objects that only ever took one car's boxes:
+  `p_stationary` under 0.5 in 9 % of their frames (most of it in their first 2.5 s, the birth prior 0.4), called
+  `moving` in 1 %. Objects fed by two or more cars: 46 % and 32 %. 12 % (plain) / 8.6 % (realistic) of all updates
+  put a box of ANOTHER car into an object; at such an update "it stands" was believed with a median of 0.39 (the
+  birth prior: the object had not settled), and fitted the box with 1.5 per row against 0.5 for its own car's.
+* **Jumps**: of the 78 / 35 jumps of a confirmed object's ground place by more than 3 m and 2 sigma between two
+  samples (under 60 m; 10 minutes each), 47 / 16 are at an update with another car's box; the rest are the
+  hypotheses changing their mind about an earlier one and far boxes.
+* **The bias** (+7 to +11 % long at 8-50 m, plain) is the car prior's 1.6 m against the simulator's 1.5 m, as section
+  2 said; on the realistic stream (sizes spread) +2 to +7 %.
+* **Night, true conflicts** (the obstacle of the stopped-car and half-in-lane scenarios): born at 24-45 m at night
+  against 48-65 m by day, confirmed at 11-28 m against 30-41 m, in 9 of 24 night runs never confirmed. Its speed at
+  confirmation is small (0.2-2.9 m/s) and its range right to 2 m: the limit is the first box and the confirmation,
+  not the range or a phantom speed. `confirm_hits` 2 changes nothing, `confirm_exist` 0.9 next to nothing: what is
+  slow is the existence itself (the misses between a night detector's boxes each take ln(1 - pd) off it). Not
+  solved here.
+
+### `ctx_prior`: the street's own count (tracker)
+A new vehicle's "it stands" is raised by the vehicles already judged at its distance beside the road's path (kernel
+`ctx_band_m` 0.8 m; the road model's path on the ground, else the car's own line): n_s standing, n_m driving ->
+(n_s + `ctx_n` p0) / (n_s + n_m + `ctx_n`), at most `ctx_max` 0.9, never lowered (a stopped car among driving ones
+keeps its kind's 0.4). A vehicle raised to a half or more takes the road's axis as its heading at once (section 4's
+prior, not a second later). `Tracker._context`, native `radar_stand_prior`.
+
+### `size_learn`: the kind's height from the objects the car has passed (tracker)
+A standing vehicle whose line of sight swung by `size_learn_swing_deg` (5) over its sightings was ranged by the
+car's own travel; its standing hypothesis' height with the prior it was given taken out is what its boxes said.
+`radar_size_fit` makes the kind's mean and spread of these (Huber's weights, held to the built-in prior with the
+weight of three objects, the spread no smaller than 0.10, the mean no further than 0.25); `_size` gives them to
+every object of the kind from its next vote on. It is every scale error of the box-height range at once (the cars'
+real size, the detector's boxes, the focal length). On the simulator: 30 cars -> 1.51-1.55 m +- 10 % (truth 1.5 m,
+built-in 1.6 m +- 20 %); on the two recorded drives 5 cars -> 1.53 m +- 14 %. A queue ahead (no parallax) teaches
+nothing.
+
+### `sil_bearing`: the box's middle is the silhouette's (tracker)
+The bearing row predicts the middle of the rectangle's picture (`r_sil_shift`: the corners' picture coordinates),
+not the centre's bearing; what is not known of the rectangle goes into the row's variance (`r_sil_var`, in
+`r_reff`); the box's middle is then taken with `sil_bearing_rel` 0.05 of the box width (the camera's 0.11 had to
+cover the difference: 0.9 degrees for a car passed at 10 m).
+
+### `std_rho`, `path_normal` (the radar box)
+`std_rho`: the correlation of the place's x and y errors beside `std` (docs/TOPICS.md). `path_normal`: beside the
+path is across the path where the object is: `path_offset_m` is the lateral difference times the cosine of the
+path's direction there, and "surely in" (`in_path`, `p_threat`) takes the place's spread across the path from the
+whole covariance (it took the car's lateral axis: a kerbside car on a bend, unsure along the line of sight by 5 m,
+was "surely in" by its 0.4 m of y).
+
+### Measured
+Standing actors, both scenarios, seeds 1-3, day + night (12 runs, 10 minutes of driving per row); range bands
+8-15 / 15-30 / 30-50 m.
+
+| plain stream | spread / range | bias % | within 1 / 2 sigma (15-30 m) | `p_stationary` < 0.5 | called moving | called stationary | updates with another car's box | birth -> `stationary` med / p90 (never) |
+|---|---|---|---|---|---|---|---|---|
+| base | 0.19 / 0.17 / 0.19 | +9.4 / +10.6 / +7.4 | 0.67 / 0.93 | 0.248 | 0.146 | 0.53 | 12.0 % | 1.72 / 3.05 s (31) |
+| `ctx_prior` | 0.18 / 0.16 / 0.17 | +7.7 / +8.1 / +4.9 | 0.68 / 0.94 | 0.168 | 0.108 | 0.71 | 10.9 % | 1.36 / 2.66 s (17) |
+| `size_learn` | 0.18 / 0.15 / 0.15 | +8.8 / +8.8 / +4.8 | 0.66 / 0.91 | 0.258 | 0.161 | 0.53 | 12.2 % | 1.75 / 2.92 s (28) |
+| `sil_bearing` | 0.18 / 0.16 / 0.18 | +8.7 / +8.3 / +4.7 | 0.68 / 0.93 | 0.214 | 0.117 | 0.57 | 10.7 % | 1.71 / 3.00 s (29) |
+| all three | 0.16 / 0.13 / 0.13 | +7.1 / +5.8 / +1.9 | 0.69 / 0.93 | 0.152 | 0.100 | 0.75 | 9.0 % | 1.31 / 2.66 s (12) |
+
+Realistic stream (`DETIN`), base -> all three: spread / range 0.20 / 0.18 / 0.18 -> 0.17 / 0.15 / 0.14,
+`p_stationary` < 0.5 0.220 -> 0.161, called moving 0.115 -> 0.106, updates with another car's box 8.6 -> 6.7 %; but
+the place ACROSS the line of sight within 2 sigma 0.85 -> 0.73 and the range beyond 50 m within 2 sigma 0.91 -> 0.82:
+a half-hidden car's box is not its silhouette, and `sil_bearing` believes its middle too well there (it needs the
+detector's flags, section 8, to know). Moving actors of the six traffic scenarios (36 runs per stream): called
+stationary 0.047 -> 0.048 (plain), 0.054 -> 0.046 (realistic), birth -> `moving` 1.94 -> 1.84 s and 1.60 -> 1.53 s.
+
+The whole stack's false `obstacle_ahead` said episodes (shadow mode, predicted futures, 6 scenarios x seeds 1-6 x
+day and night; paired bootstrap over seeds against the base; d2x counts slow leads as false):
+
+| | plain: total, paired difference | realistic: total, paired difference | true conflicts warned (of 54), mean lead |
+|---|---|---|---|
+| base | 73 | 91 | 37, 1.54 s / 36, 1.77 s |
+| `ctx_prior` | 76, +3 +- 5.1 | 90, -1 +- 3.0 | 35, 1.60 s / 37, 1.76 s |
+| `size_learn` | 91, +18 +- 5.3 | 92, +1 +- 4.1 | 36, 1.55 s / 36, 1.80 s |
+| `ctx_prior` + `size_learn` | 86, +13 +- 4.3 | 94, +3 +- 4.6 | |
+| all three (before the heading at birth) | 96 | 99 | 36, 1.69 s / 39, 1.71 s |
+
+So: `ctx_prior` makes the tracker say the truth about parked cars sooner (called stationary 0.53 -> 0.71 of the
+time, fewer hops) at no cost to moving traffic, and the alerts do not move: the causes change places (place jumps
+31 -> 25, moving futures of a parked car 4 -> 5, the stated spread alone 4 -> 8: a car now known to stand, unsure
+along the line of sight on a bend, is warned of by its spread). `size_learn` reads the range better (the bias and
+the spread fall) and, by itself on the plain stream, raises the alerts significantly (jumps 31 -> 30, spread 4 ->
+11, moving futures 4 -> 10): with the size known to a tenth, the next car's box is a surer displacement, and an
+object that has not settled is the sooner called moving. `sil_bearing` costs alerts on moving traffic (`adjacent`
+6 -> 11 / 8 -> 18 with all three). Real drives (docs/RADAR_TRUTH.md; base: wrong verdict 3.1 of 94.0 judged s,
+real things never followed 8): `ctx_prior` identical; `size_learn` 1.1 of 91.6 s, never followed 9; `sil_bearing`
+1.9 of 91.1 s, 9; all with the two box knobs 1.9 of 89.0 s, 10.
+
+Recommended: `ctx_prior` on (with `std_rho` for the prediction when it reads it, and `path_normal`); `size_learn`
+and `sil_bearing` not yet: the first once the decision layer takes a standing object's spread as it now is, the
+second with the detector's flags. Not built: births along a known row's extension, appearance in the row (the
+`in_app` knob of section 8 is the place), a confirmation that knows a night detector's miss runs.
+
+`sim.radar_score`, all 11 scenarios x seeds 1-3 x day and night (66 runs per stream), base -> `ctx_prior`: seconds a
+moving actor was called moving / stationary 470 / 16.1 -> 473 / 16.2 (plain), 475 / 20.9 -> 471 / 20.4 (realistic);
+seconds a standing actor was called stationary / moving 649 / 89 -> 819 / 80 and 501 / 54 -> 617 / 38; id switches
+370 -> 348 and 235 -> 235; time held and confirmed, the place and the velocity errors as before (along p50 3.10 ->
+3.04 m in traffic). Cost (tools/cost_bench.py, radar per road frame, three interleaved runs on a shared machine):
+dense simulated capture 2.41-2.52 ms at the base, 2.11-2.52 ms with the knobs off, 2.40-2.57 ms with all five on;
+recorded capture 0.24 / 0.22-0.25 / 0.15-0.27 ms: nothing beyond the runs' own scatter. With the knobs off every
+stream of both captures is identical to the base's (`cost_bench.py diff`).

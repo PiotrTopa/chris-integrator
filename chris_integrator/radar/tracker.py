@@ -198,8 +198,32 @@ CFG = dict(
     # time since the object's previous value); a value from the lamp pair alone is taken with Huber's weight at
     # scale_lamps_k sigma
     in_scale=False, scale_lamps_k=2.0,
+    # ---- parked cars (docs/RADAR.md, section 9) ----
+    # sil_bearing: a camera box's middle is the middle of the object's SILHOUETTE (its rectangle's picture), not the
+    # bearing of its centre: the difference (a tenth of the box width for a car passed at 10 m) is predicted, what
+    # is not known of the rectangle goes into the row's variance, and the box's middle is then as good as its edges
+    # (sil_bearing_rel of the box width, where the camera's bearing_rel 0.11 had to cover the difference). It is what
+    # lets the car's own travel range a standing thing (parallax) and tell the cars of a row apart
+    sil_bearing=False, sil_bearing_rel=0.05,
+    # ctx_prior: where a new vehicle is first seen says whether it stands before its own boxes can: the vehicles
+    # already judged, at its distance beside the road's path (kernel ctx_band_m), by their verdicts ("the street's
+    # own count"): standing n_s, driving n_m -> (n_s + ctx_n p0) / (n_s + n_m + ctx_n), p0 the kind's own prior. It
+    # only ever raises "it stands" (never above ctx_max): a stopped car among driving ones keeps the kind's prior
+    ctx_prior=False, ctx_band_m=0.8, ctx_n=1.0, ctx_max=0.9,
+    # size_learn: how tall the things of a kind are is learnt from the tracker's own objects (`_size_learn`): a
+    # standing vehicle that the car has passed is ranged by the car's own travel, and its box height at that range
+    # is its size, whatever the kind's prior said. What such objects agree on is the kind's (this camera's cars, its
+    # detector's boxes, its focal length: every scale error of the range from a box height), and becomes the prior
+    # of every object of the kind: the mean, and the spread between objects (no smaller than size_learn_floor).
+    # From objects seen size_learn_hits times, held to the built-in prior with the weight of size_learn_n0 objects,
+    # the mean moved by size_learn_shift (log) at most; the last size_learn_keep objects count
+    # and only objects whose line of sight has swung by size_learn_swing_deg over their sightings (the car passed
+    # them: without that the "range" is the ground angle's, and the camera's pitch error would be learnt as a size)
+    size_learn_swing_deg=5.0,
+    size_learn=False, size_learn_hits=6, size_learn_n0=3.0, size_learn_floor=0.10, size_learn_shift=0.25, size_learn_keep=200,
 )
-_IN_KNOBS = ("in_flags", "in_box_occl", "in_low", "in_app", "in_reid", "in_lamp_colour", "in_lamp_size", "in_width", "in_scale")
+_IN_KNOBS = ("in_flags", "in_box_occl", "in_low", "in_app", "in_reid", "in_lamp_colour", "in_lamp_size", "in_width", "in_scale",
+             "sil_bearing")
 
 
 def _npsum(a):
@@ -368,7 +392,7 @@ class Obj:
     vote, verdict, group) and, as attributes, its numbers in the tracker's arrays (`State`): the parts of its
     primary row and its row of the table."""
     __slots__ = ("id", "h", "store", "t0", "_state", "sources", "last_seen", "vote", "nis", "verdict", "coast_s",
-                 "velocity_seen", "merge_t", "scores", "cls", "_kin", "grp", "grp_kind", "lhp", "low_run")
+                 "velocity_seen", "merge_t", "scores", "cls", "_kin", "grp", "grp_kind", "lhp", "low_run", "sized", "los")
     xs, Ps, mu, xf, Pf, x, P, e, Pe, st, m = (_view(a, b, sh) for _, a, b, sh in _OFF)
     t = _meta(M_T)                   # the time its numbers are of
     logodds = _meta(M_L)             # that it exists, in the primary's story (`exist`: over all stories)
@@ -409,6 +433,9 @@ class Obj:
         self.grp_kind = None
         self.lhp = None              # the prior of its height (lh) its numbers hold: (mean, variance) (Tracker._size)
         self.low_run = 0             # its last sightings in a row that were boxes of the low-score list
+        self.sized = False           # what its boxes said of its height has gone into its kind's prior (`_size_learn`)
+        self.los = None              # the line of sight to it at its first sighting, and how far it has swung since
+                                     # (ground frame: [first, least, most]; `size_learn`)
 
     @property
     def state(self):
@@ -539,6 +566,9 @@ class Tracker:
         self.low_rate = {}           # sensor id -> low-list boxes per scan that no object took (followed over time)
         self.gallery = deque()       # dropped objects that may come back: (id, time, x, y, vx, vy, var, memory, t0, vote)
         self._xstatic = None         # the part of a scan's xcfg that the configuration alone gives
+        self.road_path = None        # the road model's path on the ground (xs, ys), as the box last gave it (`_context`)
+        self.size_obs = {}           # kind -> deque of (mean, variance): what its objects' own boxes said of their height
+        self.size_fit = {}           # kind -> (mean, variance) of its heights as learnt (`_size_learn`)
 
     def _xcfg(self, src, sensor):
         """The scan's constants for the detector's further inputs as the native core reads them (chris_native.c
@@ -558,7 +588,8 @@ class Tracker:
                 (1.0 if c["in_lamp_colour"] else 0.0, math.radians(c["lamp_colour_deg"]), 1.0 if c["in_lamp_size"] else 0.0,
                  c["lamp_sep_ratio"], c["lamp_sep_rel"], c["ruler_eps"], c["ruler_span"], float(c["ruler_uses"]),
                  1.0 if c["in_width"] else 0.0, c["width_rel"], c["grade_k"], 1.0 if c["in_scale"] else 0.0,
-                 c["scale_lamps_k"] if c["in_scale"] else 0.0, 1.0 if c["flags_side"] else 0.0))
+                 c["scale_lamps_k"] if c["in_scale"] else 0.0, 1.0 if c["flags_side"] else 0.0,
+                 1.0 if c["sil_bearing"] else 0.0))
         ek = getattr(sensor, "emb_kind", 0) if c["in_app"] else 0
         tab = c["app_tables"].get(ek) or c["app_tables"].get(str(ek))
         if tab is None:
@@ -811,7 +842,8 @@ class Tracker:
             if sc is not None:
                 o.scores.append((src, sc))
             o.velocity_seen = sensor.velocity
-            kb = M.kinb(classvote.norm_label((d.get("attrs") or {}).get("class")))
+            lab = classvote.norm_label((d.get("attrs") or {}).get("class"))
+            kb = M.kinb(lab)
             o.lhp = (math.log(kb[7]), kb[8] * kb[8])     # the height prior it was born with (chris_native.c r_birth)
             self._vote(o, d, src, t)
             kb = (d.get("kind") or "").rstrip("s")
@@ -823,6 +855,8 @@ class Tracker:
             self.objects.append(o)
             self.by_h[h] = o
             st["started"] += 1
+            if c["ctx_prior"] and not rg and lab in M.VEHICLES:
+                self._context(o, pose)
         if hit or births:
             # what follows the sightings, in one native call (chris_native.c `Hyp.after`): each sighted object's
             # earlier predictions checked against where it turned out to be (one that keeps being elsewhere has
@@ -871,7 +905,7 @@ class Tracker:
         would have: 0.6 of the truth, the box height being the strongest range beyond 40 m (docs/RADAR.md, section 4)."""
         if o.lhp is None or not o.vote or not o.vote.get("w") or not self.cfg["size_from_class"]:
             return
-        m1, v1 = M.size_prior(o.vote["w"])
+        m1, v1 = M.size_prior(o.vote["w"], self.size_fit) if self.size_fit else M.size_prior(o.vote["w"])
         m0, v0 = o.lhp
         if abs(m1 - m0) < 0.02 and abs(math.log(v1 / v0)) < 0.05:
             return
@@ -879,6 +913,83 @@ class Tracker:
         rows = self.hyp.rows(o.h)
         _NR.radar_lh_prior(self.store.a, rows, a, b)
         o.lhp = (m1, v1)
+
+    def _offsets(self, xs, ys, pose):
+        """The places' distances beside the road's path (left positive) and the path's direction there: from the road
+        model's path on the ground where the box has given one (the direction None otherwise: beside the car's own
+        line straight on)."""
+        xs, ys = np.asarray(xs, float), np.asarray(ys, float)
+        rp = self.road_path
+        if rp is None or len(rp[0]) < 2:
+            return -math.sin(pose[2]) * (xs - pose[0]) + math.cos(pose[2]) * (ys - pose[1]), None
+        px, py = rp
+        ax, ay = px[:-1], py[:-1]
+        ex, ey = px[1:] - ax, py[1:] - ay
+        L2 = np.maximum(ex * ex + ey * ey, 1e-12)
+        f = ((xs[:, None] - ax) * ex + (ys[:, None] - ay) * ey) / L2
+        lo, hi = np.zeros_like(f), np.ones_like(f)
+        lo[:, 0], hi[:, -1] = -np.inf, np.inf            # the end segments reach on beyond the polyline
+        fc = np.clip(f, lo, hi)
+        qx, qy = xs[:, None] - (ax + fc * ex), ys[:, None] - (ay + fc * ey)
+        k = np.argmin(qx * qx + qy * qy, axis=1)
+        i = np.arange(len(xs))
+        return (ex[k] * qy[i, k] - ey[k] * qx[i, k]) / np.sqrt(L2[k]), np.arctan2(ey[k], ex[k])
+
+    def _context(self, o, pose):
+        """A new vehicle's "it stands" from where it was first seen (`ctx_prior`): the vehicles already judged at its
+        distance beside the road's path, by their verdicts. A parked street says of the next car that appears at the
+        kerb that it is parked, before that car's own boxes can (at 60 m a box in three says next to nothing about
+        the range's rate): what the hypotheses' prior left open there, "the same car, driving with us" explained
+        the next car of the row, and the object hopped along the row at the car's speed (docs/RADAR.md, sections 5
+        and 9). Raised only: among driving vehicles a new one keeps its kind's prior (a stopped car in the lane)."""
+        c = self.cfg
+        don = [q for q in self.objects if q is not o and q.label_code > 0.0 and q.state != "tentative"
+               and q.verdict != "unknown"]
+        if not don:
+            return
+        d, axis = self._offsets([float(o.x[PX])] + [float(q.x[PX]) for q in don],
+                                [float(o.x[PY])] + [float(q.x[PY]) for q in don], pose)
+        w = np.exp(-0.5 * ((d[1:] - d[0]) / c["ctx_band_m"]) ** 2)
+        st = np.array([q.verdict == "stationary" for q in don])
+        ns, nm = float(w[st].sum()), float(w[~st].sum())
+        p0 = float(o.mu[STAND])
+        p = min((ns + c["ctx_n"] * p0) / (ns + nm + c["ctx_n"]), c["ctx_max"])
+        if p > p0 + 1e-3:
+            rows = self.hyp.rows(o.h)
+            _NR.radar_stand_prior(self.store.a, rows, p)
+            if axis is not None and p >= 0.5 and c["road_prior"] and abs(float(d[0])) <= c["road_prior_off_m"]:
+                # ... and a vehicle that stands beside the road stands along it: the road's axis there as its
+                # heading's prior at once (`road_prior` would give it within road_prior_s; until then it had the
+                # car's own heading, on a bend half a radian off, and its rectangle lay across the lane)
+                los = math.atan2(float(o.x[PY]) - pose[1], float(o.x[PX]) - pose[0])
+                _NR.radar_heading_prior(self.store.a, rows, float(axis[0]), los, c["road_prior_std"], c["road_prior_snap"],
+                                        c["road_prior_mirror"])
+
+    def _size_learn(self, o):
+        """What a standing vehicle's own boxes have said of its height goes into its kind's prior (`size_learn`). The
+        object's standing hypothesis holds its height as prior x likelihood (both Gaussian in the logarithm): the
+        prior it was given taken out leaves what its boxes said (a thing the car passed is ranged by the car's own
+        travel: its box height at that range is its size). radar_size_fit makes the kind's mean and spread of the
+        objects' sayings; `_size` gives them to every object of the kind from its next vote on."""
+        c = self.cfg
+        o.sized = True
+        lab = o.label
+        if (o.lhp is None or lab not in M.VEHICLES or o.verdict != "stationary" or o.hits < c["size_learn_hits"]
+                or o.state == "tentative" or o.los is None or o.los[2] - o.los[1] < math.radians(c["size_learn_swing_deg"])):
+            return
+        k = M.KIN[lab]
+        m0, v0 = self.size_fit.get(lab) or (math.log(k["h"]), k["h_rel"] ** 2)
+        mp, vp = o.lhp
+        if abs(mp - m0) > 0.03:                          # its prior is a mixture of kinds (a van): not this kind's
+            return
+        lh, v = float(o.xs[STAND, M.LH]), float(o.Ps[STAND, M.LH, M.LH])
+        if not (0.0 < v < 0.95 * vp):
+            return
+        pr = 1.0 / v - 1.0 / vp
+        q = self.size_obs.setdefault(lab, deque(maxlen=c["size_learn_keep"]))
+        q.append(((lh / v - mp / vp) / pr, 1.0 / pr))
+        self.size_fit[lab] = _NR.radar_size_fit(list(q), math.log(k["h"]), k["h_rel"] ** 2, c["size_learn_n0"],
+                                               c["size_learn_floor"], c["size_learn_shift"])
 
     def _after_update(self, o, d, sensor, src, t):
         """What a detection does to an object besides its numbers (those, its existence and its sightings are the
@@ -901,6 +1012,16 @@ class Tracker:
             self._range_seen(o)
         o.coast_s = max(o.coast_s, sensor.coast_s) if len(o.sources) == 1 else min(o.coast_s, sensor.coast_s)
         o.velocity_seen = o.velocity_seen or sensor.velocity
+        if self.cfg["size_learn"]:                       # how far the line of sight to it has swung (`_size_learn`)
+            p = self.ego.pose_at(t)
+            if p is not None:
+                x = o.x
+                a = math.atan2(float(x[PY]) - p[1], float(x[PX]) - p[0])
+                if o.los is None:
+                    o.los = [a, 0.0, 0.0]
+                else:
+                    da = (a - o.los[0] + math.pi) % (2.0 * math.pi) - math.pi
+                    o.los[1], o.los[2] = min(o.los[1], da), max(o.los[2], da)
         self._vote(o, d, src, t)
 
     # ---- life ---------------------------------------------------------------------------------------------
@@ -961,6 +1082,10 @@ class Tracker:
         gone = [o for o in self.objects if o.id not in kept]
         self.objects = keep
         self._snap = (keep,) + sn
+        if c["size_learn"]:
+            for o in gone + keep:                        # an object that has left the view, or is gone: its size is said
+                if not o.sized and (o.state == "memory" or o.id not in kept):
+                    self._size_learn(o)
         for o in gone:
             self._remember(o, T)
             self._drop(o)
