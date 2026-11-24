@@ -7306,6 +7306,10 @@ typedef struct {
     double prune_ln, keep_s;
     /* counters since the start */
     long long c_scans, c_leaves, c_children, c_hyps, c_murty, c_births, c_pruned;
+    /* the smoother's kept gains (r_rts): per row and hypothesis (3 + the free estimate), made when first needed */
+    double *sc;
+    Py_ssize_t sc_cap;
+    double sc_par[RNPAR];
 } Hyp;
 
 static PyObject *HypType;
@@ -7332,6 +7336,9 @@ static void hyp_release(Hyp *H)
     PyMem_Free(H->nchild);
     PyMem_Free(H->owner);
     PyMem_Free(H->freel);
+    PyMem_Free(H->sc);
+    H->sc = NULL;
+    H->sc_cap = 0;
     H->tr = NULL;
     H->cl = NULL;
     H->parent = H->nchild = H->owner = H->freel = NULL;
@@ -10595,13 +10602,12 @@ static int r_chol8(const double *A, double *L)
     return 0;
 }
 
-/* One step back over a prediction: from the filtered (x, P) at a node and the smoothed (xs, Ps) at its child, the
- * smoothed (x, P) at the node (in place). model, dt, kin, par: the step; e: what the car's own movement added to
- * the place at the child (e00, e01, e11). */
-static void r_rts(int model, double *x, double *P, const double *xs, const double *Ps, double dt, const double *kin,
-                  const RPar *par, const double *e)
+/* The gain of one step back over a prediction (r_rts): the prediction (xp, Pp) of the filtered (x, P) over dt with
+ * what the car's own movement added (e), and G = P F^T Pp^-1. 0: the prediction is not positive. */
+static int r_rts_gain(int model, const double *x, const double *P, double dt, const double *kin, const RPar *par,
+                      const double *e, double *xp, double *Pp, double *G)
 {
-    double xp[RN], Pp[RNN], F[RNN], C[RNN], L[RNN], G[RNN];
+    double F[RNN], C[RNN], L[RNN];
     r_predict(model, x, P, dt, kin[0], kin[1], kin[2], par, xp, Pp);
     Pp[0] += e[0];
     Pp[1] += e[1];
@@ -10634,7 +10640,7 @@ static void r_rts(int model, double *x, double *P, const double *xs, const doubl
                 C[i * RN + j] = acc;
             }
     if (r_chol8(Pp, L) < 0)
-        return;                                          /* (a prediction that is not positive: the node stays filtered) */
+        return 0;                                        /* (a prediction that is not positive: the node stays filtered) */
     for (int i = 0; i < RN; i++) {                       /* G = C Pp^-1: each row solved against L L^T */
         double y[RN];
         for (int j = 0; j < RN; j++) {
@@ -10650,6 +10656,51 @@ static void r_rts(int model, double *x, double *P, const double *xs, const doubl
             G[i * RN + j] = acc / L[j * RN + j];
         }
     }
+    return 1;
+}
+
+/* What r_rts_gain gave for a step is kept with the step's child row, per hypothesis (and the free estimate): the
+ * inputs it was computed from (x, P, dt, e, kin) and the results. A later pass over the same story finds most steps
+ * unchanged (a sighting adds one node at the front); where the kept inputs are the same bits, the kept results are
+ * what the computation would give again. Nothing has to be told when rows are rewritten (the height prior, the
+ * sensor's registration, the opened uncertainty, a group's support, the heading prior, a row taken anew): the inputs
+ * then differ and the gain is computed. The angle offset and the height (x[dp], x[lh]) are left out of what is
+ * compared: the prediction carries each of them over as it is (r_predict: its coefficient is 1, its noise is in P)
+ * and nothing else of the prediction, its covariance or the gain reads them, so the kept results hold with the
+ * present two values put in. (The sensor's registration moves every row's angle offset at every message: with them
+ * compared, nothing kept of a camera's objects would ever be used.) The model's constants are kept once (Hyp.sc_par): other constants, nothing
+ * kept is used. */
+#define RSC_IN (RN + RNN + 1 + 3 + 3)
+#define RSC_W (RSC_IN + 1 + RN + RNN + RNN)
+
+/* One step back over a prediction: from the filtered (x, P) at a node and the smoothed (xs, Ps) at its child, the
+ * smoothed (x, P) at the node (in place). model, dt, kin, par: the step; e: what the car's own movement added to
+ * the place at the child (e00, e01, e11). keep: RSC_W numbers kept with the step (NULL: nothing is kept). */
+static void r_rts(int model, double *x, double *P, const double *xs, const double *Ps, double dt, const double *kin,
+                  const RPar *par, const double *e, double *keep)
+{
+    double in[RSC_IN], loc[1 + RN + RNN + RNN], *out = loc;
+    if (keep) {
+        memcpy(in, x, RN * sizeof(double));
+        in[R_DP] = in[R_LH] = 0.0;                       /* (not inputs of the gain: see above) */
+        memcpy(in + RN, P, RNN * sizeof(double));
+        in[RN + RNN] = dt;
+        memcpy(in + RN + RNN + 1, e, 3 * sizeof(double));
+        memcpy(in + RN + RNN + 4, kin, 3 * sizeof(double));
+        out = keep + RSC_IN;
+        if (out[0] == 0.0 || memcmp(keep, in, sizeof(in)) != 0) {
+            out[0] = 0.0;                                /* (not valid while it is written) */
+            int ok = r_rts_gain(model, x, P, dt, kin, par, e, out + 1, out + 1 + RN, out + 1 + RN + RNN);
+            memcpy(keep, in, sizeof(in));
+            out[0] = ok ? 1.0 : 2.0;
+        }
+        out[1 + R_DP] = x[R_DP];                         /* the prediction of the angle offset and of the height: */
+        out[1 + R_LH] = x[R_LH];                         /* themselves */
+    } else
+        out[0] = r_rts_gain(model, x, P, dt, kin, par, e, out + 1, out + 1 + RN, out + 1 + RN + RNN) ? 1.0 : 2.0;
+    if (out[0] != 1.0)
+        return;
+    const double *xp = out + 1, *Pp = xp + RN, *G = Pp + RNN;
     double dx[RN], D[RNN], GD[RNN];
     for (int i = 0; i < RN; i++)
         dx[i] = xs[i] - xp[i];
@@ -10691,6 +10742,15 @@ static int smooth_core(Hyp *H, const double *A, HTrack *t, const RPar *par, int 
     int32_t c = t->primary;
     if (c < 0 || H->parent[c] < 0)
         return 0;
+    /* the kept gains: for the rows there are now (more rows, or other constants of the model: started anew; no
+     * memory for them: the pass computes every gain) */
+    if (H->sc == NULL || H->sc_cap != H->cap || memcmp(H->sc_par, par, sizeof(H->sc_par)) != 0) {
+        PyMem_Free(H->sc);
+        H->sc = (double *)PyMem_Calloc((size_t)H->cap * 4 * RSC_W, sizeof(double));
+        H->sc_cap = H->sc ? H->cap : 0;
+        memcpy(H->sc_par, par, sizeof(H->sc_par));
+    }
+    double *sc = H->sc;
     {
         const double *row = A + (Py_ssize_t)c * RROW;
         double xs[3 * RN], Ps[3 * RNN], mu[3], xf[RN], Pf[RNN], t0 = row[RO_M + M_T];
@@ -10748,7 +10808,7 @@ static int smooth_core(Hyp *H, const double *A, HTrack *t, const RPar *par, int 
                             acc += b[i] * (Ps[i * RNN + r * RN + q] + (xs[i * RN + r] - xb[r]) * (xs[i * RN + q] - xb[q]));
                         Pb[r * RN + q] = Pb[q * RN + r] = acc / d[j];
                     }
-                r_rts(j, xn + j * RN, Pn + j * RNN, xb, Pb, dt, kin, par, e);
+                r_rts(j, xn + j * RN, Pn + j * RNN, xb, Pb, dt, kin, par, e, sc ? sc + (4 * (size_t)c + j) * RSC_W : NULL);
                 if (j == R_STAND)
                     for (int k = R_VX; k <= R_AY; k++)
                         xn[j * RN + k] = 0.0;
@@ -10767,7 +10827,7 @@ static int smooth_core(Hyp *H, const double *A, HTrack *t, const RPar *par, int 
             double xfn[RN], Pfn[RNN];
             memcpy(xfn, rp + RO_XF, sizeof(xfn));
             memcpy(Pfn, rp + RO_PF, sizeof(Pfn));
-            r_rts(R_CV, xfn, Pfn, xf, Pf, dt, kin, par, e);
+            r_rts(R_CV, xfn, Pfn, xf, Pf, dt, kin, par, e, sc ? sc + (4 * (size_t)c + 3) * RSC_W : NULL);
             memcpy(xs, xn, sizeof(xs));
             memcpy(Ps, Pn, sizeof(Ps));
             memcpy(mu, mn, sizeof(mu));
