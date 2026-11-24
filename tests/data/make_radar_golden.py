@@ -8,6 +8,9 @@
                                                        Hyp.cycle and Hyp.after with an xcfg, the hypotheses with
                                                        their rows' memory), tests/data/radar_digests_detin.json
                                                        (tests/test_radar_inputs.py replays and holds them)
+    python3 tests/data/make_radar_golden.py --rows     the radar with the row / miss-run / pose-head knobs on (docs/RADAR.md,
+                                                       section 10): tests/data/radar_golden_rows.npz,
+                                                       radar_digests_rows.json (tests/test_radar_rows.py)
     python3 tests/data/make_radar_golden.py --parked   the radar with the parked-car knobs on (docs/RADAR.md, section
                                                        9: sil_bearing, ctx_prior, size_learn, std_rho, path_normal):
                                                        tests/data/radar_golden_parked.npz, radar_digests_parked.json
@@ -226,15 +229,57 @@ def drives_parked(trace):
         models.NR, tracker._NR, box._NR, sensors._NR = saved
 
 
-def main_detin(parked=False):
+# ---- rows, miss runs, the pose head (docs/RADAR.md, section 10): the row context, the detect / miss chain, the learnt
+# chance of a box, the shared existence; on the realistic stream with the pose head: the appearance ratio and the
+# head's ground point, centre and heading ----
+ROWS_CFG = {"tracker": dict(ctx_prior=True, row_ctx=True, det_chain=True, pd_learn=True, exist_shared=True)}
+ROWS_POSE = {"tracker": dict(ROWS_CFG["tracker"], in_app=True, in_pose_gn=True, in_pose_gc=True, in_pose_yaw=True,
+                             in_low=True, low_runs_only=True, low_exist_only=True)}
+ROWS_RUNS = (("parked_street", 1, False, None), ("bend_stopped_13", 2, True, None), ("curve_parked", 1, True, "detin_pose"),
+             ("platoon", 1, False, "detin_pose"))
+
+
+def rows_run(name, seed, night, det, keep_steps=None):
+    from chris_integrator.sim import radar_score, roaduser_sim
+    base = ROWS_POSE if det else ROWS_CFG
+    cfg = dict(base, tracker=dict(base["tracker"]))
+    if keep_steps:
+        cfg["tracker"]["hyp_keep_steps"] = keep_steps
+    return radar_score.run(name, seed=seed, night=night, cfg=cfg, det_params=roaduser_sim.det_params_arg(det) if det else None)
+
+
+def rows_digests():
+    import hashlib
+    out = {}
+    for name, seed, night, det in ROWS_RUNS:
+        r = rows_run(name, seed, night, det)
+        out["%s:%d:%d:%s" % (name, seed, night, det or "plain")] = hashlib.sha256(
+            json.dumps([f["objects"] for f in r["frames"]], sort_keys=True).encode()).hexdigest()
+    return out
+
+
+def drives_rows(trace):
+    from chris_integrator.radar import box, models, sensors, tracker
+    saved = (models.NR, tracker._NR, box._NR, sensors._NR)
+    models.NR = tracker._NR = box._NR = sensors._NR = trace
+    try:
+        for name, seed, night, det in ROWS_RUNS:
+            rows_run(name, seed, night, det, keep_steps=8)
+    finally:
+        models.NR, tracker._NR, box._NR, sensors._NR = saved
+
+
+def main_detin(parked=False, rows=False):
     import radar_golden_lib as lib
     from chris_integrator.native import radar as C
     global PER_FN, DEFAULT_N
     PER_FN, DEFAULT_N = {"Hyp.cycle": 24, "Hyp.after": 6}, 0
     if parked:
         PER_FN = {"Hyp.cycle": 20, "Hyp.after": 4, "radar_frame": 6, "radar_stand_prior": 6, "radar_size_fit": 6}
+    if rows:
+        PER_FN = {"Hyp.cycle": 28, "Hyp.after": 4}
     trace = Trace(C, lib)
-    (drives_parked if parked else drives_detin)(trace)
+    (drives_rows if rows else drives_parked if parked else drives_detin)(trace)
     cases, arrays = [], {}
     for name in (("Hyp.cycle", "Hyp.after", "radar_frame", "radar_stand_prior", "radar_size_fit") if parked
                  else ("Hyp.cycle", "Hyp.after")):
@@ -252,13 +297,13 @@ def main_detin(parked=False):
                 return v
             cases.append(ren(case))
             arrays.update({pre + k: a for k, a in arr.items()})
-    tag = "parked" if parked else "detin"
+    tag = "rows" if rows else "parked" if parked else "detin"
     path = os.path.join(HERE, "tests", "data", "radar_golden_%s.npz" % tag)
     lib.save(path, cases, arrays)
     print("wrote %s: %d cases, %.0f kB" % (path, len(cases), os.path.getsize(path) / 1e3))
     path = os.path.join(HERE, "tests", "data", "radar_digests_%s.json" % tag)
     with open(path, "w") as f:
-        json.dump(parked_digests() if parked else detin_digests(), f, indent=1, sort_keys=True)
+        json.dump(rows_digests() if rows else parked_digests() if parked else detin_digests(), f, indent=1, sort_keys=True)
         f.write("\n")
     print("wrote", path)
 
@@ -375,5 +420,7 @@ if __name__ == "__main__":
         main_detin()
     elif "--parked" in sys.argv[1:]:
         main_detin(parked=True)
+    elif "--rows" in sys.argv[1:]:
+        main_detin(rows=True)
     else:
         main()

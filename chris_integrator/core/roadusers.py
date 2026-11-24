@@ -239,10 +239,13 @@ def from_lights(msg, calib, sensor="cam", cfg=PROJ_CFG):
         out["objects_low"] = [q for q in (_placed(o, cam, cfg) for o in low) if q is not None]
     if isinstance(msg.get("emb_kind"), str):
         out["emb_kind"] = msg["emb_kind"]
+    # the contract of the boxes' `pose` (lane viewhead: "pose1"); a consumer ignores a pose of a kind it does not know
+    if isinstance(msg.get("pose_kind"), str):
+        out["pose_kind"] = msg["pose_kind"]
     return out
 
 
-_DETIN = ("trunc", "occ", "occ_by", "occ_edges", "sym", "lamps", "emb", "scale_src")
+_DETIN = ("trunc", "occ", "occ_by", "occ_edges", "sym", "lamps", "emb", "scale_src", "pose")
 
 
 def _placed(o, cam, cfg):
