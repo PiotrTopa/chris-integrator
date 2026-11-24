@@ -384,6 +384,20 @@ beside the car. Hops between the cars of a row are real (7 % of the updates in c
 were not behind those alerts. The simulator's detector boxes every car on its own (a box covered by nearer ones for
 0.6 or more is dropped, never merged), so a box covering two cars does not occur there.
 
+**A car and a van that swap boxes (platoon, seed 1, day; 2026-11-24).** radar_score's length error of 3.05 m
+(0.24 m without the class-vote height prior, `size_from_class: false`) is a swap: at 20.83 s the object of the car
+p1 (26 m, its height learnt 1.48 m) takes a box of the van p3 (67 m) with a normalised innovation of 1.0-1.3 per
+row, and 0.6 s later the van's object takes p1's box. The swap happens at the same scans with the same innovations
+without the class-vote prior: the prior does not let one track take the other's box. What lets it: at 67 m the van's
+bottom edge says 33.5 m (the road's grade there and the 0.4 degree pitch error; MEAS, 55-200 m: ground range -35 %),
+and a car of 1.48 m reads the van's 38 px box as a car at 36 m; both rows agree on "the car, 6-8 m further", in a
+scan in which p1 was not boxed, and that box was labelled `car` (a class term in the pairing would not have stopped
+it). The length moved because the van's object, born from a `truck` box with the truck kind's length (10 m, never
+seen from the side), then stands where p1 is and the scorer pairs it with p1; without the prior the van's object was
+born otherwise and the metric happened to stay small. After the previous paragraph's change: 1.62 m (other seeds and
+nights 0.11-0.24 m). Not solved: what would is a far ground angle that knows its error (the grade's share grows with
+the square of the range) or a class / appearance term over several scans.
+
 ## 6. The past, smoothed
 
 The filtered state is the estimate from the detections up to now; it is what the message carries as the present.
