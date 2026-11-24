@@ -57,6 +57,7 @@ CFG = dict(
     feat_sigma=0.25, feat_same=0.9, feat_span=3.0, feat_max_s=1.0,
     with_rel=0.3, with_std=3.0,  # "drives with the traffic": the car's own speed within this share of it + this (m/s)
     new_exist=0.2,               # existence of an object started by one detection
+    size_from_class=True,        # the height prior follows the class vote (`_size`); False: the first box's label's
     # the detector's own confidence in a box: how much likelier a box of that score is a real thing than a
     # false one, learnt from the boxes themselves (the scores of boxes that went into confirmed objects against
     # those of objects that never were confirmed); bins over the score, what is assumed before anything is
@@ -614,7 +615,7 @@ class Tracker:
         information out, the new one's in) on lh, which moves the place through what lh and the place share (the
         box height's range). Without it a van born from a `car` box was read at the range a car of its box height
         would have: 0.6 of the truth, the box height being the strongest range beyond 40 m (docs/RADAR.md, section 4)."""
-        if o.lhp is None or not o.vote or not o.vote.get("w"):
+        if o.lhp is None or not o.vote or not o.vote.get("w") or not self.cfg["size_from_class"]:
             return
         m1, v1 = M.size_prior(o.vote["w"])
         m0, v0 = o.lhp
