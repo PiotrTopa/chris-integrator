@@ -180,7 +180,10 @@ Published as `calibration.vision` (angles, std, `state`: `converging`, `ok`, `of
 `unknown`; `pitch_steps`, `last_pitch_step`, `handled`) and `calibration.signrows`.
 
 **Standstill** (vehicle: speed and every wheel exactly 0) is a set of exact pseudo-measurements (`v`, `a`,
-`w`, `al` = 0): the gyro then measures its bias, the accelerometer its offset plus grade.
+`w`, `al` = 0): the gyro then measures its bias, the accelerometer its offset plus grade. Since the ego-motion
+lane the feed's flag is only a claim (its signals read zero below a floor, 0.21 m/s on the reference car, while
+the car rolls and turns): the exact rows wait for the inertial sensors' quiet or the camera to confirm it
+([EGO_MOTION.md](EGO_MOTION.md) section 1, which also has the time offsets estimated outside the filter).
 
 ## 3. The ego estimator: measurements
 
@@ -278,7 +281,9 @@ shows how far it trails.
   re-run from there with every later measurement re-applied: the exact solution of the out-of-sequence
   problem (the same result as if it had arrived in order), which the approximate one-step algorithms
   (Bar-Shalom's A1/B1) only approach. Cost: one re-run of at most the lag times the input rate, per late
-  measurement; measured in the report. Older than the horizon: dropped and counted.
+  measurement; measured in the report (and in [EGO_MOTION.md](EGO_MOTION.md) section 3: 5-7 % of the estimator;
+  the rows' measurement functions are native, so a re-run does not enter Python for them). Older than the
+  horizon: dropped and counted.
 * **Output time.** The state for a frame is the **fixed-lag smoothed** state at the frame's time of validity
   given everything that has arrived (a Rauch-Tung-Striebel pass over the entries newer than the frame, at
   most 0.6 s): by the time a road message arrives, vehicle samples on both sides of its frame time exist.
