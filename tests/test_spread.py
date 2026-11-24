@@ -351,6 +351,24 @@ def test_a_pedestrians_entry_hold_is_its_own_where_configured():
     assert entered(quick, "vru") == 0.0 and entered(quick, "vehicle") == 0.1
 
 
+# ---- the evidence rule only while waiting costs nothing ---------------------------------------------------------------
+def test_a_place_in_doubt_enters_by_time_once_the_time_margin_is_gone():
+    def entered(cfg, tm, mass=0.32):
+        a = AL.Alert("obstacle_ahead", cfg)
+        rec = {"id": 1, "kind": "vehicle", "level": 2, "level_exit": 2, "mass": [mass] * 4, "p_coll": mass, "tm_s": tm,
+               "p_place": 0.4, "a_req": {"brake": 3.0, "left": 2.0, "right": 2.0}, "why": {}}
+        ob = {1: {"id": 1, "state": "confirmed", "exist": 1.0, "motion": "stationary", "p_stationary": 0.95, "flags": []}}
+        for k in range(61):
+            if a.step(k * 0.05, [rec], ob, {"v": 13.0})[0]["stage"] >= 2:
+                return round(k * 0.05, 2)
+    t = entered({}, 1.0)                                        # as it was: 0.07 over the minimum: five times as long
+    assert t is not None and 0.9 < t < 1.1 and entered({}, -0.3) == t
+    cfg = {"entry_evidence_tm_s": 0.0}
+    assert entered(cfg, 1.0) == t                               # time left: the evidence has to add up
+    assert entered(cfg, -0.3) == 0.2 and entered(cfg, 0.0) == 0.2      # none left: by time
+    assert entered(cfg, None) == t                              # no time margin (no contact on the mean futures): the rule
+
+
 if __name__ == "__main__":
     for k, v in list(globals().items()):
         if k.startswith("test_"):

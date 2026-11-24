@@ -51,6 +51,11 @@ ALERT_DEFAULTS = dict(
     # down again second for second.
     entry_evidence=0.6,
     entry_evidence_of="mass",                       # what adds up: the object's whole collision probability | "mass" at the level
+    # ... only while waiting for the evidence costs nothing: once the object's time margin (decide.objects[].tm_s:
+    # what the driver has left to begin the last avoiding action, reaction time taken off) is at or below this, the
+    # level is entered by time as ever. None: the evidence rule whatever the margin (a car half in the lane, P(in
+    # the way) 0.4 for a second and a half, margin gone, was not said: the sum had not added up)
+    entry_evidence_tm_s=None,
     mass_min=None,                                  # {kind: (4 minima)}; None: threat.THRESHOLDS
     latch_imminent=True,
     switch_hold_s=0.3,
@@ -236,6 +241,9 @@ class Alert:
             # the lane enter by time as ever
             pp = (rec or {}).get("p_place")
             doubt = isinstance(pp, (int, float)) and pp < ref
+            tm = (rec or {}).get("tm_s")
+            if doubt and c["entry_evidence_tm_s"] is not None and isinstance(tm, (int, float)) and tm <= c["entry_evidence_tm_s"]:
+                doubt = False                       # acting cannot wait for the evidence
             for L in range(1, 5):
                 if le >= L:
                     # how sure the conflict is: its whole collision probability (the level is held by the mass at it;
