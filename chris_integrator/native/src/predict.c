@@ -115,7 +115,11 @@
     X(motion_scale, 1.0)        /* 1: "it moves" counts no further than its velocity shows once the range's scale is  \
                                    allowed for (motion_scale_bound) */                                                \
     X(motion_scale_rel, 0.15)   /* ... the range's relative error at least (what the tracker's ranges showed) */      \
-    X(motion_scale_v, 8.0)      /* ... and the speeds of things that do move: 1 sigma (m/s) */
+    X(motion_scale_v, 8.0)      /* ... and the speeds of things that do move: 1 sigma (m/s) */                        \
+    X(std_rho, 0.0)             /* 1: where the radar gives the correlation of a place's x and y errors (`std_rho`),  \
+                                   the place's covariance is that one: the needle is read along its own long axis     \
+                                   (lane_step) and the futures start with it; 0: as if it were not given (the needle   \
+                                   rebuilt from `std` and the bearing, the futures' spread upright) */
 
 enum {
 #define X(n, d) PC_##n,
@@ -153,9 +157,11 @@ static const char *const PLANE[P_NLANE] = {"ego", "left", "right", "onc", "cross
 
 /* object row */
 enum { PO_X, PO_Y, PO_VX, PO_VY, PO_AX, PO_AY, PO_SX, PO_SY, PO_SVX, PO_SVY, PO_KIND, PO_PSTAT, PO_LEN, PO_WID, PO_HDG, PO_HDGSD,
-       PO_EXIST, PO_SEEN, PO_IND, PO_BRAKE, PO_PARKED, PO_ID, PO_VIS, PO_MOTION, PO_WITH, PO_CX, PO_CY, P_NO };
+       PO_EXIST, PO_SEEN, PO_IND, PO_BRAKE, PO_PARKED, PO_ID, PO_VIS, PO_MOTION, PO_WITH, PO_CX, PO_CY, PO_RHO, P_NO };
 /* PO_X, PO_Y: the radar's reference point (the near face: where the futures start, what the decision layer's
- * footprint is drawn from); PO_CX, PO_CY: the object's centre (NaN: not given), its place on the road */
+ * footprint is drawn from); PO_CX, PO_CY: the object's centre (NaN: not given), its place on the road; PO_RHO: the
+ * correlation of the place's x and y errors (the radar's `std_rho`; NaN: not given) */
+
 /* an object's kept state */
 enum { PS_INIT, PS_T, PS_LANE, PS_INT = PS_LANE + P_NLANE, PS_D = PS_INT + P_NM, PS_DR, PS_PDD, PS_PDR, PS_PRR, PS_V, PS_A, PS_PVV,
        PS_PVA, PS_PAA, PS_TSTAND, PS_TMOVE, PS_LMAP, PS_TKERB, PS_TOP, PS_DIR, PS_TLANE, PS_GSTAND, PS_PSL, PS_MOVED, P_NS = 48 };
@@ -184,6 +190,20 @@ enum { PK_ALON, PK_ALAT, PK_VMAX, PK_VSTILL, PK_WID, PK_LEN, P_NK };
 static inline double p_sq(double v) { return v * v; }
 static inline double p_clip(double v, double lo, double hi) { return v < lo ? lo : v > hi ? hi : v; }
 static inline double p_phi(double z) { return 0.5 * erfc(-z * 0.7071067811865476); }
+/* the covariance of an object's place between x and y: the radar's where it gives the correlation (cfg std_rho) */
+static inline double p_cxy(const double *cfg, const double *o)
+{
+    return cfg[PC_std_rho] > 0.5 && o[PO_RHO] == o[PO_RHO] ? o[PO_RHO] * o[PO_SX] * o[PO_SY] : 0.0;
+}
+/* ... as a VEHICLE's futures start with it. A pedestrian's and a cyclist's keep the spread they had: a standing
+ * vehicle whose needle crosses the car's way gets two places and the lanes' floor for the one beside it (lane_hyp);
+ * a pedestrian has no such two places yet, and its one standing future as a needle across a bend was said (two of
+ * 24 runs of a pedestrian standing at a parked row). Its lanes are read along the needle all the same. */
+static inline double p_cxy_fut(const double *cfg, const double *o)
+{
+    const int kind = (int)o[PO_KIND];
+    return kind == 6 || kind == 7 ? 0.0 : p_cxy(cfg, o);
+}
 /* a Gaussian feature: its density against a reference spread (1 at the mean when sd == ref) */
 static inline double p_logn(double z, double mu, double sd, double ref)
 {
@@ -746,13 +766,15 @@ static void roll_free(const double *o, const double *kin, const double *cfg, con
             double w = p_sq(cfg[PC_stand_drift] * t);
             cxx = p_sq(o[PO_SX]) + w;
             cyy = p_sq(o[PO_SY]) + w;
-            cxy = 0.0;
+            cxy = p_cxy_fut(cfg, o);
         } else {
             /* an acceleration that wanders with spread q and persistence tau: position variance q^2 g(t)^2-like */
             double gl = p_sq(qlon * g), gc = p_sq(qlat * g);
             cxx = p_sq(o[PO_SX]) + p_sq(o[PO_SVX] * t) + hx * hx * gl + hy * hy * gc;
             cyy = p_sq(o[PO_SY]) + p_sq(o[PO_SVY] * t) + hy * hy * gl + hx * hx * gc;
             cxy = hx * hy * (gl - gc);
+            if (p_cxy_fut(cfg, o) != 0.0)
+                cxy += p_cxy_fut(cfg, o);
         }
         out[6 * k] = x;
         out[6 * k + 1] = y;
@@ -800,6 +822,11 @@ typedef struct {
      * vehicle may be in (cfg lane_hyp; hyp 0: one place): 0 the car's lane or across it, 1 elsewhere */
     int los_n, hyp, side_h;         /* hyp 1: two places; 2: surely in the car's way (one place); side_h: the place its futures are of */
     double los_r0, los_sr, los_sc;  /* the range of its centre, its 1 sigma along and across the line of sight */
+    int needle;                     /* the needle is the radar's own (`std_rho`): its long axis (nx, ny), a unit
+                                     * vector away from the car; a place at "range" r is the track's place moved by
+                                     * r - los_r0 along it. 0: the line of sight itself (the place scaled by r / los_r0) */
+    double nx, ny;
+    double cxy;                     /* the covariance of its place between x and y as its futures start with it (p_cxy_fut) */
     double hyp_p[2], hyp_r[2], hyp_sd[2];   /* per place: its probability, the range's mean and 1 sigma given it */
     double cs, cd, cvar;            /* the place of the futures being built (object_modes): arc length and offset
                                      * beyond the track's own, its variance as a share of the track's */
@@ -936,8 +963,28 @@ static void lane_step(PCtx *c, PObj *q, double dt, double *lane_out)
     int los = 0;
     double gk[P_LOS][P_NLANE], wk[P_LOS], rk[P_LOS], vr = 0.0, vc = 0.0;
     const double r0 = hypot(ox, oy);
-    q->los_n = q->hyp = 0;
-    if (cfg[PC_lane_los] > 0.5 && r0 > 3.0) {
+    q->los_n = q->hyp = q->needle = 0;
+    q->nx = r0 > 1e-6 ? ox / r0 : 1.0;
+    q->ny = r0 > 1e-6 ? oy / r0 : 0.0;
+    if (cfg[PC_lane_los] > 0.5 && r0 > 3.0 && cfg[PC_std_rho] > 0.5 && o[PO_RHO] == o[PO_RHO]) {
+        /* the radar states the place's whole covariance (`std_rho`): the needle is its long axis as it is, wherever
+         * it points (a camera's: within a degree of the line of sight; a microwave radar's: across it) */
+        const double cxy = p_cxy(cfg, o), tot = sx * sx + sy * sy, dif = sx * sx - sy * sy;
+        const double disc = sqrt(dif * dif + 4.0 * cxy * cxy), ang = 0.5 * atan2(2.0 * cxy, dif);
+        double ex = cos(ang), ey = sin(ang);
+        if (ex * ox + ey * oy < 0.0) {
+            ex = -ex;
+            ey = -ey;
+        }
+        vr = 0.5 * (tot + disc);
+        vc = 0.5 * (tot - disc);
+        if (vc < 0.0025)
+            vc = 0.0025;
+        q->nx = ex;
+        q->ny = ey;
+        q->needle = 1;
+        los = 3;
+    } else if (cfg[PC_lane_los] > 0.5 && r0 > 3.0) {
         double c2 = (ox * ox - oy * oy) / (r0 * r0);
         if (fabs(c2) > 0.25) {
             double tot = sx * sx + sy * sy, dif = (sx * sx - sy * sy) / c2;
@@ -957,9 +1004,14 @@ static void lane_step(PCtx *c, PObj *q, double dt, double *lane_out)
             if (rk[k] < 0.1 * r0)
                 rk[k] = 0.1 * r0;
             wk[k] = W3[k];
-            pp_project(&c->base, ox * rk[k] / r0, oy * rk[k] / r0, &sk[k], &dk[k]);
+            if (q->needle)
+                pp_project(&c->base, ox + (rk[k] - r0) * q->nx, oy + (rk[k] - r0) * q->ny, &sk[k], &dk[k]);
+            else
+                pp_project(&c->base, ox * rk[k] / r0, oy * rk[k] / r0, &sk[k], &dk[k]);
         }
-        if (fabs(dk[2] - dk[0]) > 0.6 || fabs(dk[1] - 0.5 * (dk[0] + dk[2])) > 0.2) {
+        /* (the radar's own needle of a thing behind the car: three places do; whether it is in the car's way is
+         * no question any more. The rebuilt needle left most of those out by its fit) */
+        if ((fabs(dk[2] - dk[0]) > 0.6 || fabs(dk[1] - 0.5 * (dk[0] + dk[2])) > 0.2) && !(q->needle && ox <= 0.0)) {
             double ws = 0.0;
             los = P_LOS;
             for (int k = 0; k < P_LOS; k++) {
@@ -969,7 +1021,10 @@ static void lane_step(PCtx *c, PObj *q, double dt, double *lane_out)
                     rk[k] = 0.1 * r0;
                 wk[k] = exp(-0.5 * z * z);
                 ws += wk[k];
-                pp_project(&c->base, ox * rk[k] / r0, oy * rk[k] / r0, &sk[k], &dk[k]);
+                if (q->needle)
+                    pp_project(&c->base, ox + (rk[k] - r0) * q->nx, oy + (rk[k] - r0) * q->ny, &sk[k], &dk[k]);
+                else
+                    pp_project(&c->base, ox * rk[k] / r0, oy * rk[k] / r0, &sk[k], &dk[k]);
             }
             for (int k = 0; k < P_LOS; k++)
                 wk[k] /= ws;
@@ -1936,6 +1991,15 @@ static void roll_on_base(const PCtx *c, const PObj *q, PRoll *r)
     r->dr0 = st[PS_DR];
     r->pss = ct * ct * sx2 + sn * sn * sy2;
     r->psd = ct * sn * (sy2 - sx2);
+    {
+        const double cxy = q->cxy;
+        if (cxy != 0.0) {                   /* the place's covariance as the radar states it (cfg std_rho) */
+            r->pss += 2.0 * ct * sn * cxy;
+            r->psd += (ct * ct - sn * sn) * cxy;
+            if (r->pss < 0.0025)
+                r->pss = 0.0025;
+        }
+    }
     r->pdd = st[PS_PDD];
     r->pdr = st[PS_PDR];
     r->prr = st[PS_PRR];
@@ -1951,6 +2015,10 @@ static void roll_on_base(const PCtx *c, const PObj *q, PRoll *r)
         r->psd *= q->cvar;
         r->pdd = r->pdd * q->cvar + p_sq(q->los_sc);
     }
+    if (q->cxy != 0.0) {                    /* (a covariance: the lateral filter's own spread may be the smaller) */
+        const double lim = 0.99 * sqrt(r->pss * (r->pdd > 0.0 ? r->pdd : 0.0));
+        r->psd = p_clip(r->psd, -lim, lim);
+    }
 }
 
 /* A standing future at one of a vehicle's two places (lane_step, cfg lane_hyp): the reference point at that place's
@@ -1962,11 +2030,18 @@ static void roll_stand_at(const PObj *q, int side, const double *cfg, const doub
     double f = q->hyp_r[side] / q->los_r0, rr = hypot(o[PO_X], o[PO_Y]);
     double ux = rr > 1e-6 ? o[PO_X] / rr : 1.0, uy = rr > 1e-6 ? o[PO_Y] / rr : 0.0;
     double vr = p_sq(q->hyp_sd[side]), vc = p_sq(q->los_sc);
+    double x0 = o[PO_X] * f, y0 = o[PO_Y] * f;
+    if (q->needle) {                        /* along the radar's own needle (lane_step) */
+        ux = q->nx;
+        uy = q->ny;
+        x0 = o[PO_X] + (q->hyp_r[side] - q->los_r0) * ux;
+        y0 = o[PO_Y] + (q->hyp_r[side] - q->los_r0) * uy;
+    }
     for (int k = 0; k < nt; k++) {
         double w = p_sq(cfg[PC_stand_drift] * times[k]);
         double cxx = vr * ux * ux + vc * uy * uy + w, cyy = vr * uy * uy + vc * ux * ux + w, cxy = (vr - vc) * ux * uy;
-        out[6 * k] = o[PO_X] * f;
-        out[6 * k + 1] = o[PO_Y] * f;
+        out[6 * k] = x0;
+        out[6 * k + 1] = y0;
         out[6 * k + 2] = sqrt(cxx);
         out[6 * k + 3] = sqrt(cyy);
         out[6 * k + 4] = p_clip(cxy / sqrt(cxx * cyy), -0.99, 0.99);
@@ -1988,6 +2063,17 @@ static void roll_on_path(const PObj *q, PRoll *r, const PPath *p, int dir)
     r->pss = ct * ct * sx2 + sn * sn * sy2;
     r->pdd = sn * sn * sx2 + ct * ct * sy2;
     r->psd = ct * sn * (sy2 - sx2);
+    if (q->cxy != 0.0) {                    /* the place's covariance as the radar states it (cfg std_rho) */
+        r->pss += 2.0 * ct * sn * q->cxy;
+        r->pdd -= 2.0 * ct * sn * q->cxy;
+        r->psd += (ct * ct - sn * sn) * q->cxy;
+        if (r->pss < 0.0025)
+            r->pss = 0.0025;
+        if (r->pdd < 0.0025)
+            r->pdd = 0.0025;
+        const double lim = 0.99 * sqrt(r->pss * r->pdd);
+        r->psd = p_clip(r->psd, -lim, lim);
+    }
     r->pdr = 0.0;
     r->prr = p_sq(sn * o[PO_SVX]) + p_sq(ct * o[PO_SVY]);
     r->pvv = st[PS_PVV];
@@ -2447,7 +2533,11 @@ static void object_modes(PCtx *c, int i, PPath *tmp)
         /* its futures are those of the place its lane is of (side), at that place's range; the other place gets a
          * standing future of its own below */
         double f = q->hyp_r[side] / q->los_r0, s1, d1, s0, d0;
-        pp_project(&c->base, q->o[PO_X] * f, q->o[PO_Y] * f, &s1, &d1);
+        if (q->needle)
+            pp_project(&c->base, q->o[PO_X] + (q->hyp_r[side] - q->los_r0) * q->nx,
+                       q->o[PO_Y] + (q->hyp_r[side] - q->los_r0) * q->ny, &s1, &d1);
+        else
+            pp_project(&c->base, q->o[PO_X] * f, q->o[PO_Y] * f, &s1, &d1);
         pp_project(&c->base, q->o[PO_X], q->o[PO_Y], &s0, &d0);
         q->cs = s1 - s0;
         q->cd = d1 - d0;
@@ -3339,6 +3429,7 @@ static PyObject *n_predict_frame(PyObject *self, PyObject *args)
         q->grp = kind == 7 ? 2 : kind == 6 ? 1 : 0;
         q->len = q->o[PO_LEN] == q->o[PO_LEN] && q->o[PO_LEN] > 0.2 ? q->o[PO_LEN] : q->kin[PK_LEN];
         q->wid = q->o[PO_WID] == q->o[PO_WID] && q->o[PO_WID] > 0.2 ? q->o[PO_WID] : q->kin[PK_WID];
+        q->cxy = p_cxy_fut(c->cfg, q->o);
         q->pstat = motion_state(c->cfg, q->o, &q->minfo);
         if (c->cfg[PC_motion_scale] > 0.5 && q->grp == 0 && c->ego[PE_V] > 2.0) {
             /* only beside the car's way (its place as the track has it): there "it may stand after all" takes a
@@ -3564,7 +3655,7 @@ done:
     X(hdg) X(hdg_std) X(exist) X(state) X(indicator) X(brake_lights) X(vis) X(flags) X(motion) X(ctr) X(id)            \
     X(tentative) X(memory) X(left) X(right) X(parked) X(occluded) X(hidden) X(stationary) X(moving) X(with_traffic)    \
     X(oncoming) X(objects) X(type) X(radar_fut) X(fut) X(t) X(ego_fut) X(modes) X(fut_ctx) X(lane) X(intent) X(p)      \
-    X(p0) X(m) X(x) X(y) X(sx) X(sy) X(rxy) X(v) X(lane_res)
+    X(p0) X(m) X(x) X(y) X(sx) X(sy) X(rxy) X(v) X(lane_res) X(std_rho)
 #define X(n) K_##n,
 enum { PK_STRS(X) K_N };
 #undef X
@@ -3815,6 +3906,12 @@ static PyObject *n_predict_pack(PyObject *self, PyObject *args)
                 a[PO_CY] = c1;
             }
         }
+        a[PO_RHO] = NAN;
+        {
+            double rho;                           /* the correlation of the place's errors: a finite number within +-1 */
+            if (py_fin(pk_get(o, K_std_rho), &rho) && rho >= -1.0 && rho <= 1.0)
+                a[PO_RHO] = rho < -0.999 ? -0.999 : rho > 0.999 ? 0.999 : rho;
+        }
         int fin = 1;
         for (int q = 0; q < 12; q++)
             fin &= isfinite(a[q]);
@@ -3825,6 +3922,7 @@ static PyObject *n_predict_pack(PyObject *self, PyObject *args)
             a[PO_SVX] = 2.0;
             a[PO_SVY] = 1.0;
             a[PO_PSTAT] = 0.5;
+            a[PO_RHO] = NAN;
         }
         for (int q = PO_SX; q <= PO_SVY; q++)
             if (!(a[q] >= 0.05 || isnan(a[q])))
