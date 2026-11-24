@@ -138,8 +138,9 @@ def ego_velocity(az, rr, rng, tol=0.35, iters=24):
     A[:, 0], A[:, 1] = np.cos(az), np.sin(az)
     A = -A
     # all candidate pairs at once
-    # (`_randbelow(n)` is what `randrange(n)` returns for n > 0, without its argument checks: the same stream)
-    rb = rng._randbelow
+    # (`_randbelow(n)` is what `randrange(n)` returns for n > 0, without its argument checks: the same stream; a
+    # generator without it is asked as before)
+    rb = getattr(rng, "_randbelow", None) or rng.randrange
     ii = np.array([rb(n) for _ in range(iters)])
     jj = np.array([rb(n) for _ in range(iters)])
     a, b, c, d = A[ii, 0], A[ii, 1], A[jj, 0], A[jj, 1]

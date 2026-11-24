@@ -610,7 +610,9 @@ class Integrator:
         if f is None:
             f = self._foreign(spec) if m.local else None
             c = np.array(list(m.consider), dtype=np.intp)
-            f = self._foreign_ix[key] = c if f is None else np.concatenate([f, c])
+            f = c if f is None else np.concatenate([f, c])
+            f.flags.writeable = False      # (shared by rows: a write must fail, not change other rows)
+            self._foreign_ix[key] = f
         return f
 
     def _aux_ix(self):
