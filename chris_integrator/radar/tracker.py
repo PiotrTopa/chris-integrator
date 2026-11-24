@@ -221,9 +221,58 @@ CFG = dict(
     # them: without that the "range" is the ground angle's, and the camera's pitch error would be learnt as a size)
     size_learn_swing_deg=5.0,
     size_learn=False, size_learn_hits=6, size_learn_n0=3.0, size_learn_floor=0.10, size_learn_shift=0.25, size_learn_keep=200,
+    # ---- one car, one object in a row; the detector's miss runs; the pose head (docs/RADAR.md, section 10) ----
+    # row_ctx: every box of a scan is given "how much the place it was seen at is a row of standing vehicles" before
+    # the scan pairs anything: the vehicles already judged at its distance beside the road's path (the count of
+    # `ctx_prior`, of the box's own ground point), q = n_s / (n_s + n_m + ctx_n). What follows from q:
+    #   row_birth   "something else" is exp(row_birth q) times denser at such a box: beside a row the next box along
+    #               IS another car (the density of new objects was the same over the whole field)
+    #   ctx_exist   an object born there exists with new_exist + (ctx_exist - new_exist) q: a box in a row of parked
+    #               cars is a car (with new_exist 0.2 a car's own second box went to the settled neighbour's object)
+    #   ctx_vel     ... and if it moves at all it starts from rest: its moving stories start from (1 - q) x the
+    #               traffic's speed, as narrow as ctx_vel (m/s) where q is 1 ("the same car, driving with us" was what
+    #               explained the next car of the row); 0: as anywhere
+    row_ctx=False, row_birth=2.5, ctx_exist=0.6, ctx_vel=2.0,
+    # det_chain: a detector misses in runs. Per object and view of the camera a two-state chain: the detector has the
+    # object (a box with probability det_chain_d) or has lost it; its long-run share is the sensor's own model (range,
+    # box size at the view's limit), it forgets within det_chain_tau_s. The chance of a box, the price of a miss and
+    # the pairing all read it: an object boxed a moment ago is expected again (and holds its next box against a new
+    # object), a run of misses costs its first miss and little more
+    det_chain=False, det_chain_tau_s=0.8, det_chain_d=0.9,
+    # pd_learn: the chance of a box is learnt per view of the camera and box height from the settled objects' own
+    # boxes and misses there (held to the sensor's model with the weight of pd_learn_n0 scans; a bin remembers
+    # pd_learn_keep scans). The model's ramp from "the smallest box this view has shown" to twice that is a guess:
+    # where most of a view's boxes are near its smallest it said a tenth, and a young object's next box went to a new
+    # object. exist_shared: an object's existence counts the stories in which ANOTHER object took its last box (the
+    # stories of a young object disagree on whose its boxes were; every one of them has a thing there)
+    pd_learn=False, pd_learn_n0=6.0, pd_learn_keep=400.0, exist_shared=False,
+    # the low-score list inside runs of misses only (low_runs_only: an object the first list had within low_run_s;
+    # nowhere else), and as existence only (low_exist_only: a low box takes the miss back and leaves the object's
+    # numbers to its motion: its edges made standing things look moving)
+    low_runs_only=False, low_exist_only=False,
+    # the pose head (`pose`, contract pose1; roadsense docs/lanes/detin-consumption-design.md section 9):
+    #   in_pose_gn   the near-face ground point as the ground-angle row: on a whole box whichever of it and the box's
+    #                bottom has the smaller sigma (one row: the same pixels); on a box whose bottom is hidden the row
+    #                that box lacked, cut at the visible bottom (the contact lies no higher: a one-sided bound), its
+    #                sigma times pose_gn_occ under a nearer box; successive rows of one object share their error for
+    #                pose_corr_s (the variance times pose_corr_s over the time since the object's previous one)
+    #   in_pose_gc   the footprint centre's column as the bearing row (the centre's own bearing, also where a side of
+    #                the box is hidden)
+    #   in_pose_yaw  the heading: votes on which end is the front (ln(p / flip), at most pose_vote_max; the front is
+    #                turned at pose_vote_turn against it; votes nearer than pose_vote_half_s count half) and the axis
+    #                as a row on the extent's heading (sigma max(yaw_std, pose_yaw_floor_deg), Huber at
+    #                pose_yaw_huber sigma, the same memory of errors); a new object's heading; in the dark a lamp
+    #                pair's colour votes with the full weight, the head with pose_vote_dark, and its axis is taken
+    #                only with p >= pose_axis_dark_p
+    # a pose is read only where its `kind` says vehicle with pose_kind_min and the box is of a vehicle class; a point
+    # is taken where its `seen` is at least pose_min_seen or its box edge is hidden
+    in_pose_gn=False, in_pose_gc=False, in_pose_yaw=False, pose_corr_s=1.0, pose_gn_occ=1.5, pose_yaw_floor_deg=3.0,
+    pose_yaw_huber=2.0, pose_vote_max=math.log(8.0), pose_vote_turn=math.log(4.0), pose_vote_dark=math.log(2.0),
+    pose_axis_dark_p=0.9, pose_vote_half_s=0.5, pose_kind_min=0.5, pose_min_seen=0.5,
 )
 _IN_KNOBS = ("in_flags", "in_box_occl", "in_low", "in_app", "in_reid", "in_lamp_colour", "in_lamp_size", "in_width", "in_scale",
-             "sil_bearing")
+             "sil_bearing", "row_ctx", "det_chain", "in_pose_gn", "in_pose_gc", "in_pose_yaw", "pd_learn", "exist_shared")
+_POSE_KNOBS = ("in_pose_gn", "in_pose_gc", "in_pose_yaw")
 
 
 def _npsum(a):
@@ -582,20 +631,31 @@ class Tracker:
             st = self._xstatic = (
                 ((2.0 if c["flags_far_bearing"] else 1.0) if c["in_flags"] else 0.0, 1.0 if c["in_box_occl"] else 0.0,
                  c["box_occl_margin"],
-                 1.0 if c["in_low"] else 0.0, c["low_p"], c["low_p_run"], c["low_run_s"]),
+                 1.0 if c["in_low"] else 0.0, 0.0 if c["low_runs_only"] else c["low_p"], c["low_p_run"], c["low_run_s"]),
                 (-1.0 if dark is None else float(dark), c["app_bound"][0], c["app_bound"][1], c["app_gain"], c["app_y_day"],
                  c["app_y_night"]),
                 (1.0 if c["in_lamp_colour"] else 0.0, math.radians(c["lamp_colour_deg"]), 1.0 if c["in_lamp_size"] else 0.0,
                  c["lamp_sep_ratio"], c["lamp_sep_rel"], c["ruler_eps"], c["ruler_span"], float(c["ruler_uses"]),
                  1.0 if c["in_width"] else 0.0, c["width_rel"], c["grade_k"], 1.0 if c["in_scale"] else 0.0,
                  c["scale_lamps_k"] if c["in_scale"] else 0.0, 1.0 if c["flags_side"] else 0.0,
-                 1.0 if c["sil_bearing"] else 0.0))
+                 1.0 if c["sil_bearing"] else 0.0),
+                # rows, the detect / miss chain, the pose head (chris_native.c `XC_ROWB` on); nothing of it set: the
+                # scan's constants end where they did
+                ((c["row_birth"], c["ctx_exist"], c["ctx_vel"]) if c["row_ctx"] else (0.0, 0.0, 0.0))
+                + (1.0 if c["det_chain"] else 0.0, c["det_chain_tau_s"], c["det_chain_d"],
+                   1.0 if c["low_exist_only"] and c["in_low"] else 0.0,
+                   1.0 if c["in_pose_gn"] else 0.0, c["pose_corr_s"], 1.0 if c["in_pose_yaw"] else 0.0,
+                   math.radians(c["pose_yaw_floor_deg"]), c["pose_yaw_huber"], c["pose_vote_max"], c["pose_vote_turn"],
+                   c["pose_vote_dark"], c["pose_axis_dark_p"], c["pose_vote_half_s"],
+                   1.0 if c["pd_learn"] else 0.0, c["pd_learn_n0"], c["pd_learn_keep"], 1.0 if c["exist_shared"] else 0.0)
+                if (c["row_ctx"] or c["det_chain"] or (c["low_exist_only"] and c["in_low"]) or c["pd_learn"]
+                    or c["exist_shared"] or any(c[k] for k in _POSE_KNOBS)) else ())
         ek = getattr(sensor, "emb_kind", 0) if c["in_app"] else 0
         tab = c["app_tables"].get(ek) or c["app_tables"].get(str(ek))
         if tab is None:
             ek, tab = 0, ((0.0, 1.0) * 4,) * 2           # a kind of vector there is no table for: not used
         return st[0] + (max(c["low_false_per_scan"], self.low_rate.get(src, 0.0)), 1.0 if ek else 0.0, float(ek)) + st[1] \
-            + tuple(tab[0]) + tuple(tab[1]) + st[2]
+            + tuple(tab[0]) + tuple(tab[1]) + st[2] + st[3]
 
     def look(self, objs):
         """Several objects' numbers at once, as lists (the upkeep and the message read every object once per
@@ -783,6 +843,8 @@ class Tracker:
         xcfg = self._xcfg(src, sensor) if c["_in_any"] else None
         if xcfg is not None:                             # the detector's further inputs (docs/RADAR.md, section 8)
             args += (xcfg,)
+            if c["row_ctx"] and dets and objs:
+                self._row_ctx(dets, sensor, pose)
         while True:
             res = self.hyp.cycle(store.a, store.tab, store.hist, *args)
             if not isinstance(res, int):
@@ -964,6 +1026,46 @@ class Tracker:
                 los = math.atan2(float(o.x[PY]) - pose[1], float(o.x[PX]) - pose[0])
                 _NR.radar_heading_prior(self.store.a, rows, float(axis[0]), los, c["road_prior_std"], c["road_prior_snap"],
                                         c["road_prior_mirror"])
+
+    def _row_ctx(self, dets, sensor, pose):
+        """How much the place each box of the scan was seen at is a row of standing vehicles (`row_ctx`): the box's
+        own ground point (its ground angle with the camera's known pitch error taken out, its bearing) beside the
+        road's path, against the vehicles already judged there, by their verdicts: q = n_s / (n_s + n_m + ctx_n),
+        the count of `_context`. Written into the detection (`p`[0]) for the native scan: the density of new cars
+        there, a new object's existence and what it may be doing (chris_native.c `XC_ROWB`, r_birth)."""
+        c = self.cfg
+        don = [q for q in self.objects if q.label_code > 0.0 and q.state != "tentative" and q.verdict != "unknown"]
+        if not don:
+            return
+        hc, bias, cp, sp = sensor.hc, sensor.bias, math.cos(pose[2]), math.sin(pose[2])
+        js, xs, ys = [], [], []
+        for j, d in enumerate(dets):
+            k = d["kind"]
+            if k[:2] != "rb" or (d.get("attrs") or {}).get("low"):
+                continue
+            lab = self._labs.get(d["attrs"].get("class"))
+            if lab is None:
+                lab = self._lab_row(d["attrs"].get("class"))
+            if lab[0] <= 0.0:                            # (vehicles: a person in a row of cars is not one more car)
+                continue
+            z = d["z"]
+            r = hc / math.tan(max(float(z[0]) - bias, 0.003))
+            b = float(z[1])
+            js.append(j)
+            xs.append(pose[0] + r * (cp * math.cos(b) - sp * math.sin(b)))
+            ys.append(pose[1] + r * (sp * math.cos(b) + cp * math.sin(b)))
+        if not js:
+            return
+        n = len(js)
+        off, _ = self._offsets(xs + [float(q.x[PX]) for q in don], ys + [float(q.x[PY]) for q in don], pose)
+        w = np.exp(-0.5 * ((off[n:][None, :] - off[:n][:, None]) / c["ctx_band_m"]) ** 2)
+        st = np.array([q.verdict == "stationary" for q in don])
+        ns, nm = w[:, st].sum(axis=1), w[:, ~st].sum(axis=1)
+        q = ns / (ns + nm + c["ctx_n"])
+        for i, j in enumerate(js):
+            if q[i] > 1e-3:
+                d = dets[j]
+                d["p"] = (float(q[i]),) + (d["p"][1:] if "p" in d else (0.0,) * 8)
 
     def _size_learn(self, o):
         """What a standing vehicle's own boxes have said of its height goes into its kind's prior (`size_learn`). The

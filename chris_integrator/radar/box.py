@@ -123,6 +123,7 @@ class Radar:
         self.cam_height = float(self.camera_cfg["cam_height_m"])
         self.h_min = {}                  # view (its nearest ground point) -> the smallest box height seen (px)
         self.cam = None
+        self._pose = False               # the pose head's fields are read in this message: (ground point, centre, heading)
         self.frame_scale = 1.0
         self.reset()
 
@@ -174,6 +175,10 @@ class Radar:
         tc = self.tracker.cfg
         xin = tc["_in_any"]
         ek = _EMB_KINDS.get(msg.get("emb_kind"), (0, 0)) if tc["in_app"] else (0, 0)
+        # the pose head's fields (contract pose1; a kind this code does not know is not read)
+        self._pose = msg.get("pose_kind") == "pose1" and self.cam is not None and \
+            (tc["in_pose_gn"] or tc["in_pose_gc"] or tc["in_pose_yaw"]) and \
+            (tc["in_pose_gn"], tc["in_pose_gc"], tc["in_pose_yaw"])
         for o in objs:
             self._box_det(dets, o, c, xin, ek, False)
         n_hi = len(dets)
@@ -228,17 +233,66 @@ class Radar:
             at["low"] = True
         box = o.get("box")
         box = [float(v) for v in box] if isinstance(box, (list, tuple)) and len(box) == 4 and all(_fin(v) for v in box) else None
+        # the pose head (docs/RADAR.md, section 10): the footprint centre's column for the bearing, the near-face
+        # ground point for the ground angle, the heading
+        po = o.get("pose") if self._pose and box and not low else None
+        gn = gcb = yaw = None
+        if isinstance(po, dict):
+            kd = po.get("kind")
+            if not (isinstance(kd, list) and kd and _fin(kd[0]) and kd[0] >= tc["pose_kind_min"]) \
+                    or classvote.norm_label(o["class"]) not in M.VEHICLES:
+                po = None
+        if isinstance(po, dict):
+            use_gn, use_gc, use_yaw = self._pose
+            v = po.get("gn")
+            if use_gn and isinstance(v, list) and len(v) == 4 and all(_fin(q) for q in v) and v[2] > 0.0:
+                gn = v
+            v = po.get("gc")
+            if use_gc and isinstance(v, list) and len(v) == 5 and all(_fin(q) for q in v) and v[2] > 0.0:
+                gcb = (self.cam.bearing(v[0]), math.hypot(v[2] / f, math.radians(c["bearing_floor_deg"])))
+                b = gcb[0]
+            if use_yaw and all(_fin(po.get(k)) for k in ("yaw", "yaw_std", "p", "flip")):
+                yaw = (-math.radians(po["yaw"]), math.radians(po["yaw_std"]) ** 2, float(po["p"]), float(po["flip"]),
+                       1.0 if po.get("vp") == "front" and _fin(po.get("vp_conf")) and po["vp_conf"] >= 0.8 else 0.0)
         hpx = box[3] - box[1] if box else None
         wa = (box[2] - box[0]) / f if box and box[2] > box[0] else None      # the box's width as an angle
         wok = bool(box) and "l" not in clip and "r" not in clip             # ... and it is the object's own
         if box and not clip and hpx and hpx >= 6.0 and wa:
             at["aspect"] = (box[2] - box[0]) / hpx   # of a whole box: which way a vehicle points
         # the box's centre: as good as its edges, unless a side is cut (then the centre is not the object's)
-        if box and "l" not in clip and "r" not in clip:
+        if gcb is not None:                              # the pose head's centre: its own column, its own sigma
+            sb = gcb[1]
+        elif box and "l" not in clip and "r" not in clip:
             sb = math.hypot(crel * (box[2] - box[0]) / f, math.radians(c["bearing_floor_deg"]))
         else:
             sb = math.radians(o["bearing_std_deg"]) if _fin(o.get("bearing_std_deg")) else math.radians(1.0)
-        if _fin(o.get("range_m")) and o["range_m"] > 0.5 and not (flags and "b" in clip):
+        pgn = None                                       # the pose head's ground point as an angle: (angle, sigma)
+        hidb = False
+        if gn is not None:
+            g = self.cam.ground(gn[0], gn[1])
+            rg = math.hypot(g[0], g[1]) if g is not None else 0.0
+            if 0.5 < rg < 200.0:
+                pgn = (math.atan2(hc, rg), math.hypot(gn[2] / f, jit))
+                oe, tr = o.get("occ_edges"), o.get("trunc")
+                under = isinstance(oe, str) and "b" in oe
+                hidb = "b" in (o.get("clip") or "") or under or (isinstance(tr, str) and "b" in tr)
+                if hidb:
+                    # the bottom of the box is not the object's: the head's point is the row this box lacked. The
+                    # contact lies no higher in the picture than the visible bottom: the Gaussian cut there
+                    sg = pgn[1] * (tc["pose_gn_occ"] if under else 1.0)
+                    gb = self.cam.ground(0.5 * (box[0] + box[2]), box[3])
+                    rb = math.hypot(gb[0], gb[1]) if gb is not None else 0.0
+                    if rb > 0.5:
+                        m, var = _NR.radar_trunc_low(pgn[0], sg, math.atan2(hc, rb))
+                        pgn = (m, math.sqrt(var))
+                    else:
+                        pgn = (pgn[0], sg)
+                elif gn[3] < tc["pose_min_seen"]:
+                    pgn = None
+        if pgn is not None and hidb:
+            dets.append({"kind": "rb", "z": np.array([pgn[0], b]), "R": np.array([pgn[1] * pgn[1], sb * sb]), "attrs": at,
+                         "w": wa, "wok": wok})
+        elif _fin(o.get("range_m")) and o["range_m"] > 0.5 and not (flags and "b" in clip):
             # the ground point as the camera saw it: the angle below the horizon of the bottom edge
             r = float(o["range_m"])
             ang = math.atan2(hc, r)
@@ -247,6 +301,10 @@ class Radar:
             else:                                    # no box given: what the stated range error is as an angle
                 sr = float(o["range_std_m"]) if _fin(o.get("range_std_m")) else 0.2 * r
                 sa = max(sr * hc / (r * r + hc * hc), jit)
+            if pgn is not None and pgn[1] < sa:          # a whole box: ONE row, whichever is the surer (the same pixels)
+                ang, sa = pgn
+            else:
+                pgn = None
             if hpx is not None and hpx >= 6.0 and "t" not in clip and "b" not in clip:
                 sh = (hpxs + hrel * hpx) / hpx          # of the logarithm
                 if occ > 0.0:                            # partly covered with no edge hidden: its size is less sure
@@ -273,6 +331,9 @@ class Radar:
         self._scale_rate(d, o)
         if not xin:
             return
+        if pgn is not None or gcb is not None or yaw is not None:
+            d["p"] = (0.0, 1.0 if pgn is not None else 0.0, 1.0 if gcb is not None else 0.0, 1.0 if yaw is not None else 0.0) \
+                + (yaw or (0.0, 0.0, 0.0, 0.0, 0.0))
         if occ >= 0.1:
             d["wok"] = False                             # a width (and a length) is not learnt from a covered box
         hid = ("l" in clip) + 2 * ("t" in clip) + 4 * ("r" in clip) + 8 * ("b" in clip)
