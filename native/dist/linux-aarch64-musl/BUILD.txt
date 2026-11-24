@@ -3,10 +3,10 @@ image: alpine:edge (linux/arm64)
 compiler: cc (Alpine 15.2.0) 15.2.0
 python headers: Python 3.14.10
 numpy in the test run: 2.5.5
-source sha256: 02dc807bbb129533bc4fc15fff137114bcb0d58c4da3b20e1084b8e7438adb99
-source sha256 (predict.c, included): b2b567f85cda0f42a0c89c62f0de357e5e4c79a74d8a211326cd1b76379f7165
-source sha256 (decide.c, included): 4b96893383aa49c6be918c3065f88fb798149cc5cc72fac9de22172a1f91fcfb
+source sha256: 74fb19c7dd97b12852b9944e1a02314b95a5b7325527ef6df6b6796b85b30ec9
+source sha256 (predict.c, included): ac5b514abad9da9c203f8e085e534dafb2d7db8475114654c25bf749021e899c
+source sha256 (decide.c, included): d216e984aec3338accde3cb883212c6785e2cdb11aed3780e7bf0900ab5cb33e
 source sha256 (egomotion.c, included): c5de6f5efb11b3dddd5b1ae69b7d7bd8730f45bc58fc4660e746c7d7aeadb7f5
-binary sha256: f86a2a3c0462eb7223c1dd873baae34a8441efb7ed452a1e92c0e0c2e2ce6f18
+binary sha256: 24c6ca59f4429e2aa345ab8de608d99d1ff8ad29204aacd11a66d063bc76e29c
 .....................s...                                                [100%]
-24 passed, 1 skipped in 790.68s (0:13:10)
+24 passed, 1 skipped in 991.16s (0:16:31)
