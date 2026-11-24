@@ -1438,29 +1438,7 @@ static PyObject *df_get(PyObject *d, int key)   /* d.get(key): borrowed, NULL wh
     return v;
 }
 
-/* _fin(v): an int or a float (no bool), finite */
-static int df_fin(PyObject *v, double *out)
-{
-    if (v == NULL)
-        return 0;
-    if (PyFloat_Check(v)) {
-        double d = PyFloat_AsDouble(v);
-        if (!isfinite(d))
-            return 0;
-        *out = d;
-        return 1;
-    }
-    if (PyLong_Check(v) && !PyBool_Check(v)) {
-        double d = PyLong_AsDouble(v);
-        if (d == -1.0 && PyErr_Occurred()) {
-            PyErr_Clear();
-            return 0;
-        }
-        *out = d;
-        return 1;
-    }
-    return 0;
-}
+#define df_fin py_fin                           /* _fin(v): an int or a float (no bool), finite (predict.c) */
 
 /* float(v or 0.0) */
 static int df_num0(PyObject *v, double *out)

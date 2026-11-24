@@ -1,8 +1,10 @@
 """The predictor's face for in-process consumers: `Predictor.update(radar_msg, context)` -> `Prediction`.
 
-Python here is glue: it reads the radar message's objects into one array, keeps each object's filter state between
-frames (a row per object id), turns the road context into the arrays the native core reads, and wraps what the core
-wrote. Every number of the prediction is computed in `native/src/predict.c` (`predict_frame`).
+Python here is glue: it keeps each object's filter state between frames (a row per object id), turns the road context
+into the arrays the native core reads, and wraps what the core wrote. Every number of the prediction is computed in
+`native/src/predict.c` (`predict_frame`); the radar message's objects are read into its array there (`predict_pack`),
+and the forms the prediction leaves in are made there: the `radar_fut` message (`predict_message`, only when someone
+reads it) and the arrays the decision layer takes in process (`predict_handoff`).
 """
 import math
 
@@ -26,8 +28,8 @@ R_W, R_Q, R_KERBL, R_KERBR, R_VLIM = range(5)
 L_EGO, L_LEFT, L_RIGHT, L_ONC, L_CROSS, L_PARK, L_OFF = range(7)
 F_S, F_D, F_SD, F_DC, F_DIR, F_LANE, F_LEAD, F_GAP, F_E, F_R, F_A, F_PSI, F_STOP, F_JDIST, F_KERB, F_OM = range(16)
 
+# the kinds of road user in the object row's kind column, in this order (predict.c PK_KIND reads the label so)
 KINDS = ("car", "van", "truck", "bus", "tram", "motorbike", "bike", "human", None)
-_KIND = {k: i for i, k in enumerate(KINDS)}
 # width and length of a kind where the radar's models do not say (m): class priors, used while the radar message
 # has no `wid` / `len` of the object itself
 _WL = {"bike": (0.6, 1.8), "human": (0.6, 0.5), None: (1.8, 4.5)}
@@ -73,13 +75,7 @@ def sample_times(cfg):
     return np.array(out[:64])
 
 
-_STD = (2.0, 1.0, 2.0, 1.0)
 _IDLE = {"path": "idle"}
-_NAN = math.nan
-
-
-def _D(v, d):
-    return d if v is None else v
 
 
 def _fin(v):
@@ -88,14 +84,6 @@ def _fin(v):
 
 def _num(v, d=math.nan):
     return float(v) if _fin(v) else d
-
-
-def _ctr(c):
-    """The radar's `ctr` (the object's centre, car axes) as two numbers, NaN where it is not given: the object's place
-    on the road (lanes, the path); x_m, y_m (the near face) stay where its futures start."""
-    if c.__class__ in (list, tuple) and len(c) == 2 and _fin(c[0]) and _fin(c[1]):
-        return float(c[0]), float(c[1])
-    return _NAN, _NAN
 
 
 def _dist(v, n):
@@ -325,62 +313,59 @@ class Prediction:
                                      solved by belief propagation, objects, futures, the car's leader (index, -1)
     """
     names, lanes, slots = NAMES, LANES, SLOTS
+    # views and integer copies of the arrays the native core wrote: made when first read
+    _LAZY = {"n_modes": lambda s: s._modes[:, 0, 0].astype(int), "slot": lambda s: s._modes[:, 1].astype(int),
+             "m": lambda s: s._modes[:, 2].astype(int), "p": lambda s: s._modes[:, 3], "p0": lambda s: s._modes[:, 4],
+             "ego_p": lambda s: s._ego_out[:, 0], "ego_m": lambda s: s._ego_out[:, 1].astype(int),
+             "kind": lambda s: s._objs[:, O_KIND].astype(int), "seen": lambda s: s._objs[:, O_SEEN] > 0.5,
+             "xy": lambda s: s._objs[:, :2]}
 
-    def __init__(self, ts, t, ids, modes, traj, lane, intent, feat, ego_n, ego_out, ego_traj, stats, dec, source):
-        self.ts_mono_ns, self.t, self.ids = ts, t, ids
-        self._modes = modes
-        self.n_modes = modes[:, 0, 0].astype(int)
-        self.slot = modes[:, 1].astype(int)
-        self.m = modes[:, 2].astype(int)
-        self.p, self.p0 = modes[:, 3], modes[:, 4]
+    def __init__(self, ts, t, ids, sel, objs, modes, traj, lane, intent, feat, ego_n, ego_out, ego_traj, stats, dec, source):
+        self.ts_mono_ns, self.t, self.ids, self.sel = ts, t, ids, sel            # sel: {object id: row}
+        self._objs, self._modes, self._ego_out = objs, modes, ego_out            # objs: the rows predict_frame read
         self.traj, self.lane, self.intent, self.feat = traj, lane, intent, feat
-        self.ego_n, self.ego_p, self.ego_m, self.ego_traj = ego_n, ego_out[:, 0], ego_out[:, 1].astype(int), ego_traj
-        self._ego_out = ego_out
+        self.ego_n, self.ego_traj = ego_n, ego_traj
         self.stats, self._dec, self.source = stats, dec, source
-        self._index = self._f = self._lane = self._intent = self._hand = None
+        self._parts = {}
+        self._hand = None
+
+    def __getattr__(self, name):
+        make = Prediction._LAZY.get(name)
+        if make is None:
+            raise AttributeError(name)
+        v = make(self)
+        setattr(self, name, v)
+        return v
 
     def index(self, oid):
-        if self._index is None:
-            self._index = {i: k for k, i in enumerate(self.ids)}
-        return self._index.get(oid)
+        return self.sel.get(oid)
+
+    def _part(self, part, radar_msg=None):
+        """The message form, by the native core (predict.c predict_message): the `radar_fut` message (0), or the
+        futures (1), lane dicts (2), intent dicts (3) of every object, or `ego_fut` (4)."""
+        return _N.predict_message(radar_msg, self.sel, self.t, self.traj, self._modes, self.lane, self.intent, self._ego_out,
+                                  self.ego_traj, int(self.ego_n), NAMES, LANES, SLOTS, self._dec, self.source, part)
+
+    def _kept(self, part):
+        v = self._parts.get(part)
+        if v is None:
+            v = self._parts[part] = self._part(part)
+        return v
 
     def intent_names(self, i):
         """{manoeuvre name: probability} of object i: the intent filter's slots under the names this object's
         futures are published with (a slot without a future keeps its slot name)."""
-        if self._intent is None:
-            self._intent = (np.round(self.intent, 3).tolist(), self.slot.tolist(), self.m.tolist(), self.n_modes.tolist())
-        rows, slot, mm, nm = self._intent
-        named = {slot[i][k]: NAMES[mm[i][k]] for k in range(nm[i])}
-        out = {}
-        for s, v in enumerate(rows[i]):
-            if v > 0.0005:
-                k = named.get(s) or SLOTS[s]
-                out[k] = round(out[k] + v, 3) if k in out else v
-        return out
+        return self._kept(3)[i]
 
     def fut(self, i):
         """The message form of object i's futures (rounded lists)."""
-        return self._futs()[i]
-
-    def _futs(self):
-        if self._f is None:
-            self._f = _N.predict_futs(self.traj, self._modes, NAMES, self._dec)
-        return self._f
+        return self._kept(1)[i]
 
     def ego_fut(self):
-        n = self.ego_n
-        if not n:
-            return {"modes": []}
-        tr = self.ego_traj[:n]
-        flat = round_lists(np.ascontiguousarray(tr.transpose(0, 2, 1)).reshape(-1, tr.shape[1]), self._dec, False)
-        p = np.round(self.ego_p[:n], 3).tolist()
-        return {"modes": [{"p": p[k], "m": NAMES[self.ego_m[k]], "x": flat[3 * k], "y": flat[3 * k + 1], "v": flat[3 * k + 2]}
-                          for k in range(n)]}
+        return self._part(4)
 
     def lane_dict(self, i):
-        if self._lane is None:
-            self._lane = np.round(self.lane, 3).tolist()
-        return dict(zip(LANES, self._lane[i]))
+        return self._kept(2)[i]
 
     def handoff(self):
         """The prediction as the decision layer takes it in process (decide/futures.py `Futures`): the arrays with
@@ -388,31 +373,18 @@ class Prediction:
         h = self._hand
         if h is None:
             from ..decide.futures import Futures, ego_speed
-            modes, names, rows, lanes, ego, ego_names, sel, v_bad = _N.predict_handoff(
-                self.traj, self._modes, self.lane, self._ego_out, self.ego_traj, int(self.ego_n), NAMES, self._dec, self.ids)
-            n = len(self.t)
-            if ego is not None:
-                ego = np.frombuffer(ego).reshape(-1, 1 + 3 * n)
-                if v_bad:
-                    ego = ego_speed(ego, self.t)
-            h = self._hand = Futures(self.t, ego, ego_names, True, np.frombuffer(modes).reshape(-1, 2 + 5 * n), names,
-                                     np.frombuffer(rows).reshape(-1, 3), np.frombuffer(lanes).reshape(-1, 7), sel)
+            modes, names, rows, lanes, ego, ego_names, v_bad = _N.predict_handoff(
+                self.traj, self._modes, self.lane, self._ego_out, self.ego_traj, int(self.ego_n), NAMES, self._dec)
+            if ego is not None and v_bad:
+                ego = ego_speed(np.frombuffer(ego).reshape(-1, 1 + 3 * len(self.t)), self.t)
+            h = self._hand = Futures(self.t, ego, ego_names, True, modes, names, rows, lanes, self.sel)
         return h
 
     def message(self, radar_msg):
         """`radar_fut`: the radar message of the same stamp with the prediction added. Top level `fut` {"t"},
         `ego_fut` {"modes"}, `fut_ctx` (what the road context was made of); per object `fut` [modes], `lane`,
         `intent`. Objects the predictor did not take (beyond `objects_max`, tentative) are passed on as they are."""
-        futs = self._futs()
-        objs = []
-        for o in radar_msg.get("objects") or ():
-            i = self.index(o.get("id"))
-            if i is not None:
-                o = dict(o, fut=futs[i], lane=self.lane_dict(i), intent=self.intent_names(i))
-            objs.append(o)
-        out = dict(radar_msg, type="radar_fut", objects=objs, fut={"t": self.t.tolist()}, ego_fut=self.ego_fut(),
-                   fut_ctx=self.source)
-        return out
+        return self._part(0, radar_msg)
 
 
 class Predictor:
@@ -457,45 +429,6 @@ class Predictor:
         self._learn = {"oncoming": None, "park_left": None, "park_right": None}
         self._lane_key = self._lanes = self._lane_nopath = None
         self._ground = None
-
-    # ---- the radar message's objects as the native core reads them ------------------------------------------
-    def _objects(self, msg):
-        c = self.cfg
-        objs = [o for o in msg.get("objects") or () if isinstance(o, dict) and _fin(o.get("x_m")) and _fin(o.get("y_m"))
-                and (c["tentative"] or o.get("state") != "tentative")]
-        if len(objs) > c["objects_max"]:
-            objs = sorted(objs, key=lambda o: o["x_m"] * o["x_m"] + o["y_m"] * o["y_m"])[:c["objects_max"]]
-        n = len(objs)
-        a = np.full((n, NO), math.nan)
-        ids = []
-        kind = _KIND
-        for i, o in enumerate(objs):
-            g = o.get
-            std = g("std") or _STD
-            cls = g("class")
-            # the estimation core's fields when the radar sends them: extent, body direction, visibility
-            hd, hs = g("hdg"), g("hdg_std")
-            if hd.__class__ is list:                           # [value, std]
-                hd, hs = hd[0], hd[1] if len(hd) > 1 else None
-            ind, br, vis = g("indicator"), g("brake_lights"), g("vis")
-            fl, mo = g("flags") or (), g("motion")              # the radar's own verdicts
-            a[i] = (o["x_m"], o["y_m"], g("vx_mps") or 0.0, g("vy_mps") or 0.0, g("ax_mps2") or 0.0, g("ay_mps2") or 0.0,
-                    std[0], std[1], std[2], std[3], kind.get(cls.get("label"), 8) if cls else 8,
-                    _D(g("p_stationary"), 0.5), _D(g("len"), _NAN), _D(g("wid"), _NAN), _D(hd, _NAN), _D(hs, _NAN),
-                    _D(g("exist"), 1.0), 0.0 if g("state") == "memory" else 1.0,
-                    _NAN if ind is None else 1.0 if ind == "left" else -1.0 if ind == "right" else 0.0,
-                    _NAN if br is None else 1.0 if br else 0.0, 1.0 if "parked" in fl else 0.0, i,
-                    _NAN if vis is None else 0.0 if vis in ("occluded", "hidden", False) else 1.0,
-                    1.0 if mo == "stationary" else -1.0 if mo == "moving" else 0.0, 1.0 if "with_traffic" in fl or "oncoming" in fl else 0.0,
-                    *_ctr(g("ctr")))
-            ids.append(g("id"))
-        if n:
-            num = a[:, :12]
-            if not np.isfinite(num).all():                     # a number that is none: the object's row is made harmless
-                bad = ~np.isfinite(num).all(axis=1)
-                a[bad, 2:6], a[bad, 6:10], a[bad, 11] = 0.0, (2.0, 1.0, 2.0, 1.0), 0.5
-            np.maximum(a[:, 6:10], 0.05, out=a[:, 6:10])
-        return a, ids, objs
 
     def _state(self, ids):
         rows, S = self._rows, self._S
@@ -545,7 +478,11 @@ class Predictor:
             self._ground = gf
         v, w, acc = _num(eg.get("speed_mps"), 0.0), _num(eg.get("yaw_rate_rps"), 0.0), _num(eg.get("accel_mps2"), 0.0)
         self.ego.add(T, v, w)
-        a, ids, objs = self._objects(radar_msg)
+        # the radar message's objects as the native core reads them (predict.c predict_pack)
+        objs = radar_msg.get("objects") or ()
+        rows, ids, _, sel = _N.predict_pack(objs if objs.__class__ is list else list(objs), bool(self.cfg["tentative"]),
+                                            int(self.cfg["objects_max"]))
+        a = np.frombuffer(rows).reshape(-1, NO)
         n = len(ids)
         idx = self._state(ids)
         st = np.ascontiguousarray(self._S[idx]) if n else np.zeros((0, NS_))
@@ -571,11 +508,8 @@ class Predictor:
         self._learned(a, lane, feat)
         src = {"path": context.get("source") or ("given" if has_path else "kinematic"),
                "quality": round(float(road[R_Q]), 2), "arms": len(ameta), "lane_width_m": round(float(road[R_W]), 2)}
-        pred = Prediction(ts, self.times, ids, modes, traj, lane, intent, feat, ego_n, ego_out, ego_traj, stats,
+        pred = Prediction(ts, self.times, ids, sel, a, modes, traj, lane, intent, feat, ego_n, ego_out, ego_traj, stats,
                           self.cfg["decimals"], src)
-        pred.kind = a[:, O_KIND].astype(int) if n else np.zeros(0, int)
-        pred.seen = a[:, O_SEEN] > 0.5 if n else np.zeros(0, bool)
-        pred.xy = a[:, :2]
         self.check.update(T, pred, self.ego)
         self.frames += 1
         self.last = pred

@@ -79,10 +79,63 @@ def test_times_and_message_form():
             assert all(len(f[k]) == 22 for k in ("x", "y", "sx", "sy", "rxy", "v"))
             assert min(f["sx"]) > 0.0 and min(f["sy"]) > 0.0 and max(abs(r) for r in f["rxy"]) < 1.0
     json.dumps(out)                                           # plain data
+    # the parts of the message one by one (the same native builder): what the message holds
+    assert pred.ego_fut() == out["ego_fut"] and len(out["objects"]) == len(m["objects"])
+    for o in out["objects"]:
+        i = pred.index(o["id"])
+        assert (pred.fut(i), pred.lane_dict(i), pred.intent_names(i)) == (o["fut"], o["lane"], o["intent"])
+        f = max(o["fut"], key=lambda f: f["p"])               # rounded: positions to 0.01, probabilities to 0.001
+        k = [pred.names[c] for c in pred.m[i, :pred.n_modes[i]]].index(f["m"])
+        assert f["x"] == np.round(pred.traj[i, k, :, 0], 2).tolist() and f["p"] == round(float(pred.p[i, k]), 3)
+        assert o["lane"] == dict(zip(pred.lanes, np.round(pred.lane[i], 3).tolist()))
+        named = {int(pred.slot[i, q]): pred.names[int(pred.m[i, q])] for q in range(pred.n_modes[i])}
+        want = {}
+        for sl, v in enumerate(np.round(pred.intent[i], 3).tolist()):     # the slots under their futures' names
+            if v > 0.0005:
+                name = named.get(sl) or pred.slots[sl]
+                want[name] = round(want.get(name, 0.0) + v, 3) if name in want else v
+        assert o["intent"] == want
+    # an object the predictor did not take is passed on as it is
+    more = dict(m, objects=m["objects"] + [{"id": 99, "state": "tentative", "x_m": 5.0, "y_m": 0.0}])
+    assert pred.message(more)["objects"][-1] is more["objects"][-1]
     # arrays: the same content
     i = pred.index(1)
     assert pred.traj.shape[1:] == (8, 22, 6) and np.isfinite(pred.traj[i, :pred.n_modes[i]]).all()
     assert abs(pred.p[i, :pred.n_modes[i]].sum() - 1.0) < 1e-9 and abs(pred.p0[i, :pred.n_modes[i]].sum() - 1.0) < 1e-9
+
+
+def test_the_radars_objects_as_the_native_core_reads_them():
+    """predict.c predict_pack: which objects are taken, each one's row (PO_*), a row with a number that is none."""
+    nan = math.nan
+
+    def o(**kw):
+        return dict({"id": 1, "state": "confirmed", "x_m": 10.0, "y_m": 1.0}, **kw)
+    objs = [o(id=1, vx_mps=3.0, std=[0.5, 0.2, 0.01, 2.0], p_stationary=0.2, len=9.0, wid=2.5, hdg=[0.1, 0.05], exist=0.9,
+              indicator="left", brake_lights=True, flags=["parked", "oncoming"], vis="occluded", motion="moving",
+              ctr=[14.0, 1.2], **{"class": {"label": "truck"}}),
+            o(id=2, state="memory", x_m=4, indicator="right", brake_lights=False, vis=True, motion="stationary", hdg=0.3,
+              hdg_std=0.2, ctr=[1.0], **{"class": {"label": "lorry"}}),
+            o(id=3, state="tentative", x_m=2.0), o(id=4, x_m=None), "junk", o(id=6, y_m=nan),
+            o(id=5, x_m=30.0, vx_mps=nan, ay_mps2=1.0, std=[1.0, 1.0, 1.0, 1.0], p_stationary=0.9, vis=False, indicator="hazard")]
+    rows, ids, taken, sel = native.predict.predict_pack(objs, False, 48)
+    a = np.frombuffer(rows).reshape(-1, PM.NO)
+    assert ids == [1, 2, 5] and sel == {1: 0, 2: 1, 5: 2} and all(u is v for u, v in zip(taken, (objs[0], objs[1], objs[6])))
+    want = [[10.0, 1.0, 3.0, 0.0, 0.0, 0.0, 0.5, 0.2, 0.05, 2.0, 2.0, 0.2, 9.0, 2.5, 0.1, 0.05, 0.9, 1.0, 1.0, 1.0, 1.0, 0.0,
+             0.0, -1.0, 1.0, 14.0, 1.2],
+            # no std: (2, 1, 2, 1); a label that is not a kind: 8; remembered: not seen; a centre of one number: none
+            [4.0, 1.0, 0.0, 0.0, 0.0, 0.0, 2.0, 1.0, 2.0, 1.0, 8.0, 0.5, nan, nan, 0.3, 0.2, 1.0, 0.0, -1.0, 0.0, 0.0, 1.0,
+             1.0, 1.0, 0.0, nan, nan],
+            # a velocity that is no number: no motion, wide spreads, p_stationary one half
+            [30.0, 1.0, 0.0, 0.0, 0.0, 0.0, 2.0, 1.0, 2.0, 1.0, 8.0, 0.5, nan, nan, nan, nan, 1.0, 1.0, 0.0, nan, 0.0, 2.0,
+             0.0, 0.0, 0.0, nan, nan]]
+    assert np.array_equal(a, np.array(want), equal_nan=True)
+    assert native.predict.predict_pack(objs, True, 48)[1] == [1, 2, 3, 5]             # tentative ones too
+    rows, ids, _, sel = native.predict.predict_pack(objs, True, 2)                   # the nearest two, nearest first
+    assert ids == [3, 2] and sel == {3: 0, 2: 1} and np.frombuffer(rows).reshape(-1, PM.NO)[:, PM.O_ID].tolist() == [0.0, 1.0]
+    assert native.predict.predict_pack([], False, 48)[1:] == ([], [], {}) and native.predict.predict_pack(None, False, 48)[1] == []
+    kinds = [o(id=k, **{"class": {"label": lab}}) for k, lab in enumerate(PM.KINDS)] + [o(id=9, **{"class": {"label": "Car"}})]
+    a = np.frombuffer(native.predict.predict_pack(kinds, False, 48)[0]).reshape(-1, PM.NO)
+    assert a[:, PM.O_KIND].tolist() == [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 8.0]      # the row's kind: PM.KINDS' order
 
 
 def test_spread_grows_and_starts_at_the_trackers():
@@ -338,6 +391,19 @@ def test_selfcheck_scores_what_happened():
     assert np.allclose(out[[0, 1, 2, 4], 0], 0.0) and np.allclose(out[[0, 4], 3], 3.0) and np.allclose(out[4, 5], 0.0)
     assert abs(out[0, 4] - (-math.log(0.3 / (2 * math.pi * 0.25) + 0.7 * math.exp(-18.0) / (2 * math.pi * 0.25)))) < 1e-9
     assert np.allclose(out[nt].tolist()[:2], [0.0, 3.0])
+    # ... into the statistics: by horizon (here the samples 0, 3, 4; 3 was not seen) for the vehicles and for all,
+    # the calibration (the future given 0.3 was right, the one given 0.7 was not), the Brier sum
+    from chris_integrator.predict.selfcheck import SelfCheck
+    sc = SelfCheck(np.array([1.0, 2.0, 3.0, 4.0, 5.0]))
+    sc.hk = [0, 3, 4]
+    sc.reset()
+    sc.add(0, out, np.array([1.0, 1, 1, 0, 1]), np.array([0.3, 0.7]), win)
+    sc.add(7, out, np.array([1.0, 1, 1, 0, 1]), np.array([0.3, 0.7]), win)           # a pedestrian's
+    assert sc.scored == 2 and sc.n.tolist() == [[1.0, 0.0, 1.0], [0.0] * 3, [1.0, 0.0, 1.0], [2.0, 0.0, 2.0]]
+    assert np.allclose(sc.sums[0, :, 2], [3.0, 0.0, 3.0]) and np.allclose(sc.sums[3, :, 2], [6.0, 0.0, 6.0])
+    assert np.allclose(sc.sums[0, 0], out[0, [0, 1, 3, 4, 5]]) and np.allclose(sc.sums[2], sc.sums[0])
+    assert sc.cal[3].tolist() == [2.0, 2.0] and sc.cal[7].tolist() == [2.0, 0.0] and sc.cal.sum() == 6.0
+    assert np.allclose(sc.brier, [2 * (0.7 ** 2 + 0.7 ** 2), 4.0])
 
 
 def test_context_builder_reads_the_stacks_messages():

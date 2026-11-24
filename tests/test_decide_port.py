@@ -129,7 +129,8 @@ class Handoff(unittest.TestCase):
             a = pred.handoff()
             b = FU.from_message(json.loads(json.dumps(pred.message(radar))))
             self.assertEqual(a.t.tolist(), b.t.tolist())
-            self.assertEqual(np.asarray(a.ego).tolist(), b.ego.tolist())
+            (ae, am, ar, al), (be, bm, br, bl) = a.arrays(), b.arrays()
+            self.assertEqual(ae.tolist(), be.tolist())
             self.assertEqual((a.ego_names, a.ego_given), (b.ego_names, b.ego_given))
             judged = 0
             for j, o in enumerate(radar["objects"]):
@@ -137,13 +138,13 @@ class Handoff(unittest.TestCase):
                     continue
                 judged += 1
                 ra, rb = a.sel[o["id"]], b.sel[j]
-                (fa, na, sa), (fb, nb, sb) = (int(v) for v in a.rows[ra]), (int(v) for v in b.rows[rb])
+                (fa, na, sa), (fb, nb, sb) = (int(v) for v in ar[ra]), (int(v) for v in br[rb])
                 self.assertEqual((na, sa), (nb, sb))
                 self.assertEqual(sa, 1)
-                self.assertEqual(a.modes[fa:fa + na].tolist(), b.modes[fb:fb + nb].tolist())
+                self.assertEqual(am[fa:fa + na].tolist(), bm[fb:fb + nb].tolist())
                 self.assertEqual(a.names[fa:fa + na], b.names[fb:fb + nb])
-                self.assertEqual(a.lanes[ra].tolist(), list(b.lanes[rb].values()))
-                self.assertEqual(list(b.lanes[rb]), list(pred.lanes))
+                self.assertEqual(al[ra].tolist(), list(bl[rb].values()))
+                self.assertEqual(list(bl[rb]), list(pred.lanes))
             self.assertGreater(judged, 3)
             tm = TH.ThreatModel()
             ea, eb = tm.explain(radar, a), tm.explain(radar, b)

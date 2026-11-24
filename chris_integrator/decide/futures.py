@@ -112,13 +112,24 @@ class Futures:
         rows       (R, 3): first mode, modes, state (0 no futures, 1 as the contract says, 2 not: the adapter
                    stands in and it is counted)
         lanes      None | [R] of the message's lane dicts (or None) | (R, 7) probabilities of LANES
-        sel        {object id: row} | [row or -1 per object of the radar message]"""
+        sel        {object id: row} | [row or -1 per object of the radar message]
+
+    The arrays are float64 arrays or their bytes (the predictor hands bytes over: the native core reads either);
+    `arrays()` gives them as arrays."""
     __slots__ = ("t", "ego", "ego_names", "ego_given", "modes", "names", "rows", "lanes", "sel", "fields")
 
     def __init__(self, t, ego, ego_names, ego_given, modes, names, rows, lanes, sel):
         self.t, self.ego, self.ego_names, self.ego_given = t, ego, ego_names, ego_given
         self.modes, self.names, self.rows, self.lanes, self.sel = modes, names, rows, lanes, sel
         self.fields = (t, ego, ego_names, ego_given, modes, names, rows, lanes, sel)      # as decide_frame takes them
+
+    def arrays(self):
+        """(ego (E, 1 + 3 N) or None, modes (K, 2 + 5 N), rows (R, 3), lanes (R, 7) | list | None) as numpy arrays."""
+        n = len(self.t) if self.t is not None else 0
+
+        def arr(a, w):
+            return a if a is None or isinstance(a, list) else np.frombuffer(a).reshape(-1, w) if isinstance(a, bytes) else a
+        return arr(self.ego, 1 + 3 * n), arr(self.modes, 2 + 5 * n), arr(self.rows, 3), arr(self.lanes, 7)
 
 
 def ego_speed(ego, t):

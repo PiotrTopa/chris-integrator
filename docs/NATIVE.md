@@ -2,7 +2,7 @@
 
 On a slow core (the reference deployment runs chris-integrator on a phone's little core) the price of Python
 is the budget, so the arithmetic and the text work of the per-message hot path are written in C: one translation
-unit, `chris_integrator/native/src/chris_native.c` (it includes `decide.c`, the decision layer's part), compiled to one module, `chris_integrator/native/_chris_native.abi3.so`.
+unit, `chris_integrator/native/src/chris_native.c` (it includes `predict.c` and `decide.c`, the prediction and the decision layer's parts), compiled to one module, `chris_integrator/native/_chris_native.abi3.so`.
 The module is part of the package: it is required, and every function in it exists once. There is no second,
 pure-Python implementation of what is native, and no switch between two.
 
@@ -62,6 +62,7 @@ not float64 is made a float64 copy; a stream's value beyond 2^53 is read as the 
 | `radar` | `radar_frame` (radar/box) | the message's objects: their numbers, flags with their hysteresis, the dicts | golden: to rounding; digests of three drives' messages (x86-64) |
 | `radar` | `radar_h` (radar/sensors: camera kinds b, rb, rbh, bt with and without the scale-rate row, microwave radar, position), `radar_marginals`, `radar_assign`, `radar_kbest`, `radar_predict1`, `radar_still1`, `radar_transition1` (one hypothesis; tests and tools) | measurement functions, pairings' probabilities, assignment, ranked assignments, one hypothesis' step | golden |
 | `predict` | `predict_frame` (chris_integrator/predict: one frame of the predictor: the road's curvilinear frame, every object's lane filter, manoeuvre filter, futures with their covariance, car following, the joint weights of interacting road users, the car's own futures), `predict_score` (a past prediction against what happened), `predict_cfg`, `predict_names` | the predictor's arithmetic; source file `native/src/predict.c`, included by `chris_native.c` | golden (`tests/data/predict_golden.json`, recorded from this code: there never was a Python implementation): to 2e-5 (sin, cos, exp, erfc of the C library); behaviour by `tests/test_predict.py` |
+| `predict` | `predict_pack` (the radar message's objects into the array `predict_frame` reads), `predict_message` (the `radar_fut` message and its parts: futures, lane and intent dicts, `ego_fut`), `predict_futs`, `predict_handoff` (the prediction as the decision layer takes it in process: arrays with the message's rounded numbers), `predict_check_take`, `predict_score_batch`, `predict_score_add` (the self-check: a kept batch takes its objects' places; scored predictions into the sums) | the predictor's glue around the frame (predictor.py `_objects`, `Prediction.message` / `lane_dict` / `intent_names` / `ego_fut`, selfcheck.py `_score` / `add` until 2026-11-24) | the messages recorded before it moved (`tests/data/decide_port_golden.json.gz`, `tests/test_decide_port.py`: `radar_fut` as text), rows and sums by hand in `tests/test_predict.py` |
 
 The lane tracker's steps are exact because its arithmetic is elementwise, and its two means over the gate points
 are added in sequence, as numpy adds a masked selection. The road geometry's arc length is a sequential sum of
@@ -73,10 +74,22 @@ the last bit or two of a double. After the monitors and trackers, on recorded dr
 messages per drive in which a number that rounds to zero carries the other sign (`-0.0` / `0.0`) and, rarely, a
 last printed digit; lane report L50 has the counts.
 
-| `decide` | `decide_eval` (decide/threat.py), `decide_inst_prob`, `decide_draws` (`native/src/decide.c`, included by chris_native.c) | per object, mode and car mode: collision probability over the horizon (quasi-Monte Carlo on fixed Halton draws, or the exact Gaussian over the footprints' Minkowski sum per time), required braking / steering / combined demand, threat numbers, time-to-brake / -steer, time to collision, headway, levels | closed forms (required deceleration v^2 / 2d, latest onset), the exact integral against products of normal distributions and against sampling; golden `tests/data/decide_golden.npz` (`python3 tests/data/make_decide_golden.py`): to rounding, bisected demands and times within their tolerances (0.06), Monte Carlo shares within 0.01 |
+| `decide` | `decide_eval` (the evaluation alone: tests, golden data), `decide_inst_prob`, `decide_draws` (`native/src/decide.c`, included by chris_native.c) | per object, mode and car mode: collision probability over the horizon (quasi-Monte Carlo on fixed Halton draws, or the exact Gaussian over the footprints' Minkowski sum per time), required braking / steering / combined demand, threat numbers, time-to-brake / -steer, time to collision, headway, levels | closed forms (required deceleration v^2 / 2d, latest onset), the exact integral against products of normal distributions and against sampling; golden `tests/data/decide_golden.npz` (`python3 tests/data/make_decide_golden.py`): to rounding, bisected demands and times within their tolerances (0.06), Monte Carlo shares within 0.01 |
 
-The decision layer was written native from the start (no Python reference was removed): what holds it are the
-closed forms and the independent references of `tests/test_decide_native.py`, and its golden data freeze it.
+| `decide` | `decide_frame` (one radar message: the contract's futures as arrays or the degraded ones, each object's footprint, the evaluation, the records of `decide.objects[]`, the level shown, the list's order), `decide_path` (the road model's plan as a polyline) | the decision layer's glue (decide/futures.py `build`, `contract_modes`, `cv_future(s)`, `ego_futures`, `_project`, `_along`, `extent` and the heading helpers; threat.py `evaluate`, `available`, `object_record`, `pairs_record` until 2026-11-24) | the `decide` messages recorded before it moved (`tests/data/decide_port_golden.json.gz`: with the prediction, with the degraded futures, from `radar_fut` messages alone), the evaluation's arrays of the fixtures bit for bit as the Python glue made them (they are `decide_golden.npz`'s inputs), behaviour by `tests/test_decide.py` |
+
+The decision layer's evaluation was written native from the start (no Python reference was removed): what holds
+it are the closed forms and the independent references of `tests/test_decide_native.py`, and its golden data
+freeze it. The glue around it (and the predictor's) was Python until 2026-11-24 and moved as a port: the same
+arithmetic in the same order, held to the messages it gave before. Where Python's arithmetic is not the C
+library's, the C code does what Python did: `sum()` of floats is compensated (CPython from 3.12: `df_sum`),
+`math.hypot` is CPython's own algorithm (`df_hypot`; numpy's is the C library's), `x ** 2` of a float is the C
+library's `pow` (kept from being folded into `x * x`: the two differ in the last bit now and then), `%` is
+`fmod` with Python's sign rule, `numpy.interp` is `df_interp`. On the development machine the evaluation's input
+arrays are the same bits as the Python glue's in every frame of the simulator runs compared. On another C library
+(the phone: musl) sin / cos / atan2 / pow may differ in a last bit, as they did between its Python and this
+machine's; `python -m chris_integrator.native` holds two frames of it to 1e-9 there
+(`chris_integrator/native/_decide_selftest.py`).
 
 ### The radar: native only
 
@@ -132,7 +145,7 @@ random states with detections up to 1e-10 of the state's variance, many in a row
 
 `chris_integrator/native/src/predict.c` holds the `predict` part. It is not a second module: `chris_native.c`
 includes it (one translation unit, one binary; the build scripts compile `chris_native.c` as before) just above
-its method table, where the macro `PREDICT_METHODS` adds the part's four functions. It uses that file's array
+its method table, where the macro `PREDICT_METHODS` adds the part's functions (`decide.c` likewise: `DECIDE_METHODS`). It uses that file's array
 helpers and nothing of the other parts; its names carry a `P` / `p_` / `pp_` prefix. Its constants are one list in
 the C file (`PCFG`: name and default), which Python reads (`predict_cfg()`) and hands back as an array: there is
 no second copy of a default. Its results were never a Python program's: the golden data
