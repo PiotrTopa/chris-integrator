@@ -108,6 +108,24 @@ class RadarModel(SensorModel):
         return self.p_d
 
 
+def _ill(N, lim=1e4):
+    """np.linalg.cond(N) > lim for a 2 x 2 matrix, the same decision without the SVD where it is clear: the
+    condition number in closed form (s1^2 + s2^2 = |N|_F^2, s1 s2 = |det N|) is accurate to ~1e-12 relative at
+    these sizes, so outside a factor 2 of the limit its side of the limit is the SVD's; near the limit, for a
+    singular or non-finite matrix, the SVD decides as before."""
+    (a, b), (c, d) = N.tolist()
+    f = a * a + b * b + c * c + d * d
+    dt = abs(a * d - b * c)
+    if dt > 0.0 and math.isfinite(f) and math.isfinite(dt):
+        s1sq = 0.5 * (f + math.sqrt(max(f * f - 4.0 * dt * dt, 0.0)))
+        k = s1sq / dt                      # s1 / s2 = s1^2 / (s1 s2)
+        if k < 0.5 * lim:
+            return False
+        if k > 2.0 * lim and math.isfinite(k):
+            return True
+    return bool(np.linalg.cond(N) > lim)
+
+
 def ego_velocity(az, rr, rng, tol=0.35, iters=24):
     """The sensor's own velocity (vx, vy in its frame) from detections of the stationary world:
     rr_i = -(vx cos az_i + vy sin az_i). RANSAC over pairs, then least squares on the inliers.
@@ -142,7 +160,7 @@ def ego_velocity(az, rr, rng, tol=0.35, iters=24):
     for _ in range(2):
         Ai, ri = A[inl], rr[inl]
         N = Ai.T @ Ai
-        if np.linalg.cond(N) > 1e4:
+        if _ill(N):
             return None
         v = np.linalg.solve(N, Ai.T @ ri)
         res = A @ v - rr
