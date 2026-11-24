@@ -416,6 +416,16 @@ What uses it:
   estimate's SMOOTHED velocity at the lag (`shown_moving`);
 * the trajectory (`Obj.history`): the smoothed places and velocities as far back as the smoother reaches.
 
+Two knobs lower its cost (both off; `radar.json` `{"tracker": {...}}`): `smooth_every_s` (0: after every
+sighting): an object's past is smoothed at most this often, a sighting that comes sooner keeps the `vs` it has with
+`vs_age_s` grown; `smooth_for: "read"` (default `"all"`): only objects whose verdict is not "moving" are smoothed
+(the verdict and the groups read the smoothed free estimate of those only), a moving object has `vs: null`.
+Measured 2026-11-24 (`sim.radar_score`, 26 scenarios x day and night, plain and `DETIN`): `"read"` changes no
+score in any of the 104 runs; `smooth_every_s` 0.25 changes 8 of 104 runs, each by a few thousandths (id switches
+351 -> 345 in all). In a dense scene with a detector at frame rate the backward pass is 5.9 % of the stack's
+instructions: `"read"` saves 2.0 %, 0.25 s saves 3.2 %; on a recorded night drive (few objects, a detector at
+6-7 a second) neither saves anything measurable.
+
 Because the history is the primary's story, a pairing revised by the hypotheses (section 1) is revised in the
 trajectory too. Measured (`tests/test_radar.py::PastAndStructure`): a car braking in a radar with 0.8 m/s range
 rate noise, the smoothed velocity of half a second ago is under three quarters of the filtered velocity's error

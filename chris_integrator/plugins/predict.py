@@ -1,6 +1,7 @@
 """The predictor's plug-in face: the component `chris_integrator/predict` wired into the mixer.
 
-In: `radar` (every message is predicted; `rate_hz` lowers that), and what the stack knows of the road, read as it
+In: `radar` (every message is predicted; `rate_hz` lowers that, and the stack's pace, `pace.json`, leaves out
+messages while nothing could matter: plugins/common.py `Pace`), and what the stack knows of the road, read as it
 stands when the radar speaks: `roadgeom`, `lanes`, `egolane`, `road` (its plan), `map`, the car's own `ego` (turn
 signal). Out: `radar_fut`, at the radar message's stamps: that message with the futures added (docs/TOPICS.md).
 
@@ -42,6 +43,12 @@ class Predict(Plugin):
         if not isinstance(ts, int):
             return
         if self._ts is not None and 0 <= ts - self._ts < (1.0 / self.rate_hz - 0.01) * 1e9:
+            return
+        pace = ctx.service("pace")
+        if pace is not None and not pace.due(msg):
+            # a message the stack's pace leaves out (plugins/common.py Pace): only the car's pose is kept up
+            eg = msg.get("ego") or {}
+            b.ego.add(ts / 1e9, float(eg.get("speed_mps") or 0.0), float(eg.get("yaw_rate_rps") or 0.0))
             return
         self._ts = ts
         # with no object to predict nothing is computed (most frames of a quiet road): the message then has no

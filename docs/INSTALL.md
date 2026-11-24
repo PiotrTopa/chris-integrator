@@ -68,7 +68,7 @@ explicitly in the environment is replaced, every other line stays.
 |---|---|
 | `/usr/local/lib/chris/chris_integrator`, `/usr/local/lib/chris/chris_mapper` | the code (replaced on every run) |
 | `/etc/chris/integrator.env` | `CHRIS_API_PORT`, `CHRIS_API_HOST`, `CHRIS_ROADSENSE_HTTP` (and anything the host adds) |
-| `/etc/chris/<plug-in>.json`, `mixer.json`, `recorder.json`, `mapper.json` | optional configuration, one file per plug-in (`chris_integrator/stack.py`) |
+| `/etc/chris/<plug-in>.json`, `mixer.json`, `recorder.json`, `mapper.json` | optional configuration, one file per plug-in (`chris_integrator/stack.py`); `recorder.json`'s keys are listed in `chris_integrator/io/recorder.py` (e.g. `{"dir": "/var/lib/chris/rec", "stamp_hz": {"road": 10}}` records `road` at 10 Hz, thinned by the messages' own `ts_mono_ns`) |
 | `/var/lib/chris/` | state carried across restarts (`integrator.json`: faults, calibration; one file per plug-in that keeps state), `signs.jsonl` (ended sign tracks) |
 | `/var/lib/chris/maps/current.rsmap` | the map pack (a symlink; a changed pack is loaded without a restart) |
 | `/run/chris/` | `position.sock` and `feed.sock` (the vehicle input API: the same server under two names), `integrator.sock` (JSON lines of the public streams) |

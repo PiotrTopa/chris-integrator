@@ -13,7 +13,11 @@ from ..native import round                  # builtins.round (its results; the n
 
 def _median(data):
     """statistics.median of a non-empty list (its arithmetic, without its generic overhead)."""
-    data = sorted(data)
+    return _median_sorted(sorted(data))
+
+
+def _median_sorted(data):
+    """_median of a list already in sorted()'s order."""
     n = len(data)
     if n % 2 == 1:
         return data[n // 2]
@@ -117,6 +121,55 @@ class Pair:
         # the largest value each test statistic reached, as a fraction of its firing level (1 = fired): how near
         # a healthy pair came to an alarm, and what a limit's margin is on a drive
         self.peak = {}
+        # the fire window (what win.last(fire_window_s) returns), kept as samples come and go: (ev, bad, v, rv) in
+        # time order, the count of bad ones, and v and rv each in sorted()'s order (insort after equal values, the
+        # oldest removed from the front of its equal values: the order a stable sort of the window gives), so a
+        # sample costs two insertions instead of two sorts. A NaN in the window has no sorted order to keep: while
+        # one is in, the medians are taken by sorting the window as before (_sv is None).
+        self._fq = collections.deque()
+        self._sv, self._sr = [], []
+        self._nb = self._nan = 0
+        self._fire_ok = True                  # False once the evidence clock is not finite: win.last from then on
+
+    def _fire_add(self, bad, v, rv):
+        """Mirror of win.add for the fire window (called right after it, at the same evidence time)."""
+        win = self.win
+        ev = win.ev
+        if not self._fire_ok:
+            return
+        if not math.isfinite(ev):
+            self._fire_ok = False
+            return
+        q, sv, sr = self._fq, self._sv, self._sr
+        q.append((ev, bad, v, rv))
+        if bad:
+            self._nb += 1
+        if v != v or rv != rv:
+            self._nan += 1
+            sv = self._sv = self._sr = None
+        elif sv is not None:
+            bisect.insort_right(sv, v)
+            bisect.insort_right(sr, rv)
+        # what win.add dropped (older than its keep) and what win.last leaves out (older than the fire window): the
+        # evidence clock never runs back, so both are a prefix of the window
+        drop, lim = ev - win.keep, ev - self.c["fire_window_s"]
+        while q and (q[0][0] < drop or not q[0][0] >= lim):
+            _, b0, v0, r0 = q.popleft()
+            if b0:
+                self._nb -= 1
+            if v0 != v0 or r0 != r0:
+                self._nan -= 1
+            elif sv is not None:
+                del sv[bisect.bisect_left(sv, v0)]
+                del sr[bisect.bisect_left(sr, r0)]
+        if sv is None and not self._nan:
+            self._sv = sorted([x[2] for x in q])
+            self._sr = sorted([x[3] for x in q])
+
+    def _fire_clear(self):
+        self._fq.clear()
+        self._sv, self._sr = [], []
+        self._nb = self._nan = 0
 
     def _peak(self, name, value):
         if value > self.peak.get(name, 0.0):
@@ -171,7 +224,10 @@ class Pair:
         if hs is None:
             hs = math.hypot(s, rs)
         z = (v - rv) / hs
-        self.win.add(t, (abs(z) > c["z_bad"], v, rv))
+        bad = abs(z) > c["z_bad"]
+        self.win.add(t, (bad, v, rv))
+        if c["mode"] != "mean":
+            self._fire_add(bad, v, rv)
         self.last_delta = v - rv
         self.times.append(t)
         self.sample_t = t
@@ -224,13 +280,26 @@ class Pair:
 
     def _evaluate(self, t):
         c = self.c
-        fire = self.win.last(c["fire_window_s"])
-        n = len(fire)
-        share = sum([1 for b, _, _ in fire if b]) / n if n else None
-        ratio = None
-        if n >= 3:
-            mr = _median([r for _, _, r in fire])
-            ratio = _median([v for _, v, _ in fire]) / mr if abs(mr) > 1e-3 else None
+        if self._fire_ok:
+            fq = self._fq
+            n = len(fq)
+            share = self._nb / n if n else None
+            ratio = None
+            if n >= 3:
+                if self._sv is not None:
+                    mr = _median_sorted(self._sr)
+                    ratio = _median_sorted(self._sv) / mr if abs(mr) > 1e-3 else None
+                else:
+                    mr = _median([x[3] for x in fq])
+                    ratio = _median([x[2] for x in fq]) / mr if abs(mr) > 1e-3 else None
+        else:
+            fire = self.win.last(c["fire_window_s"])
+            n = len(fire)
+            share = sum([1 for b, _, _ in fire if b]) / n if n else None
+            ratio = None
+            if n >= 3:
+                mr = _median([r for _, _, r in fire])
+                ratio = _median([v for _, v, _ in fire]) / mr if abs(mr) > 1e-3 else None
         self.stats = {"n": n, "share": share, "ratio": ratio}
         if n >= c["min_n"] and c["mode"] == "share":
             self._peak("share", share / c["fire_share"])
@@ -322,6 +391,7 @@ class Pair:
 
     def reset_data(self):
         self.win.clear()
+        self._fire_clear()
         self.pending.clear()
         self.gp = self.gn = 0.0
         self.recent.clear()

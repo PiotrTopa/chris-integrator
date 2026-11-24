@@ -80,6 +80,16 @@ CFG = dict(
     # back within 1.5 lags; once per smooth_hist_s the pass looks as far as smooth_s for it). An object's trajectory
     # (`Obj.history`) is smoothed as far back as smooth_s when it is asked for
     smooth=True, smooth_s=2.0, smooth_lag_s=0.5, smooth_hist_s=0.5,
+    # smooth_every_s: an object's past is smoothed at most this often (0: after every sighting). A sighting that
+    # comes sooner keeps the smoothed velocity the object has (`vs`, and what the verdict "it moves" reads), its age
+    # (`vs_age_s`) grown by the time since; the backward pass is a third of the tracker's arithmetic in a dense scene
+    # at a detector's frame rate. What it changes: docs/RADAR.md, section 6
+    smooth_every_s=0.0,
+    # smooth_for: whose past is smoothed. "all": every object's. "read": only where the tracker itself reads the
+    # smoothed estimate: an object whose verdict is not "moving" (the verdict "it moves" and the groups read what its
+    # sightings by themselves show of its speed). A moving object then has no `vs` (null, as before a second
+    # sighting); should its verdict be released, the filtered estimate stands in until its next sighting
+    smooth_for="all",
     # structure (docs/RADAR.md, section 7): rows of standing things, queues, platoons. The free room between two
     # members (standing / driving), how alike two drivers' velocities are, how straight the line is (m + share
     # of its length), how near the car's own line a queue's passes, members needed (a queue: two)
@@ -825,7 +835,8 @@ class Tracker:
                            (c["check_window_s"], c["inconsistent"], c["inflate"], c["history_s"], len(hz)) + tuple(hz)
                            + (0.0,) * (4 - len(hz))
                            + (1.0 if c["smooth"] else 0.0, c["hyp_keep_steps"], c["smooth_s"], 1.5 * c["smooth_lag_s"],
-                              c["smooth_lag_s"], c["smooth_hist_s"]))
+                              c["smooth_lag_s"], c["smooth_hist_s"], c["smooth_every_s"]),
+                           None if c["smooth_for"] != "read" else [o.h for o in kept if o.verdict != "moving"])
         r0 = self.new_rate.get(src, 0.0)
         self.new_rate[src] = r0 + c["new_rate_gain"] * (len(births) - r0)
 
@@ -905,15 +916,16 @@ class Tracker:
         lasts = [max(o.last_seen.values()) for o in self.objects]
         life = self._life(T, pose, scan, slots, tb, rec, lasts)
         sn = ([], [], [])                                # ... of the objects that stay
+        delete_exist, view_gap, seen_max = c["delete_exist"], c["view_gap_s"], c["seen_max_s"]   # (out of the loop)
         for o, (p_st, finite, _, sd, rng), s, r, m, last in zip(self.objects, life, slots, tb, rec, lasts):
             exist, cover, hidden, hits = r[OT_PE], r[OT_COVER], r[OT_HIDDEN], int(m[M_HITS])
-            if exist < c["delete_exist"] or not finite:
+            if exist < delete_exist or not finite:
                 continue
-            if scan - cover <= c["view_gap_s"]:
+            if scan - cover <= view_gap:
                 # a sensor is looking at where it should be: it lives by being seen
                 # (the time it was hidden behind another object does not count: nothing was to be seen)
                 hid = hidden > last
-                if T - max(last, hidden) > max(o.coast_s, c["seen_max_s"]):
+                if T - max(last, hidden) > max(o.coast_s, seen_max):
                     continue
                 # (a member of a queue hidden by the queue itself is kept as long as a remembered object)
                 if hid and (T - last > (c["memory_s"] if o.grp_kind == "queue" else c["hidden_s"])
@@ -966,7 +978,8 @@ class Tracker:
         `group_s`): each stands on the line the OTHERS make, and standing is likelier for it than for a thing by
         itself; a member whose own sightings show a speed is not of the group."""
         c = self.cfg
-        objs = [o for o in self.objects if o.state != "tentative"]
+        nt = [o.state != "tentative" for o in self.objects]
+        objs = [o for o, k in zip(self.objects, nt) if k]
         prev = {o.id: o.grp for o in objs if o.grp is not None}
         for o in self.objects:
             o.grp = o.grp_kind = None
@@ -975,7 +988,7 @@ class Tracker:
             return
         info = []
         slots, tb, _ = self.looked()
-        slots, tb = ([v for o, v in zip(self.objects, q) if o.state != "tentative"] for q in (slots, tb))
+        slots, tb = ([v for v, k in zip(q, nt) if k] for q in (slots, tb))
         a = self.store.a
         for o, s, r in zip(objs, slots, tb):
             v = o.verdict
@@ -1143,6 +1156,8 @@ class Tracker:
         None x 3)."""
         c = self.cfg
         objs = self.objects
+        if not objs:                                     # (radar_life of no objects: an empty list)
+            return []
         kin = [o.kin for o in objs]
         return _NR.radar_life(self.store.a, slots, [k[3] for k in kin],
                               [1.0 if o.state != "tentative" and (scan - r[OT_COVER] > c["view_gap_s"] or r[OT_HIDDEN] > last)

@@ -11,6 +11,7 @@ plug-in that declared the stream as a trigger, in plug-in order; what a plug-in 
 the next plug-in runs. So when a later plug-in handles a camera frame, the outputs of the earlier ones for
 that frame are already on the bus. The order is derived from the declarations (a producer runs before its
 consumers; `feedback` inputs are exempt) and is stable in the order the plug-ins were added."""
+import bisect
 import collections
 import logging
 import time
@@ -325,15 +326,22 @@ class Mixer:
         if not q:
             return 0.0
         now = self.bus.clock.now()
-        # arrivals are in time order (the bus clock never goes back): count from the newest until the window ends
-        n, first = 0, None
-        for t in reversed(q):
-            if now - t > window:
-                break
-            n += 1
-            first = t
-        if n < 2:
-            return 0.0
+        # arrivals are in time order (the bus clock never goes back): count from the newest until the window ends.
+        # `now - t > window` is monotone along the deque, so where more than a few arrivals are in the window
+        # (a 20 Hz stream: 40) the first one in it is found by bisection, with the same test on the same floats
+        m = len(q)
+        if m > 12 and not now - q[-12] > window:
+            i = bisect.bisect_left(q, True, 0, m - 12, key=lambda t: not now - t > window)
+            n, first = m - i, q[i]
+        else:
+            n, first = 0, None
+            for t in reversed(q):
+                if now - t > window:
+                    break
+                n += 1
+                first = t
+            if n < 2:
+                return 0.0
         span = now - first
         return round((n - 1) / span, 2) if span > 0 else 0.0
 

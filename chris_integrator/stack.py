@@ -8,7 +8,7 @@ Everything here is configuration of the mixer; nothing here is needed to use the
 
 Configuration: one JSON file per plug-in in the configuration directory, named after the plug-in
 (`integrator.json` for the estimator, `road_users.json`, `radar.json`, `decide.json`, `learnt.json`, `lead.json`, `lanes.json`, `egolane.json`, `roadgeom.json`, `view.json`,
-`lights.json`, `rules.json`, `fused.json`, `mapper.json`, `rates.json`, `predict.json`), and `mixer.json` for the wiring:
+`lights.json`, `rules.json`, `fused.json`, `mapper.json`, `rates.json`, `predict.json`, `pace.json`), and `mixer.json` for the wiring:
 
     {"disable": ["fused"],                                        plug-ins of the default stack to leave out
      "plugins": [{"class": "mypkg.mymod:MyPlugin", "cfg": {...}},   further plug-ins (in process)
@@ -27,7 +27,7 @@ import logging
 import os
 
 from .mixer import Mixer, Plugin, StreamSpec
-from .plugins.common import Rates
+from .plugins.common import Pace, Rates
 from .learners import Learnt
 from .plugins.decide import Decide
 from .plugins.estimator import Estimator
@@ -170,6 +170,7 @@ def build(cfg=None, config_dir=None, datadir=None, clock=None, mapper="auto", ex
     m.services["rates"] = Rates(m, conf("rates").get("floors"))
     m.services["store"] = store = Store(datadir)
     m.services["reset"] = m.reset
+    m.services["pace"] = Pace(conf("pace") or None)   # which radar messages `predict` and `decide` look at
 
     est_cfg = conf("estimator", "integrator")
     lead = conf("lead")

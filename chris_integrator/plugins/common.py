@@ -141,3 +141,115 @@ class Latest(collections.abc.Mapping):
 
     def __len__(self):
         return len(self.names)
+
+
+class Pace:
+    """Which radar messages the expensive layers look at (`predict`, `decide`): a service of the mixer both ask
+    (`ctx.service("pace")`), so the two skip the same messages. Configuration `pace.json`:
+
+        mode        "full"      every radar message (20 a second with the road model)
+                    "fixed"     `idle_hz` a second, whatever happens
+                    "adaptive"  every message while something could matter, `idle_hz` a second otherwise
+        idle_hz     10.0        the low rate
+        hold_s      0.5         full rate is kept this long after the last sign that something could matter
+
+    The low rate: a message is left out only when the one after it (expected one radar period later) still comes
+    within `1 / idle_hz` of the last look. With the radar at 20 a second that is every second message; a radar
+    that runs at 12 a second is not thinned at all. Adaptive: on top of that a message is looked at at once
+
+    * while the decision layer says something could matter (`report`: an object at level `hot_level` or above
+      (entry or exit level), with a collision probability from `hot_p`, a headway under `thw_s`; an alert at a
+      stage or on its way to one), and `hold_s` on;
+    * when the radar message itself shows a cue: an object the last looked-at message did not have (once), an
+      object in the path or a threat by the radar's own corridor test (flags `in_path`, `threat`), a time to reach
+      of at most `ttc_s`, a `p_threat` from `p_threat` (then `hold_s` on); a new ground frame.
+
+    What that guarantees: a message is left out only when the look before it found nothing that could matter,
+    the message shows no cue, and the next message is due within `1 / idle_hz` (+ 0.01 s) of that look. So whatever
+    arises is first judged at most `1 / idle_hz` minus the radar's period later than at full rate (0.05 s at 20
+    messages a second and 10 looks; a radar message that comes late or is lost adds its delay, as it does at full
+    rate), and from that judgement on every message is judged: the alerts' holds run in time, so a stage is
+    entered at most that much later. (The prediction's filters see fewer frames while nothing matters;
+    their evidence is weighed in time. What it costs in warnings' times and false warnings: docs/TOPICS.md.)"""
+    DEFAULT_CFG = dict(mode="adaptive", idle_hz=10.0, hold_s=0.5, hot_level=1, hot_p=0.01, thw_s=2.0, ttc_s=8.0,
+                       p_threat=0.02)
+
+    def __init__(self, cfg=None):
+        self.cfg = dict(self.DEFAULT_CFG, **(cfg or {}))
+        if self.cfg["mode"] not in ("full", "fixed", "adaptive"):
+            self.cfg["mode"] = "full"
+        self.reset()
+
+    def reset(self):
+        self._ts = None                  # the message last asked about, and the answer
+        self._due = True
+        self._last = None                # the message last looked at (ts_mono_ns)
+        self._prev = None                # the message before this one, looked at or not
+        self._hot_until = None           # ns
+        self._ids = frozenset()
+        self._ground = None
+        self.stats = {"messages": 0, "looked": 0, "interval": 0, "hot": 0, "cue": 0, "new": 0}
+
+    def due(self, msg):
+        """Is this radar message looked at? The same answer for everyone who asks about one message."""
+        ts = msg.get("ts_mono_ns")
+        if ts == self._ts:
+            return self._due
+        c, st = self.cfg, self.stats
+        st["messages"] += 1
+        self._ts = ts
+        mode = c["mode"]
+        why = None
+        prev, self._prev = self._prev, ts
+        if mode == "full" or self._last is None or not isinstance(ts, int) or not isinstance(prev, int):
+            why = "interval"
+        else:
+            # left out only when the next message (expected one radar period on) still comes within the low rate's
+            # period of the last look: two looks are never further apart than that period (or one radar period)
+            gap = ts - self._last
+            if not (0 <= gap and prev <= ts and gap + (ts - prev) <= (1.0 / c["idle_hz"] + 0.01) * 1e9):
+                why = "interval"
+            elif mode == "adaptive":
+                if self._hot_until is not None and ts <= self._hot_until:
+                    why = "hot"
+                else:
+                    why = self._cue(msg, ts)
+        self._due = why is not None
+        if why is not None:
+            st["looked"] += 1
+            st[why] += 1
+            self._last = ts
+            if mode == "adaptive":           # the objects of the message looked at: a later one's new ones are a cue
+                self._ids = frozenset([o.get("id") for o in msg.get("objects") or ()])
+                self._ground = (msg.get("ego") or {}).get("ground_frame")
+        return self._due
+
+    def _cue(self, msg, ts):
+        c = self.cfg
+        if (msg.get("ego") or {}).get("ground_frame") != self._ground:
+            return "new"
+        ids, ttc_max, p_min = self._ids, c["ttc_s"], c["p_threat"]
+        new = False
+        for o in msg.get("objects") or ():
+            if o.get("state") == "tentative":
+                continue
+            fl = o.get("flags")
+            ttc, pt = o.get("ttc_s"), o.get("p_threat")
+            if (fl and ("in_path" in fl or "threat" in fl)) or (ttc is not None and ttc <= ttc_max) \
+                    or (pt is not None and pt >= p_min):
+                self._hot_until = ts + int(c["hold_s"] * 1e9)
+                return "cue"
+            if o.get("id") not in ids:
+                new = True
+        return "new" if new else None
+
+    def report(self, ts, hot):
+        """The decision layer's word on the message it has just judged: could something matter?"""
+        if hot and isinstance(ts, int):
+            until = ts + int(self.cfg["hold_s"] * 1e9)
+            if self._hot_until is None or until > self._hot_until or ts < self._hot_until - 10 * 1e9:
+                self._hot_until = until
+
+    def health(self):
+        st = self.stats
+        return dict(st, mode=self.cfg["mode"], share=round(st["looked"] / st["messages"], 3) if st["messages"] else None)

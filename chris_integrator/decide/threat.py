@@ -60,7 +60,8 @@ DEFAULT_CFG = dict(
     # than its spread "had" no time left (breached at once, the last full steer before the driver could react)
     tm_needs_contact=True,
     pc_method="mc",                           # "mc": quasi-Monte Carlo over the horizon | "analytic": per time
-    samples=256,                              # draws of the Monte Carlo (full quality; cost scales with it)
+    samples=128,                              # draws of the Monte Carlo (256: half the error, a tenth more of the
+                                              # layer's cost; docs/TOPICS.md)
     sim_dt_s=0.05,                            # the horizon's step (collision tests, evasions)
     prune_sigma=5.0,
     ego_accel_sigma=0.3, ego_lat_sigma=0.15,  # the car's own execution (m/s^2): its place spreads with t^2 / 2 (pc only)

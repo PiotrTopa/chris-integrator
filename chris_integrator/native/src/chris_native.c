@@ -7286,6 +7286,9 @@ typedef struct {
     long long freed;                 /* the level at which its handle became free (not taken again in that scan) */
     double kin[4], veh, idnum;       /* what its kind can do; vehicle (1) / person (-1) / not known (0); its id */
     double pe, pp;                   /* probability that it exists; that the primary's story is the true one */
+    double sm_t, sm_age;             /* the smoother (Hyp.after): its sighting's time when its past was last smoothed, and
+                                      * how far back the lag's node was then (read only while its table row has a
+                                      * smoothed velocity) */
 } HTrack;
 
 typedef struct {
@@ -12120,9 +12123,9 @@ static void hist_push(double *Hh, Py_ssize_t hn, double t, double x, double y, d
 }
 
 enum { RAFT_WINDOW, RAFT_INCONS, RAFT_INFLATE, RAFT_HIST_S, RAFT_NHZ, RAFT_HZ, RAFT_SMOOTH = RAFT_HZ + 4, RAFT_STEPS, RAFT_SMOOTH_S, RAFT_SHORT_S,
-       RAFT_LAG_S, RAFT_WHOLE_S, RAFT_N };
+       RAFT_LAG_S, RAFT_WHOLE_S, RAFT_EVERY_S, RAFT_N };
 
-/* Hyp.after(S, table, hist, sighted, kept, born, t, par, cfg) -> None
+/* Hyp.after(S, table, hist, sighted, kept, born, t, par, cfg[, smooth]) -> None
  * What follows a scan's sightings once the tracker has done its own bookkeeping of them (Tracker.process).
  * sighted: the handles of the objects that took a detection. Each one's expectations whose time has passed are
  * compared with where it is now believed to have been then (how well its predictions hold: consistency, the
@@ -12134,14 +12137,19 @@ enum { RAFT_WINDOW, RAFT_INCONS, RAFT_INFLATE, RAFT_HIST_S, RAFT_NHZ, RAFT_HZ, R
  * born: the objects this scan started: the first point of their trajectories.
  * cfg: check_window_s, inconsistent, inflate, history_s, the number of horizons (at most 4) and the horizons,
  * smooth (0: not), the smoother's steps, how far back the whole pass and the short pass reach, the lag, how often
- * the whole pass runs. */
+ * the whole pass runs, and how often at most an object's past is smoothed (cfg[RAFT_EVERY_S]; 0: after every
+ * sighting): a sighting that comes sooner keeps the smoothed velocity it has, a little older.
+ * smooth (optional; None: every one of kept): the kept objects whose past is smoothed; a kept object that is not
+ * among them has no smoothed velocity from this sighting on (its table row says so: who reads it takes the
+ * filtered estimate, as before an object's second sighting). */
 static PyObject *hyp_after(PyObject *self, PyObject *args)
 {
     Hyp *H = (Hyp *)self;
-    PyObject *oS, *oT, *oHi, *ohit, *okept, *oborn, *opar, *ocfg;
+    PyObject *oS, *oT, *oHi, *ohit, *okept, *oborn, *opar, *ocfg, *osm = NULL;
     double t;
-    if (!PyArg_ParseTuple(args, "OOOOOOdOO", &oS, &oT, &oHi, &ohit, &okept, &oborn, &t, &opar, &ocfg))
+    if (!PyArg_ParseTuple(args, "OOOOOOdOO|O", &oS, &oT, &oHi, &ohit, &okept, &oborn, &t, &opar, &ocfg, &osm))
         return NULL;
+    Py_ssize_t ns = 0, *sm = NULL;       /* the smoother's own choice of the kept (not given: all of them) */
     PyObject *res = NULL;
     View vS, vT, vH;
     vS.held = vT.held = vH.held = 0;
@@ -12149,13 +12157,22 @@ static PyObject *hyp_after(PyObject *self, PyObject *args)
     double cfg[RAFT_N];
     RPar par;
     if (store_get(oS, &vS, &cap) < 0 || tab_get(oT, &vT, ROTW, &trows, NULL, "table") < 0 ||
-        tab_get(oHi, &vH, 0, &hrows, &hcols, "hist") < 0 || rpar_get(opar, &par) < 0 || rnums_get(ocfg, RAFT_N, cfg, "cfg") < 0)
+        tab_get(oHi, &vH, 0, &hrows, &hcols, "hist") < 0 || rpar_get(opar, &par) < 0)
         goto done;
+    {
+        /* (a caller from before RAFT_EVERY_S gives one number less: every sighting is smoothed) */
+        Py_ssize_t nc = PySequence_Check(ocfg) ? PySequence_Size(ocfg) : -1;
+        cfg[RAFT_EVERY_S] = 0.0;
+        if (rnums_get(ocfg, nc == RAFT_N - 1 ? RAFT_N - 1 : RAFT_N, cfg, "cfg") < 0)
+            goto done;
+    }
     Py_ssize_t lim = trows < hrows ? trows : hrows;
     if (lim > H->ntr)
         lim = H->ntr;
     if ((hit = idx_get(ohit, lim, &nh)) == NULL || (kept = idx_get(okept, lim, &nk)) == NULL ||
         (born = idx_get(oborn, lim, &nb)) == NULL)
+        goto done;
+    if (osm != NULL && osm != Py_None && (sm = idx_get(osm, lim, &ns)) == NULL)
         goto done;
     int nhz = (int)cfg[RAFT_NHZ], steps = (int)cfg[RAFT_STEPS];
     if (cap < H->cap || hcols < 6 || (hcols - 1) % 5 != 0 || nhz < 0 || nhz > 4 || steps < 0) {
@@ -12263,7 +12280,20 @@ static PyObject *hyp_after(PyObject *self, PyObject *args)
                 goto done;
             }
             double *T = tab + h * ROTW;
+            if (sm != NULL) {                            /* not among the chosen: it has no smoothed past from now on */
+                Py_ssize_t q = 0;
+                while (q < ns && sm[q] != h)
+                    q++;
+                if (q == ns) {
+                    T[ROT_HASVS] = 0.0;
+                    continue;
+                }
+            }
             double ot = A[(Py_ssize_t)T[ROT_SLOT] * RROW + RO_M + M_T], lag[5], fl[5], pl;
+            if (cfg[RAFT_EVERY_S] > 0.0 && T[ROT_HASVS] != 0.0 && ot - tr->sm_t >= 0.0 && ot - tr->sm_t < cfg[RAFT_EVERY_S]) {
+                T[ROT_VS + 4] = tr->sm_age + (ot - tr->sm_t);    /* the kept one, as old as it now is */
+                continue;
+            }
             /* back to the lag: the first node at least the lag back within cfg[RAFT_SHORT_S], and once per
              * cfg[RAFT_WHOLE_S] within cfg[RAFT_SMOOTH_S] (sightings far apart: the nearer reach finds none). The
              * trajectory itself is smoothed when it is asked for (Hyp.history). */
@@ -12275,6 +12305,8 @@ static PyObject *hyp_after(PyObject *self, PyObject *args)
             memcpy(T + ROT_FS, fl, sizeof(fl));
             T[ROT_PSLAG] = pl;
             T[ROT_HASVS] = 1.0;
+            tr->sm_t = ot;
+            tr->sm_age = lag[4];
             if (whole)
                 T[ROT_HIST_T] = ot;
         }
@@ -12288,6 +12320,7 @@ done:
     PyMem_Free(hit);
     PyMem_Free(kept);
     PyMem_Free(born);
+    PyMem_Free(sm);
     view_drop(&vS);
     view_drop(&vT);
     view_drop(&vH);

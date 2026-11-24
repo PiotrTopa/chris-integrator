@@ -444,7 +444,10 @@ def test_context_builder_reads_the_stacks_messages():
 def test_plugin_in_the_stack():
     from chris_integrator.mixer import MessageClock
     from chris_integrator.stack import build
-    for cfg, want in (({}, True), ({"predict": {"enabled": False}}, False), ({"mixer": {"disable": ["predict"]}}, False)):
+    # (the stack's pace on `full`: every radar message is predicted; the default pace is held below)
+    full = {"pace": {"mode": "full"}}
+    for cfg, want in ((full, True), (dict(full, predict={"enabled": False}), False),
+                      (dict(full, mixer={"disable": ["predict"]}), False)):
         st = build(cfg=cfg, mapper=None, clock=MessageClock())
         got = {"radar": [], "radar_fut": []}
         st.mixer.add_output("t", lambda e: got[e.stream].append(e.msg), streams=("radar", "radar_fut"))
@@ -466,6 +469,16 @@ def test_plugin_in_the_stack():
             f = got["radar_fut"][-1]
             assert f["fut_ctx"]["path"] == "plan" and f["ego_fut"]["modes"][0]["m"] == "path" and f["objects"][0]["fut"]
             assert "fut" not in got["radar"][-1]["objects"][0] and st.plugin("predict").health()["frames"] == 31
+    # the default pace (adaptive): on a quiet road at 20 messages a second every second one is predicted
+    st = build(cfg={}, mapper=None, clock=MessageClock())
+    got = {"radar": [], "radar_fut": []}
+    st.mixer.add_output("t", lambda e: got[e.stream].append(e.msg["ts_mono_ns"]), streams=("radar", "radar_fut"))
+    box = st.plugin("radar").box
+    for k in range(30):
+        ts = 100_000_000_000 + k * 50_000_000
+        box.on_ego({"ts_mono_ns": ts, "speed_mps": 10.0, "yaw_rate_rps": 0.0, "accel_long_mps2": 0.0})
+        st.mixer.publish("radar", box.frame(ts), "radar")
+    assert len(got["radar"]) == 30 and got["radar_fut"] == got["radar"][::2]
 
 
 def test_golden():
