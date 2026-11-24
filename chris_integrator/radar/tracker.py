@@ -142,6 +142,9 @@ CFG = dict(
     # the view's first ground point. False: such a box is left to the near objects (measured: taken, it costs a
     # fifth more id switches in rows for 3 % more tracked time; docs/RADAR.md, section 8)
     flags_far_bearing=False,
+    # flags_side: the centre of a box with one side hidden is moved to the object's (by half of what the object's
+    # silhouette has beyond the box). False: such a box keeps its centre and its wider bearing spread
+    flags_side=True,
     # the scan's own boxes hide what stands behind them (the miss probability): a box counts as nearer where its
     # bottom lies lower than the object's by more than box_occl_margin of what is not known of the difference
     in_box_occl=False, box_occl_margin=1.5,
@@ -545,7 +548,7 @@ class Tracker:
                 (1.0 if c["in_lamp_colour"] else 0.0, math.radians(c["lamp_colour_deg"]), 1.0 if c["in_lamp_size"] else 0.0,
                  c["lamp_sep_ratio"], c["lamp_sep_rel"], c["ruler_eps"], c["ruler_span"], float(c["ruler_uses"]),
                  1.0 if c["in_width"] else 0.0, c["width_rel"], c["grade_k"], 1.0 if c["in_scale"] else 0.0,
-                 c["scale_lamps_k"] if c["in_scale"] else 0.0))
+                 c["scale_lamps_k"] if c["in_scale"] else 0.0, 1.0 if c["flags_side"] else 0.0))
         ek = getattr(sensor, "emb_kind", 0) if c["in_app"] else 0
         tab = c["app_tables"].get(ek) or c["app_tables"].get(str(ek))
         if tab is None:

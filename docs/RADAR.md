@@ -606,3 +606,65 @@ the object's boxes. It goes where the tracker already has such an offset: the st
   where that is shorter (`x_det_leaf`).
 * `scale_src` "lamps": Huber's weight at `scale_lamps_k` sigma on the leaf's own innovation (the variance raised
   until the innovation is that many sigma).
+
+### What was measured (2026-11-24)
+On the detector simulator emitting what a camera detector would (`sim/roaduser_sim.py` `DETIN`: visible-part boxes,
+roadside occluders, flags, the low list, vectors fitted to the measured distance tables, lamp pairs, scale rates
+with shared errors, vehicles of spread sizes; with the scale rate on: docs/VISUAL_RADAR_EVAL.md), the tracker alone
+(`sim.radar_score`), all 11 scenarios x seeds 1-6 x day and night = 132 runs per row. Confirmed outputs against the
+truth: error along the line of sight by range band (m), id switches, share of detectable time held and confirmed,
+seconds a standing actor was called `moving`. Then the whole stack's false `obstacle_ahead` episodes (shadow mode;
+6 scenarios x seeds 1-6 x day and night, with the prediction / with constant-velocity futures). The real drives'
+recordings carry none of the fields: there, with the knobs off, the output is identical (both captures of
+tools/cost_bench.py, every stream), and nothing more can be said from them.
+
+| knobs on | 0-25 p50 / p90 | 25-60 p50 / p90 | 60+ p50 / p90 | id switches | held | confirmed | standing called moving (s) | false episodes pred / cv |
+|---|---|---|---|---|---|---|---|---|
+| none (today's stream on today's simulator) | | | | | | | | 91 / 79 |
+| none (the realistic stream: the "before") | 0.76 / 3.77 | 2.40 / 8.21 | 6.06 / 19.5 | 262 | 0.262 | 0.091 | 74 | 110 / 93 |
+| `in_flags` | 0.74 / 3.70 | 2.52 / 8.12 | 7.67 / 21.5 | 207 | 0.250 | 0.086 | 69 | 117 / 108 |
+| `in_box_occl` | 0.75 / 3.71 | 2.36 / 8.12 | 6.34 / 19.5 | 270 | 0.261 | 0.090 | 72 | not run |
+| `in_low` | 0.82 / 3.93 | 2.66 / 8.90 | 7.81 / 22.0 | 282 | 0.270 | 0.115 | 111 | (with the set below: 126 / 128) |
+| `in_app` | 0.75 / 3.77 | 2.48 / 8.09 | 6.97 / 19.8 | 271 | 0.267 | 0.092 | 64 | 101 / 92 |
+| `in_lamp_size` | 0.77 / 3.66 | 2.39 / 8.06 | 6.34 / 21.3 | 252 | 0.264 | 0.091 | 72 | 108 / 96 |
+| `in_width` | 0.76 / 3.67 | 2.34 / 7.71 | 7.66 / 20.2 | 277 | 0.267 | 0.091 | 74 | 104 / 99 |
+| `in_scale` | 0.75 / 3.71 | 2.39 / 8.00 | 7.03 / 19.3 | 254 | 0.263 | 0.091 | 70 | 109 / 99 |
+| `grade_k` 1/3000 | 0.77 / 3.91 | 2.53 / 8.69 | 7.30 / 20.3 | 281 | 0.258 | 0.089 | 71 | not run |
+| `in_app` + `in_width` | | | | | | | | 104 / 91 |
+| **`in_app` + `in_width` + `in_lamp_size` + `in_scale`** | 0.74 / 3.48 | 2.09 / 7.59 | 7.46 / 18.4 | 255 | 0.273 | 0.093 | 64 | 101 / 103 |
+| ... + `in_flags` | 0.76 / 3.49 | 2.20 / 7.38 | 6.68 / 17.0 | 212 | 0.260 | 0.089 | 58 | 116 / 107 |
+| ... + `in_flags` + `in_low` | 0.77 / 3.63 | 2.27 / 7.55 | 6.82 / 19.2 | 208 | 0.268 | 0.112 | 87 | 126 / 128 |
+
+On the (actor, frame) pairs confirmed both before and with the four knobs of the bold row: at 25-60 m the mean error
+along the line of sight 3.22 -> 2.88 m by day and 3.77 -> 3.06 m at night (p90 8.8 -> 6.7 m at night); at 0-25 m
+1.77 -> 1.56 m at night; beyond 60 m the mean 8.2 -> 7.8 m by day with the median worse (5.7 -> 6.3 m).
+`in_lamp_colour` (the oncoming scenario at night, 12 seeds) and `in_reid` (it fires two or three times a run) change
+no score measurably.
+
+What it says:
+* **Range at 25-60 m**: the width ruler is the one input that moves it (leave it out of everything-on: 25-60 m
+  p50 2.31 -> 2.61, beyond 60 m 7.5 -> 8.9), the lamp pair adds at night. Neither needs a new state.
+* **Phantom motion of standing things** falls with the appearance ratio (74 -> 64 s) and is the one thing that also
+  lowers the false episodes with the prediction (110 -> 101). The id switches do NOT fall with it alone.
+* **The flags** cut id switches by a fifth and cost 3-5 % of the tracked time, and **the false episodes rise** with
+  them (110 / 93 -> 117 / 108; not the side shift: 115 / 112 without it). Dropping the rows of hidden edges takes
+  away wrong information and, in a row of parked cars where most boxes have a hidden edge, most of the information.
+* **The low list** buys a quarter more confirmed time and pays with standing things called moving (74 -> 111 s) and
+  more false episodes. The simulator's low list is three to five times as busy as the rides' (its excess of visible
+  actors), so this is a pessimistic reading; it is not evidence for switching it on.
+* **`grade_k`** does nothing for this simulator, whose roads' vertical curvature (at most 1 / 6000 m) is half the
+  1 / 3000 m assumed; **`in_box_occl`** is neutral.
+* **No set of knobs lowers the false `obstacle_ahead` episodes beyond what one run's noise could be** (101-104
+  against 110 with the prediction; with constant-velocity futures none is better than 91-92 against 93).
+
+Recommended: all knobs stay off in the code (the detector's options are off on the car, and the appearance tables
+are from other cameras). When the detector's options are switched on, with its scale rate: `in_app`, `in_width`,
+`in_lamp_size`, `in_scale`. Not `in_width` on today's stream without a scale rate: there (today's simulator with
+spread sizes, 132 runs) it moves 25-60 m from 3.43 to 3.22 m and standing things called moving from 192 to 239 s
+(each use shifts the height, and with no scale rate the range's shift reads as motion).
+
+Cost (this laptop, one scan of the tracker with the detections' making, the realistic stream; a phone's small core
+is 10 to 16 times slower): 0.30 ms with the knobs off; each knob but one adds 0.01 to 0.03 ms; `in_low` adds 0.14 ms
+(more detections); the four recommended together 0.30 ms; everything on 0.46 ms. With the knobs off the whole stack
+on the recorded captures costs what it did (tools/cost_bench.py: 1.461 -> 1.462 ms per road frame on the real
+capture, 6.42 -> 6.44 ms on the dense simulated one; outputs identical).

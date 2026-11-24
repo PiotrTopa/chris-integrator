@@ -7239,7 +7239,7 @@ enum { XC_FLAGS, XC_BOXOCC, XC_BOXOCC_M,
        XC_LOW, XC_LOW_P, XC_LOW_PRUN, XC_LOW_RUN_S, XC_LOW_EXTRA,
        XC_APP, XC_APP_KIND, XC_APP_DARK, XC_APP_BDAY, XC_APP_BNIGHT, XC_APP_GAIN, XC_APP_YDAY, XC_APP_YNIGHT, XC_APP_TAB,
        XC_LCOL = XC_APP_TAB + 16, XC_LCOL_SIG, XC_LSIZE, XC_LSEP_RATIO, XC_LSEP_REL, XC_AUX_EPS, XC_AUX_SPAN, XC_AUX_USES,
-       XC_WID, XC_WID_REL, XC_GRADE, XC_SCORR, XC_SROB, RXCFG };
+       XC_WID, XC_WID_REL, XC_GRADE, XC_SCORR, XC_SROB, XC_SIDE, RXCFG };
 
 typedef struct RXc {
     double c[RXCFG];
@@ -8021,7 +8021,7 @@ static const double *x_det_leaf(const RXc *xc, const RSens *sen, const double *p
         return d;
     const double *c = xc->c;
     int kind = (int)d[D_KIND], base = kind & 7, hid = (int)d[D_HID];
-    int side = c[XC_FLAGS] != 0.0 && (hid & 5) != 0 && d[D_W] > 0.0;
+    int side = c[XC_FLAGS] != 0.0 && c[XC_SIDE] != 0.0 && (hid & 5) != 0 && d[D_W] > 0.0;
     int scale = (kind & K_SCALE) && (c[XC_SCORR] != 0.0 || (c[XC_SROB] > 0.0 && d[D_SSRC] == 1.0));
     if (!side && !scale)
         return d;
