@@ -93,6 +93,7 @@ class RoadGeometryFusion:
         if cfg:
             self.cfg.update(cfg)
         self._local = LocalEgo()
+        self._xl = self._xa = None     # _vision: the last lanes' distances (a copy of the list) and their array
         self.reset()
 
     def reset(self):
@@ -195,7 +196,12 @@ class RoadGeometryFusion:
         """(x, y, sigma, source) of the ego-lane centre from the camera, or None."""
         c = self.cfg
         if isinstance(lanes, dict) and isinstance(lanes.get("x"), list):
-            x = np.asarray(lanes["x"], dtype=float)
+            lx = lanes["x"]
+            if lx == self._xl:
+                x = self._xa                    # the same distances as the last frame: their array (only read)
+            else:
+                x = np.asarray(lx, dtype=float)
+                self._xl, self._xa = list(lx), x
             ln = lanes.get("lines") or []
             if len(ln) >= 3:
                 le, ri = ln[1], ln[2]
