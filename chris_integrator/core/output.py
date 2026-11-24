@@ -75,7 +75,8 @@ def _health(I, g, T, by=None):
         if usable:
             state = "suspect"
         reason = "; ".join("%s set aside: %s" % (q, f["reason"]) for q, f in sorted(qf.items()))
-    n = sum(1 for a in g.arrivals if a > I.now - 2.0)
+    lim = I.now - 2.0
+    n = len([a for a in g.arrivals if a > lim])
     out = {"state": state, "reason": reason, "usable": usable,
            "age_s": None if age is None else round(age, 3), "rate_hz": round(n / 2.0, 1)}
     if qf:
@@ -187,16 +188,18 @@ def _pos_none(reason):
 
 
 def calibration(I, x, P):
-    sd = math.sqrt(max(float(P[E.SV, E.SV]), 0.0))
-    out = {"odometry": {"speed_scale": {"value": round(float(x[E.SV]), 5), "std": round(sd, 5), "unit": "1",
+    # (the state and the variances as Python floats once: the same numbers as indexing the arrays one by one)
+    xl, pd = x.tolist(), P.diagonal().tolist()
+    sd = math.sqrt(max(float(pd[E.SV]), 0.0))
+    out = {"odometry": {"speed_scale": {"value": round(float(xl[E.SV]), 5), "std": round(sd, 5), "unit": "1",
                                         "known": sd < 0.5 * I.model.c["scale_sigma0"]},
                         "note": "speed is in the vehicle speed signal's scale; ground distance = speed / (1 + speed_scale)"}}
     for s in I.specs:
         d = {}
         for a in s.aux:
             i = s.ix[a.name]
-            sd = math.sqrt(max(float(P[i, i]), 0.0))
-            d[a.name] = {"value": round(float(x[i]), 5), "std": round(sd, 5), "unit": a.unit,
+            sd = math.sqrt(max(float(pd[i]), 0.0))
+            d[a.name] = {"value": round(float(xl[i]), 5), "std": round(sd, 5), "unit": a.unit,
                          "known": sd < 0.5 * a.sigma0}
         d.update(s.calib_state(I.ctx[s.id]) or {})
         if not d:
