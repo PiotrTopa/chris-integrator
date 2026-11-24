@@ -36,18 +36,26 @@ def tracks_message(layer, es, ts, valid=True, reason=None):
         seen = {s: round(max(0.0, T - t), 3) for s, t in tr.last_seen.items()}
         # (the state and the variances converted once per track: the same numbers as indexing them one by one)
         xl, dg = tr.x.tolist(), tr.P.diagonal().tolist()
+        fl = tr.flags                      # (with the two derived flags added to a copy only when they hold)
+        if tr.standing or tr.designated:
+            fl = set(fl)
+            if tr.standing:
+                fl.add("standing")
+            if tr.designated:
+                fl.add("designated")
+        po = tr.mem.get("path_offset")
+        vx = float(xl[VX])
         out.append({
             "id": tr.id, "state": tr.state, "exist": round(tr.exist, 3),
             "x_m": round(float(xl[X]), 2), "y_m": round(float(xl[Y]), 2),
-            "vx_mps": round(float(xl[VX]), 2), "vy_mps": round(float(xl[VY]), 2),
+            "vx_mps": round(vx, 2), "vy_mps": round(float(xl[VY]), 2),
             "ax_mps2": round(float(xl[AX]), 2),
-            "std": [round(math.sqrt(max(float(dg[i]), 0.0)), 2) for i in range(5)],
-            "v_rel_mps": round(float(xl[VX]) - layer._ve, 2),
+            "std": [round(math.sqrt(max(float(v), 0.0)), 2) for v in dg[:5]],
+            "v_rel_mps": round(vx - layer._ve, 2),
             "age_s": round(T - tr.t0, 2), "meas_age_s": round(min(seen.values()), 3) if seen else None,
             "sources": sorted(tr.sources), "seen": seen, "hits": tr.hits,
-            "flags": sorted(tr.flags | ({"standing"} if tr.standing else set())
-                            | ({"designated"} if tr.designated else set())),
-            "path_offset_m": None if tr.mem.get("path_offset") is None else round(tr.mem["path_offset"], 2),
+            "flags": sorted(fl),
+            "path_offset_m": None if po is None else round(po, 2),
             # what kind of road user (non-critical metadata: label, confidence, the sensor that said so); null: unknown
             "class": class_of(tr, T),
             "attrs": tr.mem.get("attrs") or {}})
