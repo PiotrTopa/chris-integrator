@@ -8,6 +8,11 @@ NS = 1e9
 
 
 def fin(v):
+    t = type(v)
+    if t is float or t is int:             # (the common cases first: the same answer as the general test below)
+        return math.isfinite(v)
+    if v is None:
+        return False
     return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
 
 
