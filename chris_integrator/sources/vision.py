@@ -13,8 +13,8 @@ import numpy as np
 from ..native import round                  # builtins.round (its results; the native core)
 from ..core import ego as E
 from ..core.ego import AuxState
-from ..core.registry import NS, Meas, Source, fin
-from .vehicle import SCALE_MIN_SPEED, SCALE_MIN_YAW, clear_reg
+from ..core.registry import NS, Meas, Source, delayed_speed, fin, lin, scaled
+from .vehicle import SCALE_MIN_SPEED, SCALE_MIN_YAW
 
 PAIR_LAG_S = 0.125               # prior of the delay: the pose describes the image pair
 STOP_SPEED, GO_SPEED, STOP_CONFIRM_S = 0.15, 0.8, 1.0
@@ -72,6 +72,10 @@ class VisionSource(Source):
         AuxState("dpitch", 0.0, 0.15, 1e-9, unit="rad", doc="... pitch (-vz / vx)"),
     )
     lever_m = 1.5                # camera ahead of the rear axle
+    # time offsets estimated outside the filter (docs/EGO_MOTION.md): the pose's yaw rate behind the gyro (the
+    # filter's delay state is learnt from the speed rows only), and a witness of that state: the pose's speed
+    # behind the bus speed
+    lags = (("yaw", "yaw_rate", PAIR_LAG_S, 0.0, 0.4, 0.05, 0.004), ("speed", "speed", PAIR_LAG_S, 0.0, 0.4, 0.3, 0.02))
 
     def reset(self):
         pass
@@ -121,29 +125,30 @@ class VisionSource(Source):
         imf = self.ix["mf"]
         fz = TAIL * char                                 # the sigma that covers the error's tails (as fused)
         white = max(white, WHITE_SHARE * fz, math.sqrt(max(fz * fz - SLOW_SIGMA ** 2 - FAST_SIGMA ** 2, 0.0)))
-        cs = cf = 1.0
-        i_sp = np.array([E.V, isc, im, imf, itau], dtype=np.intp)
-
         vv, vw = float(ctx.P[E.V, E.V]), float(ctx.P[E.W, E.W])
-
-        def h_speed(x, tau0=tau):
-            k = 1.0 + x[isc]
-            d = x[itau] - tau0
-            return k * (x[E.V] - x[E.A] * d) + cs * x[im] + cf * x[imf], i_sp, \
-                np.array([k, clear_reg(x[E.V], vv, SCALE_MIN_SPEED), cs, cf, -k * x[E.A]])
+        # (1 + s) (v - a (tau - tau0)) + m + mf: the scale's regressor judged by how well the speed is known
+        h_speed = delayed_speed(E.V, isc, im, imf, itau, tau, vv, SCALE_MIN_SPEED)
         # without a speed reference the scale cannot be told from the speed: it then stays at its prior and its
         # uncertainty is the speed's (a "consider" state), instead of drifting on its own linearisation
         sp0 = ctx.speed_known()
         # (a reference is another source holding the speed of a moving car: the camera's own inferred standstill
         # makes the speed certain too, and taught the scale nonsense at every pull-away before L41)
         ref = sp0 is not None and sp0[1] < 0.1 and abs(sp0[0]) > 1.0
+        lag_v, _ = ctx.lag("speed")
+        cb_v = None
+        if lag_v is not None and ref:
+
+            def cb_v(nu, s0, tt, lag=lag_v, var=white * white, rel=tau):
+                lag.offer(tt, nu, s0 + var, rel)
         out.append(Meas("speed", t, v, white, h_speed, "vision.pose", robust=True, mon=(v, char), local=True,
-                        consider=None if ref else (isc,)))
+                        consider=None if ref else (isc,), cb=cb_v))
         if fin(vs) and abs(v) >= 1.0:
             # (against the straight-road level, as before L43: a model that has left its range reports any yaw rate,
             # and the turn term would then excuse its exploded uncertainty; measured on the incident drive, 0.6 s)
             out.append(Meas("self:speed", ts, float(vs) / speed_sigma(v), role="self"))
         r = pose.get("yaw_rate")
+        if ctx.integ.stand is not None and fin(r):       # a witness of the standstill (docs/EGO_MOTION.md)
+            ctx.integ.stand.cam(t, v, float(r))
         if fin(r):
             r = -float(r)                                # the device frame is z down: positive right
             rs = pose.get("yaw_rate_std")
@@ -151,14 +156,26 @@ class VisionSource(Source):
             sig_f = 0.009 + 0.08 * abs(r)                # as fused: the gain error is a state, not noise
             # (the delay is estimated from the speed rows only: the yaw acceleration the delay's Jacobian would
             # need here is itself too poorly known, and a noisy regressor biases what it teaches)
-            i_w = np.array([E.W, isw], dtype=np.intp)
-
-            def h_w(x):
-                k = 1.0 + x[isw]
-                return k * x[E.W], i_w, np.array([k, clear_reg(x[E.W], vw, SCALE_MIN_YAW)])
             ref_w = ctx.P[E.W, E.W] < 0.01 ** 2          # a gyro (or wheels) holds the yaw rate
-            out.append(Meas("yaw_rate", t, r, max(sig_f, float(rs)) if fin(rs) else sig_f, h_w, "vision.pose",
-                            robust=True, mon=(r, sig), local=True, consider=None if ref_w else (isw,)))
+            sg_w = max(sig_f, float(rs)) if fin(rs) else sig_f
+            # The yaw rate's time offset (docs/EGO_MOTION.md). The row is inserted with the speed row, at the
+            # delay state's time; where the yaw rate's own lag behind the gyro is configured, or estimated and
+            # applied, its model carries the rest: the yaw rate of (lag + the gyro's own delay - tau) before that.
+            # What a row tells the estimator of that lag is how far behind the gyro its model has put it.
+            integ = ctx.integ
+            lag_w, off = ctx.lag("yaw")
+            gd, d_w, cb_w = integ.gyro_delay(), 0.0, None
+            if ctx.cfg["ego_motion"]["offsets_apply"] if lag_w is not None else False:
+                d_w = off + gd - tau
+            elif ctx.cfg["ego_motion"]["time_offsets"].get(self.id + ".yaw") is not None:
+                d_w = integ.offset_cfg(self.id + ".yaw") + gd - tau
+            if lag_w is not None:        # (without a gyro's samples about the row's time the estimator drops it)
+
+                def cb_w(nu, s0, tt, lag=lag_w, var=sg_w * sg_w, rel=tau + d_w - gd):
+                    lag.offer(tt, nu, s0 + var, rel)
+            h_w = scaled(E.W, isw, vw, SCALE_MIN_YAW, None, d_w, E.AL)       # (1 + s_w) w
+            out.append(Meas("yaw_rate", t, r, sg_w, h_w, "vision.pose",
+                            robust=True, mon=(r, sig), local=True, consider=None if ref_w else (isw,), cb=cb_w))
         # camera mounting: the direction of travel in the device frame, judged at the integrator's speed
         sp = ctx.speed_known()
         vy, vz = pose.get("vy"), pose.get("vz")
@@ -169,15 +186,7 @@ class VisionSource(Source):
             # forward velocity (the same pose, the same monocular scale). The regressor is therefore the measured
             # vx, not the speed state: with the state there, these rows were a speed measurement in disguise
             # (vy = v x yaw offset), which let a camera without any reference "learn" its own scale.
-            i_y = np.array([idy, E.W], dtype=np.intp)
-            i_z = np.array([idp], dtype=np.intp)
-            c_y, c_z = np.array([v, -L]), np.array([-v])
-
-            def h_y(x):
-                return v * x[idy] - x[E.W] * L, i_y, c_y
-
-            def h_z(x):
-                return -v * x[idp], i_z, c_z
+            h_y, h_z = lin([idy, E.W], [v, -L]), lin([idp], [-v])        # v dyaw - w L;  -v dpitch
             sy, sz = pose.get("vy_std"), pose.get("vz_std")
             fl = 0.02 + 0.006 * sp[0]
             sgz = max(fl, float(sz)) if fin(sz) else fl
@@ -202,8 +211,11 @@ class VisionSource(Source):
             ctx.integ.fdi.findings.pop(("vision", "mount", "model_out_of_range"), None)
         # the camera moves while the car stands (another source knows the standstill exactly): somebody is handling
         # it. Whatever the mount was, it is not known any more; its pitch is free again until the next drive.
+        # (a standstill the bus only claims is not one: under its speed floor the car creeps and turns, and the pose
+        # moves with it; before the standstill was confirmed that reset the mount's pitch 9 times on one drive)
         st = ctx.integ.still.get("vehicle")
-        if st and st[-1][1] is not None and ts - st[-1][0] < 0.5 and ts - st[-1][1] > 2.0:
+        if st and st[-1][1] is not None and ts - st[-1][0] < 0.5 and ts - st[-1][1] > 2.0 and \
+                (ctx.integ.stand is None or ctx.integ.stand.state == 2):
             pr = pose.get("pitch_rate")
             moving = abs(v) > HANDLED_SPEED or (fin(r) and abs(r) > HANDLED_RATE) or (fin(pr) and abs(pr) > HANDLED_RATE)
             hq = mem.setdefault("handled", [])

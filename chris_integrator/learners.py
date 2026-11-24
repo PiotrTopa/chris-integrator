@@ -131,6 +131,53 @@ class EstimatorCalibration(Learner):
         return {"priors": self.n_prior}
 
 
+class TimeOffsets(Learner):
+    """The estimator's time offsets that are estimated outside its filter (docs/EGO_MOTION.md): a property of how
+    the car's sources stamp their data, kept across drives. A restart may change it a little (another boot of the
+    feeder), a day more; the prior never claims more than the configured sigma allows."""
+    name = "time_offsets"
+    LO, HI = -0.5, 0.5
+
+    def __init__(self, est):
+        self.est = est
+        self.seeded = None
+        self.n_prior = 0
+        if hasattr(est, "on_new"):
+            est.on_new.append(lambda e: self._on_new())
+
+    def _spec(self):
+        sig = self.est.integ.cfg["ego_motion"]["offset_sigma_s"]
+        return Spec("gauss", lo=self.LO, hi=self.HI, var_cap=sig ** 2, q_restart=0.005 ** 2, q_per_day=0.01 ** 2)
+
+    def export(self, store, cond):
+        spec = self._spec()
+        for name, (v, var, n) in self.est.integ.offsets_snapshot().items():
+            if n > 0:                    # (what no row has spoken about is the configuration, not something learnt)
+                store.put("estimator.offset." + name, spec, round(float(v), 5), float(var), int(n), cond)
+
+    def _on_new(self):
+        self.seeded = None
+        if getattr(self, "store", None) is not None:
+            self.seed(self.store, self.cond)
+
+    def seed(self, store, cond):
+        self.store, self.cond = store, dict(cond)
+        I = self.est.integ
+        if self.seeded is I:
+            return
+        spec, snap = self._spec(), {}
+        for name in I.lags:
+            p = store.prior("estimator.offset." + name, spec, cond)
+            if p is not None:
+                snap[name] = [p.value, p.var]
+        I.offsets_restore(snap)
+        self.n_prior = len(snap)
+        self.seeded = I
+
+    def status(self):
+        return {"priors": self.n_prior}
+
+
 class RadarLearners(Learner):
     name = "radar"
     BIAS = "radar.pitch_bias."
@@ -302,7 +349,7 @@ class Learnt(Plugin):
         rad = m.plugin("radar") if "radar" in m.slots else None
         view = m.plugin("view") if "view" in m.slots else None
         if est is not None and hasattr(est, "integ"):
-            self.learners += [EstimatorCalibration(est), SignRowsReference(est)]
+            self.learners += [EstimatorCalibration(est), TimeOffsets(est), SignRowsReference(est)]
         if rad is not None and hasattr(rad, "box"):
             self.learners.append(RadarLearners(rad))
         if view is not None and hasattr(view, "builder"):

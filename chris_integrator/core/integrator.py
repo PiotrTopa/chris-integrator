@@ -6,6 +6,7 @@ import math
 import numpy as np
 
 from . import ego as E
+from ..native import core as _C
 from .ekf import Filter, Row, wrap_pi
 from .fdi import Diagnostics
 from .monitors import NisMonitor, Pair, SelfCheck, Series
@@ -78,6 +79,49 @@ DEFAULT_CFG = dict(
     objects={},                  # overrides of objects.DEFAULT_CFG
     lead={},                     # the camera-lead source's constants (sources/camera_lead.py) and the lead message's
     sources=None,                # extra sources of this car: [{"kind": "radar", "id": ..., "mount": {...}}, ...]
+    ego_motion=dict(             # ego-motion hygiene (docs/EGO_MOTION.md)
+        # The bus says "standstill" when its speed and every wheel read zero. They read zero below a floor (the
+        # reference car: 0.21 m/s), while the car still rolls and turns: on its two drives with the gyro as read,
+        # the gyro showed up to 0.136 rad/s under that flag, and the exact standstill rows taught that turn to
+        # the gyro's bias (up to 0.008 rad/s wrong on arriving at a real standstill, stated +- 0.0003).
+        stand_confirm=True,      # the exact standstill rows (and with them what a standstill teaches the biases) only
+                                 # once the inertial sensors' quiet or the camera confirm the bus's flag
+        stand_dwell_s=0.5,       # ... and the flag has held this long
+        stand_alone_dwell_s=2.0,     # ... this long where no witness speaks either way
+        stand_window_s=1.0,      # the inertial witness: the spans of gyro and accelerometers over this long
+        stand_gyro_span=0.0095,  # rad/s: a gyro at rest stays within this (the reference car's steps are 0.0022)
+        stand_gyro_max=0.03,     # rad/s: no gyro bias is larger; a mean beyond it is a turn
+        stand_mean_tol=0.006,    # rad/s: the gyro's mean at rest lies this near its estimated bias (or within 3 sigma of it);
+                                 # further off is a steady slow turn or a changed bias: the camera decides, or ...
+        stand_offset_dwell_s=10.0,   # ... this long a quiet (nobody turns that steadily for that long)
+        stand_step_tol=0.006,    # rad/s: at a confirmed standstill a gyro mean this far from the bias state (and 4 sigma)
+                                 # is a bias that has changed: the state's uncertainty is opened to the difference
+        stand_accel_span=0.25,   # m/s2: accelerometers at rest (reference car: steps of 0.04-0.10 at rest, 0.2-0.5 moving)
+        stand_move_k=3.0,        # the gyro's span beyond this many quiet spans speaks against
+        stand_camera_speed=0.15, stand_camera_yaw=0.005,           # the camera for: medians of |vx|, |yaw rate| under these
+        stand_camera_move_speed=0.6, stand_camera_move_yaw=0.02,   # the camera against: its yaw rate over this (its speed
+                                 # never: at night it reports speeds of a standing car)
+        stand_camera_fresh_s=0.6,
+        stand_gap_s=1.0,         # a silence of the bus this long ends a standstill's count
+        stand_floor_sigma=0.12,  # m/s: the speed while the flag is claimed only (zero to the sensor's floor, 0.21 / sqrt 3)
+        gyro_bias_psd=None,      # (rad/s)^2 / s: the gyro bias's random walk; None: the vehicle source's own (1e-9)
+        gyro_bias_wheels=True,   # may the rear wheels' yaw rate correct the gyro's bias (False: a consider state of those rows)
+        # Time offsets. The filter's time axis is the bus speed's stamps; the camera's and the receiver's delays
+        # against it are filter states (vision.tau, gnss.tau). What is configured or estimated here:
+        time_offsets={},         # configured, s: how late a source's stamps are, {"vehicle": every row of the bus,
+                                 # "vehicle.yaw": the gyro beyond that, "wheels.yaw": the rear wheels' yaw rate beyond that,
+                                 # "vision.yaw": the camera's yaw rate (None / absent: the camera's delay state)}
+        offsets_estimate=True,   # the slow estimators of the sources' declared offsets (native Lag) run and are published
+        offsets_apply=False,     # ... and their rows are inserted at what they say (within bounds; the configured value
+                                 # while they have nothing to say)
+        gyro_to_camera=False,    # with offsets_apply: the gyro's rows go onto the camera's clock (the image pair's lag less
+                                 # the camera yaw rate's lag behind the gyro) instead of the camera's yaw rows onto the gyro's
+        offset_sigma_s=0.05,     # prior sigma of an offset about its configured value
+        offset_half_life_s=300.0,    # the rows' information halves over this much excitation
+        offset_span_s=0.25,      # the reference's rate: the slope of its samples within +- this of the row
+        offset_clear=3.0,        # a row counts where that rate stands this many sigma clear of its own noise
+        offset_huber=2.5, offset_corr=4.0,     # robust weight (sigma); rows are correlated in time: variance x this
+    ),
 )
 
 # Every detector that can set a source (or one quantity of it, or a row class) aside has a mode:
@@ -108,17 +152,7 @@ DETECTORS = {
 GATE_ALL = {k: "gate" for k in DETECTORS}      # every detector acts (a car whose sensors were shown to support it; tests)
 
 _POSE_ROWS = ("pos", "heading", "map_cross", "map_heading")      # rows that are about where the car is and where it points
-_IV, _IA, _IW, _IAL = (np.array([i], dtype=np.intp) for i in (E.V, E.A, E.W, E.AL))
-_ONE = np.array([1.0])
-
-
-def _zero(idx):
-    def h(x):
-        return float(x[idx[0]]), idx, _ONE
-    return h
-
-
-_H0 = {"v": _zero(_IV), "a": _zero(_IA), "w": _zero(_IW), "al": _zero(_IAL)}
+_H0 = {"v": lin([E.V], [1.0]), "a": lin([E.A], [1.0]), "w": lin([E.W], [1.0]), "al": lin([E.AL], [1.0])}
 
 
 class _Group:
@@ -163,6 +197,12 @@ class Integrator:
         self.odometer = 0.0
         self._odo_t = None
         self.objects = None
+        em = self.cfg["ego_motion"]
+        self.stand = _C.Stand(*(em["stand_" + k] for k in (
+            "dwell_s", "alone_dwell_s", "window_s", "gyro_span", "gyro_max", "accel_span", "move_k", "camera_speed",
+            "camera_yaw", "camera_move_speed", "camera_move_yaw", "camera_fresh_s", "gap_s", "mean_tol", "offset_dwell_s"))) \
+            if em["stand_confirm"] else None
+        self.lags, self.lag_refs = {}, {}      # name -> (Lag, reference signal, prior); reference signal -> [Lag]
         if sources is None:
             from ..sources import default_sources
             sources = default_sources(self.cfg)
@@ -186,6 +226,15 @@ class Integrator:
         g.sources.append(src)
         for a in src.aux:
             src.ix[a.name] = self.model.add_aux(src.id, a)
+        em = self.cfg["ego_motion"]
+        for name, ref, prior, lo, hi, r_min, ref_sigma in (src.lags if em["offsets_estimate"] else ()):
+            key = "%s.%s" % (src.id, name)
+            cfgd = em["time_offsets"].get(key)
+            prior = prior if cfgd is None else float(cfgd)
+            lag = _C.Lag(prior, em["offset_sigma_s"], lo, hi, em["offset_half_life_s"], em["offset_span_s"], r_min,
+                         em["offset_clear"], em["offset_huber"], em["offset_corr"], ref_sigma)
+            self.lags[key] = (lag, ref, prior)
+            self.lag_refs.setdefault(ref, []).append(lag)
         self.ctx[src.id] = Ctx(self, src)
         if _build:
             self._build(keep=True)
@@ -299,6 +348,50 @@ class Integrator:
             out.append((d, a[1]))
         return None if out[0][1] != out[1][1] else out[1][0] - out[0][0]
 
+    # ---- time offsets estimated outside the filter (docs/EGO_MOTION.md) ------------------------------------------
+    def lag_of(self, key):
+        """(the Lag of the offset `key`, the offset its rows are inserted with now) or (None, None)."""
+        e = self.lags.get(key)
+        if e is None:
+            return None, None
+        return e[0], (e[0].value if self.cfg["ego_motion"]["offsets_apply"] else e[2])
+
+    def lag_ref(self, ref, t, value):
+        """A sample of a reference signal (the source that holds a quantity), at the time its row is inserted."""
+        for lag in self.lag_refs.get(ref, ()):
+            lag.ref(t, value)
+
+    def offset_cfg(self, key):
+        """A configured offset, s (0 where none is)."""
+        v = self.cfg["ego_motion"]["time_offsets"].get(key)
+        return 0.0 if v is None else float(v)
+
+    def gyro_shift(self):
+        """How old the gyro's value is at its stamp beyond the configured offset, as estimated: with
+        `gyro_to_camera` the gyro's lateness on the camera's clock, i.e. the image pair's lag (the camera's own
+        delay as configured) less the camera yaw rate's lag behind the gyro as estimated; else 0."""
+        em = self.cfg["ego_motion"]
+        if not (em["offsets_apply"] and em["gyro_to_camera"]):
+            return 0.0
+        e = self.lags.get(em.get("gyro_clock", "vision.yaw"))
+        return 0.0 if e is None else e[2] - e[0].value
+
+    def gyro_delay(self):
+        """How old the gyro's value is taken to be at its stamp, s: configured (`time_offsets["vehicle.yaw"]`) plus
+        estimated (`gyro_shift`). Its row and the other yaw sensors' rows carry it in their models (the yaw rate
+        as it was then, by the yaw acceleration): no row leaves its place in time."""
+        return self.offset_cfg("vehicle.yaw") + self.gyro_shift()
+
+    def offsets_snapshot(self):
+        return {k: [e[0].value, e[0].std ** 2, e[0].n] for k, e in self.lags.items()}
+
+    def offsets_restore(self, snap):
+        """Offsets learnt before, as this run's priors: {name: [value, variance]}."""
+        for k, rec in (snap or {}).items():
+            e = self.lags.get(k)
+            if e is not None and rec[1] > 0 and math.isfinite(rec[0]):
+                e[0].seed(float(rec[0]), math.sqrt(rec[1]))
+
     def carry_fault(self, group, reason):
         """A fault known from before this run: the group starts faulted until its monitors see agreement."""
         g = self.groups.get(group)
@@ -392,6 +485,10 @@ class Integrator:
         covariance stay; a fault survives as carried; the position stays with its uncertainty inflated."""
         self.epoch += 1
         self.fdi.reset()
+        if self.stand is not None:
+            self.stand.reset()
+        for e in self.lags.values():
+            e[0].clear()
         self.fdi.event("clock", "epoch", None, "the device clock restarted (epoch %d): buffers dropped, calibration kept" % self.epoch,
                        quantity="time")
         l = self.ekf.latest()
@@ -453,6 +550,12 @@ class Integrator:
                 # consider states of these rows (the sources' own rows learn their biases from the known zero).
                 # Correlations built at speed would otherwise be cashed in at v = 0, where they mean nothing.
                 fz = self._aux_ix()
+                if m.level == 1:
+                    # claimed, not confirmed (docs/EGO_MOTION.md): the speed is zero to the sensor's floor; nothing
+                    # is said about the turn or the accelerations, so no bias is taught by this flag
+                    self._fuse(m.t, Row("standstill", 0.0, self.cfg["ego_motion"]["stand_floor_sigma"] ** 2, _H0["v"],
+                                        m.src, g.name, freeze=fz))
+                    return True
                 for name, var in (("v", 1e-6), ("a", 1e-4), ("w", 1e-8), ("al", 1e-4)):
                     self._fuse(m.t, Row("standstill" if name == "v" else "standstill_" + name, 0.0, var * k, _H0[name],
                                         m.src, g.name, robust=m.sigma is not None, freeze=fz))

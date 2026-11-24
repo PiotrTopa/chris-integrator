@@ -53,7 +53,7 @@ import numpy as np
 from ..native import round                  # builtins.round (its results; the native core)
 from ..core import ego as E
 from ..core.ego import AuxState
-from ..core.registry import NS, Meas, Source, fin
+from ..core.registry import NS, Meas, Source, delayed_heading, fin, lin
 
 FIXES = ("2d", "3d", "dgps", "rtk")
 
@@ -491,8 +491,6 @@ class GnssSource(Source):
         lag = mem.pop("lag", None)
         if lag is not None:
             L, sig, sharp = lag
-            i_t = np.array([itau], dtype=np.intp)
-            one_ = np.array([1.0])
             st = math.sqrt(max(float(ctx.P[itau, itau]), 0.0))
             far = abs(L - tau) > max(self.lag_change_s, 3.0 * math.hypot(sharp, st))
             mem["lag_far"] = mem.get("lag_far", 0) + 1 if far and sharp <= 1.0 else 0
@@ -505,16 +503,13 @@ class GnssSource(Source):
                 integ.fdi.event("gnss", "delay", None, "the receiver's delay is %.1f s by its own motion against the car's "
                                 "(the state said %.1f s): taken from there" % (L, tau), quantity="position")
             else:
-                out.append(Meas("delay", ts, L, sig, lambda x: (x[itau], i_t, one_), "gnss.delay", robust=True, local=True))
+                out.append(Meas("delay", ts, L, sig, lin([itau], [1.0]), "gnss.delay", robust=True, local=True))
         if place is not None:
             mem["placed_moving"] = mem.get("placed_moving", 0) + 1
         if not integ.anchored:
             return out or self._alive(ts)
         if course_ok and straight and not unsteady:
-            i_h = np.array([E.PSI, itau], dtype=np.intp)
-
-            def h_c(x, tau0=tau):
-                return x[E.PSI] - x[E.W] * (x[itau] - tau0), i_h, np.array([1.0, -x[E.W]])
+            h_c = delayed_heading(E.PSI, itau, tau)          # psi - w (tau - tau0)
             # the innovation is wrapped: compare against the heading unwrapped to the state's branch
             zc = E.course_to_psi(float(course))
             zc = float(x[E.PSI]) + ((zc - float(x[E.PSI]) + math.pi) % (2.0 * math.pi) - math.pi)
@@ -522,10 +517,7 @@ class GnssSource(Source):
                             local=not c["gnss_absolute"]))
         alt = msg.get("alt_m")
         if fin(alt):
-            i_z = np.array([E.Z], dtype=np.intp)
-            one = np.array([1.0])
-            out.append(Meas("alt", ts - tau, float(alt), self.alt_sigma_m, lambda x: (x[E.Z], i_z, one),
-                            "gnss.alt", robust=True))
+            out.append(Meas("alt", ts - tau, float(alt), self.alt_sigma_m, lin([E.Z], [1.0]), "gnss.alt", robust=True))
         return out or self._alive(ts)
 
     def _unplaced(self, ctx):

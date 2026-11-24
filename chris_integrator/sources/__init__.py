@@ -10,7 +10,7 @@ def default_sources(cfg=None):
     from .signrows import SignRowsSource
     from .vision import VisionSource
     cfg = cfg or {}
-    out = [VehicleSource(), VehicleSignals(), WheelsSource(), VisionSource(), GnssSource(), GnssSpeedSource(), GnssTrackSource(),
+    out = [VehicleSource(ego_motion=cfg.get("ego_motion")), VehicleSignals(), WheelsSource(), VisionSource(), GnssSource(), GnssSpeedSource(), GnssTrackSource(),
            MapMatchSource(), CameraLeadSource(cfg.get("lead")), SignRowsSource()]
     for spec in cfg.get("sources") or ():
         out.append(build(spec))

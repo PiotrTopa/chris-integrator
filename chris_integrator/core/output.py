@@ -182,6 +182,19 @@ def calibration(I, x, P):
         if s.mount is not None:
             d["mount"] = s.mount.as_dict()
         out[s.id] = d
+    if I.lags:
+        # the time offsets estimated outside the filter (docs/EGO_MOTION.md): `info` is the rows' share of the
+        # estimate (0: the configured value alone), `applied` what the rows are inserted with
+        em = I.cfg["ego_motion"]
+        to = {}
+        for k, (lag, ref, prior) in I.lags.items():
+            n, gated, dropped, waiting = lag.counts
+            to[k] = {"value": round(lag.value, 4), "std": round(lag.std, 4), "unit": "s", "against": ref, "configured": round(prior, 4),
+                     "rows": n, "excited_s": round(lag.excited_s, 1), "info": round(lag.info, 3),
+                     "applied": round(lag.value if em["offsets_apply"] else prior, 4)}
+        gs = I.gyro_shift()
+        to["gyro_shift"] = {"value": round(gs, 4), "unit": "s", "applied": bool(em["offsets_apply"] and em["gyro_to_camera"])}
+        out["time_offsets"] = to
     return out
 
 
