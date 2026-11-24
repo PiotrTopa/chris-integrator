@@ -1038,6 +1038,41 @@ oncoming on our side, a pedestrian stepping out; parked row, adjacent lane, onco
 courses warn 1.5 to 3 s before contact and the rest stays at stage 0 (tests/test_decide.py).
 
 
+### 17.1 A standing vehicle's place under a camera's range (lane CURVES, 2026-11-24)
+
+Why the alert said parked cars on bends, measured on the simulator (docs/TOPICS.md has the constants):
+
+* The tracker's range is known to 17-20 % of itself at every age and distance (its error within that, 10-17 % long
+  below 30 m); the bearing to a tenth of a degree. The place is a needle along the line of sight, and on a bend
+  of 110 m radius that needle crosses the road at 0.2 m per metre of range at 45 m: a car parked on the outside
+  of the bend and a car stopped in the lane share a line of sight, 6 m of range apart. At 45 m the honest
+  probability that a roadside car is in the lane is 0.2-0.4 whenever its range reads half a sigma short; with 50
+  parked cars a run, that happens for a second or so several times a run.
+* What was wrong on our side: the lane filter multiplied the same range error in every 0.4 s (certainty out of a
+  one-second error); the futures stood at the track's mean with an upright spread and were weighed by the lanes,
+  so the doubt was counted twice for the car that IS in the lane and not at all for the futures that "moved" a
+  metre; the car's straight-on future held a fifth of every frame.
+* What is done: the place is read along the line of sight; a thing never seen to move takes its lane from the
+  track's place now; a standing vehicle whose range leaves both open gets futures of two places (in the car's way,
+  beside it), the first with the probability the ranges give it, the second with the floor a standing thing beside
+  the lane always had; where cars have been seen standing beside the road, one standing in the lane is that many
+  times less likely; a camera velocity that the range's scale explains does not make a roadside car move; and an
+  alert on an object whose place is in doubt needs the conflict to last in proportion to how little it exceeds
+  the level's minimum (a sequential test in place of a fixed hold).
+* What was tried and withdrawn, each for a measured reason: the lane from the place alone for everything
+  (cut-ins and crossing traffic were no longer recognised: how a thing moves does add up); two places for moving
+  vehicles (a car in the next lane at speed got a standing future in the car's way); "in the way" as the weight
+  of a vehicle whose place is open only across the line of sight (a parked car on a real drive whose track stood
+  a metre nearer the plan than the car was passed was said); the velocity's scale bound for vehicles in the
+  car's way (a lead read at 17 instead of 26 m/s became a stopped car) and with a range share above 0.3 (a car
+  keeping the car's own speed 14 m ahead became a standing one on a real drive); the evidence rule on the whole
+  collision probability instead of the mass at the level (no gain on the car half in the lane, one false threat
+  on an oncoming car).
+* What it cannot do: tell the two cars apart before the range does. That is the tracker's (parallax ranging of
+  standing objects, the range scale in its velocity covariance). The reconstruction of the needle from `std`
+  assumes a spread along the line of sight; a correlation in the radar message (`std_rho`, the correlation of
+  the x and y errors, or `std_los`: 1 sigma along and across the line of sight) would replace it.
+
 ## 18. Learnt values across drives (lane DECIDE, 2026-11-23)
 
 `chris_integrator/learnt.py` (the store) and `chris_integrator/learners.py` (the learners' adapters and the plug-in

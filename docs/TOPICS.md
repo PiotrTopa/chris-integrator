@@ -620,14 +620,15 @@ constants, each a switch):
   drove up and stopped keeps its lane). 1: the filter for all, as before.
 * `lane_hyp` (1): a vehicle that (probably) stands (`lane_hyp_stand` 0.3) and whose range leaves both open gets
   **futures of two places**: in the car's way (its body reaches into the strip the car's body sweeps along its
-  lane: a car parked half in the lane is in the way, whatever its lane) and not. Each place is the stretch of the
-  line of sight that belongs to it, its futures stand at that stretch's mean range with a spread kept inside it;
-  the futures built for the object's lane are of the one place and weigh what it weighs, the other place gets one
-  standing future (`stopped` in the way, `parked` beside). The object then carries `"lane_res": P(in the car's
-  way)` (in process: state 3 + that probability in the hand-off's rows) and its futures' weights are final: the
-  decision layer does not weigh the standing ones by the lanes again. A place open only across the line of sight
-  (the two less than max(1 m, half the range's sigma) apart in range) stays one place whose spread says it, and a
-  vehicle as good as surely in the way keeps its futures: both with `lane_res` 1.
+  lane) and not. Each place is the stretch of the line of sight that belongs to it, its futures stand at that
+  stretch's mean range with a spread kept inside it; the futures built for the object's lane are of the one place
+  and weigh what it weighs, the other place gets one standing future (`stopped` in the way, `parked` beside). The
+  object then carries `"lane_res": P(in the car's way)` (in process: state 3 + that probability in the hand-off's
+  rows): the decision layer takes the futures at their weight, except the standing one beside the way (`parked`),
+  which weighs the lanes' floor as a standing thing beside the lane always did. Only where the two places are
+  apart in range (the ranges of the one are mostly not the other's): a place open across the line of sight alone
+  (a car at the lane's edge, a car parked half in the lane) and a moving vehicle keep their futures and the
+  lanes' weight as before.
 * `row_odds_max` (predictor's own, 12; 0: off): where vehicles have been seen standing beside the road on a side
   (their offset known to `row_sd_m`, within `row_mem_s`), a vehicle standing in a lane on that side is (beside +
   1) / (in the lane + 1) times less likely, at most `row_odds_max`: a count of what this street has shown.
@@ -636,7 +637,8 @@ constants, each a switch):
   0.15 v: the tracker called parked cars moving in a fifth of their frames, their velocity along the car's own,
   0.15-0.35 of its speed). For a vehicle BESIDE the car's way whose velocity across the car's travel is within its
   spread, p_stationary is raised to what that velocity leaves of "it stands" (never lowered; never for a vehicle in
-  the car's way: a lead whose speed is not found yet must not become a car standing in the lane).
+  the car's way: a lead whose speed is not found yet must not become a car standing in the lane; the range's share
+  counts up to 0.3).
 * `ego_path_p` 0.95 (was 0.8): the car's straight-on future (`ctra`) held a fifth of the weight in every frame
   and ran through the bends' roadside cars; it still takes over where the yaw rate leaves the path.
 
@@ -1011,7 +1013,8 @@ or the car stands. The primary changes to a challenger that ranks higher for `sw
 a higher level. An object whose PLACE is in doubt (`p_place` below
 `entry_evidence`, 0.6) enters a stage by evidence instead of by time: the conflict's mass at that level, as far as
 it exceeds the level's minimum, adds up at (mass - minimum) / (entry_evidence - minimum) per second (at most 1) to
-`entry_hold_s`, and runs down again while the level is not held: a clear conflict enters as fast as ever, one that
+`entry_hold_s` (`entry_evidence_of: "p_coll"`: the object's whole collision probability in place of the mass), and
+runs down again while the level is not held: a clear conflict enters as fast as ever, one that
 a second of range error lifts just over the minimum does not (`entry_evidence: 0` is the time rule for all).
 Candidates: confirmed or coast, existence >= 0.6, seen within 2.5 s. On degraded futures: an
 object whose velocity is not observed yet raises at most information until the radar's p_stationary has moved to

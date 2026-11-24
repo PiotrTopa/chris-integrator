@@ -47,6 +47,7 @@ ALERT_DEFAULTS = dict(
     # range, for a second, leaves a third of it in the lane) has to last in proportion. Below the level the sum runs
     # down again second for second.
     entry_evidence=0.6,
+    entry_evidence_of="mass",                       # what adds up: the object's whole collision probability | "mass" at the level
     mass_min=None,                                  # {kind: (4 minima)}; None: threat.THRESHOLDS
     latch_imminent=True,
     switch_hold_s=0.3,
@@ -222,7 +223,12 @@ class Alert:
             doubt = isinstance(pp, (int, float)) and pp < ref
             for L in range(1, 5):
                 if le >= L:
+                    # how sure the conflict is: its whole collision probability (the level is held by the mass at it;
+                    # a car half in the lane kept P(collision) at 0.3-0.7 while the mass at the level sat at its minimum)
                     m = mass[L - 1] if isinstance(mass[L - 1], (int, float)) else 1.0
+                    pc = (rec or {}).get("p_coll") if c["entry_evidence_of"] == "p_coll" else None
+                    if isinstance(pc, (int, float)) and pc > m:
+                        m = pc
                     rate = 1.0 if ref <= thr[L - 1] or not doubt else min(1.0, max(0.0, (m - thr[L - 1]) / (ref - thr[L - 1])))
                     self.ev[L] = self.ev.get(L, 0.0) + rate * dt
                 else:

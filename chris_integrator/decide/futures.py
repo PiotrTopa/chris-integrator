@@ -125,7 +125,8 @@ class Futures:
         rows       (R, 3): first mode, modes, state (0 no futures, 1 as the contract says, 2 not: the adapter
                    stands in and it is counted, 3 as the contract says and the futures carry both places the object
                    may be in (`lane_res`: in the car's way or not; the state is 3 + the probability of the former, below 4):
-                   the lanes' weight is not applied again)
+                   the lanes' weight is not applied again; of the two, the future beside the way (`parked`) weighs
+                   the lanes' floor)
         lanes      None | [R] of the message's lane dicts (or None) | (R, 7) probabilities of LANES
         sel        {object id: row} | [row or -1 per object of the radar message]
 
