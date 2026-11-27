@@ -95,6 +95,20 @@ class DaemonTest(unittest.TestCase):
         self.assertEqual(fastjson.loads_road(odd)["pose"], road["pose"])     # anything unexpected: the whole line is parsed
 
 
+class CarriedStateTest(unittest.TestCase):
+    def test_a_fault_carried_over_several_runs_is_said_once(self):
+        """Six starts in a car park with the camera's fault carried each time: the reason grew a prefix per run."""
+        from chris_integrator.plugins.estimator import Estimator
+        reason = "own speed uncertainty 6.5x its characterised level"
+        saved = {"faults": {"vision": {"reason": reason, "rule": "gate"}}}
+        for _ in range(4):                                           # four runs, the state handed on each time
+            est = Estimator({})
+            est.state_load(saved)
+            saved = est.state_dump()
+            saved["faults"] = {g: dict(r) for g, r in saved["faults"].items()}
+        self.assertEqual(saved["faults"]["vision"]["reason"], Estimator.CARRIED + reason)
+
+
 class StopTest(unittest.TestCase):
     """The stop (SIGTERM from the service manager): the carried state first, the clients within limits, the process
     never longer than its own limit. On 27 November 2026 the unit was killed 90 s after its stop signal."""

@@ -108,10 +108,17 @@ class Estimator(Plugin):
         return {"faults": {g: {"reason": r.get("reason"), "rule": r.get("rule")} for g, r in faults.items()},
                 "calibration": self.integ.calibration_snapshot()}
 
+    CARRIED = "carried over from the previous run: "
+
     def state_load(self, saved):
         for g, rec in ((saved or {}).get("faults") or {}).items():
             if isinstance(rec, dict):
-                self.integ.carry_fault(g, "carried over from the previous run: %s" % rec.get("reason"))
+                # a fault that survives several runs is said once to be carried, not once per run (after six starts
+                # in a car park the reason was six prefixes long: the drives of 26 November 2026)
+                reason = str(rec.get("reason"))
+                while reason.startswith(self.CARRIED):
+                    reason = reason[len(self.CARRIED):]
+                self.integ.carry_fault(g, self.CARRIED + reason)
         self.integ.calibration_restore((saved or {}).get("calibration"))
         self.saved = sorted(self.integ.faults())
 
