@@ -10,9 +10,19 @@ directory `<dir>/<YYYYmmdd-HHMMSS>/` with
                         `env`, `speed_limit`, `rules`, `fused`, `map`, `ego` (at most `ego_hz`), `vehicle` (what
                         the host says about the car), `objects` (range-sensor scans, at most `objects_hz`),
                         `view` (the display channel as consumers got it, with the road picture `view.road`, at most `view_hz`),
-                        `calib` and one `camera` message a second, as they are. `lanes` and `lead` are not written: they are
+                        `calib` and one `camera` message a second, as they are; `radar` (the object tracker's objects as
+                        the stack had them on the drive, at most `radar_hz`), `decide` (the decision layer: at most
+                        `decide_hz`, and EVERY message that carries an alert transition in `events`, whatever the cap),
+                        `governor` (the camera instance's load governor: level, what is shed, the headroom; at most
+                        `governor_hz`). `lanes` and `lead` are not written: they are
                         derived from `road` and `ego`, and chris-roadsense `tools/lanes_replay.py` / chris-roadsense `tools/lead_replay.py`
-                        recompute them from this file.
+                        recompute them from this file. `radar_fut` (the objects with their predicted futures, three times
+                        the size of `radar`) is not written by default: name it in `topics` (cap `radar_fut_hz`).
+
+What a review of a drive needs and a replay cannot give back: a replay of `road` / `lights` / `ego` through today's
+code tells what today's tracker and decision layer would do, not what the car's did (another configuration, another
+version, the load governor's shedding, the arrival order of the messages). Until lane "drive-quality" the tracker's
+objects and the alerts of a drive were only in the journal's log lines.
     frames/<seq>.jpg    the camera's preview JPEG every `frame_every_s` seconds (the file camerad already
                         writes for its /preview; copied, not re-encoded; only when the recorder is given that path): the pictures a detector replay
                         (roadsense-signs `lights_replay`, `signd_replay`) needs to say what was there to see.
@@ -23,12 +33,14 @@ compressor works through its buffer in pieces of about 128 kB (tens of milliseco
 and the per-message path does not wait for that. A session opened while the wall clock was wrong (a boot without a clock source) is renamed to its
 true start time when the clock is stepped.
 
-Cost: about 30 kB/s of compressed messages and one 40-110 kB JPEG a second, a few milliseconds of one little
-core per second. Old sessions are deleted, oldest first, when the directory exceeds `max_mb`. Nothing leaves
+Cost: about 40 kB/s of compressed messages (`radar`, `decide` and `governor` are 1-3 kB/s of that: 1.1 kB/s in a
+replay of the 9-minute night drive of 27 November 2026, more in dense traffic) and one 40-110 kB JPEG a second, a few milliseconds of one little
+core per second: 4000 MB hold about ten hours of driving. Old sessions are deleted, oldest first, when the directory exceeds `max_mb`. Nothing leaves
 the device. The recorder never raises into the fan-out: a full disk stops the recording, not the api.
 
 Config keys (all optional but `dir`): `max_mb` (4000), `road_hz` (20), `ego_hz` (25), `ego_state_hz` (2), `objects_hz` (10), `view_hz` (2),
-`frame_every_s` (1.0; 0 = no frames), `topics` (list; default below), `stamp_hz` ({}; see below).
+`radar_hz` (5), `decide_hz` (2), `governor_hz` (1), `radar_fut_hz` (2), `frame_every_s` (1.0; 0 = no frames),
+`topics` (list; default below), `more_topics` (list: topics on top of `topics`, e.g. `["radar_fut"]`), `stamp_hz` ({}; see below).
 
 The `<topic>_hz` caps are counted on the recorder's clock (the host's monotonic clock: when a message reaches the
 recorder). `stamp_hz`, a map topic -> rate (e.g. `{"road": 10}`), thins the topics it names by the messages' own
@@ -52,9 +64,10 @@ from ..native import core as _C
 log = logging.getLogger("chris_integrator.recorder")
 
 DEFAULT_TOPICS = ("road", "lights", "signs", "env", "speed_limit", "rules", "fused", "map", "ego", "calib", "camera",
-                  "vehicle", "objects", "view", "gnss", "ego_state", "tracks")
+                  "vehicle", "objects", "view", "gnss", "ego_state", "tracks", "radar", "decide", "governor")
 DEFAULTS = dict(dir=None, max_mb=4000, road_hz=20.0, ego_hz=25.0, objects_hz=10.0, view_hz=2.0, frame_every_s=1.0,
-                ego_state_hz=2.0, topics=list(DEFAULT_TOPICS), stamp_hz={})
+                ego_state_hz=2.0, radar_hz=5.0, decide_hz=2.0, governor_hz=1.0, radar_fut_hz=2.0,
+                topics=list(DEFAULT_TOPICS), more_topics=[], stamp_hz={})
 CLOCK_STEP_S = 120.0            # the wall clock moved this much against the monotonic one: re-date the session
 
 
@@ -99,10 +112,12 @@ class Recorder:
         self.cfg.update(cfg or {})
         self.preview_path = preview_path
         self.clock, self.wall = clock, wall
-        self.topics = set(self.cfg["topics"])
+        self.topics = set(self.cfg["topics"]) | set(self.cfg["more_topics"] or ())
         c = self.cfg
         self._caps = {"road": c["road_hz"], "ego": c["ego_hz"], "objects": c["objects_hz"], "view": c["view_hz"],
-                      "camera": 1.0, "ego_state": c["ego_state_hz"], "tracks": c["ego_state_hz"]}
+                      "camera": 1.0, "ego_state": c["ego_state_hz"], "tracks": c["ego_state_hz"],
+                      "radar": c["radar_hz"], "decide": c["decide_hz"], "governor": c["governor_hz"],
+                      "radar_fut": c["radar_fut_hz"]}
         # topic -> least spacing of the written messages' ts_mono_ns, in ns (`stamp_hz`; the 5 ms of the clock cap)
         self._stamp = {k: 1e9 / hz - 5e6 for k, hz in (c["stamp_hz"] or {}).items()
                        if isinstance(hz, (int, float)) and not isinstance(hz, bool) and hz > 0}
@@ -158,17 +173,29 @@ class Recorder:
                     log.warning("recorder stopped (write): %s", e)
                 self.failed = True
 
-    def close(self):
+    def close(self, timeout=None):
+        """Write what is queued and close the file. `timeout` (s): how long to wait for the writer thread (a disk
+        that does not answer); False when it did not finish in time (the file is then closed under it: the lines
+        still queued are lost, what was written stays), True otherwise."""
+        ok = True
         if self._thread is not None:
-            self._q.put(self._STOP)
-            self._thread.join()
+            try:
+                self._q.put(self._STOP, timeout=timeout)
+            except queue.Full:
+                ok = False
+            self._thread.join(timeout)
+            ok = ok and not self._thread.is_alive()
+            if not ok:
+                self.failed = True              # the writer drops what it still takes from the queue
+                log.warning("recorder: the writer did not finish within %s s", timeout)
             self._thread = self._q = None
         if self.fh is not None:
             try:
                 self.fh.close()
-            except OSError:
+            except (OSError, ValueError):
                 pass
             self.fh = None
+        return ok
 
     def _fail(self, what, exc):
         if not self.failed:
@@ -184,7 +211,9 @@ class Recorder:
         if self.failed or mtype not in self.topics:
             return
         now = self.clock()
-        if self._stamp and mtype in self._stamp and env.ts is not None:
+        if mtype == "decide" and isinstance(env.msg, dict) and env.msg.get("events"):
+            self._last[mtype] = now             # an alert transition: written whatever the cap
+        elif self._stamp and mtype in self._stamp and env.ts is not None:
             if not self._due_ts(mtype, env.ts, now):
                 return
         elif not self._due(mtype, now):
@@ -200,7 +229,9 @@ class Recorder:
             return
         now = self.clock()
         msg = None
-        if self._stamp and mtype in self._stamp:
+        if mtype == "decide" and '"events":[]' not in line and '"events": []' not in line and '"events"' in line:
+            self._last[mtype] = now             # an alert transition: written whatever the cap
+        elif self._stamp and mtype in self._stamp:
             msg = json.loads(line)
             ts = msg.get("ts_mono_ns") if isinstance(msg, dict) else None
             if isinstance(ts, int):
