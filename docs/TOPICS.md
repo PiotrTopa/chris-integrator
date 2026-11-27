@@ -802,7 +802,9 @@ Derived from the measurement topics, never fed back into them; nothing in it bel
                                  //   now (the reason says why): no lead, no lines, no path in this message; a display shows that state
 "objects": [ {"id": "lead:12" | "light:7" | "sign:31" | "ru:4",   // stable while the measurement track lives
               "kind": "vehicle|traffic_light|sign|road_user", "role": "lead|ego|other",   // ego: the ego traffic light
-              "x": 34.2, "y": 1.9,                        // car frame (x forward from the camera, y right), m
+              "x": 34.2, "y": 1.9,                        // car frame (x forward from the camera, y right), m; a road user from
+                                                          //   the radar: its body, with "near", "hdg", "hdg_std", "hdg_src",
+                                                          //   "len", "wid" (below: the body and which way it faces)
               "vx": -12.1, "vy": 0.0,                     // m/s relative to the car: x(t) = x + vx (t - ts)
               "sx": 2.1, "sy": 0.5,                       // 1 sigma of the drawn position (null: not known)
               "age_s": 4.2,                               // since the object appeared
@@ -844,6 +846,39 @@ that pop on or off without a fade 106 -> 2; the lead's step per frame after its 
 a lane line's step per frame at 30 m 0.089 -> 0.068 m rms, steps over 0.3 m 119 -> 72 (the reference consumer,
 which moves the lines with their own rate between two messages, draws 6 such steps on that drive).
 Cost: 0.15-0.18 ms per frame on the laptop without the road picture.
+
+**Road users from the radar: the body and which way it faces** (`RadarDisplay.objects`, 2026-11-27; drive of
+2026-11-26/27: a vehicle in the next lane and oncoming traffic stood partly in the car's own lane on the screen,
+oncoming and crossing traffic was drawn from behind). The radar's place of an object (`x_m`, `y_m`) is its NEAR
+point: where the line of sight to its centre enters its rectangle. For a vehicle straight ahead that is the middle
+of its rear; for one in the next lane or an oncoming one it is the corner towards the car's own lane. A screen
+that draws a vehicle's width centred on it moves the vehicle towards the car's lane: by 0.65 m (median) at
+10-20 m, 0.4 m at 20-35 m, 0.1 m beyond, measured on the standing vehicles the car later passed (their place when
+near, carried back by the car's own motion, is the truth; the rectangle's centre is right to 0.0-0.1 m median).
+So a road user drawn from the radar's objects carries, in `objects`:
+
+```
+"x": 12.4, "y": -3.5,        // x: the nearest edge of its rectangle along the car's axis (for a vehicle ahead: its rear
+                             //   face); y: the MIDDLE of its body (view frame, y right)
+"near": [12.6, -2.7],        // the radar's near point (what `x`, `y` were until 2026-11-27; what is in the way)
+"hdg": -3.05,                // where its front points, rad, 0 = the car's own direction, positive to the RIGHT (the view's
+                             //   frame; the radar's `hdg` is positive to the left); +-pi: it faces the car
+"hdg_std": 0.1,              // 1 sigma of the axis (the radar's `ext_std[2]`); it does not say which end is the front
+"hdg_src": "motion",         // which end is the front: "motion" once the object was seen driving at 2.5 m/s (latched: a
+                             //   vehicle that then stops keeps it); "guess" before (the pose head's votes, the first box):
+                             //   a screen must not draw head or tail lamps on a guess
+"len": 4.4, "wid": 1.8       // the rectangle, m
+```
+
+On the recordings of 2026-11-26/27 (re-run with the phone's tracker knobs): a vehicle in the lane left of the
+car's, drawn 1.8-2.5 m wide centred on (x, y), stood over the car's left lane line in 28.5 % of the frames
+within 20 m when it stood (queues, parked rows), 38.5 % when it came towards the car, 7.7 % when it drove with
+the car; with the body's middle 1.2 %, 5.2 %, 1.9 % (at night, standing: 72.6 % -> 0.9 %). What is left beyond
+20 m (6-18 %) is the range: a camera's range error of 10-25 % moves a vehicle 3.5 m to the side by 0.4-0.9 m. Of
+the oncoming vehicles' frames 87 % (day; 97 % at night, few) carry the front towards the car with
+`hdg_src: "motion"`, 11 % a guess (the first second), 1 % the wrong end. `{"view": {"radar": {"place": "near"}}}`
+gives the old objects (near point, none of these keys). `around` is unchanged (near points, velocities).
+`tests/test_view_facing.py` holds it on the simulator (a car in the next lane, oncoming cars, crossing cars).
 
 **`view.around`: every object all round the car** (`RadarDisplay.around`, `chris_integrator/trackers/roadusers_view.py`;
 added 2026-11-23 for the MFD's 360-degree radar view). `objects` holds what a picture of the road AHEAD draws (0.5 to
