@@ -222,6 +222,14 @@ RADAR_CFG = dict(
     # while it is fresh (its per-object level as shown, with hysteresis, and its `obstacle_ahead` alert); "radar":
     # the radar's own flags as before
     flags_from="decide", decide_stale_s=0.5,
+    # where a road user of `objects` is drawn (2026-11-27). "body": `x` the nearest edge of its rectangle along the
+    # car's axis, `y` the middle of its body, with `hdg`, `len`, `wid` (and the radar's near point as `near`): a
+    # screen that draws a vehicle's width centred on (x, y) draws it where it is. "near": the radar's near point
+    # (`x_m`, `y_m`: where the line of sight to the centre enters the rectangle) as before: for a vehicle in the
+    # next lane or an oncoming one that point is its corner towards the car's own lane (0.4-0.9 m off its middle
+    # within 20 m), and a vehicle drawn centred on it stood half in the car's lane
+    place="body",
+    hdg_motion_mps=2.5,          # `hdg_src` is "motion" once the object was seen driving at this speed (latched)
 )
 
 # a class label is passed in `around` only from this confidence on (the MFD's own rule for `objects`; a screen
@@ -236,6 +244,26 @@ _K0, _K1 = operator.itemgetter(0), operator.itemgetter(1)
 def _r1(v):
     v = round(float(v), 1)
     return 0.0 if v == 0 else v                 # no "-0.0"
+
+
+def _wrap(a):
+    return (a + math.pi) % (2.0 * math.pi) - math.pi
+
+
+def body_place(o, x_near, y_near):
+    """Where a display draws a radar object's body, from its rectangle (`ctr`, `len`, `wid`, `hdg`), given its
+    near point carried to the frame's time (view frame: x forward, y RIGHT): (x of the rectangle's nearest edge
+    along the car's axis, y of its middle, heading in the view frame (rad, 0 = the car's direction, positive to
+    the RIGHT) or None). Without a rectangle: the near point, no heading."""
+    c, h = o.get("ctr"), o.get("hdg")
+    if not (isinstance(c, (list, tuple)) and len(c) == 2 and isinstance(h, (int, float))):
+        return x_near, y_near, None
+    ln, wd = float(o.get("len") or 0.0), float(o.get("wid") or 0.0)
+    # the centre relative to the near point does not change while the object is carried on
+    cx = x_near + (float(c[0]) - float(o["x_m"]))
+    cy = y_near - (float(c[1]) - float(o["y_m"]))
+    hx = 0.5 * (ln * abs(math.cos(h)) + wd * abs(math.sin(h)))
+    return min(x_near, cx - hx), cy, _wrap(-float(h))
 
 
 class RadarDisplay:
@@ -398,6 +426,7 @@ class RadarDisplay:
                 if abs(place[oid][0] - place[first][0]) <= max(3.0, 2.0 * sx):
                     lead_ids.add(oid)
         alert_states, max_x, max_y, fade_s = c["alert_states"], c["max_range_m"], c["max_lateral_m"], c["fade_s"]
+        body, hm_v = c["place"] == "body", c["hdg_motion_mps"]
         for oid, (x, y, gone) in place.items():
             s = self.seen[oid]
             o = s["o"]
@@ -439,6 +468,20 @@ class RadarDisplay:
                 phase = "appear" if fin < 1.0 else ("coast" if o.get("state") == "coast" else "steady")
                 alpha = min(1.0, max(0.0, fin))
             sd = o.get("std") or [0.0, 0.0, 0.0, 0.0]
+            # which end is the front: shown by its own travel once it was seen driving (latched), a guess before
+            # (the pose head's votes, a lamp pair's colour, or nothing: the tracker's first heading)
+            if not s.get("hm") and o.get("motion") == "moving" and float(o.get("speed_mps") or 0.0) >= hm_v:
+                s["hm"] = True
+            ext = None
+            if body:
+                bx, by, hd = body_place(o, x, y)
+                if hd is not None:
+                    es = o.get("ext_std") or (None, None, None)
+                    ext = {"near": [round(x, 2), round(y, 2)], "hdg": round(hd, 2),
+                           "hdg_std": None if es[2] is None else round(float(es[2]), 2),
+                           "hdg_src": "motion" if s.get("hm") else "guess",
+                           "len": round(float(o.get("len") or 0.0), 1), "wid": round(float(o.get("wid") or 0.0), 1)}
+                    x, y = max(bx, 0.6), by
             out.append({"id": "ru:%d" % oid, "kind": "road_user", "role": "other",
                         "x": round(x, 2), "y": round(y, 2),
                         "vx": round(float(o.get("v_rel_mps") or 0.0), 2), "vy": round(-float(o["vy_mps"]), 2),
@@ -451,6 +494,8 @@ class RadarDisplay:
                         "cls": None if not isinstance(cls, dict) else {"label": cls.get("label"), "confidence": cls.get("confidence"),
                                                                        "source": cls.get("source")},
                         "box": None})
+            if ext is not None:
+                out[-1].update(ext)
         out.sort(key=lambda q: q["x"])
         return out[:c["max_objects"]], alert
 
