@@ -117,6 +117,8 @@ class CameraBoxes(Sensor):
     kind = "camera_boxes"
     coast_s = 2.0                # the detector misses in runs
     has_bias = True
+    p_cut = None                 # the chance of a box in the view's cut zone as a share of p_d, where the tracker
+                                 # follows it (tracker.py `pd_cut`); None: the configuration's
 
     def __init__(self, cover=None, cfg=None, focal_px=975.0, height_m=None, h_min_px=None):
         """cover: {"bearing_min", "bearing_max" (rad, left positive), "ground_min_m"} of this scan's view, or
@@ -153,7 +155,7 @@ class CameraBoxes(Sensor):
         v = self.vol
         return (0.0, self.hc, self.logf, self.bias, 1.0 if cv else 0.0, cv["bearing_min"] if cv else 0.0,
                 cv["bearing_max"] if cv else 0.0, cv["ground_min_m"] if cv else 0.0, c["max_range_m"], self.p_d,
-                c["p_cut"], math.nan if self.h_min is None else self.h_min, c["h_full_rel"], c["p_small"],
+                c["p_cut"] if self.p_cut is None else self.p_cut, math.nan if self.h_min is None else self.h_min, c["h_full_rel"], c["p_small"],
                 c["near_margin"], self.extraneous, v["b"], v["rb"], v["rbh"], v["bt"], c["scale_rate_span"],
                 c["logh_span"], c["born_small"], c["born_small_scale"], self.bias_var, self.dp_obj_var,
                 math.radians(c["pitch_jitter_deg"]) ** 2, math.radians(c["bias_floor_deg"]) ** 2, c["top_start_rel"],
