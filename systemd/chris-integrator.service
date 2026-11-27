@@ -31,6 +31,9 @@ StateDirectory=chris
 ExecStart=/usr/bin/python3 -m chris_integrator --roadsense ${CHRIS_ROADSENSE_RUNDIR}
 Restart=always
 RestartSec=2
+# The daemon saves its carried state first and ends itself 6 s after SIGTERM at the latest (chris_integrator/daemon.py,
+# "Stopping"); the manager's own limit is the backstop behind that, not 90 s of a car's key-off grace.
+TimeoutStopSec=15
 # The integrator is in the measurement path (it produces `lead` for every camera frame): a little ahead of
 # the background analysers that share its cores (nice 5 there), behind the camera pipeline's own threads
 # (nice -5). Within one slice without the cpu controller, nice is what orders the slice's services against

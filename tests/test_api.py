@@ -316,6 +316,48 @@ class ApiTest(unittest.TestCase):
         self.wait(lambda: self.get("/v1/health")["fps"]["road"] > 3, 10)
         self.assertEqual(self.get("/v1/road")["type"], "road")
 
+    def test_zzz_stop_with_clients_that_do_not_let_go(self):
+        """SIGTERM with clients on the API that never answer: two WebSockets (one reads, one does not, neither
+        answers the close frame), two forwarded /preview streams (the camera's debug face keeps feeding them; one
+        client does not read). On 27 November 2026 the unit did not stop within 90 s and was killed. (Last test of
+        the class: it ends the api process.)"""
+        import signal
+        import threading
+        socks = []
+
+        def raw(path, read, extra=""):
+            c = socket.create_connection(("127.0.0.1", self.port))
+            c.sendall(("GET %s HTTP/1.1\r\nHost: x\r\n%s\r\n" % (path, extra)).encode())
+            socks.append(c)
+            if read:
+                def drain():
+                    try:
+                        while c.recv(65536):
+                            pass
+                    except OSError:
+                        pass
+                threading.Thread(target=drain, daemon=True).start()
+        up = "Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n"
+        raw("/ws", True, up)
+        raw("/ws?topics=road,camera", False, up)
+        raw("/preview", True)
+        raw("/preview", False)
+        time.sleep(1.5)
+        self.assertIsNone(self.api.poll())
+        t0 = time.monotonic()
+        self.api.send_signal(signal.SIGTERM)
+        try:
+            rc = self.api.wait(20)
+        finally:
+            for c in socks:
+                c.close()
+        took = time.monotonic() - t0
+        self.assertEqual(rc, 0)
+        self.assertLess(took, 8.0)                 # the daemon's own limit is 6 s; with these clients it needs about 2
+        saved = os.path.join(self.datadir, "integrator.json")
+        self.assertTrue(os.path.exists(saved))
+        self.assertGreater(os.path.getmtime(saved), time.time() - took - 5.0)     # saved by this stop
+
 
 if __name__ == "__main__":
     unittest.main()

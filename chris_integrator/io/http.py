@@ -216,13 +216,16 @@ async def h_preview(req):
         return _json({"error": "chris-roadsense debug face unreachable"}, 503)
     resp = web.StreamResponse(headers={"Content-Type": up.headers.get("Content-Type", "multipart/x-mixed-replace"),
                                        "Cache-Control": "no-store"})
-    await resp.prepare(req)
-    try:
+    me = asyncio.current_task()
+    req.app["previews"][me] = req          # cancelled on shutdown: the stream has no end of its own, and a viewer
+    try:                                   # that does not read holds the write
+        await resp.prepare(req)
         async for chunk in up.content.iter_any():
             await resp.write(chunk)
     except (ConnectionResetError, asyncio.CancelledError, Exception):
         pass
     finally:
+        req.app["previews"].pop(me, None)
         up.close()
     return resp
 
@@ -300,6 +303,8 @@ def make_app(stack, readers=None, datadir=None, feed=None, recorder=None, roadse
     app["api"] = Api(stack, readers, datadir, feed, recorder)
     app["roadsense_http"] = roadsense_http.rstrip("/") if roadsense_http else None
     app["websockets"] = weakref.WeakSet()
+    app["previews"] = {}                   # handler task -> request of the /preview streams being forwarded
+    app["stop_step_s"] = 2.0               # limit of letting the clients go on shutdown (the daemon sets its own)
     app.on_response_prepare.append(_cors)
 
     async def startup(app):
@@ -308,9 +313,26 @@ def make_app(stack, readers=None, datadir=None, feed=None, recorder=None, roadse
     async def cleanup(app):
         await app["client"].close()
 
-    async def shutdown(app):      # close /ws clients so they finish (else a service manager waits for them)
-        for ws in set(app["websockets"]):
-            await ws.close(code=WSCloseCode.GOING_AWAY, message=b"api shutdown")
+    async def shutdown(app):
+        """Let the clients go, so that a service manager does not wait for them: the forwarded /preview streams end
+        (they have no end of their own), the /ws clients are told (all at once; one that does not answer the close
+        within the limit is dropped: a frozen consumer must not hold the stop)."""
+        previews = list(app["previews"].items())
+        streams = [t for t, _ in previews]
+        for t in streams:
+            t.cancel()
+        wss = set(app["websockets"])
+        closing = [asyncio.ensure_future(ws.close(code=WSCloseCode.GOING_AWAY, message=b"api shutdown")) for ws in wss]
+        if closing or streams:
+            _, pending = await asyncio.wait(closing + streams, timeout=app["stop_step_s"])
+            for t in pending:
+                t.cancel()
+            # what is still connected is cut: the server's own shutdown would wait for it (a minute, in some
+            # versions of the library)
+            for r in [getattr(ws, "_req", None) for ws in wss if not ws.closed] + [r for _, r in previews]:
+                tr = getattr(r, "transport", None)
+                if tr is not None:
+                    tr.abort()
 
     app.on_startup.append(startup)
     app.on_shutdown.append(shutdown)

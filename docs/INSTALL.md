@@ -68,8 +68,8 @@ explicitly in the environment is replaced, every other line stays.
 |---|---|
 | `/usr/local/lib/chris/chris_integrator`, `/usr/local/lib/chris/chris_mapper` | the code (replaced on every run) |
 | `/etc/chris/integrator.env` | `CHRIS_API_PORT`, `CHRIS_API_HOST`, `CHRIS_ROADSENSE_HTTP` (and anything the host adds) |
-| `/etc/chris/<plug-in>.json`, `mixer.json`, `recorder.json`, `mapper.json` | optional configuration, one file per plug-in (`chris_integrator/stack.py`); `recorder.json`'s keys are listed in `chris_integrator/io/recorder.py` (e.g. `{"dir": "/var/lib/chris/rec", "stamp_hz": {"road": 10}}` records `road` at 10 Hz, thinned by the messages' own `ts_mono_ns`) |
-| `/var/lib/chris/` | state carried across restarts (`integrator.json`: faults, calibration; one file per plug-in that keeps state), `signs.jsonl` (ended sign tracks) |
+| `/etc/chris/<plug-in>.json`, `mixer.json`, `recorder.json`, `mapper.json` | optional configuration, one file per plug-in (`chris_integrator/stack.py`); `recorder.json`'s keys are listed in `chris_integrator/io/recorder.py` (e.g. `{"dir": "/var/lib/chris/rec", "stamp_hz": {"road": 10}}` records `road` at 10 Hz, thinned by the messages' own `ts_mono_ns`; the tracker's objects `radar`, the decision layer `decide` with every alert transition, and the load governor are recorded by default: `radar_hz`, `decide_hz`, `governor_hz`, and `"more_topics": ["radar_fut"]` for the futures) |
+| `/var/lib/chris/` | state carried across restarts (`integrator.json`: faults, calibration; one file per plug-in that keeps state; written every 120 s while running and first thing on a stop), `signs.jsonl` (ended sign tracks) |
 | `/var/lib/chris/maps/current.rsmap` | the map pack (a symlink; a changed pack is loaded without a restart) |
 | `/run/chris/` | `position.sock` and `feed.sock` (the vehicle input API: the same server under two names), `integrator.sock` (JSON lines of the public streams) |
 | `/etc/systemd/system/chris-integrator.service` (+ `chris-integrator.service.d/50-cpus.conf` with `CPUS`) | the unit |
@@ -97,7 +97,12 @@ explicitly in the environment is replaced, every other line stays.
   `StartLimitIntervalSec=0` so that a restart loop (e.g. while another process still holds the port during a
   switch-over) never gives up. `MemoryMax=768M` is a backstop against a leak, not a throttle (no `MemoryHigh`):
   the daemon is about 70-75 MB resident with the map box and the recorder (measured on the reference phone).
-* `systemctl stop` sends SIGTERM; the daemon then saves its carried state and exits with status 0.
+* `systemctl stop` sends SIGTERM; the daemon then saves its carried state and closes the recording first, lets its
+  clients go within 2-3 s (a WebSocket that does not answer the close and a `/preview` stream are cut) and exits with
+  status 0; a process still there 6 s after the signal ends itself (`chris_integrator/daemon.py`, "Stopping"), and
+  the unit's `TimeoutStopSec=15` is the backstop behind that. On 27 November 2026 a stop took the manager's 90 s and
+  ended in SIGKILL: with a `/preview` viewer connected, the HTTP library's own shutdown waited for the stream that
+  never ends (75 s with aiohttp 3.8, reproduced; 10 s per silent WebSocket client with newer versions).
 
 ### CPU placement and priority
 

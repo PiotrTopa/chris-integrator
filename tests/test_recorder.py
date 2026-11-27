@@ -185,6 +185,59 @@ class RecorderTest(unittest.TestCase):
         self.assertIn(n["objects"], (19, 20))                 # at most objects_hz (10)
         self.assertIn(n["view"], (4, 5))                  # at most view_hz (2)
 
+    def _feed_decisions(self, r, envelope):
+        """4 s: `radar` and `radar_fut` 12.5 a second, `decide` 10 a second with two alert transitions between the
+        cap's slots, `governor` twice a second."""
+        from chris_integrator.mixer.bus import Envelope
+        seq = 0
+
+        def put(mtype, m):
+            nonlocal seq
+            seq += 1
+            if envelope:
+                r.on_envelope(Envelope(mtype, m, self.clock.t, "stack", seq))
+            else:
+                r.on_message(mtype, json.dumps(m, separators=(",", ":")))
+        for k in range(100):
+            self.clock.t += 0.04
+            if k % 2 == 0:
+                obj = {"id": 7, "state": "confirmed", "x_m": 30.0 - 0.1 * k, "y_m": 0.2, "vx_mps": 9.0}
+                put("radar", {"type": "radar", "seq": k, "objects": [obj]})
+                put("radar_fut", {"type": "radar_fut", "seq": k, "objects": [dict(obj, fut=[{"x": [1.0] * 22}])]})
+            if k % 5 == 0:
+                ev = [{"alert": "obstacle_ahead", "event": "raise", "stage": 2, "object": 7}] if k in (35, 40) else []
+                put("decide", {"type": "decide", "seq": k, "alerts": [{"id": "obstacle_ahead", "stage": 2 if k >= 35 else 0}],
+                               "events": ev})
+            if k % 25 == 0:
+                put("governor", {"type": "governor", "level": k // 25, "shed": [], "headroom_k": 9.5})
+        out = {}
+        for m in self.lines(r):
+            out.setdefault(m["type"], []).append(m)
+        return out
+
+    def test_the_trackers_objects_and_the_alert_transitions_are_recorded(self):
+        """What a replay cannot give back (module docstring): the tracker's objects and the decision layer of the
+        drive itself. Until lane "drive-quality" neither was in a session."""
+        for envelope in (True, False):
+            out = self._feed_decisions(self.rec(frame_every_s=0), envelope)
+            self.assertIn(len(out["radar"]), (16, 17, 18))                # radar_hz 5 of 12.5: every third message
+            self.assertEqual(out["radar"][0]["objects"][0]["id"], 7)      # as it went out
+            self.assertNotIn("radar_fut", out)                            # three times the size: not by default
+            dec = out["decide"]
+            self.assertIn(len(dec), (8, 9, 10, 11))                       # decide_hz 2 of 10, and the transitions
+            with_events = [m["seq"] for m in dec if m["events"]]
+            self.assertEqual(with_events, [35, 40])                       # every one of them, whatever the cap
+            self.assertEqual(len(out["governor"]), 4)
+        self.assertTrue({"radar", "decide", "governor"} <= set(Recorder({"dir": "x"}).topics))
+
+    def test_recorded_decision_topics_are_configurable(self):
+        out = self._feed_decisions(self.rec(frame_every_s=0, radar_hz=1.0, decide_hz=0, more_topics=["radar_fut"]), True)
+        self.assertIn(len(out["radar"]), (4, 5))
+        self.assertEqual(len(out["decide"]), 20)                          # no cap: every message
+        self.assertIn(len(out["radar_fut"]), (7, 8, 9))                   # radar_fut_hz 2
+        out = self._feed_decisions(self.rec(frame_every_s=0, topics=["road", "decide"]), True)
+        self.assertEqual(set(out), {"decide"})
+
     def test_session_started_on_a_stale_clock_is_renamed_when_the_clock_steps(self):
         wall = [1794300000.0]                                 # a boot without a clock source: days in the past
         r = Recorder({"dir": os.path.join(self.tmp.name, "rec")}, self.preview, clock=self.clock,

@@ -95,5 +95,155 @@ class DaemonTest(unittest.TestCase):
         self.assertEqual(fastjson.loads_road(odd)["pose"], road["pose"])     # anything unexpected: the whole line is parsed
 
 
+class CarriedStateTest(unittest.TestCase):
+    def test_a_fault_carried_over_several_runs_is_said_once(self):
+        """Six starts in a car park with the camera's fault carried each time: the reason grew a prefix per run."""
+        from chris_integrator.plugins.estimator import Estimator
+        reason = "own speed uncertainty 6.5x its characterised level"
+        saved = {"faults": {"vision": {"reason": reason, "rule": "gate"}}}
+        for _ in range(4):                                           # four runs, the state handed on each time
+            est = Estimator({})
+            est.state_load(saved)
+            saved = est.state_dump()
+            saved["faults"] = {g: dict(r) for g, r in saved["faults"].items()}
+        self.assertEqual(saved["faults"]["vision"]["reason"], Estimator.CARRIED + reason)
+
+
+class StopTest(unittest.TestCase):
+    """The stop (SIGTERM from the service manager): the carried state first, the clients within limits, the process
+    never longer than its own limit. On 27 November 2026 the unit was killed 90 s after its stop signal."""
+
+    def daemon(self, tmp, record=True, **kw):
+        rs, run = os.path.join(tmp, "rs"), os.path.join(tmp, "chris")
+        os.makedirs(rs, exist_ok=True)
+        rec = {"dir": os.path.join(tmp, "rec"), "frame_every_s": 0} if record else None
+        return Daemon(run, [(rs, ["modeld.sock"])], {}, tmp, record=rec, feed_cfg={"max_input_age_s": None}, **kw)
+
+    def feed(self, d, seconds=5.0):
+        w = World(seed=1)
+        n = 0
+        for t, m in w.messages(default_sensors()):
+            if t - w.t0 > seconds:
+                break
+            d.on_message(dict(m))
+            n += 1
+        return n
+
+    def test_stop_saves_the_state_closes_the_recording_and_is_quick(self):
+        import gzip
+        import time
+
+        async def go():
+            tmp = tempfile.mkdtemp(prefix="chris-test-")
+            d = self.daemon(tmp)
+            task = asyncio.create_task(d.run())
+            await asyncio.sleep(0.1)
+            self.feed(d)
+            t0 = time.monotonic()
+            d.stop()
+            await asyncio.wait_for(task, 3.0)
+            return d, time.monotonic() - t0
+        d, took = asyncio.run(go())
+        self.assertLess(took, 1.0)
+        self.assertTrue(d.stopped["state_saved"])
+        self.assertEqual(d.stopped["steps"]["recorder"], "ok")
+        saved = json.load(open(d.state_file))
+        self.assertIn("calibration", saved)
+        with gzip.open(os.path.join(d.recorder.dir, "messages.jsonl.gz"), "rt") as f:   # a whole gzip stream: closed
+            kinds = {json.loads(ln)["type"] for ln in f}
+        # the stack's wiring: the tracker's objects and the decision layer reach the recorder
+        self.assertTrue({"road", "ego_state", "radar", "decide"} <= kinds, kinds)
+
+    def test_the_state_is_also_saved_while_running(self):
+        async def go():
+            tmp = tempfile.mkdtemp(prefix="chris-test-")
+            d = self.daemon(tmp, record=False)
+            d.state_save_s = 0.05
+            task = asyncio.create_task(d.run())
+            await asyncio.sleep(0.1)
+            self.feed(d, 2.0)
+            await asyncio.sleep(0.15)
+            saved = os.path.exists(d.state_file)                     # a host that loses power is not stopped first
+            d.stop()
+            await asyncio.wait_for(task, 3.0)
+            return saved
+        self.assertTrue(asyncio.run(go()))
+
+    def test_a_client_that_does_not_let_go_does_not_hold_the_stop(self):
+        """The HTTP side's cleanup waits for its clients (a WebSocket that never answers the close, a stream without
+        an end; some versions of the library wait a minute): the stop gives it its limit and goes on."""
+        import time
+
+        class Runner:
+            async def cleanup(self):
+                await asyncio.sleep(3600)
+
+        async def go():
+            tmp = tempfile.mkdtemp(prefix="chris-test-")
+            d = self.daemon(tmp)
+            d.stop_step_s = 0.2
+            self.feed(d, 2.0)
+            t0 = time.monotonic()
+            await d._shutdown([], [], Runner())
+            return d, time.monotonic() - t0
+        d, took = asyncio.run(go())
+        self.assertLess(took, 2.0)
+        self.assertEqual(d.stopped["steps"]["http"], "timeout")
+        self.assertTrue(d.stopped["state_saved"])
+        self.assertTrue(os.path.exists(d.state_file))
+
+    def test_a_stop_that_cannot_finish_ends_the_process_with_the_state_saved(self):
+        """Something blocks the loop itself (no limit of a step can interrupt that): after `stop_hard_s` the process
+        ends itself, with exit code 0 because the state is on the disk by then."""
+        import time
+        calls = []
+
+        class Runner:
+            async def cleanup(self):
+                time.sleep(0.6)                                      # blocks the thread, not an await
+
+        async def go():
+            tmp = tempfile.mkdtemp(prefix="chris-test-")
+            d = self.daemon(tmp, record=False)
+            d.hard_stop, d.stop_hard_s = True, 0.2
+            d.hard_exit = lambda code: calls.append((code, os.path.exists(d.state_file)))
+            self.feed(d, 2.0)
+            await d._shutdown([], [], Runner())
+        asyncio.run(go())
+        self.assertEqual(calls, [(0, True)])
+
+    def test_sigterm_stops_the_process(self):
+        """The daemon as a process, as the unit runs it (no HTTP side: that part is in tests/test_api.py)."""
+        import signal
+        import subprocess
+        import sys
+        import time
+        tmp = tempfile.mkdtemp(prefix="chris-test-")
+        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        p = subprocess.Popen([sys.executable, "-m", "chris_integrator", "--rundir", os.path.join(tmp, "chris"),
+                              "--datadir", tmp, "--config-dir", os.path.join(tmp, "etc"), "--roadsense",
+                              os.path.join(tmp, "rs"), "--http-port", "0", "--no-mapper"],
+                             env=dict(os.environ, PYTHONPATH=here), stderr=subprocess.PIPE, text=True)
+        try:
+            end = time.monotonic() + 20.0
+            while not os.path.exists(os.path.join(tmp, "chris", "feed.sock")) and time.monotonic() < end:
+                time.sleep(0.05)
+            self.assertTrue(os.path.exists(os.path.join(tmp, "chris", "feed.sock")))
+            time.sleep(0.3)
+            t0 = time.monotonic()
+            p.send_signal(signal.SIGTERM)
+            rc = p.wait(10.0)
+            took = time.monotonic() - t0
+        finally:
+            if p.poll() is None:
+                p.kill()
+        err = p.stderr.read()
+        self.assertEqual(rc, 0, err[-2000:])
+        self.assertLess(took, 3.0)
+        self.assertIn("state saved", err)
+        self.assertIn("chris-integrator: stopped", err)
+        self.assertTrue(os.path.exists(os.path.join(tmp, "integrator.json")))
+
+
 if __name__ == "__main__":
     unittest.main()
