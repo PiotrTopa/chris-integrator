@@ -233,6 +233,31 @@ Rules:
 * **Tunnel.** In a tunnel when the matched edge is one (then `exit_in_m` is the map distance to its end) or
   when envd's label is `tunnel` with confidence >= 0.5 (no distance).
 
+### consolidated topic (chris-integrator): `{"type":"lights", ...}` (the provider's lights with the ego light)
+
+The provider's message (chris-roadsense `docs/ARCHITECTURE.md`, "lights": tracked housings with a smoothed state)
+with what the api knows about the road: per light `dist_m`, `lateral_m` (offset from the path), `relevance`,
+`slot` (offset from the ego lane's centre in lane widths), `ego`; the message's `ego` (`track_id`, `state`,
+`dist_m`, `lateral_m`, `relevance`, `agree`, `n_relevant`, `source`, `assign`, `amb`, `held`, `age_s`) and
+`map_signal`. The rules are the module text of `chris_integrator/trackers/lights.py`; the replay of a recorded
+session through them is `tools/lights_replay.py`. Since lane "drive-quality" (the drives of 26 / 27 November 2026) the
+selector keeps a memory between messages (`/etc/chris/lights.json` `{"memory": false}`: the choice per message, as
+before); what a consumer sees of it:
+
+| field | what |
+|---|---|
+| `ego.source` | `path` (the road model's plan), `path_mem` (the plan remembered from while the car moved, carried to the car's present pose: a plan at walking pace or at rest reaches nowhere), `image` (no usable road) |
+| `lights[].state_in` | present where the selector serves another state than the provider's (`state` is then the selector's): a housing cut by the edge of the detector's view reads `off` in that view, a red LED lamp between its pulses reads `off` |
+| `ego.assign.other_lane` | the only facing light hangs over another lane: by the lane lines, or (new) a gantry head with a sibling of the same gantry nearer the ego lane, also where there are no lane lines |
+| `out_of_view` | `{track_id, state, age_s}`: the ego light left the picture through the top (the car stands at the line under its own head) and what is still in the picture is another lane's head: `ego` is `null`, the state here is the last one seen and that old. Ends after 15 m of driving |
+
+A light of another lane is no longer served as the ego light while one that may be the ego lane's qualifies, and the
+ego light does not change between two heads unless the other is better by a factor 1.3.
+Measured on the drives of 26 / 27 November (replay of the six sessions with lights, 5318 messages with a light):
+changes of the ego track 240 -> about 125, A-B-A flaps 149 -> about 40, colour flips that revert within 4 s 85 ->
+about 27; on the 855 messages of five stretches whose true state was read from the frames: right 48 % -> 97 %,
+wrong colour 27 % -> 0.2 %, no ego light 24 % -> 3 %.
+
 ### The data integrator (chris-integrator): topics `ego_state`, `tracks`, and the source of `lead`
 
 The integrator is a component of its own, `chris-integrator/` (design: `chris-integrator/docs/DESIGN.md`; README

@@ -95,16 +95,19 @@ class EgoLight(Plugin):
     """The ego traffic light: a camera's light detections placed against the planned path, the tracked lanes
     and the map's signals. In: the detector's message; out: the same message with the ego light selected."""
     name = "ego_light"
-    DEFAULT_CFG = {"lane_assign": True}
+    DEFAULT_CFG = {"lane_assign": True,
+                   "memory": True}      # what the selector remembers between messages (trackers/lights.py); False:
+                                        # the choice per message, as before lane "drive-quality"
     inputs = (In("lights_raw", trigger=True), In("road", optional=True), In("calib", optional=True),
               In("ego_state", optional=True), In("lanes", trigger=True, optional=True),
-              In("map", trigger=True, optional=True), In("governor", optional=True))
+              In("map", trigger=True, optional=True), In("governor", optional=True), In("egolane", optional=True))
     outputs = (Out("lights", "decision", "sample", doc="traffic lights with the ego light selected"),)
 
     def __init__(self, cfg=None, name=None):
         super().__init__(cfg, name)
         self.sel = lights_mod.EgoLightSelector()
         self.sel.lane_assign = bool(self.cfg.get("lane_assign", True))
+        self.sel.memory = bool(self.cfg.get("memory", True))
 
     def on_input(self, stream, msg, ctx):
         if stream == "lanes":
@@ -113,8 +116,13 @@ class EgoLight(Plugin):
             self.sel.on_map(msg)
         else:
             # the plan positions a light against the path: not while the camera is not believable
-            road = ctx.get("road") if contract.usable(ctx.get("ego_state"), "vision") else None
+            es = ctx.get("ego_state")
+            road = ctx.get("road") if contract.usable(es, "vision") else None
             calib = ctx.get("calib")
+            self.sel.on_ego(es)
+            el = ctx.get("egolane")
+            if el is not None:
+                self.sel.on_egolane(el.get("est"), el.get("ts_mono_ns"))
             self.sel.annotate(msg, road, calib, intrinsics(calib))
             rate = _rate(ctx, "lights", msg)
             if rate is not None:
