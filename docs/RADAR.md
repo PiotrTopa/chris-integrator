@@ -1297,3 +1297,184 @@ chain); a height prior with a van's tail (a van boxed `car` needs "it stands" to
 1.6 m +- 20 %); the size learnt per kind from the scale-ranged objects (`size_learn` of section 9 with the scale
 rate and the rows set: 60 false episodes against 55 without it, nothing either way); the residual +0.1 to +0.4 m far
 of a parked car on a straight road with noise-free boxes and rates (not traced).
+
+## 12. An object that is no longer there (2026-11-27/28)
+
+The first real drives with alerts in shadow (27 November, night, session `20261127-202650`; the day and dusk sessions
+of 26 November replayed) raised `obstacle_ahead` on objects the car could not be about to hit. Traced on the
+recordings (the stack re-run on them with the phone's knobs; `/home/piotr/scratch/stale/tools/`):
+
+* **20:31:44-49, said imminent (the car's object 516).** A queue creeping at 2-3 m/s. The lead's boxes (wide view,
+  cut at the bottom, the pose head's ground point 7.2 m +- 2.7 degrees) start an object that "stands" (0.98 after six
+  boxes: at 1.8 m/s the car's own travel does not yet tell a lead that creeps with it from one that stands, and the
+  scale rates that would went to other, one-box objects). From then on no box is its own: its predicted box grows as
+  the car "approaches" it, the lead's does not, and the box feature and the gate give every box of the lead to a new
+  object, which the standing object then hides (`r_visible`: `occ` by it, `pd` 0.01), so that the next box starts
+  the next one. A miss costs the standing object ln(1 - 0.22) (below). It coasts 2.5 s into the car.
+* **20:32:14-17, said caution (547).** A car in the lane to the right, its rear 8 m ahead, boxed in every wide scan
+  (bearing -18 to -20 degrees, cut at the bottom). Its object's velocity has a lateral part (1-1.8 m/s) that is not
+  the car's; the object leaves its boxes, its place opens to 4.4 m (1 sigma) within 1.2 s and 9.7 m within 2.4 s
+  while it is put out 4 m ahead in the car's own lane, between the car and the van it follows; there it hides the
+  van's object (one scan: `occ` by it).
+* **20:30:53 and 20:33:07 (153, 843), imminent / caution under the low-speed suppression.** A queue starts. The
+  standing lead's object (0.97 "it stands", existence at its cap) takes none of the lead's boxes from the first one
+  that shows the start: the scale rate (-0.061 +- 0.007 1/s with the car at rest) and the box sliding put them
+  outside the gate of the object as a whole, each starts a tentative object, and the lead is not an object at all
+  for the next seconds. The car pulls away towards the standing one.
+
+What the inputs are, measured on the six driving sessions against the road model's lead (probability >= 0.95/0.97):
+
+| | wide view (rows 0-446) | narrow view (90-410) |
+|---|---|---|
+| first ground point of the view | 15.6 m | 30 m |
+| share of scans with a box on a lead within 10 m, day / night | 0.87-0.91 / 0.88-0.94 | 0.75-0.80 / 0.39-0.45 |
+| the same, 10-20 m | 0.90 / 0.83 | 0.61 / 0.30 |
+| pose head's ground point of a cut box, read as a range, minus the lead's: lead < 4 m / 4-6 / 6-9 / 9-14 m | +2.7 / +2.5 / +0.4 / -1.1 m | +6.3 / +6.3 / +4.4 / +2.2 m |
+| the box width as a range (1.8 m wide) minus the lead's, all distances | +0.7 to +0.9 m (quartiles 0.6 m apart) | +0.8 to +1.4 m |
+
+Every vehicle within 15 m has a box cut at the bottom in both views. The sensor's model gives such an object the
+chance `p_d` x `p_cut` = 0.22 of a box where the wide view boxes it in nine scans of ten: a miss there costs a
+quarter of a nat, an object at the existence cap (12) outlives 5 s of misses (`seen_max_s` ends it), and a box is
+worth little against "a new object". The ground point of a cut box is an extrapolation below the picture that
+reaches 85-125 px below the wide view's cut and 50-95 px below the narrow one's (0.23 of the view's height), where
+the wheels of a lead 4-5 m ahead stand 150-250 px below it: the two views state ranges 4-8 m apart for one vehicle,
+both too far, with stated sigmas of 1-3 degrees. The tracked lead's near face is 2.9 m (median) beyond the road
+model's lead at night and 1.3-2.6 m by day, and wanders +-3 m about it within seconds while it creeps.
+
+### What is built (each a knob of `tracker.CFG`, off; with all off the stack's output is the base's, bit for bit)
+
+* **`see_through`** (native `Hyp.evidence`, called after a camera's `Hyp.cycle`). The visibility model says of a
+  thing behind a settled object that it is hidden; the scan's boxes are that statement read the other way. For a
+  settled object A that the best story left without a box, and every first-list box D of the scan that is not A's:
+  how much of D's box lies inside A's silhouette (across: five bearings of the box against A's rectangle as seen, as
+  soft as A's bearing is unsure, here not capped; up: the rows of the box that A's box holds), and how sure the
+  thing is the farther one (q: A's near face against the thing's as angles below the horizon, by more than
+  `see_margin` sigma of what is not known of the two; the thing's from the object that took D, else from D's own
+  ground row; a box without a range is not read). A box so far covered has the chance pv(cover) of the model's ramp
+  (`occl_from` .. `occl_full`, no lower than `see_floor` 0.1: the detector does box what it sees a part of), so A's
+  log odds take ln(1 - q (1 - pv)), every story alike (`h_exist_shift`), no more than `see_min` per scan. A is not
+  touched in a scan that boxes it. Geometry counts as it is: a car 5 m ahead covers 7 degrees either side, also a
+  van in the next lane 45 m on.
+* **`swept`** (native `radar_swept`, `Hyp.shift`; from `Tracker.manage`). The car drives where nothing is. For a
+  settled object without a box for `swept_unseen_s`: the probability p that its rectangle lies where the car's body
+  is or has been since that box (front and rear bumper from the reference camera as the decision layer has them,
+  half the width, drawn out behind by the car's travel since; `swept_margin_m` off; the place's own spread along and
+  across the car). Its existence takes ln(1 - p) once, as p grows; from `swept_drop` (0.9) it is dropped, because
+  what is left of it is not at the place its numbers state (they are not cut to the room left). How soon is the
+  place's own spread: an object placed to 0.7 m goes as the bumper reaches its near face. Not for a tentative
+  object: its place is three stories (stands, drives with the traffic, comes the other way) whose blur reaches into
+  the car from 15 m away; with those included one night warning of the simulator's `bend_exit_stopped_13` was lost.
+* **`coast_std_m`** (`Tracker.manage`, `radar_life`). Inside a sensor's field and in the open, an object that is
+  believed to move, has had no box for `coast_min_s` (0.6 s) and whose place is known no better than `coast_std_m`
+  and `coast_std_rel` (0.5) of its range (1 sigma, larger axis) is dropped. Out of view the rule has been
+  `memory_std_m`, behind another object `hidden_std_m`; in view there was none, and the object's motion model was
+  put out for 5 s. A standing object is not touched (its place is known as well as ever). With `coast_std_rel` 0.35
+  the lead was without an object in 29 % of the night session's lead frames against 21 %; with 0.5 in 24 %.
+* **`pd_cut`** (`Tracker.process`, `Hyp.evidence`). The chance of a box in a view's cut zone followed per view from
+  the settled objects themselves: of those in the open there with a box within `pd_cut_fresh_s`, the share the scan
+  boxes (held to the model with `pd_cut_n0` scans, at most `pd_cut_max`); `CameraBoxes.p_cut` carries it into the
+  scan. Built and measured, not proposed (below).
+* **`gate_hyp`** (native `ras_row`, the scan's constant `XC_GHYP`). A box outside the gate of the object as a whole
+  but within `gate_hyp` gates, and lying on the object's last box, is inside where it is inside the gate of one of
+  the object's hypotheses. Built and measured, not proposed (below).
+
+The simulator (`sim/roaduser_sim.py`): `queue_creep` (stop and go behind a lead whose box is cut by both views the
+whole time, a queue in the next lane), `left_behind` (a car beside that falls back out of the view while the car
+follows a van) in `STALE_SCENARIOS`; `POSE["gn_cut_reach"]` (None in the presets) makes the ground point of a
+view-cut box reach only so far below the cut: with (0.23, 0.035) the point of a lead 5 m ahead reads 1.8 m far in
+the wide view and 5.6 m in the narrow one, as measured. Tests: `tests/test_radar_stale.py` (fixtures at the radar
+box: a standing object that is no longer boxed with a lead beyond it, driven through, a car beside that is no longer
+boxed, the cut zone), `tests/test_radar_stale_sim.py` (the scenarios, the reach).
+
+### Measured
+
+**The recordings** (six driving sessions re-run through the whole stack with the phone's knobs, `cost_bench.py run
+--dump`; said = `obstacle_ahead` at caution or higher, not suppressed; a re-run is not the car's run: object ids
+differ, and on `202650` the re-run says two cautions at 255.6 and 258.7 s that the car did not). The 47 said
+episodes of the base judged one by one on the frames and the tracks, by cause:
+
+| cause | said in the base | still said with `see_through` + `swept` + `coast_std_m` 3 |
+|---|---|---|
+| an object that is not there: left behind by its boxes, coasting beside or into the lane, driven through (`202650` 297 and 324 s, the car's 516 and 547; `152055` 367, 373, 378; `153449` 267, 592, 600, 1043) | 9 | 3 (`153449` 267, 592, 1043) |
+| a vehicle in the next lane (a standing queue beside, a coasting neighbour predicted to cut in or turn) | 3 | 0 |
+| a queue that starts or creeps: the lead's object stands on, or lags the lead that pulls away (`152055` 250, 567; `153449` 581, 947, 1458, 1460, 1778, 1870; on the car 20:30:53 and 20:33:07, suppressed) | 8 | 8 |
+| a young object whose velocity is not known yet (far, at the roadside, crossing, cutting in) | 7 | 5 |
+| the car turns or manoeuvres: parked and standing vehicles on the turn's exit, parked ones called moving (the car's 1118 among them) | 8 | 7 |
+| an oncoming or a standing vehicle on a narrow street | 3 | 3 |
+| the re-run's own two cautions on the coasting lead of `202650` | 2 | 2 |
+| true or arguable: a slow or stopped lead the car closes on | 7 | 7 |
+
+Per session, base -> with the three knobs: `113849` 2 -> 2, `114700` 7 -> 7, `152055` 12 -> 9, `153449` 21 -> 20
+(three of them new: a young object in a car park, a standing object beside the lane, a parked car that turns
+"moving" as the car passes), `195700` 0 -> 0, `202650` 5 -> 3. In total 47 -> 41; twelve of the base's are no longer
+said, none of them a true one. The car's cases: 516 is no longer said (the standing object's existence falls with
+the lead's boxes seen through it; the decision layer lets go of it at 296.5 s, 0.8 s before the low-speed
+suppression lifts, and it is gone at 297.3 s, its near face 1 m ahead of the camera; it still reaches "imminent"
+under the suppression: it is born standing, see below); 547 is gone (dropped at 322.65 s, 1.7 s before the alert
+was raised, when its place was a guess); 153 and 843 are as they were. The road model's lead (within 20 m, probability >= 0.97) has no
+object in 21 -> 24 % of its frames on `202650`, 19 -> 18 % on `152055`, 20 -> 25 % on `153449`: a lead that the
+detector loses is coasted 2-3 s, no longer 5.
+
+**The simulator** (`tools/alert_truth.py`, the phone's knobs as the base, paired over the same runs: six streets and
+the pedestrian controls x seeds 1-6, the scripted conflicts x seeds 1-3, day and night; +- the bootstrap's 1 sigma):
+
+| stream | knobs added | false episodes | conflicts warned | lost / gained / later / earlier |
+|---|---|---|---|---|
+| `detin_pose_scale` | `see_through` + `swept` + `coast_std_m` 3 | 87 -> 85 (-2 +- 2.4) | 42 -> 42 of 72 | 0 / 0 / 0 / 0 |
+| `scale` | the same | 70 -> 67 (-3 +- 2.6) | 37 -> 37 | 0 / 0 / 0 / 1 (2.12 -> 2.30 s) |
+| `detin_pose_scale` | `see_through` | 87 -> 86 (-1 +- 1.0) | 42 -> 42 | 0 / 0 / 0 / 0 |
+| `detin_pose_scale` | `swept` | 87 -> 86 (-1 +- 1.0) | 42 -> 42 | 0 / 0 / 0 / 0 |
+| `detin_pose_scale` | `coast_std_m` 3 | 87 -> 87 (0 +- 2.0) | 42 -> 42 | 0 / 0 / 0 / 0 |
+| `detin_pose_scale` | the three + `pd_cut` | 87 -> 85 (-2 +- 2.4) | 42 -> 42 | 0 / 0 / 1 (1.78 -> 1.52 s) / 0 |
+| `detin_pose_scale` | the three + `gate_hyp` 6 | 87 -> 86 (-1 +- 2.3) | 42 -> 41 | 1 (`bend_exit_stopped_13` s1 night, 0.88 s) / 0 / 0 / 0 |
+| `queue_creep` + `left_behind`, the reach modelled, seeds 1-6 | the three | 25 -> 24 (-1 +- 1.7) | 6 -> 6 of 6 | 0 / 0 / 0 / 0 |
+
+The simulator shows the queue's start as the car had it (`queue_creep`: two false said episodes a run, one at each
+start, 24 in 12 runs; the standing lead's object stays 6-8 m behind the lead that pulls away, the car drives at it,
+said as the speed passes 3 m/s) and none of the knobs changes it (22 with the three). The objects that the knobs end on the recordings (left by
+their boxes, coasting beside) do not arise in the simulator's streets: there the three knobs are within the noise.
+
+On the recordings `pd_cut` with the three (against the three alone) says eight episodes more on five sessions
+(`202650` 243.7 and 250.1 s, `114700` four, `152055` one, and three of the ended ones come back): with the real
+chance of a box the lead's object holds its boxes through the start, and what it then says of the lead is wrong by
+the range and speed errors above. `gate_hyp` changes no said episode on five sessions.
+
+Identities (the radar alone on the simulator, `sim/radar_score.py`, `detin_pose_scale`, eleven scenarios x seeds
+1-3 x day and night, the three knobs against the phone's): id switches 131 -> 137 (paired +0.09 +- 0.06 a run),
+held share 0.379 -> 0.373. The difference is `slow_lead` (3 -> 9 switches, held 0.56 -> 0.50; `adjacent` 11 -> 13,
+`curve_parked` 35 -> 33, the other eight unchanged): a lead that the detector loses for more than 2-3 s comes back
+as a new object where it used to keep its id through 5 s (`coast_std_m`).
+
+Cost (`tools/cost_bench.py run`, the whole path over a session, three runs each, on the P52): the radar plug-in
+0.190 -> 0.203 ms per road frame on `202650` and 0.447 -> 0.487 ms on `152055` (the whole path 2.03 -> 2.04 and
+2.94 -> 3.01 ms): `Hyp.evidence` once per camera scan, `radar_swept` per message for the objects without a box. Not
+measured on the phone. With the knobs off the three captures of `/home/piotr/scratch/cost-rest` (`cost_bench.py
+diff`: IDENTICAL) and the six sessions (the dumps' sha256) are the base's.
+
+### Proposed for the car, and what is not solved
+
+In the phone's `radar.json`: **`"see_through": true, "swept": true, "coast_std_m": 3.0`**.
+
+Not `pd_cut`: more said episodes on the recordings (above); it wants the range of a cut box first. Not `gate_hyp`:
+no gain on the recordings, one night warning lost in the simulator.
+
+Not solved, and why:
+
+* **The queue's start.** With clean boxes the tracker lets "it stands" go 0.6 s after the lead starts (fixture: a
+  scale rate at the car's rest) and 1.4 s without a scale rate. On the car and in `queue_creep` it takes 3-3.5 s,
+  because for the first seconds there is nothing to read: the detector's miss run at the start (the simulator), or
+  boxes that the standing object cannot take and whose ranges are wrong by metres (the car). The witness that knows
+  is the road model's lead (its range and speed, `road.leads`): it said "opening" in every case. It is not an input
+  of the tracker. As existence evidence against the standing object it does not work on the car's cases: the
+  standing object stands 3 m BEYOND the road model's lead (the ground point's reach), not inside its range. It
+  belongs in as a sensor: a range and a range rate of the vehicle in the car's own lane, like a microwave radar's
+  return (`MicrowaveRadar`), which would also give a cut box's object its range.
+* **The range of a box cut at the bottom.** The box width is the cue the data has (table above). A row on the
+  range from it was built and taken out again: the width the object holds is learnt from these very boxes at the
+  range believed (a lead 4.5 m ahead is held 7 m ahead and 3 m wide, or turned by 25 degrees: the pose head's
+  heading of a rear view is +-16 degrees), so the row has to bring the kind's width and a heading of its own, and
+  that is the lead as a sensor again.
+* **A standing object born of a creeping lead** (the car's 516 before it is ended): at walking pace a few boxes with
+  3-degree ground points do not tell "creeps with the car" from "stands", and the kind's prior says 0.4 "it stands".
+* The other causes of the table (young objects, the car's own turns, narrow streets) are not the tracker's memory
+  of things that are gone; they are named there and not touched here.

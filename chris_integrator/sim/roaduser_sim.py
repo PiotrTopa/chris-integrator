@@ -571,6 +571,13 @@ POSE = dict(
                   (0.40, 0.072, 0.015, 1.55), (0.55, 0.055, -0.012, 1.79)),  # M; kappa F to 70.2 / 86.7 / 82.8 / 86.6 /
                              # 91.2 %; beyond 0.55 the median grows by (1 + s - 0.55) (A)
     gn_cut_tail=(0.1, None, 0.03, 2.5),   # A (the cut rows are near-Gaussian: 90 % point / median 2.4-3.0)
+    # gn_cut_reach: (share of the view's height, its spread between vehicles) | None. The ground point of a box cut
+    # by the VIEW is an extrapolation below the picture, and it reaches only so far: on the drives of 2026-11-26/27,
+    # against the road model's lead, the point of a lead nearer than 6 m lay 85-125 px below the wide view's cut (rows
+    # 0-446) and 50-95 px below the narrow view's (90-410), where the wheels stood 150-250 px below it: read as a
+    # range 2.5 m far in the wide view and 6 m in the narrow one (chris-integrator docs/RADAR.md, section 12). None
+    # (the presets): not modelled, the cut rows of the M table as they are (they end at a cut share of 0.55)
+    gn_cut_reach=None,
     gn_under=(0.051, 0.0),   # near face under a nearer box: median, bias (M: median 0.051, 90 % point 0.236)
     gn_under_tail=(0.880, 0.790, 0.073, 1.28),   # F to M: 61.1 / 80.9 % within 1 / 2 stated (too small), 90 % point
                              # / median 0.236 / 0.051; fit 55.8 / 87.1 %, 4.60
@@ -1200,6 +1207,13 @@ class PoseGen:
             e_b = None
             unit = x["Ht"]
         vn = tr["vn"] + e_g * unit
+        reach = c.get("gn_cut_reach")
+        if reach and bottom == "cut" and x["s_view"] > 0.0 and x["s_frame"] <= 0.0:
+            # the head's point of a box cut by the view reaches only so far below the cut (`gn_cut_reach`): of a
+            # vehicle a few metres ahead it stays there, far above where the wheels stand
+            if "reach" not in st:
+                st["reach"] = r.gauss(0.0, 1.0)
+            vn = min(vn, roi[3] + (reach[0] + reach[1] * st["reach"]) * (roi[3] - roi[1]))
         s_gn_px = s_gn * unit
         # seen: the point in the crop (the box x 1.3 about its centre), in the picture, not under a nearer box
         bcx, bcy = 0.5 * (b[0] + b[2]), 0.5 * (b[1] + b[3])
@@ -3005,6 +3019,62 @@ def sc_queue_stop(seed, night):
     return spec
 
 
+def sc_queue_creep(seed, night):
+    """Stop and go in a queue (the drives of 2026-11-27, 20:30-20:33): the ego stands 2.3-3.3 m behind a lead and
+    creeps 4-8 m behind it; the lead's box is cut by the bottom of both views the whole time (its rear 4.3-12 m from
+    the camera), a second car ahead of the lead; the queue stands (0-5 s), creeps at
+    2-3 m/s, stands again (4 s), pulls away to 5 m/s, slows, pulls away to 12 m/s; the ego does what the lead did a
+    second earlier. A row of cars queues in the lane to the right, a little slower. Nothing here is a conflict: every
+    said `obstacle_ahead` is a false one. `labels`: the lead "follow" while it drives."""
+    rng = random.Random(seed * 101 + 33)
+    t1, t2 = 5.0 + rng.uniform(-1, 1), 17.0 + rng.uniform(-1.5, 1.5)
+    lead_v = [(0, 0.0), (t1, 0.0), (t1 + 2.0, 2.5), (t1 + 6.0, 2.5 + rng.uniform(-0.5, 0.5)), (t2, 0.0), (t2 + 4.0, 0.0),
+              (t2 + 7.5, 5.0), (t2 + 12.0, 5.0), (t2 + 14.5, 2.0), (t2 + 17.0, 2.0), (t2 + 24.0, 12.0)]
+    lag = 0.3 + rng.uniform(-0.1, 0.1)                # (the world smooths the ego's speed: about 0.7 s more)
+    spec = dict(T=t2 + 30.0, speed=[(0, 0.0)] + [(t + lag, v) for t, v in lead_v[1:]], curv=[(0, 0.0)], accel_lim=2.5,
+                lead_range_m=70.0 if night else 100.0,
+                layout=dict(n_left=0, n_right=1, oncoming=False, park_right=0.0, park_left=0.0))
+
+    def actors(w):
+        s0 = float(w.s[0]) + CAM_TO_AXLE + 2.0            # the ego's front at the start
+        gap = 2.3 + rng.uniform(0.0, 1.0)               # standing: the lead's rear 4.3-5.3 m from the camera
+        a = [Actor(900, "car", "lead", s0 + gap + DIMS["car"][0] / 2, speed=lead_v, lateral=[(0, rng.gauss(0, 0.15))]),
+             Actor(901, "car", "lead", s0 + gap + DIMS["car"][0] * 1.5 + 4.5,
+                   speed=[(max(0.0, t - 1.2), v) for t, v in lead_v], lateral=[(0, rng.gauss(0, 0.2))])]
+        sr = s0 - 3.0
+        for k in range(5):                               # the queue in the lane to the right
+            a.append(Actor(910 + k, "car", "adjacent", sr + DIMS["car"][0] / 2,
+                           speed=[(t + 0.8 * (2 - k), 0.85 * v) for t, v in lead_v], lateral=[(0, -3.4 + rng.gauss(0, 0.15))]))
+            sr += DIMS["car"][0] + rng.uniform(2.0, 3.5)
+        w.spec["labels"] = [(900, t1 + 2.0, t2 - 2.0, ("follow", "keep"))]
+        return a
+    spec["actors"] = actors
+    return spec
+
+
+def sc_left_behind(seed, night):
+    """A track left behind (the drive of 2026-11-27, 20:32:14): the ego follows a van at 12 m/s, 11-13 m behind; a car
+    drives in the lane to the right, its rear 6-8 m ahead of the camera (its box cut by the bottom of the view and
+    near the picture's edge), and from 12 s falls back (to 5 m/s within 1.5 s): within a second it is out of the
+    view, beside and then behind the ego. Nothing is ahead in that lane afterwards, and nothing ever between the ego
+    and the van: an object put out there is one that is no longer there, and every said `obstacle_ahead` is false."""
+    rng = random.Random(seed * 101 + 34)
+    t_b = 12.0 + rng.uniform(-1.5, 1.5)
+    spec = dict(T=t_b + 14.0, speed=[(0, 12.0)], curv=[(0, 0.0)], lead_range_m=70.0 if night else 100.0,
+                layout=dict(n_left=0, n_right=1, oncoming=False, park_right=0.0, park_left=0.0),
+                events=[(round(t_b, 2), "the car beside falls back")])
+
+    def actors(w):
+        s0 = float(w.s[0]) + CAM_TO_AXLE
+        van = (5.5, 2.0, 2.4)
+        return [Actor(920, "truck", "lead", s0 + 12.0 + rng.uniform(-1.0, 1.0) + van[0] / 2, speed=[(0, 12.0)],
+                      lateral=[(0, rng.gauss(0, 0.15))], dims=van),
+                Actor(921, "car", "adjacent", s0 + 7.0 + rng.uniform(-1.0, 1.0) + DIMS["car"][0] / 2,
+                      speed=[(0, 12.0), (t_b, 12.0), (t_b + 1.5, 5.0)], lateral=[(0, -3.3 + rng.gauss(0, 0.15))])]
+    spec["actors"] = actors
+    return spec
+
+
 def sc_cyclist(seed, night):
     """A cyclist rides along the right edge of the ego's lane at 5 m/s; a car is parked ahead of it half in its
     way; it swerves 1.3 m into the lane to pass it and goes back. The ego follows 35 m behind at the cyclist's
@@ -3076,12 +3146,16 @@ def sc_park_out_curve(seed, night):
 
 
 EGO_SCENARIOS = {"park_out_curve": sc_park_out_curve}
+# an object that is no longer there, a queue that creeps and starts (docs/RADAR.md, section 12; tools/alert_truth.py
+# run --false queue_creep --true stopped_cruise_14)
+STALE_SCENARIOS = {"queue_creep": sc_queue_creep, "left_behind": sc_left_behind}
 
 
 def scenario(name, seed=1, night=False, world=None):
     """A ScenarioWorld by name (SCENARIOS, PREDICT_SCENARIOS, EGO_SCENARIOS or ALERT_SCENARIOS). world: world
     options (e.g. {"dims_spread": True}); also read from CHRIS_SIM_DET's "world" key (explicit `world` wins)."""
-    fn = SCENARIOS.get(name) or PREDICT_SCENARIOS.get(name) or EGO_SCENARIOS.get(name) or ALERT_SCENARIOS[name]
+    fn = SCENARIOS.get(name) or PREDICT_SCENARIOS.get(name) or EGO_SCENARIOS.get(name) or STALE_SCENARIOS.get(name) \
+        or ALERT_SCENARIOS[name]
     spec = fn(seed, night)
     return ScenarioWorld(spec, seed=seed, name=name, night=night, world=world)
 

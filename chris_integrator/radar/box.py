@@ -348,7 +348,7 @@ class Radar:
         top = bot = math.nan
         tr = o.get("trunc")                              # (the bottom cut by the view or the frame, not by a box)
         cut = 1.0 if "b" in (o.get("clip") or "") or (isinstance(tr, str) and "b" in tr) else 0.0
-        if tc["in_box_occl"] and box and self.cam is not None:
+        if (tc["in_box_occl"] or tc["see_through"]) and box and self.cam is not None:
             # the box in the picture as angles below the horizon (what it hides of the things behind it); its
             # bottom cut by the view or the frame is lower than it shows
             u, ray = 0.5 * (box[0] + box[2]), self.cam.ray
@@ -357,6 +357,14 @@ class Radar:
             ry = ray(u, box[3])
             bot = math.atan2(ry[2], math.hypot(ry[0], ry[1]))
         d["x"] = (float(hid), occ, 1.0 if low else 0.0, lc, ls, lv, src, top, bot, cut)
+        if tc["see_through"]:
+            # the box as the evidence on unreported objects reads it (chris_native.c Hyp.evidence): bearing, half
+            # width, the ground angle and its variance where it has one, its top and bottom
+            z, R = d["z"], d["R"]
+            if d["kind"][:2] == "rb":
+                d["ev"] = (float(z[1]), 0.5 * (wa or 0.0), float(z[0]), float(R[0]), top, bot, 1.0 if low else 0.0)
+            else:
+                d["ev"] = (float(z[0]), 0.5 * (wa or 0.0), math.nan, 0.0, top, bot, 1.0 if low else 0.0)
         e = o.get("emb")
         if ek[0] and isinstance(e, str) and len(e) == 2 * ek[1]:
             try:

@@ -297,10 +297,47 @@ CFG = dict(
     # (a car born from a box called `truck`: 10 x 2.5 m; a van called `truck`: 10 m for its 6): its centre then lies
     # half that length behind a near face known to a few tenths of a metre
     ext_size=False, ext_size_step=0.08, ext_size_learnt=0.25,
+    # ---- an object that is no longer there (docs/RADAR.md, section 12). Each off: with all of them off the tracker is
+    # what it was, bit for bit ----
+    # see_through: a settled object that a camera's scan left without a box, and a box of that scan that is not its
+    # own, lies inside its silhouette and is of a thing beyond it (chris_native.c `Hyp.evidence`): the object would
+    # have hidden that thing. Its existence takes ln(1 - q (1 - pv)): q how sure the thing is the farther one (by
+    # see_margin sigma of what is not known of the two ranges), pv the chance of a box of a thing so far covered (the
+    # visibility model's ramp occl_from .. occl_full, no lower than see_floor); per scan no more than see_min
+    see_through=False, see_floor=0.1, see_margin=1.0, see_min=-3.0,
+    # pd_cut: the chance of a box of an object nearer than a view's first ground point (its box is cut at the bottom:
+    # the sensor's model says p_d x p_cut = 0.22 of everything within 15 m of this camera) is followed per view from
+    # the settled objects themselves: of those in the open there that had a box within pd_cut_fresh_s, the share the
+    # next scan boxes; held to the model with the weight of pd_cut_n0 scans, never above pd_cut_max, pd_cut_keep
+    # scans remembered. What a miss costs there, and what a box is worth against "a new object", follow it
+    pd_cut=False, pd_cut_n0=8.0, pd_cut_max=0.9, pd_cut_keep=300.0, pd_cut_fresh_s=0.6,
+    # swept: the car drives where nothing is. An object without a box for swept_unseen_s whose rectangle lies where
+    # the car's own body is or has been since that box (to the front and rear bumper from the reference camera, half
+    # the width, drawn out behind by the car's travel since; swept_margin_m taken off for what is not known of both
+    # rectangles) with probability p loses that share of its existence, once: ln(1 - p), as p grows. How soon that
+    # ends it is the place's own spread: an object placed to 0.7 m is gone as the bumper reaches its near face, one
+    # placed to 1.8 m when the car is in it. From swept_drop on the object is dropped: what is left of it is not at
+    # the place its numbers state (they are not cut to the room the car has left it), whatever its existence was.
+    # Settled objects only (a tentative one's place is three stories at once)
+    swept=False, swept_front_m=2.1, swept_rear_m=2.35, swept_half_m=0.88, swept_margin_m=0.4, swept_unseen_s=0.3,
+    swept_drop=0.9,
+    # coast_std_m: inside a sensor's field and in the open, an object that is believed to move, has had no box for
+    # coast_min_s and whose place is by now known no better than coast_std_m and coast_std_rel of its range (1 sigma,
+    # larger axis) is dropped: where it is is no longer known, and what is put out of it is its motion model's guess
+    # (out of view the same rule has been memory_std_m, behind another object hidden_std_m). 0: kept until seen_max_s
+    coast_std_m=0.0, coast_std_rel=0.5, coast_min_s=0.6,
+    # gate_hyp: a detection outside the gate of the object as a whole, but within gate_hyp gates of it, is inside
+    # where it is inside the gate of one of the object's hypotheses (each with its own prediction). The combination
+    # is where the believed hypothesis is: a standing lead that pulls away left it at its first box that showed it
+    # (a scale rate, the box sliding), the box started a new object and the standing one stayed. 0: as it was
+    gate_hyp=0.0,
 )
+_XC_END = 105                    # the scan's xcfg up to the scale rates' baselines (chris_native.c XC_GHYP)
+_NOEV = (0.0, 0.0, math.nan, 0.0, math.nan, math.nan, 0.0)      # a detection the evidence does not read
+_NOEV_LOW = _NOEV[:6] + (1.0,)
 _IN_KNOBS = ("in_flags", "in_box_occl", "in_low", "in_app", "in_reid", "in_lamp_colour", "in_lamp_size", "in_width", "in_scale",
              "sil_bearing", "row_ctx", "det_chain", "in_pose_gn", "in_pose_gc", "in_pose_yaw", "pd_learn", "exist_shared",
-             "scale_iter", "scale_seed", "scale_exact", "near_axis")
+             "scale_iter", "scale_seed", "scale_exact", "near_axis", "see_through", "gate_hyp")
 _RANGE_KNOBS = ("scale_iter", "scale_seed", "scale_exact", "near_axis")
 _SPREV = 8                       # scale-rate baselines of one scan whose far end's pose is given (chris_native.c RSPREV)
 _POSE_KNOBS = ("in_pose_gn", "in_pose_gc", "in_pose_yaw")
@@ -473,7 +510,7 @@ class Obj:
     vote, verdict, group) and, as attributes, its numbers in the tracker's arrays (`State`): the parts of its
     primary row and its row of the table."""
     __slots__ = ("id", "h", "store", "t0", "_state", "sources", "last_seen", "vote", "nis", "verdict", "coast_s",
-                 "velocity_seen", "merge_t", "scores", "cls", "_kin", "grp", "grp_kind", "lhp", "low_run", "sized", "los", "extp")
+                 "velocity_seen", "merge_t", "scores", "cls", "_kin", "grp", "grp_kind", "lhp", "low_run", "sized", "los", "extp", "swept")
     xs, Ps, mu, xf, Pf, x, P, e, Pe, st, m = (_view(a, b, sh) for _, a, b, sh in _OFF)
     t = _meta(M_T)                   # the time its numbers are of
     logodds = _meta(M_L)             # that it exists, in the primary's story (`exist`: over all stories)
@@ -516,6 +553,7 @@ class Obj:
         self.low_run = 0             # its last sightings in a row that were boxes of the low-score list
         self.sized = False           # what its boxes said of its height has gone into its kind's prior (`_size_learn`)
         self.extp = None             # the priors of its length and width its numbers hold: (L, variance, W, variance)
+        self.swept = 0.0             # the share of its place that the car's own body has refuted (`swept`)
         self.los = None              # the line of sight to it at its first sighting, and how far it has swung since
                                      # (ground frame: [first, least, most]; `size_learn`)
 
@@ -651,6 +689,8 @@ class Tracker:
         self.road_path = None        # the road model's path on the ground (xs, ys), as the box last gave it (`_context`)
         self.size_obs = {}           # kind -> deque of (mean, variance): what its objects' own boxes said of their height
         self.size_fit = {}           # kind -> (mean, variance) of its heights as learnt (`_size_learn`)
+        self.cut_stat = {}           # (sensor id, view) -> [boxes, scans] of fresh objects in the view's cut zone (`pd_cut`)
+        self.ev_stats = {"seen_through": 0, "swept": 0, "coast_std": 0}
 
     def _xcfg(self, src, sensor):
         """The scan's constants for the detector's further inputs as the native core reads them (chris_native.c
@@ -892,6 +932,24 @@ class Tracker:
                     tail += [float(dt), float(p[0]), float(p[1]), float(p[2])]
             if tail:
                 xcfg = xcfg + (float(len(tail) // 4),) + tuple(tail)
+        if xcfg is not None and c["gate_hyp"] > 0.0:
+            xcfg = xcfg + (0.0,) * (_XC_END - len(xcfg)) + (float(c["gate_hyp"]),)
+        cam = sensor.kind == "camera_boxes"
+        ev = cam and (c["see_through"] or c["pd_cut"])
+        lasts = ()
+        if ev:
+            # the chance of a box in this view's cut zone as followed; each object's last sighting before the scan
+            cv = sensor.cover
+            ckey = (src, round(cv["ground_min_m"])) if cv else None
+            if c["pd_cut"] and ckey is not None:
+                hn = self.cut_stat.get(ckey)
+                p0 = sensor.p_d * sensor.cfg["p_cut"]
+                if hn is not None:
+                    pc = (hn[0] + c["pd_cut_n0"] * p0) / (hn[1] + c["pd_cut_n0"])
+                    sensor.p_cut = min(max(pc, p0), c["pd_cut_max"]) / sensor.p_d
+                    args = args[:4] + (sensor.native(),) + args[5:]
+            if objs:
+                lasts = store.a[store.tab[args[0], OT_SLOT].astype(np.intp), _MO + M_THIT].tolist()
         if xcfg is not None:                             # the detector's further inputs (docs/RADAR.md, section 8)
             args += (xcfg,)
             if c["row_ctx"] and dets and objs:
@@ -906,6 +964,23 @@ class Tracker:
                 store.grow(max(2 * len(store.a), len(store.a) + res + 64))
         late, hits, births, dead, bias = res
         st["late"] += late
+        if ev and objs:
+            # what the scan says of the objects it did not report (docs/RADAR.md, section 12): boxes seen through
+            # them; the share of the cut zone's fresh objects it boxed
+            marks, nf, nh = self.hyp.evidence(store.a, store.tab, args[0], float(t), pose, args[4],
+                                              [d.get("ev") or (_NOEV_LOW if (d.get("attrs") or {}).get("low") else _NOEV)
+                                               for d in dets], lasts,
+                                              (1.0 if c["see_through"] else 0.0, c["occl_from"], c["occl_full"], c["see_floor"],
+                                               c["see_margin"], c["see_min"], 1.0 if c["pd_cut"] else 0.0, c["pd_cut_fresh_s"]))
+            if marks:
+                self.ev_stats["seen_through"] += len(marks)
+            if nf and ckey is not None:
+                hn = self.cut_stat.setdefault(ckey, [0.0, 0.0])
+                hn[0] += nh
+                hn[1] += nf
+                if hn[1] > c["pd_cut_keep"]:
+                    hn[0] *= 0.5
+                    hn[1] *= 0.5
         if bias is not None:                             # the sensor's pitch error after the scan
             b[:] = bias
             sensor.bias, sensor.bias_var = bias[0], bias[1]
@@ -1225,14 +1300,18 @@ class Tracker:
         # at all (frames dropped, the detector shed by the load governor) nothing has left any field
         scan = T if self.t is None else min(T, self.t)
         self._snap = None
-        slots, tb, rec = self.looked()
         lasts = [max(o.last_seen.values()) for o in self.objects]
+        if c["swept"] and pose is not None and self.objects:
+            self._swept(T, pose, lasts)
+        slots, tb, rec = self.looked()
         life = self._life(T, pose, scan, slots, tb, rec, lasts)
+        coast_std, coast_rel, coast_min = c["coast_std_m"], c["coast_std_rel"], c["coast_min_s"]
         sn = ([], [], [])                                # ... of the objects that stay
         delete_exist, view_gap, seen_max = c["delete_exist"], c["view_gap_s"], c["seen_max_s"]   # (out of the loop)
+        swept_drop = c["swept_drop"] if c["swept"] else 2.0
         for o, (p_st, finite, _, sd, rng), s, r, m, last in zip(self.objects, life, slots, tb, rec, lasts):
             exist, cover, hidden, hits = r[OT_PE], r[OT_COVER], r[OT_HIDDEN], int(m[M_HITS])
-            if exist < delete_exist or not finite:
+            if exist < delete_exist or not finite or o.swept >= swept_drop:
                 continue
             if scan - cover <= view_gap:
                 # a sensor is looking at where it should be: it lives by being seen
@@ -1244,6 +1323,10 @@ class Tracker:
                 if hid and (T - last > (c["memory_s"] if o.grp_kind == "queue" else c["hidden_s"])
                             or (sd is not None and sd > c["hidden_std_m"])):
                     continue                             # hidden for too long: where it is is no longer known
+                if coast_std > 0.0 and not hid and sd is not None and T - last > coast_min and p_st < 0.5 \
+                        and sd > max(coast_std, coast_rel * rng):
+                    self.ev_stats["coast_std"] += 1
+                    continue                             # in the open, no box, its place a guess: not kept
                 if o.state == "tentative":
                     if exist >= c["confirm_exist"] and hits >= c["confirm_hits"] and r[OT_INMAP]:
                         o.state = "confirmed"
@@ -1467,6 +1550,33 @@ class Tracker:
         self.hyp.sync(self.store.tab, [q.h for q in self.objects])
         self._snap = None
 
+    def _swept(self, T, pose, lasts):
+        """The car's own body is where nothing is (`swept`, chris_native.c radar_swept): an object without a box for
+        swept_unseen_s loses the share of its existence that lies there, as that share grows."""
+        c = self.cfg
+        # (a settled object: a tentative one's place is three stories, stands / drives with the traffic / comes the
+        # other way, and their blur reaches into the car from 15 m away)
+        sel = [(o, last) for o, last in zip(self.objects, lasts) if T - last > c["swept_unseen_s"] and o.state != "tentative"]
+        if not sel:
+            return
+        back, was = [], {}
+        for o, last in sel:                              # how far the car has driven since the object's last box
+            d = was.get(last)
+            if d is None:
+                p0 = self.ego.pose_at(last)
+                d = was[last] = 0.0 if p0 is None else min(math.hypot(pose[0] - p0[0], pose[1] - p0[1]), 50.0)
+            back.append(d)
+        sel = [o for o, _ in sel]
+        ps = _NR.radar_swept(self.store.a, [o.slot for o in sel], [T - o.t for o in sel], [o.kin for o in sel],
+                             M._native_par(self.mcfg), pose[:3],
+                             (c["swept_front_m"], c["swept_rear_m"], c["swept_half_m"], c["swept_margin_m"]), back)
+        for o, p in zip(sel, ps):
+            p = min(p, 1.0 - 1e-7)
+            if p > o.swept + 1e-3:
+                self.hyp.shift(self.store.a, self.store.tab, o.h, math.log((1.0 - p) / (1.0 - o.swept)))
+                o.swept = p
+                self.ev_stats["swept"] += 1
+
     def _life(self, T, pose, scan, slots, tb, rec, lasts):
         """Per object: (p_still, its combined state finite, and for one out of every field (not tentative) where
         it will be at T: the probability that it stands, 1 sigma of its place (larger axis), its range; else
@@ -1476,8 +1586,10 @@ class Tracker:
         if not objs:                                     # (radar_life of no objects: an empty list)
             return []
         kin = [o.kin for o in objs]
+        cs, cm = c["coast_std_m"] > 0.0, c["coast_min_s"]
         return _NR.radar_life(self.store.a, slots, [k[3] for k in kin],
-                              [1.0 if o.state != "tentative" and (scan - r[OT_COVER] > c["view_gap_s"] or r[OT_HIDDEN] > last)
+                              [1.0 if o.state != "tentative" and (scan - r[OT_COVER] > c["view_gap_s"] or r[OT_HIDDEN] > last
+                                                                  or (cs and T - last > cm))
                                else 0.0 for o, r, last in zip(objs, tb, lasts)],
                               [T - m[M_T] for m in rec], kin, M._native_par(self.mcfg), pose[:2] if pose else None,
                               self.mcfg["stand_drift"] ** 2)

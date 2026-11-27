@@ -7418,7 +7418,11 @@ enum { XC_FLAGS, XC_BOXOCC, XC_BOXOCC_M,
        XC_NAX,
        /* the car's own pose at the far end of each scale rate's baseline: how many baselines the scan has (0: the
         * rate is read as the range's rate now, as it was), then per baseline (the baseline in s, X, Y, heading then) */
-       XC_SPN, XC_SPT, RXCFG = XC_SPT + 4 * RSPREV };
+       XC_SPN, XC_SPT,
+       /* the gate per hypothesis (docs/RADAR.md, section 12): a detection outside the gate of the object as a whole
+        * (but within this many gates of it) is inside where it is inside the gate of one of its hypotheses; 0: the
+        * object as a whole only, as it was */
+       XC_GHYP = XC_SPT + 4 * RSPREV, RXCFG };
 /* a row's second memory (Hyp.Y; made when a scan first asks for the chain or the pose head): the detect / miss
  * chain per view of the camera (two views: the view's key, the probability that the detector has lost the object,
  * the time of that), when the row last took a ground point of the pose head, when a heading; the log odds that the
@@ -8513,7 +8517,29 @@ static void ras_row(const RAs *q, const double *row, double pd, double pdlo, dou
                 sing = 1;
                 break;
             }
-            ok[a] = ok[a] && s <= gate;
+            int in = s <= gate;
+            if (!in && ok[a] && q->xc != NULL && q->xc->c[XC_GHYP] > 0.0 && s <= q->xc->c[XC_GHYP] * gate && ar >= 0 &&
+                !isnan(lbw) && d[D_W] > 0.0 && fabs(wrap_pi(d[D_Z + ar] - zp[ar])) <= 0.25 * (d[D_W] + lbw)) {
+                /* the gate per hypothesis: the combination of the hypotheses is where the believed one is, and a
+                 * standing lead that pulls away is outside it while "it moves" (weighed a few hundredths) holds its
+                 * box: each hypothesis that is not ruled out gates with its own prediction. Only for a box that
+                 * lies on the object's last one (its middle within half their mean width of where the object
+                 * predicts it): a doubtful hypothesis is wide, and would hold a neighbour's box too */
+                for (int mm = 0; mm < 3 && !in; mm++) {
+                    if (mu[mm] < 1e-4)
+                        continue;
+                    double zh[4], Hh[4 * RN], HPh[4 * RN], Sh[16], sh;
+                    r_h(sen, kind, sdt, row + RO_XS + mm * RN, pose, zh, Hh, row + RO_E);
+                    r_hph(Hh, m, row + RO_PS + mm * RNN, HPh, Sh);
+                    for (int r = 0; r < m; r++) {
+                        nuj[r] = r == ar ? wrap_pi(d[D_Z + r] - zh[r]) : d[D_Z + r] - zh[r];
+                        Sh[r * m + r] += Rf[r];
+                    }
+                    if (r_mahal(Sh, m, nuj, &sh, NULL) == 0 && sh <= gate)
+                        in = 1;
+                }
+            }
+            ok[a] = ok[a] && in;
             anyok |= ok[a];
         }
         if (sing || !anyok)
@@ -13217,6 +13243,276 @@ done:
     return res;
 }
 
+/* ---- an object that is no longer there (docs/RADAR.md, section 12) ---- */
+/* evidence on an object's existence from outside the pairing: the log odds of every story of it moved by dl (as a
+ * miss moves them), and what the table says of it */
+static void h_exist_shift(Hyp *H, double *A, double *T, long h, double dl)
+{
+    HTrack *tr = &H->tr[h];
+    for (int k = 0; k < tr->nleaf; k++) {
+        double *L = A + (Py_ssize_t)tr->leaf[k] * RROW + RO_M + M_L;
+        *L = pymax(-12.0, pymin(12.0, *L + dl));
+    }
+    double p = pymin(pymax(tr->pe, 1e-9), sigm(12.0));
+    tr->pe = sigm(log(p / (1.0 - p)) + dl);
+    if (T != NULL)
+        T[ROT_PE] = tr->pe;
+}
+
+/* Hyp.shift(S, table, handle, dl) -> the object's probability of existing after evidence of dl (log odds) */
+static PyObject *hyp_shift(PyObject *self, PyObject *args)
+{
+    Hyp *H = (Hyp *)self;
+    PyObject *oS, *oT;
+    long h;
+    double dl;
+    if (!PyArg_ParseTuple(args, "OOld", &oS, &oT, &h, &dl))
+        return NULL;
+    HTrack *t = h_get(H, h);
+    if (t == NULL)
+        return NULL;
+    View vS, vT;
+    vS.held = vT.held = 0;
+    Py_ssize_t cap, trows;
+    PyObject *res = NULL;
+    if (store_get(oS, &vS, &cap) < 0 || tab_get(oT, &vT, ROTW, &trows, NULL, "table") < 0)
+        goto done;
+    if (cap < H->cap || h >= trows || !isfinite(dl)) {
+        PyErr_SetString(PyExc_ValueError, "Hyp.shift: arrays that are too small, or evidence that is not a number");
+        goto done;
+    }
+    h_exist_shift(H, (double *)vS.b.buf, (double *)vT.b.buf + h * ROTW, h, dl);
+    res = PyFloat_FromDouble(t->pe);
+done:
+    view_drop(&vS);
+    view_drop(&vT);
+    return res;
+}
+
+#define REVCFG 8
+enum { EV_SEE, EV_FROM, EV_FULL, EV_FLOOR, EV_MARGIN, EV_MIN, EV_CUT, EV_FRESH };
+enum { EG_ON, EG_B, EG_HW, EG_SB, EG_PB, EG_VPB, EG_PT, EG_DET, EG_N };
+
+/* Hyp.evidence(S, table, objects, t, pose, sensor, dets, lasts, cfg) -> ([(object's place in `objects`, dl)], n, hits)
+ * After a camera's scan (Hyp.cycle), what the scan says of the objects it did not report, beyond "not reported":
+ *
+ * SEEN THROUGH (cfg[EV_SEE]). A settled object A that the scan's best story left without a box hides what stands
+ * behind it; the tracker says so of the things behind (r_visible). The scan's boxes are that statement read the
+ * other way: a box D that is not A's, lies inside A's silhouette (across: D's box at five bearings against A's
+ * rectangle as seen, as soft as A's bearing and the box's are unsure; up: the rows of D's box that A's box holds)
+ * and is of a thing BEYOND A (q: A's near face against the thing's, as angles below the horizon, by more than
+ * cfg[EV_MARGIN] sigma of what is not known of the two; the thing's from the object that took D in the best story,
+ * else from D's own ground row; a box that says no range is not read) would have been reported with the chance
+ * pv(cover) of a thing so far hidden (the visibility model's ramp from cfg[EV_FROM] to cfg[EV_FULL], no lower than
+ * cfg[EV_FLOOR]: the detector does box things it sees a part of). A's log odds move by ln(1 - q (1 - pv)), all its
+ * stories alike, summed over the scan's boxes and no further than cfg[EV_MIN].
+ *
+ * THE VIEW'S CUT ZONE (cfg[EV_CUT]): of the settled objects in the open that stand nearer than the view's first
+ * ground point (their boxes are cut at the bottom) and had a box within cfg[EV_FRESH] s before this scan
+ * (lasts: each object's last sighting before the scan), how many there were (n) and how many of them the scan boxed
+ * (hits): the tracker follows the share per view (tracker.py `pd_cut`).
+ * dets: per detection (bearing, half width as an angle, ground angle | NaN, its variance, top, bottom as angles
+ * below the horizon | NaN, 1: low list). */
+static PyObject *hyp_evidence(PyObject *self, PyObject *args)
+{
+    Hyp *H = (Hyp *)self;
+    PyObject *oS, *oT, *otr, *opose, *osen, *odets, *olast, *ocfg, *res = NULL, *out = NULL;
+    double t;
+    if (!PyArg_ParseTuple(args, "OOOdOOOOO", &oS, &oT, &otr, &t, &opose, &osen, &odets, &olast, &ocfg))
+        return NULL;
+    View vS, vT;
+    vS.held = vT.held = 0;
+    Py_ssize_t cap, trows, na = 0, *th = NULL, nd, nlast;
+    double cfg[REVCFG], *buf = NULL;
+    Py_ssize_t nfresh = 0, nhit = 0;
+    Scan s;
+    memset(&s, 0, sizeof(s));
+    if (store_get(oS, &vS, &cap) < 0 || tab_get(oT, &vT, ROTW, &trows, NULL, "table") < 0 ||
+        (th = idx_get(otr, 1 << 30, &na)) == NULL || sens_get(osen, &s.sen) < 0 || rnums_get(opose, 6, s.pose, "pose") < 0 ||
+        rnums_get(ocfg, REVCFG, cfg, "cfg") < 0)
+        goto done;
+    nd = PySequence_Size(odets);
+    nlast = PySequence_Size(olast);
+    if (nd < 0 || nlast < 0)
+        goto done;
+    if (cap < H->cap) {
+        PyErr_SetString(PyExc_ValueError, "Hyp.evidence: a state array that is too small");
+        goto done;
+    }
+    if ((out = PyList_New(0)) == NULL)
+        goto done;
+    if (s.sen.type == SEN_CAMERA && na > 0) {
+        buf = (double *)PyMem_Malloc(((size_t)nd * 7 + (size_t)nlast + (size_t)na * EG_N + (size_t)nd + 1) * sizeof(double));
+        if (buf == NULL) {
+            PyErr_NoMemory();
+            goto done;
+        }
+        double *D = buf, *last = D + (size_t)nd * 7, *G = last + nlast, *own = G + (size_t)na * EG_N;
+        if ((nd && rows_get(odets, nd, 7, D, "dets") < 0) || (nlast && rows_get(olast, nlast, 1, last, "lasts") < 0))
+            goto done;
+        double *A = (double *)vS.b.buf, *tab = (double *)vT.b.buf;
+        double cph = cos(s.pose[2]), sph = sin(s.pose[2]), hc = s.sen.hc;
+        for (Py_ssize_t j = 0; j < nd; j++)
+            own[j] = -1.0;
+        /* every object that took part: its silhouette, its near face's angle below the horizon, the box it took */
+        for (Py_ssize_t i = 0; i < na; i++) {
+            double *g = G + (size_t)i * EG_N;
+            g[EG_ON] = 0.0;
+            Py_ssize_t h = th[i];
+            if (h >= H->ntr || h >= trows || !H->tr[h].alive)
+                continue;
+            const double *row = A + (Py_ssize_t)H->tr[h].primary * RROW, *x = row + RO_X, *P = row + RO_P, *M = row + RO_M;
+            if (fabs(M[M_T] - t) > 1e-9 || !all_finite(x, RN))
+                continue;
+            Occ o;
+            r_outline(&s, row, &o);
+            double dx = x[R_PX] - s.pose[0], dy = x[R_PY] - s.pose[1], rc = pymax(hypot(dx, dy), 0.5), los = atan2(dy, dx);
+            double rn = pymax(rc - r_half_depth(row + RO_E, los, NULL), 0.5), gg = hc / (rn * rn + hc * hc);
+            double ux = dx / rc, uy = dy / rc, vr = ux * ux * P[0] + 2.0 * ux * uy * P[1] + uy * uy * P[RN + 1];
+            g[EG_ON] = 1.0;
+            g[EG_B] = o.b;
+            g[EG_HW] = o.hw;
+            g[EG_SB] = o.sb;
+            g[EG_PB] = atan2(hc, rn) + s.sen.bias + x[R_DP];
+            g[EG_VPB] = gg * gg * pymax(vr, 0.0) + P[R_DP * RN + R_DP];
+            g[EG_PT] = g[EG_PB] - exp(x[R_LH]) / rn;
+            int j = (int)M[M_DET];
+            g[EG_DET] = (double)j;
+            if (j >= 0 && j < nd)
+                own[j] = (double)i;
+            const double *T = tab + h * ROTW;
+            int settled = T[ROT_STATE] == 1.0 || T[ROT_STATE] == 2.0;
+            if (cfg[EV_CUT] != 0.0 && settled && s.sen.cover && M[M_COV] > 0.0 && M[M_OCC] == 0.0 && i < nlast &&
+                t - last[i] <= cfg[EV_FRESH]) {
+                double cx = cph * dx + sph * dy, cy = -sph * dx + cph * dy;
+                if (cx > 0.5 && py_hypot(cx, cy) < s.sen.gmin) {
+                    nfresh++;
+                    if (j >= 0 && j < nd && D[(size_t)j * 7 + 6] == 0.0)
+                        nhit++;
+                }
+            }
+            if (!settled || j >= 0 || !(M[M_COV] > 0.0))
+                g[EG_ON] = 2.0;                          /* (not one that the scan left without a box) */
+        }
+        for (Py_ssize_t i = 0; cfg[EV_SEE] != 0.0 && i < na; i++) {
+            const double *g = G + (size_t)i * EG_N;
+            if (g[EG_ON] != 1.0 || !(g[EG_HW] > 0.0))
+                continue;
+            double dl = 0.0;
+            for (Py_ssize_t j = 0; j < nd; j++) {
+                const double *d = D + (size_t)j * 7;
+                if (d[6] != 0.0 || !(d[1] > 0.0) || isnan(d[4]) || isnan(d[5]) || !(d[5] > d[4]))
+                    continue;
+                double ad = d[2], vd = d[3];
+                if (own[j] >= 0.0) {                     /* the thing the box is of, as its object has it now */
+                    const double *gb = G + (size_t)own[j] * EG_N;
+                    ad = gb[EG_PB];
+                    vd = gb[EG_VPB];
+                }
+                if (isnan(ad) || !(vd >= 0.0))
+                    continue;
+                double q = r_phi((g[EG_PB] - ad) / sqrt(g[EG_VPB] + vd + 1e-12) - cfg[EV_MARGIN]);
+                if (!(q > 1e-3))
+                    continue;
+                double sg = sqrt(g[EG_SB] * g[EG_SB] + 1e-8), in = 0.0;
+                for (int p = 0; p < 5; p++) {
+                    double beta = d[0] + d[1] * (-0.8 + 0.4 * p);
+                    in += 0.2 * (r_phi((g[EG_B] + g[EG_HW] - beta) / sg) - r_phi((g[EG_B] - g[EG_HW] - beta) / sg));
+                }
+                double up = pymin(1.0, pymax(0.0, (pymin(d[5], g[EG_PB]) - pymax(d[4], g[EG_PT])) / (d[5] - d[4])));
+                double cover = in * up, c0 = cfg[EV_FROM], c1 = cfg[EV_FULL], fl = cfg[EV_FLOOR];
+                double pv = cover <= c0 ? 1.0 : cover >= c1 ? fl : 1.0 - (1.0 - fl) * (cover - c0) / (c1 - c0);
+                dl += log(pymax(1.0 - q * (1.0 - pv), 1e-6));
+            }
+            dl = pymax(dl, cfg[EV_MIN]);
+            if (dl < -1e-3) {
+                h_exist_shift(H, A, tab + th[i] * ROTW, (long)th[i], dl);
+                PyObject *o = Py_BuildValue("(nd)", i, dl);
+                if (o == NULL || PyList_Append(out, o) < 0) {
+                    Py_XDECREF(o);
+                    goto done;
+                }
+                Py_DECREF(o);
+            }
+        }
+    }
+    res = Py_BuildValue("(Onn)", out, nfresh, nhit);
+done:
+    Py_XDECREF(out);
+    PyMem_Free(th);
+    PyMem_Free(buf);
+    view_drop(&vS);
+    view_drop(&vT);
+    return res;
+}
+
+/* radar_swept(S, rows, dt, kin, par, pose, cfg, back) -> [p]: per object the probability that its rectangle lies
+ * where the car's own body is or has been since the object's last box, at the message's time (dt from the object's
+ * own time): the car drives where nothing is, so that much of what is believed of the object's place is refuted.
+ * The place across and along the car's axes (each with its own spread), the object's rectangle as its half extents
+ * along those axes, the car's body from cfg: (to the front bumper, to the rear bumper, half its width, a margin
+ * taken off: m), drawn out to the rear by back[i]: how far the car has driven since the object's last box (the
+ * swept path, taken as straight behind the car). pose: the car's (X, Y, heading). */
+static PyObject *n_radar_swept(PyObject *self, PyObject *args)
+{
+    PyObject *oS, *orows, *odt, *okin, *opar, *opose, *ocfg, *oback, *res = NULL;
+    if (!PyArg_ParseTuple(args, "OOOOOOOO", &oS, &orows, &odt, &okin, &opar, &opose, &ocfg, &oback))
+        return NULL;
+    View vS;
+    vS.held = 0;
+    Py_ssize_t cap, B = 0, *rows = NULL;
+    double *buf = NULL, pose[3], cfg[4];
+    RPar par;
+    if (store_get(oS, &vS, &cap) < 0 || (rows = idx_get(orows, cap, &B)) == NULL || rpar_get(opar, &par) < 0 ||
+        rnums_get(opose, 3, pose, "pose") < 0 || rnums_get(ocfg, 4, cfg, "cfg") < 0)
+        goto done;
+    buf = (double *)PyMem_Malloc((size_t)(B ? B : 1) * 6 * sizeof(double));
+    if (buf == NULL) {
+        PyErr_NoMemory();
+        goto done;
+    }
+    double *dts = buf, *kin = dts + B, *back = kin + 4 * B;
+    if (rows_get(odt, B, 1, dts, "dt") < 0 || rows_get(okin, B, 4, kin, "kin") < 0 || rows_get(oback, B, 1, back, "back") < 0)
+        goto done;
+    if ((res = PyList_New(B)) == NULL)
+        goto done;
+    double *A = (double *)vS.b.buf, c = cos(pose[2]), sn = sin(pose[2]);
+    for (Py_ssize_t b = 0; b < B; b++) {
+        const double *row = A + rows[b] * RROW, *e = row + RO_E;
+        double o[6], p = 0.0;
+        if (fabs(dts[b]) < 1e-6) {
+            o[0] = row[RO_X + R_PX];
+            o[1] = row[RO_X + R_PY];
+            o[2] = row[RO_P];
+            o[3] = row[RO_P + 1];
+            o[4] = row[RO_P + RN];
+            o[5] = row[RO_P + RN + 1];
+        } else
+            r_peek_pos(row, dts[b], kin + 4 * b, &par, o);
+        if (all_finite(o, 6) && all_finite(e, 3)) {
+            double dx = o[0] - pose[0], dy = o[1] - pose[1], cx = c * dx + sn * dy, cy = -sn * dx + c * dy;
+            double sx = sqrt(pymax(c * c * o[2] + 2.0 * c * sn * o[3] + sn * sn * o[5], 1e-6));
+            double sy = sqrt(pymax(sn * sn * o[2] - 2.0 * c * sn * o[3] + c * c * o[5], 1e-6));
+            double a = e[E_HDG] - pose[2], ca = fabs(cos(a)), sa = fabs(sin(a));
+            double hx = 0.5 * (e[E_LEN] * ca + e[E_WID] * sa), hy = 0.5 * (e[E_LEN] * sa + e[E_WID] * ca);
+            double xlo = -cfg[1] - hx + cfg[3] - pymax(back[b], 0.0), xhi = cfg[0] + hx - cfg[3], yh = cfg[2] + hy - cfg[3];
+            if (xhi > xlo && yh > 0.0)
+                p = (r_phi((xhi - cx) / sx) - r_phi((xlo - cx) / sx)) * (r_phi((yh - cy) / sy) - r_phi((-yh - cy) / sy));
+        }
+        PyObject *v = PyFloat_FromDouble(pymin(pymax(p, 0.0), 1.0));
+        if (v == NULL) {
+            Py_CLEAR(res);
+            goto done;
+        }
+        PyList_SetItem(res, b, v);
+    }
+done:
+    PyMem_Free(rows);
+    PyMem_Free(buf);
+    view_drop(&vS);
+    return res;
+}
+
 /* Hyp.debug(on) -> the last kept scan's pairing numbers (None: none kept); on: keep them from now on / stop */
 static PyObject *hyp_debug(PyObject *self, PyObject *arg)
 {
@@ -13239,6 +13535,8 @@ static PyMethodDef hyp_methods[] = {
     {"cycle", hyp_cycle, METH_VARARGS, "one scan of the tracker: its objects in, what the scan did to them out"},
     {"after", hyp_after, METH_VARARGS, "after a scan's sightings: predictions checked and written down, trajectories, the smoothed past"},
     {"drop", hyp_drop, METH_VARARGS, "an object taken out"},
+    {"shift", hyp_shift, METH_VARARGS, "evidence on an object's existence from outside the pairing (log odds)"},
+    {"evidence", hyp_evidence, METH_VARARGS, "after a camera's scan: boxes seen through an unreported object; the cut zone's boxes"},
     {"rows", hyp_rows_of, METH_O, "every row of an object, the primary first"},
     {"chain", hyp_chain, METH_O, "the primary's rows from now back"},
     {"leaves", hyp_leaves, METH_O, "an object's hypotheses and their probabilities"},
@@ -13987,6 +14285,7 @@ static PyMethodDef methods[] = {
     {"radar_kbest", n_radar_kbest, METH_VARARGS, "the k cheapest assignments in order (Murty)"},
     {"radar_frame", n_radar_frame, METH_VARARGS, "the output's per-object numbers (box.py Radar.frame)"},
     {"radar_life", n_radar_life, METH_VARARGS, "Tracker.manage's numbers: stillness, finiteness, out-of-view place"},
+    {"radar_swept", n_radar_swept, METH_VARARGS, "per object the probability that it lies in the car's own body"},
     {"radar_merge", n_radar_merge, METH_VARARGS, "Tracker._merge's geometry: the near pairs and their test"},
     {"radar_register", n_radar_register, METH_VARARGS, "Tracker._register for one sensor: the shared offset, taken out"},
     PREDICT_METHODS
