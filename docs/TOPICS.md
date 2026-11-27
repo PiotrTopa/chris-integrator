@@ -254,8 +254,8 @@ before); what a consumer sees of it:
 A light of another lane is no longer served as the ego light while one that may be the ego lane's qualifies, and the
 ego light does not change between two heads unless the other is better by a factor 1.3.
 Measured on the drives of 26 / 27 November (replay of the six sessions with lights, 5318 messages with a light):
-changes of the ego track 240 -> about 125, A-B-A flaps 149 -> about 40, colour flips that revert within 4 s 85 ->
-about 27; on the 855 messages of five stretches whose true state was read from the frames: right 48 % -> 97 %,
+changes of the ego track 240 -> 120, A-B-A flaps 149 -> 33, colour flips that revert within 4 s 85 -> 24; on the
+855 messages of seven stretches (four junctions) whose true state was read from the frames: right 48 % -> 97 %,
 wrong colour 27 % -> 0.2 %, no ego light 24 % -> 3 %.
 
 ### The data integrator (chris-integrator): topics `ego_state`, `tracks`, and the source of `lead`
