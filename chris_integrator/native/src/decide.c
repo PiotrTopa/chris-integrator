@@ -452,15 +452,22 @@ typedef struct {               /* one object mode, sampled */
     int done;                     /* steps sampled so far (dk_obj_sample) */
 } DkObj;
 
+/* (threat cfg ego_turn_rel, set by decide_frame for its call of dk_eval; 0: off) the share of a future's own
+ * lateral displacement, the turn it makes away from the line the car is on now, that is not known: 1 sigma across the
+ * car, beyond the cap of a car that keeps its lane */
+static double dk_turn_rel = 0.0;
+
 /* the car's own covariance of position at time tau: along and across its heading (a demand it holds with some
- * error: 1 sigma a t^2 / 2, bounded) */
-static void dk_ego_cov(const double *cfg, double tau, double th, double *sxx, double *sxy, double *syy)
+ * error: 1 sigma a t^2 / 2, bounded); dev: how far the future has left the line the car is on now (m) */
+static void dk_ego_cov(const double *cfg, double tau, double th, double dev, double *sxx, double *sxy, double *syy)
 {
     double a = 0.5 * cfg[DC_SDEL] * tau * tau, b = 0.5 * cfg[DC_SDET] * tau * tau;
     if (a > cfg[DC_ECAPL])
         a = cfg[DC_ECAPL];
     if (b > cfg[DC_ECAPT])
         b = cfg[DC_ECAPT];
+    if (dk_turn_rel > 0.0)
+        b = sqrt(b * b + dk_turn_rel * dk_turn_rel * dev * dev);
     double c = cos(th), s = sin(th);
     *sxx = a * a * c * c + b * b * s * s;
     *syy = a * a * s * s + b * b * c * c;
@@ -1065,8 +1072,10 @@ static void dk_ego_sample(const DkSamp *S, DkEgo *e, int nh, int to)
         /* the mode's footprint and (within the horizon) its own covariance at the step: the same for every
          * object mode it is judged against */
         dk_ego_rect(S->cfg, e->x[i], e->y[i], e->th[i], &e->er[i]);
-        if (i < nh)
-            dk_ego_cov(S->cfg, i * S->dt, e->th[i], &e->exx[i], &e->exy[i], &e->eyy[i]);
+        if (i < nh) {
+            const double dev = dk_turn_rel > 0.0 ? -(e->x[i] - e->x[0]) * e->er[0].s + (e->y[i] - e->y[0]) * e->er[0].c : 0.0;
+            dk_ego_cov(S->cfg, i * S->dt, e->th[i], dev, &e->exx[i], &e->exy[i], &e->eyy[i]);
+        }
     }
     if (to > e->done)
         e->done = to;
@@ -1613,7 +1622,8 @@ static PyObject *n_decide_draws(PyObject *self, PyObject *arg)
     X(t_contact_s) X(lane) X(shown) X(pairs) X(w0) X(w) X(course) X(radar) X(cv) X(contract) X(vehicle) X(vru)         \
     X(unknown) X(stand) X(stand_path) X(cv_path) X(path) X(turn) X(none) X(information) X(caution) X(warning)          \
     X(imminent) X(threat_number) X(time_margin) X(collision_course) X(confirmed) X(coast) X(stationary) X(moving)   \
-    X(p_place) X(hold) X(act_s) X(res_s) X(held) X(gaps) X(in_reach) X(side) X(s_m) X(clear_m) X(v_stop_mps) X(t_reach_s)
+    X(p_place) X(hold) X(act_s) X(res_s) X(held) X(gaps) X(in_reach) X(side) X(s_m) X(clear_m) X(v_stop_mps) X(t_reach_s) \
+    X(occ) X(seen) X(exist) X(object) X(screen)
 #define X(n) S_##n,
 enum { DF_STRS(X) S_N };
 #undef X
@@ -1642,7 +1652,8 @@ enum {
     DX_BRAKE_SHARE = DC_NC, DX_STEER_SHARE, DX_SPEED_FADE, DX_TURN_R, DX_HDG_RES, DX_AXIS_STANDING, DX_AXIS_SNAP,
     DX_AXIS_STD, DX_LANE_AXIS_P, DX_LANE_WEIGHT, DX_LANE_FLOOR, DX_STAND_MOVE, DX_LIST_MIN_P, DX_NC,
     /* further constants, read where the array reaches them (an array of DX_NC numbers: all off) */
-    DX_HOLD = DX_NC, DX_HOLD_DECEL, DX_HOLD_REL, DX_HOLD_SIGMA, DX_HOLD_P, DX_HOLD_LEVEL, DX_NX
+    DX_HOLD = DX_NC, DX_HOLD_DECEL, DX_HOLD_REL, DX_HOLD_SIGMA, DX_HOLD_P, DX_HOLD_LEVEL, DX_TURN_REL, DX_SCREEN,
+    DX_SCREEN_EXIST, DX_SCREEN_SEEN, DX_NX
 };
 #define DX_GET(tc, ntc, i, absent) ((ntc) > (i) ? (tc)[i] : (absent))
 #define DF_G 9.81
@@ -2056,6 +2067,7 @@ typedef struct {
     int first, nm, cv, along, row;
     int lane_res;                /* its futures carry the lanes' weight (state 3 of the futures' rows) */
     double p_place;              /* ... the probability of the place in the car's way (state - 3); 1 where not given */
+    double scr;                  /* threat cfg screen: the probability that another object stands between the car and it */
 } DfObj;
 
 static int df_parse(PyObject *o, DfObj *q)
@@ -2302,6 +2314,48 @@ static void df_road_axis(double *h, double *sh, double road, double snap, double
         return;
     *h = *h - d;
     *sh = isfinite(*sh) ? DF_MIN(*sh, sd) : sd;
+}
+
+/* ---- what stands between the car and an object (threat cfg screen) ---- */
+/* a point against a polyline of n points (x, y, the arc length s): its arc length and its offset to the left; before the
+ * first point and beyond the last the end segments are carried on */
+static void df_poly_project(const double *x, const double *y, const double *s, int n, double px, double py, double *sp, double *off)
+{
+    double best = INFINITY;
+    *sp = 0.0;
+    *off = 0.0;
+    for (int i = 0; i + 1 < n; i++) {
+        const double dx = x[i + 1] - x[i], dy = y[i + 1] - y[i], L2 = dx * dx + dy * dy;
+        if (!(L2 > 1e-8))
+            continue;
+        double u = ((px - x[i]) * dx + (py - y[i]) * dy) / L2;
+        const int first = i == 0, last = i + 2 >= n || !(s[i + 2] > s[i + 1] + 1e-4);
+        if (u < 0.0 && !first)
+            u = 0.0;
+        if (u > 1.0 && !last)
+            u = 1.0;
+        const double ex = px - x[i] - u * dx, ey = py - y[i] - u * dy, e2 = ex * ex + ey * ey;
+        if (e2 < best) {
+            const double L = sqrt(L2);
+            best = e2;
+            *sp = s[i] + u * L;
+            *off = (dx * (py - y[i]) - dy * (px - x[i])) / L;
+        }
+    }
+}
+
+/* the least number of dict `d`'s values (a radar object's `seen`: the age of its last sighting per sensor); inf: none */
+static double df_min_value(PyObject *d)
+{
+    double best = INFINITY, v;
+    if (d == NULL || !PyDict_Check(d))
+        return best;
+    PyObject *k, *val;
+    Py_ssize_t pos = 0;
+    while (PyDict_Next(d, &pos, &k, &val))
+        if (df_fin(val, &v) && v < best)
+            best = v;
+    return best;
 }
 
 /* decide_frame(objects, ego, futures, path, t_own, fcfg, tcfg, thr, mu, shown, opt)
@@ -2786,6 +2840,139 @@ static PyObject *n_decide_frame(PyObject *self, PyObject *args)
             row[1] = pn[2 * (q->first + i) + 1] * f;
         }
     }
+    /* ---- what stands between the car and an object (threat cfg screen): a vehicle (or a thing of no known kind) ahead on the car's most
+     * likely future cannot be reached before another object that is on that future nearer the car. Per future of that
+     * other one: it screens where it stays in the strip the car sweeps until the car would be at the further
+     * object, and either is still the nearer one then (the car meets IT first: its own record says what that
+     * takes), or has by then driven through the place of an object that is not seen now (hidden by an object, or
+     * not sighted for screen_seen_s: a memory, which the one driving through its place refutes). A leader that
+     * drives into a standing vehicle in plain view screens nothing. The weights of the screened object's futures
+     * are scaled by 1 - P(screened). ---- */
+    for (int m = 0; m < M; m++)
+        Q[m].scr = 0.0;
+    if (DX_GET(tc, ntc, DX_SCREEN, 0.0) > 0.5 && M > 1 && E > 0 && N >= 2) {
+        int jt = 0;
+        for (int j = 1; j < E; j++)
+            if (EG[(size_t)j * wE] > EG[(size_t)jt * wE])
+                jt = j;
+        const double *ex = EG + (size_t)jt * wE + 1, *ey = ex + N;
+        double *es = (double *)PyMem_Malloc((size_t)(N + 3 * M) * sizeof(double));
+        if (es == NULL) {
+            PyErr_NoMemory();
+            goto done;
+        }
+        double *so = es + N, *doff = so + M, *sm = doff + M;
+        es[0] = 0.0;
+        for (int i = 1; i < N; i++)
+            es[i] = es[i - 1] + hypot(ex[i] - ex[i - 1], ey[i] - ey[i - 1]);
+        const double front = tc[DC_FRONT], hwc = tc[DC_HALFW];
+        const double ex_min = DX_GET(tc, ntc, DX_SCREEN_EXIST, 0.9), seen_max = DX_GET(tc, ntc, DX_SCREEN_SEEN, 0.5);
+        for (int m = 0; m < M; m++) {
+            df_poly_project(ex, ey, es, N, Q[m].x, Q[m].y, &so[m], &doff[m]);
+            /* (the offset of its middle: what covers the strip) */
+            double sc, dc;
+            df_poly_project(ex, ey, es, N, Q[m].x + (Q[m].has_ctr ? Q[m].cdx : 0.0), Q[m].y + (Q[m].has_ctr ? Q[m].cdy : 0.0), &sc, &dc);
+            sm[m] = dc;
+        }
+        /* An object refuted so (hidden, and another one driving through its place with a probability of 0.9 at
+         * least) stays refuted until it is sighted again: the one that drove through is then beyond it, and what
+         * is left is a standing thing between the car and its leader that nobody has seen there. The ids are kept
+         * in the dict of the levels shown, under "_refuted". */
+        PyObject *ref_old = PyDict_GetItemString(shown, "_refuted"), *ref_new = PyDict_New();
+        if (ref_new == NULL || PyDict_SetItemString(shown_new, "_refuted", ref_new) < 0) {
+            Py_XDECREF(ref_new);
+            PyMem_Free(es);
+            goto done;
+        }
+        Py_DECREF(ref_new);                                      /* (shown_new holds it) */
+        for (int m = 0; m < M; m++) {
+            DfObj *q = &Q[m];
+            if (DF_SET[q->cls] == 1)                                 /* (not someone on foot or on a bicycle) */
+                continue;
+            if (ref_old != NULL && PyDict_Check(ref_old) && PyDict_GetItem(ref_old, q->id) != NULL &&
+                (df_is(df_get(q->o, S_occ), S_object) || !(df_min_value(df_get(q->o, S_seen)) <= seen_max))) {
+                q->scr = 1.0;
+                for (int i = 0; i < q->nm; i++) {
+                    double *row = MD + (size_t)(q->first + i) * wM;
+                    row[0] = row[1] = 0.0;
+                }
+                if (PyDict_SetItem(ref_new, q->id, Py_True) < 0) {
+                    PyMem_Free(es);
+                    goto done;
+                }
+                continue;
+            }
+            if (!(so[m] > front + 1.0))
+                continue;
+            /* when the car's front is at its near point (inf: never on this future) */
+            double T_o = INFINITY;
+            for (int i = 1; i < N; i++)
+                if (es[i] + front >= so[m]) {
+                    const double a = es[i - 1] + front, b = es[i] + front;
+                    T_o = b > a ? t[i - 1] + (t[i] - t[i - 1]) * (so[m] - a) / (b - a) : t[i];
+                    break;
+                }
+            if (!isfinite(T_o))
+                continue;
+            int hidden = -1;                        /* (read when first asked for) */
+            double best = 0.0, best_b = 0.0;
+            for (int l = 0; l < M; l++) {
+                const DfObj *u = &Q[l];
+                if (l == m || !(so[l] + 0.5 < so[m]) || !(so[l] > 0.0) || !(fabs(sm[l]) < hwc + 0.5 * u->W - 0.3))
+                    continue;
+                double exist = 1.0;
+                if (df_fin(df_get(u->o, S_exist), &exist) && exist < ex_min)
+                    continue;
+                if (!(df_min_value(df_get(u->o, S_seen)) <= seen_max))
+                    continue;                                   /* the screen itself is seen now */
+                double p_scr = 0.0, p_b = 0.0;
+                for (int i = 0; i < u->nm; i++) {
+                    const double *row = MD + (size_t)(u->first + i) * wM, *X = row + 2, *Y = X + N;
+                    int stays = 1;
+                    double s_at = so[l];
+                    for (int k = 0; k < N && stays; k++) {
+                        if (t[k] > T_o + 1e-9)
+                            break;
+                        double sk, dk;
+                        df_poly_project(ex, ey, es, N, X[k] + (u->has_ctr ? u->cdx : 0.0), Y[k] + (u->has_ctr ? u->cdy : 0.0), &sk, &dk);
+                        if (!(fabs(dk) < hwc + 0.5 * u->W))
+                            stays = 0;
+                        df_poly_project(ex, ey, es, N, X[k], Y[k], &sk, &dk);
+                        s_at = sk;
+                    }
+                    if (!stays)
+                        continue;
+                    if (!(s_at < so[m])) {                      /* it has driven through the place by then */
+                        if (hidden < 0)
+                            hidden = df_is(df_get(q->o, S_occ), S_object) || !(df_min_value(df_get(q->o, S_seen)) <= seen_max);
+                        if (!hidden)
+                            continue;
+                        p_b += pn[2 * (u->first + i)];
+                    }
+                    p_scr += pn[2 * (u->first + i)];
+                }
+                p_scr = DF_MIN(1.0, p_scr) * DF_MIN(1.0, exist);
+                if (p_scr > best)
+                    best = p_scr;
+                p_b = DF_MIN(1.0, p_b) * DF_MIN(1.0, exist);
+                if (p_b > best_b)
+                    best_b = p_b;
+            }
+            if (best_b >= 0.9 && PyDict_SetItem(ref_new, q->id, Py_True) < 0) {
+                PyMem_Free(es);
+                goto done;
+            }
+            if (best > 0.0) {
+                q->scr = best;
+                for (int i = 0; i < q->nm; i++) {
+                    double *row = MD + (size_t)(q->first + i) * wM;
+                    row[0] *= 1.0 - best;
+                    row[1] *= 1.0 - best;
+                }
+            }
+        }
+        PyMem_Free(es);
+    }
     double *cfg = w;
     w += DX_NC;
     for (int i = 0; i < DC_NC; i++)
@@ -2797,7 +2984,10 @@ static PyObject *n_decide_frame(PyObject *self, PyObject *args)
     double *PO = w, *OO = w + (size_t)K * E * DK_PF;
     {
         int nsim;
-        if (dk_eval(t, N, EG, E, OH, DK_OHC, M, MD, K, cfg, thr, (int)(nthr / 24), PO, OO, &steps, &nsim) < 0)
+        dk_turn_rel = DX_GET(tc, ntc, DX_TURN_REL, 0.0);
+        const int rc = dk_eval(t, N, EG, E, OH, DK_OHC, M, MD, K, cfg, thr, (int)(nthr / 24), PO, OO, &steps, &nsim);
+        dk_turn_rel = 0.0;
+        if (rc < 0)
             goto done;
     }
     /* ---- the records (threat.object_record) of the objects that matter, the level shown, the list ---- */
@@ -2964,6 +3154,8 @@ static PyObject *n_decide_frame(PyObject *self, PyObject *args)
             bad |= df_set(r, S_shown, x) < 0 || df_setb(r, S_in_path, q->in_path ? Py_True : Py_False) < 0;
             if (q->lane_res && !q->cv)
                 bad |= df_set(r, S_p_place, df_r(q->p_place, 3)) < 0;
+            if (q->scr > 0.005)
+                bad |= df_set(r, S_screen, df_r(q->scr, 2)) < 0;
             if (!isnan(h_res)) {                  /* (None for act_s: no contact with the place in the way within the horizon) */
                 PyObject *hd = PyDict_New();
                 if (hd == NULL || df_set(hd, S_act_s, df_r(h_act, 2)) < 0 || df_set(hd, S_res_s, df_r(h_res, 2)) < 0 ||
