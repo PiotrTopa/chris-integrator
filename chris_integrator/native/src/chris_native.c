@@ -32,7 +32,7 @@
 #include <stdint.h>
 #include <string.h>
 
-#define NATIVE_VERSION 15
+#define NATIVE_VERSION 16
 
 static PyObject *Fallback;          /* raised where CPython's json must decide */
 static PyObject *builtin_round;
