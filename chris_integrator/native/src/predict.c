@@ -142,7 +142,40 @@
     X(std_rho, 1.0)             /* 1: where the radar gives the correlation of a place's x and y errors (`std_rho`),  \
                                    the place's covariance is that one: the needle is read along its own long axis     \
                                    (lane_step) and the futures start with it; 0: as if it were not given (the needle   \
-                                   rebuilt from `std` and the bearing, the futures' spread upright) */
+                                   rebuilt from `std` and the bearing, the futures' spread upright) */                 \
+    X(v_track, 0.0)             /* > 0: a future starts at the TRACK's speed where the track states that speed to this \
+                                   (1 sigma, m/s) or better, and between this and 1.5 times it in proportion (the     \
+                                   track is the sum of its sightings; the speed kept here is a second filter over it, \
+                                   which lags a start or a braking by about 1 m/s). A speed the track states worse    \
+                                   (a camera's, far away) is that filter's, as with 0 */                              \
+    X(start_go, 0.0)            /* 1: a vehicle that stood in a lane and has moved off within the last 3 s goes on     \
+                                   accelerating towards the road's speed in its futures along the lane (the car-      \
+                                   following law's free term); 0: its acceleration dies away within acc_tau_s */       \
+    X(ego_follow, 0.0)          /* 1: the car behind a vehicle in its lane is judged as the follower its driver is:    \
+                                   the gap is the one between the bumpers; the gap the driver keeps now is one the    \
+                                   driver keeps (no shorter gap is asked for than the present one); the leader's own  \
+                                   acceleration is fed forward (a follower in a queue that starts accelerates with    \
+                                   it); the acceleration is the one the driver uses (ego_a_max at most). Its          \
+                                   "follow" future is its own acceleration carried on, no further than that law       \
+                                   allows behind the leader's own run */                                               \
+    X(ego_front_m, 2.1)         /* ... the car's front bumper ahead of its origin (the camera) */                     \
+    X(ego_a_max, 2.5)                                                                                                 \
+    X(ego_ff, 1.0)              /* ... the share of the leader's acceleration fed forward */                          \
+    X(ego_dv_fol, 0.8)          /* ... a follower's speed is its leader's to this (1 sigma, m/s; the leader's own     \
+                                   spread added); a driver who is not following has a speed of its own, off the       \
+                                   leader's by ego_dv_free: a speed that matches is evidence of following, also where \
+                                   the acceleration says nothing (steady following) */                                \
+    X(ego_dv_free, 4.0)                                                                                               \
+    X(ego_fol_hz, 0.1)          /* ... "the driver is following" is a belief kept from frame to frame (one             \
+                                   observation per evid_tau_s); it is forgotten towards one half at this rate (1/s) */ \
+    X(ego_arc, 0.0)             /* 1: the car's kinematic future ("ctra") runs on the arc of its speed and yaw rate     \
+                                   itself (half-metre steps, a radius down to ego_arc_r_min); 0: on pp_base's          \
+                                   polyline of 5 m chords, each turned by its whole step from its start (0.3 m inside  \
+                                   the arc after 1 m and 0.5-0.8 m after 4 m at a 12 m radius; no tighter radius; a    \
+                                   straight line below 1.5 m/s) */                                                     \
+    X(ego_arc_r_min, 5.0)                                                                                             \
+    X(ego_yaw_trend_s, 0.5)     /* ... the yaw rate goes on changing as it has over the last half second, for this     \
+                                   long (steering under way; 0: the yaw rate as it is) */
 
 enum {
 #define X(n, d) PC_##n,
@@ -201,7 +234,10 @@ enum { PR_W, PR_Q, PR_KERBL, PR_KERBR, PR_VLIM, PR_ROWL, PR_ROWR, PR_SPARE3, P_N
  * there than one standing in a lane (0 or 1: nothing known; predictor.py `row_prior`) */
 enum { PB_LO, PB_HI, PB_TYPE, PB_P, PB_DIR, PB_SPARE, P_NB };
 enum { PA_I0, PA_N, PA_SJ, PA_SIDE, PA_PRIO, PA_ENTRY, PA_EXIT, PA_CTRL, P_NA };
-enum { PE_V, PE_W, PE_A, PE_SIG, PE_PATH, PE_SPARE1, PE_SPARE2, PE_SPARE3, P_NE };
+enum { PE_V, PE_W, PE_A, PE_SIG, PE_PATH, PE_FOL, PE_FOLDT, PE_WDOT, P_NE };
+/* PE_WDOT: the yaw rate's change over the last half second (rad/s2; cfg ego_arc) */
+/* PE_FOL, PE_FOLDT (cfg ego_follow): the belief "the driver is following the one ahead" of the frame before (0: none)
+ * and the time since that frame (s) */
 enum { PK_ALON, PK_ALAT, PK_VMAX, PK_VSTILL, PK_WID, PK_LEN, P_NK };
 
 #define P_KMAX 8
@@ -449,6 +485,51 @@ static void pp_base(PPath *b, const double *c, int nc, double v, double w, doubl
         b->s[i] -= s0;
 }
 
+/* The arc of the car's own motion (cfg ego_arc): from the origin along +x with the curvature w / v, which goes on
+ * changing as the yaw rate has (wdot, for trend_s) and then dies away over four seconds of travel as pp_base's does;
+ * half-metre steps over the first 30 m (each chord at the heading of its middle), 5 m steps beyond. s = 0 at the
+ * origin. */
+static void pp_kin(PPath *b, double v, double w, double wdot, double trend_s, double r_min, double back, double ahead)
+{
+    const double vv = v > 1.0 ? v : 1.0, kmax = 1.0 / (r_min > 1.0 ? r_min : 1.0);
+    const double k0 = p_clip(w / vv, -kmax, kmax), k1 = p_clip((w + wdot * trend_s) / vv, -kmax, kmax);
+    const double s_tr = vv * trend_s, tau = (v > 3.0 ? v : 3.0) * 4.0;
+    PPath t;
+    t.n = 0;
+    int nb = (int)back;
+    if (nb > 20)
+        nb = 20;
+    double bx[20], by[20], x = 0.0, y = 0.0, h = 0.0;
+    for (int i = 0; i < nb; i++) {                 /* behind: the arc it came on, 1 m steps */
+        const double hm = h - 0.5 * k0;
+        x -= cos(hm);
+        y -= sin(hm);
+        h -= k0;
+        bx[i] = x;
+        by[i] = y;
+    }
+    for (int i = nb - 1; i >= 0; i--)
+        pp_add(&t, bx[i], by[i]);
+    pp_add(&t, 0.0, 0.0);
+    x = y = h = 0.0;
+    double run = 0.0;
+    while (run < ahead && t.n < P_PTS) {
+        const double ds = run < 30.0 ? 0.5 : 5.0, sm = run + 0.5 * ds;
+        const double k = (s_tr > 1e-6 && sm < s_tr ? k0 + (k1 - k0) * sm / s_tr : k1) * exp(-sm / tau);
+        const double hm = h + 0.5 * k * ds;
+        x += ds * cos(hm);
+        y += ds * sin(hm);
+        h += k * ds;
+        run += ds;
+        pp_add(&t, x, y);
+    }
+    pp_finish(&t, 0.0);
+    double s0 = t.s[nb < t.n ? nb : 0];
+    *b = t;
+    for (int i = 0; i < b->n; i++)
+        b->s[i] -= s0;
+}
+
 /* a quadratic corner between two directed points (the control point where their tangents meet) */
 static void pp_corner(PPath *p, double ax, double ay, double ah, double bx, double by, double bh)
 {
@@ -500,6 +581,9 @@ typedef struct {
     double lead_len, len;
     double a_lat;                 /* lateral acceleration it corners with */
     double v_max;
+    double idm_t;                 /* the time gap it keeps to the one ahead (0: cfg idm_t_s) */
+    double idm_s0;                /* ... and the gap at rest (0: cfg idm_s0_m) */
+    double ff;                    /* the share of the leader's acceleration fed forward into the following law */
     /* covariance */
     double pss, pdd, psd, pvv, paa, pdr, prr;
     double sig_a, tau_a, k_v;     /* acceleration noise and persistence; pull of the speed to its reference */
@@ -571,7 +655,7 @@ static void roll_out(const PRoll *r, const double *cfg, const double *times, int
     double px = 0.0, py = 0.0, pth = 0.0, pk = 0.0, d = r->d0, dr = r->dr0;
     double prev[6] = {0, 0, 0, 0, 0, 0};
     double tprev = 0.0;
-    double b = cfg[PC_idm_b], T = cfg[PC_idm_t_s], s0g = cfg[PC_idm_s0_m], amax = r->a_go, bmax = cfg[PC_brake_max];
+    double b = cfg[PC_idm_b], T = r->idm_t > 0.0 ? r->idm_t : cfg[PC_idm_t_s], s0g = r->idm_s0 > 0.0 ? r->idm_s0 : cfg[PC_idm_s0_m], amax = r->a_go, bmax = cfg[PC_brake_max];
     /* what does not change from step to step is taken once: the decay over a step, the car-following law's root;
      * and what depends on the step's time alone (exp(-t / 2), t summed up step by step as below) is the same for
      * every future rolled out with this step: kept from one roll-out to the next */
@@ -691,6 +775,11 @@ static void roll_out(const PRoll *r, const double *cfg, const double *times, int
                 if (ss < s0g)
                     ss = s0g;
                 ai = amax * (1.0 - p_sq(ss / gap));
+                if (r->ff > 0.0 && k < nstep) {                  /* the leader's acceleration over this step, fed forward */
+                    ai += r->ff * r->dir * (r->lead_v[k + 1] - r->lead_v[k]) / h;
+                    if (ai > amax)
+                        ai = amax;
+                }
             } else {
                 /* a stop is braked for from where a comfortable braking still reaches it, with what it needs */
                 double need = -v * v / (2.0 * (gap > 0.5 ? gap : 0.5));
@@ -1484,6 +1573,15 @@ static void feat_step(PCtx *c, PObj *q, double dt)
         pva -= k0 * paa;
         paa -= k1 * paa;
         st[PS_V] = v > 0.0 ? v : 0.0, st[PS_A] = a, st[PS_PVV] = pvv, st[PS_PVA] = pva, st[PS_PAA] = paa;
+        if (cfg[PC_v_track] > 0.0) {
+            /* the speed is the track's, known as the track states it; the acceleration is this filter's: the track's
+             * own smoothed, and what the track's speed has gained since the last frame beyond it */
+            const double sv = sqrt(rsp / infl), u = p_clip((1.5 * cfg[PC_v_track] - sv) / (0.5 * cfg[PC_v_track]), 0.0, 1.0);
+            if (u > 0.0) {
+                st[PS_V] += u * (q->sp - st[PS_V]);
+                st[PS_PVV] += u * (rsp / infl - st[PS_PVV]);
+            }
+        }
     }
     if (q->pstat > 0.5) {
         st[PS_TSTAND] += dt;
@@ -2395,6 +2493,23 @@ static int mode_build(PCtx *c, int i, int k, int m, PPath *tmp)
             r.k_v = 1.0 / cfg[PC_follow_v_tau_s];
             q->yield[k] = 1;
         }
+        if (cfg[PC_start_go] > 0.5 && m != PM_STOP && q->grp == 0 && q->lane <= PL_ONC && q->pstat < 0.5 && q->a > 0.0) {
+            /* A vehicle gaining speed below the road's speed goes on gaining it: the car-following law's free term,
+             * scaled to the acceleration it has now, in place of an acceleration that dies away within acc_tau_s.
+             * One that stood here and has moved off within the last 3 s (feat_step) has not reached the
+             * acceleration of its start yet: the law's own at least. */
+            const double vd = c->road[PR_VLIM] == c->road[PR_VLIM] ? c->road[PR_VLIM] : cfg[PC_pull_v] + 3.0;
+            const int started = q->st[PS_TSTAND] > 0.5;
+            if (q->v < 0.8 * vd && (started || q->a > 2.0 * q->sa || q->a >= 0.5)) {
+                const double u4 = p_sq(p_sq(q->v / vd));
+                double ag = q->a / (1.0 - u4);
+                if (started && ag < cfg[PC_idm_a])
+                    ag = cfg[PC_idm_a];
+                r.go = 1;
+                r.v_des = vd;
+                r.a_go = ag;
+            }
+        }
         if (m == PM_STOP) {
             r.s_stop = q->stop_s;
             q->yield[k] = 1;
@@ -2758,7 +2873,35 @@ static void ego_modes(PCtx *c, PPath *tmp)
     }
     int n = 0, have_path = e[PE_PATH] > 0.5;
     double a_idm = 0.0;
-    if (c->elead >= 0) {
+    const int efol = cfg[PC_ego_follow] > 0.5 && c->elead >= 0;
+    double e_t = 0.0, e_s0 = 0.0, e_am = cfg[PC_idm_a], e_sd = cfg[PC_acc_sd];
+    if (efol) {
+        /* The driver as a follower (cfg ego_follow). The gap is between the bumpers: the leader's near face (its
+         * futures' reference point) less the car's front. The gap the driver keeps now is not what the law objects
+         * to (the gap at rest and the time gap are the law's or the present ones, whichever are shorter: a driver
+         * 3 m behind a queue that starts is following it, at a gap of its own); the leader's own acceleration is fed
+         * forward; the acceleration is the one in use where that is more than the law's. What is then left between
+         * the law and the acceleration measured is the evidence that the driver is NOT following: closing on a slow
+         * leader without braking, the law asks for a braking the driver does not make. */
+        const PObj *u = c->obj + c->elead;
+        const double b = cfg[PC_idm_b], v = e[PE_V] > 0.0 ? e[PE_V] : 0.0;
+        double g = u->s + u->sref - cfg[PC_ego_front_m];
+        if (g < 0.3)
+            g = 0.3;
+        c->egap = g;
+        e_s0 = cfg[PC_idm_s0_m] < 0.5 * g ? cfg[PC_idm_s0_m] : 0.5 * g;
+        e_t = v > 0.5 && (g - e_s0) / v < cfg[PC_idm_t_s] ? (g - e_s0) / v : cfg[PC_idm_t_s];
+        if (e_t < 0.05)
+            e_t = 0.05;
+        e_am = p_clip(e[PE_A], cfg[PC_idm_a], cfg[PC_ego_a_max] > cfg[PC_idm_a] ? cfg[PC_ego_a_max] : cfg[PC_idm_a]);
+        double ss = e_s0 + v * e_t + v * (v - lv) / (2.0 * sqrt(e_am * b));
+        if (ss < e_s0)
+            ss = e_s0;
+        /* the leader's acceleration as its futures have it over their first step */
+        double al = cfg[PC_ego_ff] * (u->vprof[1] - u->vprof[0]) / c->h;
+        a_idm = p_clip(e_am * (1.0 - p_sq(ss / g)) + al, -cfg[PC_brake_max], e_am);
+        e_sd = hypot(cfg[PC_acc_sd], cfg[PC_ego_ff] * u->sa * (1.0 - u->pstat));
+    } else if (c->elead >= 0) {
         double g = c->egap > 0.5 ? c->egap : 0.5, a = cfg[PC_idm_a], b = cfg[PC_idm_b];
         double ss = cfg[PC_idm_s0_m] + e[PE_V] * cfg[PC_idm_t_s] + e[PE_V] * (e[PE_V] - lv) / (2.0 * sqrt(a * b));
         if (ss < cfg[PC_idm_s0_m])
@@ -2786,8 +2929,32 @@ static void ego_modes(PCtx *c, PPath *tmp)
     double p_path = have_path ? cfg[PC_ego_path_p] * l_yaw / (cfg[PC_ego_path_p] * l_yaw + 1.0 - cfg[PC_ego_path_p]) : 0.0;
     if (p_path < 0.05 && have_path)
         p_path = 0.05;
-    double lf = exp(p_logn(e[PE_A], a_idm, cfg[PC_acc_sd], cfg[PC_acc_sd])), l0 = exp(p_logn(e[PE_A], 0.0, cfg[PC_acc_sd], cfg[PC_acc_sd]));
+    double lf = exp(p_logn(e[PE_A], a_idm, e_sd, cfg[PC_acc_sd])), l0 = exp(p_logn(e[PE_A], 0.0, cfg[PC_acc_sd], cfg[PC_acc_sd]));
+    if (efol) {
+        /* the speeds: a follower's is its leader's, a driver's who is not following is its own */
+        const PObj *u = c->obj + c->elead;
+        const double dv = (e[PE_V] > 0.0 ? e[PE_V] : 0.0) - lv;
+        const double sf = hypot(cfg[PC_ego_dv_fol], sqrt(u->st[PS_PVV] > 0.0 ? u->st[PS_PVV] : 0.0)), s0 = cfg[PC_ego_dv_free];
+        lf *= exp(-0.5 * p_sq(dv / sf)) / sf;
+        l0 *= exp(-0.5 * p_sq(dv / s0)) / s0;
+    }
     double p_follow = c->elead >= 0 && cfg[PC_interact] > 0.5 ? lf / (lf + l0) : 0.0;
+    if (efol && cfg[PC_interact] > 0.5 && e[PE_FOL] > 0.0 && e[PE_FOL] < 1.0) {
+        /* The belief of the frame before, forgotten a little, and this frame's share of one observation: a driver
+         * who has been following goes on being taken for one through a frame that says nothing either way (the
+         * leader's acceleration read as nothing for a moment while both pull away). That holds for the car's own
+         * acceleration only. A closing speed is judged by the present alone: the belief counts in full while the
+         * car is no faster than its leader by more than one sigma of the leader's speed, and not at all from two. */
+        const PObj *u = c->obj + c->elead;
+        /* (a frame that speaks against following counts at once and in full: the leader brakes and the driver
+         * does not) */
+        const double dt = e[PE_FOLDT] > 0.0 ? e[PE_FOLDT] : 0.0, w = lf < l0 ? 1.0 : p_clip(dt / cfg[PC_evid_tau_s], 0.0, 1.0);
+        const double pr = 0.5 + (e[PE_FOL] - 0.5) * exp(-dt * cfg[PC_ego_fol_hz]);
+        const double a = pr * pow(lf > 1e-300 ? lf : 1e-300, w), b = (1.0 - pr) * pow(l0 > 1e-300 ? l0 : 1e-300, w);
+        const double sv = sqrt(u->st[PS_PVV] > 0.09 ? u->st[PS_PVV] : 0.09), dv = (e[PE_V] > 0.0 ? e[PE_V] : 0.0) - lv;
+        const double keep = p_clip(2.0 - dv / sv, 0.0, 1.0);
+        p_follow = p_clip(p_follow + keep * (a / (a + b) - p_follow), 0.02, 0.98);
+    }
     for (int which = 0; which < 3; which++) {                   /* along the road, the same behind the one ahead, by its own motion */
         PRoll r;
         roll_defaults(&r, cfg, CAR);
@@ -2814,17 +2981,29 @@ static void ego_modes(PCtx *c, PPath *tmp)
                 r.lead_v = c->obj[c->elead].vprof;
                 r.lead_len = c->obj[c->elead].len;
                 r.k_v = 1.0 / cfg[PC_follow_v_tau_s];
+                if (efol) {
+                    /* (the leader's run is its near face's, the car's its origin's: the gap is that less the front) */
+                    r.lead_len = 2.0 * cfg[PC_ego_front_m];
+                    r.len = 0.0;
+                    r.idm_t = e_t;
+                    r.idm_s0 = e_s0;
+                    r.ff = cfg[PC_ego_ff];
+                    r.a_go = e_am;
+                }
             }
             c->ename[n] = !have_path ? (which == 1 ? PN_EGO_FOLLOW : PN_EGO_CTRA) : which == 1 ? PN_EGO_FOLLOW : PN_EGO_PATH;
         } else {
-            pp_base(tmp, NULL, 0, e[PE_V], e[PE_W], 10.0, cfg[PC_path_ahead_m]);
+            if (cfg[PC_ego_arc] > 0.5)
+                pp_kin(tmp, e[PE_V], e[PE_W], e[PE_WDOT], cfg[PC_ego_yaw_trend_s], cfg[PC_ego_arc_r_min], 10.0, cfg[PC_path_ahead_m]);
+            else
+                pp_base(tmp, NULL, 0, e[PE_V], e[PE_W], 10.0, cfg[PC_path_ahead_m]);
             r.path = tmp;
             r.t_dur = 1.0;
             c->ename[n] = PN_EGO_CTRA;
         }
         r.v0 = e[PE_V] > 0.0 ? e[PE_V] : 0.0;
         r.a0 = e[PE_A];
-        r.len = cfg[PC_ego_len];
+        r.len = efol && which == 1 ? 0.0 : cfg[PC_ego_len];
         r.s0 += 0.0;
         r.pss = r.pdd = 0.01;
         r.pvv = 0.04;
@@ -3498,7 +3677,11 @@ static PyObject *n_predict_frame(PyObject *self, PyObject *args)
     }
     if (c->nstep < 1)
         c->nstep = 1;
-    pp_base(&c->base, (const double *)v[8].b.buf, (int)rows[8], c->ego[PE_V], c->ego[PE_W], c->cfg[PC_path_back_m],
+    if (rows[8] < 2 && c->cfg[PC_ego_arc] > 0.5)                /* no road known: the arc of the car's own motion (cfg ego_arc) */
+        pp_kin(&c->base, c->ego[PE_V], c->ego[PE_W], c->ego[PE_WDOT], c->cfg[PC_ego_yaw_trend_s], c->cfg[PC_ego_arc_r_min], 20.0,
+               c->cfg[PC_path_ahead_m]);
+    else
+        pp_base(&c->base, (const double *)v[8].b.buf, (int)rows[8], c->ego[PE_V], c->ego[PE_W], c->cfg[PC_path_back_m],
             c->cfg[PC_path_ahead_m]);
     {
         double s0, d0;
