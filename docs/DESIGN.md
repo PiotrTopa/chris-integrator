@@ -1216,6 +1216,237 @@ and once on the two recorded drives; on the streets: `parked_street` 67-74 % of 
 `oncoming` 42-50 %, a junction 4-5 %, nothing where nothing is parked. As a caution it is a statement about the
 street, not about a moment; it does not hold the stack's pace.
 
+### 17.3 The futures of a driver who is driving (lane DSTART, 2026-11-28)
+
+The tracker's lead is right at close range since `in_lead` (docs/RADAR.md 13); what the alert still said on the six
+driving sessions of 26 / 27 November (re-run through the whole stack with the phone's tracker knobs and `in_lead`,
+the decision layer on its defaults: 38 said `obstacle_ahead` episodes; scripts and per-episode tables in
+`/home/piotr/scratch/dstart/tools`: `eps.py`, `classes.py`, `trace.py`, `lead_fut_err.py`, `ego_fut_err.py`,
+`follow_data.py`) was read frame by frame against what the car and the objects then did. A re-run of one tree is
+exact, and with the tracker untouched every knob below leaves the radar's stream as it was: the comparisons on the
+recordings are of the same objects at the same times.
+
+| class | base | cause in prediction / decision |
+|---|---|---|
+| 1 a queue starts, the lead followed right | 4 | the lead's future starts 0.9 m/s slow and its start dies away; the car's "follow" future is one of a law the driver does not keep and of a gap measured between the wrong points; a stage latched under the low-speed suppression is said when that lifts |
+| 2 the car's own turn or manoeuvre among standing vehicles | 8 | the car's kinematic future runs 0.5 m inside its arc after 1 s; its lateral spread is a lane keeper's 0.3 m |
+| 3 young, far, roadside, crossing, cutting in | 9 | futures of a velocity three to five sightings old; mass 0.3-0.55 entered by time |
+| 4 an oncoming or standing vehicle passed on a narrow street | 5 | (not touched) |
+| 5 the next vehicle of the queue, hidden beyond the lead | 2 | a standing memory behind a lead that drives off through its place is judged as a standing car |
+| true or arguable (closing on a slow or stopped vehicle ahead) | 7 | |
+| other (a long vehicle turning beside; a parked car the track puts in the car's line; the lead's object off) | 3 | |
+
+**What the futures were, measured.** The lead's top future against where the same object then was (objects in the
+car's lane within 25 m, moving, 3 s old at least; 3872 frames), and the car's futures against its own track (speed
+and yaw rate integrated; frames above 1 m/s):
+
+| | published (base) | with `v_track` 1.0 and `start_go` (the lead), `ego_arc` (the car) |
+|---|---|---|
+| lead, all: rms at 1 / 2 / 3 s; error over stated spread (rms) | 1.56 / 3.10 / 5.16 m; 1.36 / 1.78 / 2.09 | 1.31 / 2.55 / 4.36 m; 0.89 / 1.18 / 1.58 |
+| lead that starts (below 6 m/s, gaining 0.5 m/s^2): its future's first speed less the track's; bias at 1 / 2 / 3 s; rms | -0.89 m/s; -1.9 / -3.9 / -6.5 m; 2.2 / 4.6 / 7.8 m | +0.27 m/s; -0.6 / -0.9 / -1.2 m; 1.2 / 2.2 / 4.0 m |
+| lead that brakes (losing 0.5 m/s^2): the same | +1.08 m/s; +1.5 / +3.4 / +5.6 m; 2.2 / 4.7 / 7.6 m | +0.19 m/s; +0.8 / +2.1 / +3.7 m; 1.7 / 3.6 / 6.0 m |
+| ... with `start_go` alone (the speed still the filter's): a lead that starts; one that brakes | | -0.80 m/s; -1.6 / -2.8 / -3.9 m; 2.1 / 3.7 / 5.5 m. +1.06 m/s; as the base |
+| the car's `ctra` future in a turn (0.12-0.3 rad/s, below 6 m/s): lateral error, median at 1 / 2 / 3 s; mean towards the inside at 1 s | 0.49 / 0.86 / 1.65 m; +0.49 m | 0.06 / 0.32 / 0.98 m; -0.05 m |
+| ... tighter than 0.3 rad/s | 0.56 / 0.72 / 1.37 m; +0.53 m | 0.13 / 0.61 / 1.37 m; -0.16 m |
+| ... its `path` future (the road model's plan), the same turns | 0.15 / 0.39 / 0.88 m | (the same) |
+| the exact arc of the speed and yaw rate, off line: turns below 6 m/s, median (ninth decile) at 1 / 2 / 3 s | 0.06 (0.23) / 0.38 (1.36) / 1.10 (3.49) m | |
+| ... straight road (below 0.03 rad/s) | 0.00 (0.02) / 0.02 (0.13) / 0.04 (0.43) m | |
+
+The predictor keeps a filter of its own over the track's speed (`feat_step`: one observation per `evid_tau_s`, the
+track's variance times 5.7 per frame); it lags a start by 0.9 m/s and a braking by 1.1 m/s, in both directions
+against the car. The car's kinematic path (`pp_base` without a centre line) is a polyline of 5 m chords each turned
+by its WHOLE step from its start, at a curvature of 0.08 / m at most and straight below 1.5 m/s: 0.3 m inside the
+arc after 1 m, 0.5-0.8 m after 4 m at a radius of 12 m; in a turn that future has up to 0.95 of the weight. An arc
+of the car's own motion is off by a third of its lateral move (median; a tenth in tight turns), a metre after 3 s:
+the decision layer's cap of 0.3 m on the car's lateral spread is a lane keeper's.
+
+The driver behind a lead (28 380 frames with the road model's lead, 13 568 moving): the default following law (2 m
++ 1.4 s x v, 1.5 / 2 m/s^2) is 1.0-2.1 m/s^2 below what the driver does in every speed band (the driver's time gap
+to the bumper: 1.1 s median, 0.7-0.9 s at the first decile). Where the car gains 0.7 m/s^2 or more below 4.5 m/s
+(1132 frames: queue starts) the gap is 2.8 / 5.4 / 8.6 m (first decile / median / ninth), the lead 0.3 / 1.0 /
+2.0 m/s the faster and itself gaining 0.2 / 1.0 / 1.9 m/s^2, the car 0.8 / 1.2 / 1.8 m/s^2: the law asks for
+-2.3 m/s^2 at the first decile. And the "follow" future's gap was the leader's reference point (its near face)
+less the car's ORIGIN less half of both lengths: 2.4 m short for a 4.5 m lead, 3.3 m for a 6.2 m one (that future
+braked to a halt 3.4 m behind a lead that pulls away).
+
+**What is built** (every knob off in the code's defaults; with them off the golden data and the three captures of
+`/home/piotr/scratch/cost-rest` are as they were, `cost_bench.py diff`: IDENTICAL):
+
+* `v_track` (predict native, m/s; `feat_step`). A future starts at the track's own speed where the track states it
+  to this or better, in proportion up to 1.5 times it; the acceleration stays the filter's (the track's own
+  smoothed, and what the track's speed gained beyond it since the last frame). The track is the sum of its
+  sightings.
+* `start_go` (predict native; `mode_build`). A vehicle in a lane that gains speed below 0.8 of the road's speed
+  (the limit, else 11 m/s) goes on gaining it by the following law's free term a (1 - (v / v0)^4) scaled to its
+  acceleration now, where that acceleration is two of its sigmas or 0.5 m/s^2 at least; one that stood there and
+  has moved off within 3 s, at the law's own acceleration at least.
+* `ego_follow` (predict native; `ego_modes`, `roll_out`; the belief is kept by `Predictor`). The car behind a
+  vehicle in its lane as the follower its driver is. The gap is between the bumpers (`ego_front_m`). The gap the
+  driver keeps now is one the driver keeps: the law's gap at rest and time gap are its own or the present ones,
+  whichever are shorter. The leader's acceleration (its top futures' first step) is fed forward (`ego_ff`), the
+  driver's own acceleration is the law's maximum up to `ego_a_max`. The car's "follow" future is its own
+  acceleration carried on, no further than that law allows behind the leader's run. "The driver is following" is
+  the likelihood of the acceleration measured under that law against a driver's who drives on its own (as
+  before), times that of the speeds (a follower's is its leader's to `ego_dv_fol` and the leader's spread, a
+  driver's own is off it by `ego_dv_free`), and is kept from frame to frame (one observation per `evid_tau_s`,
+  forgotten at `ego_fol_hz`): a frame in which the leader's acceleration reads as nothing does not end it. Against
+  following a frame counts at once and in full; and the belief of the frame before counts only while the car is no
+  faster than its leader by more than one sigma of the leader's speed, not at all from two: a closing speed is
+  judged by the present alone.
+* `ego_arc` (predict native; `pp_kin`). The car's kinematic future, and the road's frame where no road is known,
+  is the arc of its speed and yaw rate (half-metre steps, a radius down to `ego_arc_r_min`, also at a crawl), the
+  yaw rate changing on for `ego_yaw_trend_s` as it has over the last half second (steering under way: off line
+  0.07 / 0.40 / 1.15 m become 0.04 / 0.26 / 0.72 m in turns).
+* `ego_turn_rel` (decide threat; `dk_ego_cov`). Of what a future moves the car aside of the line it is on now, this
+  share is not known: 1 sigma across the car, on top of the lane keeper's cap. It enters the collision probability
+  (not the time margin, which is of the mean futures).
+* `screen` (decide threat; `decide_frame`). A vehicle (or a thing of no known kind) ahead on the car's most
+  likely future is not reached before another object on that future nearer the car (existence 0.9, sighted within
+  0.5 s). A future of the nearer one screens where it stays in the strip the car sweeps until the car would be at
+  the further object and (a) is then still the nearer one (the car meets it first, and its own record says what
+  that takes), or (b) has by then driven through the place of an object that is NOT SEEN now (the radar's `occ`
+  "object", or no sighting for 0.5 s). The screened object's futures weigh 1 - P(screened) (`screen` in its
+  record); refuted by (b) with 0.9, it stays refuted until it is sighted again (the ids ride in the dict of the
+  levels shown, `_refuted`): the lead is then beyond it and what is left is a standing thing in the gap that
+  nobody has seen there. A lead that drives into a standing vehicle in plain view screens nothing: the cut-out
+  that reveals a stopped car is warned of as it was from the moment the car is seen.
+* `unsaid_needs_level` (alerts). An alert not said since it left none is said only while its object's entry level
+  NOW is one that is said; below that it is `suppressed: "held_unsaid"` until the level is there again or the
+  holds run out. (15:25:06: imminent under the low-speed suppression 2.3 s before, latched; the lead pulled away,
+  the level fell to information, the car passed 3 m/s, and the latch was said.) Holds and latches keep something
+  SHOWN from flickering; this takes none of them away from an alert that was said.
+* `entry_evidence_young_s` (alerts). The evidence rule of 17.1 also for an object tracked for less than this.
+
+The simulator's driver (`sim/roaduser_sim.py` `DRIVER_SCENARIOS`, not in the lists the other tools walk):
+`queue_start` (the car 2.3-3.1 m behind a lead that pulls away at 1.5-2 m/s^2, starting a tenth of a second after
+it at 0.85-1 of its acceleration: at 3 m/s 3.0-4.6 m behind its bumper and gaining 1.3-2 m/s^2; the next vehicle
+of the queue ahead of the lead, hidden), `queue_start_stall` (the same, and the lead brakes to a stop again 1.6-
+2.2 s after it began while the car goes on: a collision), `turn_parked` (4.5 m/s round a 10 m corner between rows
+of parked cars, 0.5 m and more from every body), `narrow_oncoming` (7 m/s, parked cars on the right and oncoming
+cars 0.6-1 m from the car's side). `queue_creep` (section 12) is the driver who starts a second after the lead.
+Tests: `tests/test_driver_futures.py` (every knob on fixtures; the scenarios' driver).
+
+**Measured: the recordings** (base against all the knobs but `v_track`, and against the set proposed below;
+matched by the alert's object within 4 s):
+
+| | base | all but `v_track` (no evidence rule) | proposed |
+|---|---|---|---|
+| 1 queue start | 4 (15:25:06, 15:30:23, 15:59:08; 27 Nov 20:30:54) | 1: 20:30:54 is said 2.4 s later, on the lead's own "follow" future | 0 |
+| 2 own turn | 8 | 8 | 7 (15:30:33 gone) |
+| 3 young / far / roadside | 9 | 8 (15:27:13 gone) | 7 (15:27:13 gone; by the evidence rule 15:25:11 gone and 15:39:19 said 0.57 s later) |
+| 4 narrow street | 5 | 5 | 5 |
+| 5 hidden beyond the lead | 2 (15:44:31, 15:50:37) | 0 on the hidden object (15:44:31 is said 1.6 s later on the car merging from the right) | 0 (1.4 s later, the same) |
+| true or arguable | 7 | 7 | 7 |
+| other | 3 | 3 | 3 |
+| new | | 4: two closings on a lead that brakes to a stop (15:42:51: 7.9 m, 3.6 m/s, the driver braking 1.9 m/s^2; 16:00:50: 10 m, 3.9 m/s, 1.2 m/s^2), two false (15:30:29 a car 3.6 m beside; 20:33:26 a standing vehicle in a turn) | 6: four such closings (15:42:51, 15:50:09, 16:00:07, 16:00:50: 7.8-11.9 m, 2.8-5.2 m/s, the driver braking 0.5-2.6 m/s^2), the same two false |
+| said | 38 | 37 | 36 |
+
+Of the base's 31 that are not true or arguable, 23 are still said with the proposed set and two new ones are; four
+are added of the kind the last lane counted as true or arguable (closing on the lead with less than 4 s to its
+bumper). By knob, alone on the recordings: `start_go` + `ego_follow` take 15:25:06 and 15:30:23 (15:59:08 comes
+0.6 s later); `unsaid_needs_level` 15:25:06; `screen` 15:44:31 (15:50:37 needs the lead's future to drive off as
+well); `ego_arc` + `ego_turn_rel` none (15:30:33 comes 0.5 s later, and two episodes are new).
+
+The seven true or arguable ones, the time first said against the base's (the base's time to contact and time
+margin at that moment), without / with `v_track`: 26 Nov 11:47:46 (1.0 s, -1.2 s) +0.00 / +0.00 s; 11:53:17
+(2.3 s, 0.3 s) -2.31 / -2.31 s (earlier: the car 5 m/s faster than a lead that slows is no follower, whatever the
+braking); 15:30:51 (3.05 s, 1.4 s) +0.00 / -0.21 s; 15:41:18 (1.85 s, -0.2 s) +0.00 / +0.00 s; 15:41:33 (2.05 s,
+-0.1 s) +0.00 / +0.00 s; 15:46:08 (2.45 s, 0.2 s) +0.00 / -0.10 s; 27 Nov 20:30:12 (3.25 s, 0.9 s) +0.00 /
+-0.82 s. None is later.
+
+What is left of class 2, read frame by frame with the knobs on (the car's arc now agrees with its track to 0.1 m
+at 1 s): the car parks (11:39:15: it turns towards a parked car 9 m ahead and stops within 3 s at -0.3 m/s^2, which
+no future knows); a slow vehicle ahead in a junction closed on at 3 m/s (11:41:16: arguable); near objects the
+track puts in the car's line while they stand in the next lane or beside it (15:24:17 a van 5 m ahead at y +0.35
+m; 11:53:50 a track 1.1 s old). On the recordings the turn's knobs make the car's future right and take no
+episode by themselves. Class 4 is as it was.
+
+**Measured: the simulator** (`tools/alert_truth.py`, the phone's tracker knobs with `in_lead` as the base, the road
+model's lead as measured (`+lead`); six streets and the pedestrian controls x seeds 1-6, the scripted conflicts x
+seeds 1-3, day and night; paired over the same runs, +- the bootstrap's 1 sigma):
+
+| knobs added | `detin_pose_scale+lead`: false episodes; conflicts lost / gained / later / earlier | `scale+lead` |
+|---|---|---|
+| `start_go` | 82 -> 82; 0 / 0 / 0 / 0 | 71 -> 70 (-1 +- 1.0); 0 / 0 / 0 / 0 |
+| `ego_follow` | 82 -> 81 (-1 +- 1.0); 0 / 0 / 0 / 0 | 71 -> 71; 0 / 0 / 1 (1.55 -> 1.46 s) / 0 |
+| `ego_arc` | 82 -> 84 (+2 +- 1.3); 0 / 0 / 0 / 3 (1.48 -> 3.25, 1.55 -> 2.42, 2.24 -> 2.40 s) | 71 -> 73 (+2 +- 1.3); 0 / 0 / 0 / 1 (1.71 -> 2.51 s) |
+| `ego_turn_rel` 0.35 | 82 -> 79 (-3 +- 2.5); 0 / 0 / 1 (3.21 -> 3.14 s) / 0 | 71 -> 67 (-4 +- 1.6); 0 / 0 / 1 (3.48 -> 3.40 s) / 0 |
+| `screen` | 82 -> 82; 0 / 0 / 0 / 0 | 71 -> 71; 0 / 0 / 0 / 0 |
+| `unsaid_needs_level` | 82 -> 82; 0 / 0 / 0 / 0 | 71 -> 68 (-3 +- 2.1); 0 / 0 / 0 / 0 |
+| `entry_evidence_young_s` 2 | 82 -> 81 (-1 +- 1.0); 0 / 0 / 0 / 5 (by 0.08-0.24 s) | 71 -> 70 (-1 +- 1.0); 0 / 0 / 0 / 4 (by 0.08-1.09 s) |
+| `v_track` 1.0 | 82 -> 93 (+11 +- 3.7): `slow_lead` 7 -> 16; 0 / 0 / 0 / 0 | 71 -> 76 (+5 +- 2.2): `slow_lead` 6 -> 11; 0 / 0 / 0 / 1 |
+| all but `v_track` and the evidence rule | 82 -> 78 (-4 +- 3.6); 42 -> 42 warned; 0 / 0 / 1 (3.21 -> 3.14 s) / 3 | 71 -> 65 (-6 +- 3.3); 40 -> 40; 0 / 0 / 2 (3.48 -> 3.40, 1.55 -> 1.46 s) / 1 |
+| ... with `v_track` 1.0 (the proposed set less the evidence rule) | 82 -> 86 (+4 +- 4.6); 42 -> 42; 0 / 0 / 1 / 3 | 71 -> 67 (-4 +- 4.1); 40 -> 40; 0 / 0 / 3 (4.12 -> 3.41, 3.48 -> 3.40, 1.55 -> 1.46 s) / 2 |
+
+`queue_creep` + `left_behind` (the reach modelled, seeds 1-6): 8 -> 5 false (-3 +- 2.5), `stopped_cruise_14` 4 of 6
+warned at the same frames, with or without `v_track`. The driver scenarios, the reach modelled, seeds 1-6, day
+and night (48 runs; all but `v_track`):
+
+| | base | knobs |
+|---|---|---|
+| `queue_start` false episodes (12 runs) | 12 | 2 |
+| `turn_parked` (12 runs) | 5 | 3 |
+| `narrow_oncoming` (12 runs) | 13 | 14 |
+| all three | 30 | 19 (-11 +- 1.0) |
+| `queue_start_stall`: warned; first said before contact, median (least) | 12 of 12; 1.19 s (0.56 s) | 12 of 12; 0.56 s (0.43 s); with `v_track` 0.60-0.71 s (0.49 s) |
+
+Every start was said by the base (12 of 12): its warning of the lead that stalls is the one it gives of every lead
+that starts, said as the car passes 3 m/s: in six of the twelve runs within a quarter of a second of the lead's
+first braking (which is 1.41-1.54 s before contact), once 0.07 s after it. With the knobs the stall is said once the
+lead's braking is in its track and the car is the faster: 0.43-0.87 s before contact (once 1.29 s), 0.55-1.1 s into
+the braking. That is the price of class 1, stated: a lead that stalls within 2 s of a start is warned of 0.6 s later
+(median). On the plain stream (`scale+lead`) `queue_start`
+is never said and the stall never warned of, with or without the knobs (not looked into); `turn_parked` 9 -> 9,
+`narrow_oncoming` 19 -> 18.
+
+`v_track`'s false episodes are `slow_lead`: the car follows a lead at 7 m/s 4 m behind it (the simulator's driver
+there keeps 0.55 s), and the road model's speed of the lead is off by up to 1 m/s for seconds with a stated spread
+of a third of that (docs/RADAR.md 13: the same episodes came with `in_lead` itself). The predictor's second filter
+hid half of them; the honest speed shows them.
+
+**Cost** (`tools/cost_bench.py run`, the three captures of `/home/piotr/scratch/cost-rest`, three runs each on the
+P52, medians; base against the proposed knobs; with `v_track` the same within 0.01 ms): `bench` 1.226 -> 1.212 ms per
+road frame (predict 0.048 -> 0.048, decide 0.042 -> 0.041); `sim1` 3.71 -> 3.58 (predict 0.514 -> 0.510, decide
+0.337 -> 0.314); `sim2` 3.65 -> 3.61 (predict 0.509 -> 0.522, decide 0.311 -> 0.280); the 99th centile of a road
+frame 4.64 -> 4.34 and 4.43 -> 3.97 ms. Nothing added that a run-to-run difference of 0.05 ms shows: the predictor
+does a few multiplications more per frame and one arc of 100 points where a future of the car is kinematic, the
+decision layer projects every object once on the car's most likely future and judges a screened object's futures
+at no weight (the dense scenes' decide cost falls by 7-10 %). Not measured on the phone.
+
+**Proposed for the car** (the alert stays in shadow). `/etc/chris/predict.json`: `{"native": {"v_track": 1.0,
+"start_go": 1, "ego_follow": 1, "ego_arc": 1}}`; `/etc/chris/decide.json`: `{"threat": {"ego_turn_rel": 0.35,
+"screen": true}, "alerts": {"obstacle_ahead": {"unsaid_needs_level": true, "entry_evidence_young_s": 2.0}}}`.
+
+`v_track` is the one with a measured cost, and the choice is stated rather than hidden. For it: only with it is
+the lead's future right (the table above: a braking lead's future starts 1.1 m/s fast without it, against the
+car); it takes the last queue start; three of the seven true warnings come 0.1-0.8 s earlier; the four episodes
+it adds on the recordings are closings on a lead that brakes to a stop, which the lagging speed hid. Against it:
+the simulator's `slow_lead` (+11 +- 3.7 and +5 +- 2.2 false episodes), a lead followed 4 m behind at 7 m/s whose
+speed the tracker has wrong by 1 m/s for seconds with a stated spread of a third of that. The drives have no
+such episode in 43 minutes of following (the driver's time gap is 1.1 s, 0.7-0.9 s at the first decile, where
+the simulator's is 0.55 s), and the error is the lead sensor's (docs/RADAR.md 13: `lead_v_k`, `lead_tau_v`). If
+the shadow log shows cautions in steady following, `v_track` is the knob to take out: without it the set is
+-4 +- 3.6 and -6 +- 3.3 false episodes in the simulator and one queue start more on the recordings.
+
+Not solved, and why:
+
+* **Class 4**, the oncoming or standing vehicle passed on a narrow street (5 of 5; `narrow_oncoming` 13 of 12
+  runs): the driver passes 0.6-1 m from a body whose place the track knows to 0.3-0.7 m. What is right is the same
+  interaction model across the car as `ego_follow` is along it (a driver who passes is steering by the thing it
+  passes: the car's lateral place is not independent of the object's); not built.
+* **Class 2** beyond the arc: a stop the driver is about to make (parking), and the track's place of near objects
+  in a turn.
+* **Class 3**: the futures of a track three to five sightings old are built on its velocity as stated (2.5-3 m/s
+  for a mean of 5-14 m/s); the evidence rule takes the marginal ones (mass under 0.6), a turn or a crossing given
+  0.5 of the weight on the first second's lateral velocity is said as before.
+* **The other followers.** The law of the car's own following is still the default one for every OBJECT that
+  follows: a lead 6.7 m behind its own leader at 7 m/s gets a "follow" future that brakes at 4 m/s^2 in its first
+  quarter second (27 Nov 20:30:56, the one queue start left), and the car's leader profile is the least far of the
+  lead's weighty futures.
+* **A stall within a start** is said half a second later (above).
+* The driver's following law is one driver's on six sessions; nothing is learnt per drive. `ego_turn_rel` and the
+  arc's numbers are of the same sessions (1 h 17 min, 1100 frames in turns).
+
 ## 18. Learnt values across drives (lane DECIDE, 2026-11-23)
 
 `chris_integrator/learnt.py` (the store) and `chris_integrator/learners.py` (the learners' adapters and the plug-in
