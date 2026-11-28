@@ -331,14 +331,64 @@ CFG = dict(
     # is where the believed hypothesis is: a standing lead that pulls away left it at its first box that showed it
     # (a scale rate, the box sliding), the box started a new object and the standing one stayed. 0: as it was
     gate_hyp=0.0,
+    # sil_near: a box's width is the angle between the outermost corners of the object's rectangle as the camera sees
+    # them (chris_native.c r_sil_angle). It was the rectangle's silhouette over the range of its CENTRE: right far
+    # away, but the rear of a car 4 m ahead fills 0.44 rad where that says 0.29, and the object's rectangle explained
+    # the rest by a length of 6-8 m and a heading 14-24 degrees off the lane (the lead within 6 m on the recorded
+    # drives: section 13)
+    sil_near=False,
+    # pose_gn_cut_deg: the pose head's ground point of a box cut by the bottom of the VIEW is an extrapolation below
+    # the picture that reaches a part of the way to the wheels (it reads 2.5-2.7 m far in the wide view and 6.3 m in
+    # the narrow one for a vehicle within 6 m, with a stated sigma of 1-3 degrees: section 12). This much (degrees) is
+    # added to its sigma, in quadrature. 0: as stated
+    pose_gn_cut_deg=0.0,
+    # ---- the road model's lead as a sensor (docs/RADAR.md, section 13). Off: the tracker is what it was, bit for bit ----
+    # in_lead: `road.leads[0]` (the vehicle ahead in the car's own path as the road model reads it: distance, speed,
+    # their stated spreads, a probability) is a scan of one return: the range of a vehicle's near face, a direction
+    # and a range rate (sensors.RoadLead, chris_native.c SEN_LEAD). Which object it speaks of is the scan's
+    # hypotheses (the objects about its place take part; "none of them" has the density lead_other); it adds no
+    # existence, counts as no sighting and a miss costs nothing: it places and speeds an object the boxes found.
+    #   lead_prob      a lead less probable than this is not read
+    #   lead_every_s   at most one return per this long (the road model gives 13-19 a second)
+    #   lead_max_m     ... and none farther than this
+    #   lead_off_m     added to its distance (the reference camera to the near face)
+    #   lead_x_k, lead_x_floor     the range's sigma: lead_x_k x the stated one, no less than the floor (m)
+    #   lead_v_k, lead_v_floor     the range rate's: lead_v_k x the stated one, no less than the floor (m/s)
+    #                  ... and lead_v_rel x the distance on top, in quadrature (m/s per m)
+    #   lead_v_bias, lead_v_bias_max   added to the range rate of a lead that drives: lead_v_bias x its speed, at most
+    #                  lead_v_bias_max (it under-reads the opening by 0.06 m/s at 0.3-2 m/s, 0.21 at 2-5, 0.33 above)
+    #   lead_v_stand, lead_v_stand_rel   ... and for "it stands" no more than lead_v_stand + lead_v_stand_rel x the car's
+    #                  speed: of a vehicle that stands the network's speed is sharp (0.06-0.11 m/s measured with the
+    #                  car at rest, +0.05 x the car's speed while it closes), whatever it states of one that moves
+    #   lead_y_std     its lateral place says "in the car's lane" and no more: sigma (m), no less than the stated one
+    #   lead_tau_x, lead_tau_v     its errors live this long (s; the range's and the direction's, the range rate's):
+    #                  a return is taken to the sigma it states and no better however often it comes, or, where the
+    #                  object states its own better than that, as one return per that time (chris_native.c
+    #                  r_take_lead); the pairing and the hypotheses' weights read the sigma as stated
+    #   lead_open      a hypothesis whose range is this many sigma (of its own and the return's together) from the
+    #                  return's does not know its range as well as it states: its place is opened along the line of
+    #                  sight until the return is that far, then the return taken. 0: not
+    #   lead_pd        the chance that the object in the open nearest the car in its lane is the one it names
+    #   lead_other     the density of "a vehicle the tracker has no object for" (per m, rad, m/s)
+    #   lead_near_m, lead_near_rel, lead_side_m    the objects that take part in its scan: their near face within
+    #                  lead_near_m + lead_near_rel x the distance of the return's (and what is not known of their
+    #                  own place), no farther beside it than lead_side_m
+    #   lead_range     it counts as a sensor that measures range: an object it has placed within consider_range_s
+    #                  learns its height and angle offset from the boxes (`consider_moving`), and its distance counts
+    #                  as measured (`threat_range_s`)
+    #   lead_velocity  ... and as one that measures speed (the verdict's `verdict_hits_velocity`)
+    in_lead=False, lead_prob=0.9, lead_every_s=0.2, lead_max_m=60.0, lead_off_m=0.0, lead_x_k=1.4, lead_x_floor=0.25,
+    lead_v_k=1.25, lead_v_floor=0.1, lead_v_rel=0.0, lead_v_bias=0.045, lead_v_bias_max=0.35, lead_v_stand=0.12,
+    lead_v_stand_rel=0.06, lead_y_std=0.7, lead_tau_x=1.0, lead_tau_v=2.0, lead_open=1.0, lead_pd=0.9, lead_other=7e-4,
+    lead_near_m=5.0, lead_near_rel=0.35, lead_side_m=4.0, lead_range=True, lead_velocity=True,
 )
 _XC_END = 105                    # the scan's xcfg up to the scale rates' baselines (chris_native.c XC_GHYP)
 _NOEV = (0.0, 0.0, math.nan, 0.0, math.nan, math.nan, 0.0)      # a detection the evidence does not read
 _NOEV_LOW = _NOEV[:6] + (1.0,)
 _IN_KNOBS = ("in_flags", "in_box_occl", "in_low", "in_app", "in_reid", "in_lamp_colour", "in_lamp_size", "in_width", "in_scale",
              "sil_bearing", "row_ctx", "det_chain", "in_pose_gn", "in_pose_gc", "in_pose_yaw", "pd_learn", "exist_shared",
-             "scale_iter", "scale_seed", "scale_exact", "near_axis", "see_through", "gate_hyp")
-_RANGE_KNOBS = ("scale_iter", "scale_seed", "scale_exact", "near_axis")
+             "scale_iter", "scale_seed", "scale_exact", "near_axis", "see_through", "gate_hyp", "sil_near")
+_RANGE_KNOBS = ("scale_iter", "scale_seed", "scale_exact", "near_axis", "sil_near")
 _SPREV = 8                       # scale-rate baselines of one scan whose far end's pose is given (chris_native.c RSPREV)
 _POSE_KNOBS = ("in_pose_gn", "in_pose_gc", "in_pose_yaw")
 
@@ -691,6 +741,7 @@ class Tracker:
         self.size_fit = {}           # kind -> (mean, variance) of its heights as learnt (`_size_learn`)
         self.cut_stat = {}           # (sensor id, view) -> [boxes, scans] of fresh objects in the view's cut zone (`pd_cut`)
         self.ev_stats = {"seen_through": 0, "swept": 0, "coast_std": 0}
+        self._lead_src = set()           # the sensor ids that are a road model's lead (`in_lead`)
 
     def _xcfg(self, src, sensor):
         """The scan's constants for the detector's further inputs as the native core reads them (chris_native.c
@@ -725,7 +776,8 @@ class Tracker:
                     or c["exist_shared"] or any(c[k] for k in _POSE_KNOBS) or any(c[k] for k in _RANGE_KNOBS)) else (),
                 # the range of a standing thing (chris_native.c `XC_SITER` on)
                 (float(c["scale_iter_n"]) if c["scale_iter"] else 0.0, c["scale_seed_sigma"] if c["scale_seed"] else 0.0,
-                 c["scale_seed_k"], 1.0 if c["near_axis"] else 0.0) if any(c[k] for k in _RANGE_KNOBS) else ())
+                 c["scale_seed_k"], (1.0 if c["near_axis"] else 0.0) + (2.0 if c["sil_near"] else 0.0))
+                if any(c[k] for k in _RANGE_KNOBS) else ())
         ek = getattr(sensor, "emb_kind", 0) if c["in_app"] else 0
         tab = c["app_tables"].get(ek) or c["app_tables"].get(str(ek))
         if tab is None:
@@ -870,7 +922,8 @@ class Tracker:
             # the camera's pitch error: its slow part (value, variance) and its fast part (value, variance, time)
             b = self.bias.setdefault(src, [0.0, sensor.bias_var, 0.0, 0.0, -1e18])
             sensor.bias, sensor.bias_var = b[0], b[1]
-        rg = sensor.kind in ("microwave_radar", "position")
+        lead = sensor.kind == "road_lead"
+        rg = sensor.kind in ("microwave_radar", "position") or (lead and c["lead_range"])
         if self._ranges.get(src) is not rg:
             self._ranges[src] = rg
             for o in self.objects:
@@ -878,8 +931,17 @@ class Tracker:
         pose = self._pose(t)
         if pose is None:
             return
+        objs = self.objects
+        if lead:
+            self._lead_src.add(src)
+            # the objects the lead's return may be of take part in its scan; the others are not touched by it. It
+            # starts no object, and with no object about its place there is no scan
+            objs = self._lead_objs(pose, dets) if dets else []
+            if not objs:
+                return
         self._snap = None
-        self.t = t if self.t is None else max(self.t, t)
+        if not lead:                                     # ("the last scan": of a sensor that looks at objects)
+            self.t = t if self.t is None else max(self.t, t)
         if getattr(sensor, "extraneous", None) is not None:
             sensor.extraneous = max(sensor.extraneous, self.new_rate.get(src, 0.0))
         code = self.src_code.setdefault(src, len(self.src_code) + 1)
@@ -904,13 +966,12 @@ class Tracker:
                 1.0 if c["occlusion"] else 0.0, c["occl_from"], c["occl_full"], c["occl_floor"], c["occl_floor_radar"],
                 c["split_rel"])
         bcfg = (c["new_exist"], c["p_any_side"], c["side_m"], c["with_rel"], c["with_std"], self.mcfg["p_ca0"],
-                c["mu_floor"], max(0, c["max_objects"] - len(self.objects)))
+                c["mu_floor"], 0 if lead else max(0, c["max_objects"] - len(self.objects)))
         # the scan in one native call (chris_native.c `Hyp.cycle`): the objects that are not too far ahead of its
         # time take part (what the car's own movement over the interval is not sure about goes into where each is;
         # whether its moving hypotheses hold its height and angle offset: the consider parameters, see `CFG`); the
         # detections as the native core reads them; what the scan did to each object goes into its row of the table
         store, par = self.store, M._native_par(self.mcfg)
-        objs = self.objects
         args = ([o.h for o in objs], float(t), self.ego.motion_noise, pose, sensor.native(), code, dets,
                 (self._kinds, self._kind_code, self._labs, self._lab_row, lambda k: self._bin_odds(src, k), c["score_bins"]),
                 rows, float(len(self.scan_times.get(src) or ())), acfg, par, (c["mu_hold_hits"], c["mu_floor"]), bcfg, b,
@@ -1063,6 +1124,30 @@ class Tracker:
                            None if c["smooth_for"] != "read" else [o.h for o in kept if o.verdict != "moving"])
         r0 = self.new_rate.get(src, 0.0)
         self.new_rate[src] = r0 + c["new_rate_gain"] * (len(births) - r0)
+
+    def _lead_objs(self, pose, dets):
+        """The objects that take part in the scan of the road model's lead (`in_lead`): those whose near face is
+        about where the return is (generously: the scan's gate and likelihood decide), as they are at their own
+        times."""
+        c = self.cfg
+        objs = self.objects
+        if not objs:
+            return objs
+        z = dets[0]["z"]
+        r, az = float(z[0]), float(z[1])
+        lx, ly = r * math.cos(az), r * math.sin(az)
+        s = self.store
+        slots = s.tab[[o.h for o in objs], OT_SLOT].astype(np.intp)
+        a = s.a[slots]
+        ox, oP = OFF["x"][0], OFF["P"][0]
+        dx, dy = a[:, ox + PX] - pose[0], a[:, ox + PY] - pose[1]
+        cp, sp = math.cos(pose[2]), math.sin(pose[2])
+        cx, cy = cp * dx + sp * dy, -sp * dx + cp * dy
+        sd = np.sqrt(np.maximum(np.maximum(a[:, oP + PX * N + PX], a[:, oP + PY * N + PY]), 0.0))
+        half = 0.5 * a[:, OFF["e"][0]]                   # (half its length: the near face against the centre, at most)
+        near = c["lead_near_m"] + c["lead_near_rel"] * r + 2.0 * np.minimum(sd, 10.0)
+        ok = (cx - lx > -near) & (cx - lx < near + half + 1.0) & (np.abs(cy - ly) < c["lead_side_m"] + np.minimum(sd, 3.0))
+        return [o for o, k in zip(objs, ok.tolist()) if k and o.state != "memory"]
 
     def _cells(self, sensor, pose, t, objs, returns):
         """The returns of a sensor that gives several per object, as detections: one per cell (radar_cells), the
@@ -1277,6 +1362,9 @@ class Tracker:
         o.last_seen[src] = t
         if self._ranges[src]:
             self._range_seen(o)
+        if sensor.kind == "road_lead":                   # (it places an object: its life is its boxes')
+            o.velocity_seen = o.velocity_seen or self.cfg["lead_velocity"]
+            return
         o.coast_s = max(o.coast_s, sensor.coast_s) if len(o.sources) == 1 else min(o.coast_s, sensor.coast_s)
         o.velocity_seen = o.velocity_seen or sensor.velocity
         if self.cfg["size_learn"]:                       # how far the line of sight to it has swung (`_size_learn`)
@@ -1301,6 +1389,10 @@ class Tracker:
         scan = T if self.t is None else min(T, self.t)
         self._snap = None
         lasts = [max(o.last_seen.values()) for o in self.objects]
+        if self._lead_src:
+            # (an object lives by the sensors that look at objects: the road model's lead places it and no more)
+            ls = self._lead_src
+            lasts = [max((t for k, t in o.last_seen.items() if k not in ls), default=o.t0) for o in self.objects]
         if c["swept"] and pose is not None and self.objects:
             self._swept(T, pose, lasts)
         slots, tb, rec = self.looked()

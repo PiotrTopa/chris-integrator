@@ -60,7 +60,7 @@ def run(name, seed=1, night=False, radar=None, cfg=None, hz_out=20.0, det_params
     t_wall = time.time()
     w = rs.scenario(name, seed=seed, night=night, world=(det_params or {}).get("world"))
     det = rs.DetectorSim(seed=1000 + seed, night=night, params=det_params)
-    sensors = [VehicleSim(seed=11 + 97 * seed, **(vehicle_kw or {})), VisionSim(seed=21 + 97 * seed, leads=False), det]
+    sensors = [VehicleSim(seed=11 + 97 * seed, **(vehicle_kw or {})), VisionSim(seed=21 + 97 * seed, leads=bool(w.world_opts.get("lead_real"))), det]
     integ = None
     if ego == "estimator":
         from ..core.integrator import Integrator

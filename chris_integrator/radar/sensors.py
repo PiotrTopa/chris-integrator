@@ -220,6 +220,31 @@ class MicrowaveRadar(Sensor):
                 1.0 if self.extended else 0.0) + (0.0,) * 23
 
 
+class RoadLead(Sensor):
+    """The road model's lead (`road.leads[0]`): z = [range of the vehicle's near face, direction, range rate] from the
+    reference camera, of "the vehicle ahead in the car's own path" as an end-to-end network reads it off the same
+    picture the boxes come from. One return per scan at most, and it names one vehicle: it says nothing of the
+    others, and it is no evidence that its vehicle is there (the tracker takes it as a range and a range rate of an
+    object it has: chris_native.c `SEN_LEAD`, `r_take_lead`; docs/RADAR.md, section 13). `other`: the density of
+    "the lead is a vehicle the tracker has no object for" in the measurement space; `v_stand`: the range rate's
+    sigma for a vehicle that stands (0: as stated); `corr`: how many returns share one error."""
+    name = "lead"
+    kind = "road_lead"
+    angle_rows = (1,)
+    velocity = True
+    coast_s = 2.0
+
+    def __init__(self, p_d=0.9, other=7e-4, fov=math.radians(60.0), max_range=80.0, v_stand=0.0, corr=(1.0, 1.0, 1.0),
+                 open_sigma=0.0):
+        self.p_d, self.clutter, self.fov, self.max_range, self.v_stand = p_d, other, fov, max_range, v_stand
+        self.corr = tuple(corr)          # returns that share one error: range, direction, range rate (r_take_lead)
+        self.open_sigma = open_sigma     # a hypothesis this many sigma off in range is opened along the line of sight
+
+    def native(self):
+        return (3.0, self.fov, self.max_range, self.p_d, self.clutter, self.v_stand * self.v_stand) + self.corr \
+            + (self.open_sigma,) + (0.0,) * 22
+
+
 class Position(Sensor):
     """z = [x, y] in the car frame (an object list of another camera or of a lidar)."""
     name = "position"

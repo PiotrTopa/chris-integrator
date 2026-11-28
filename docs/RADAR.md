@@ -1478,3 +1478,252 @@ Not solved, and why:
   3-degree ground points do not tell "creeps with the car" from "stands", and the kind's prior says 0.4 "it stands".
 * The other causes of the table (young objects, the car's own turns, narrow streets) are not the tracker's memory
   of things that are gone; they are named there and not touched here.
+
+## 13. The vehicle ahead: the road model's lead as a sensor (2026-11-28)
+
+Section 12 ended at a witness the tracker did not read. The road model's lead (`road.leads[0]`: the vehicle ahead in
+the car's own path as an end-to-end network reads it off the same picture, with a distance, a speed, their stated
+spreads and a probability) knew at every queue start that the lead was pulling away, and it knows the distance of a
+vehicle whose box is cut at the bottom of the view, where the boxes' own range is an extrapolation. It is now a sensor
+of the tracker: a range and a range rate of an object the boxes have found.
+
+### What the lead is, measured
+
+On the six driving sessions of 26 / 27 November (1 h 17 min; `/home/piotr/scratch/qstart/tools/`: `leadtab.py`,
+`an_stand.py`, `an_appr.py`, `an_dyn.py`). The references: (a) the car's own odometer on approaches to a lead that
+stands (the lead's world place is the stop distance + the odometer: 510 frames of 14 approaches); (b) the lead's own
+speed against its own distance over 2 s; (c) the detector's ground range of whole boxes beyond 18 m; (d) the two cars
+at rest (23 stands of 3-100 s).
+
+| | measured |
+|---|---|
+| rate, latency | 13-19 messages a second; its speed is of an image pair 200 ms apart |
+| it is there | probability >= 0.9 in 0.56 of all frames, 0.1-0.9 in 0.33; of the tracker's settled vehicle on the path it reports (>= 0.9) 0.99 within 8 m, 0.98 to 25 m, 0.61 at 25-40 m, 0.17 at 40-60 m, none beyond; a vehicle that STANDS and is closed on faster than 3 m/s: 0.73 at 8-15 m, 0.1 beyond 25 m (few cases) |
+| short losses inside a steady lead within 20 m | one per 170 s, 0.1 s (median) to 0.7 s |
+| it names another vehicle (a jump of the distance) | 108 times an hour |
+| the distance, against (a) | 0-5 m: +0.01 m (p10 -0.46, p90 +0.50); 5-8 m: +0.20 (-0.65, +0.67); 8-12 m: +0.24 (-0.74, +0.99); 12-18 m: +0.30 (-1.16, +1.16). No scale error (+1 % by day; +8 % on the one night approach) |
+| ... its stated sigma (0.09 of the distance; 0.27-0.6 m within 6 m) | the error is within it in 0.70 / 0.56 / 0.59 / 0.43 of the frames of those four bands, within twice it in 0.93 / 0.89 / 0.86 / 0.90: honest times 1.2-1.4 |
+| ... where its zero is | not settled: a box's width read as a range (a car 1.8 m wide) is 0.3-1.0 m beyond it at 2.5-9 m and 2 % beyond at 20-30 m; a number plate (0.52 m) puts a lead read at 3.6 m at 4.1 m. A constant of some tenths of a metre between the network's zero and the camera's (`lead_off_m`, 0) |
+| ... both cars at rest | sd 0.10-0.29 m about its mean (0.5-0.7 m in two short stands of one session; half the stated sigma on the whole), no drift; it forgets within a second (autocorrelation 0.45 at 0.1 s, 0.26 at 0.5 s, 0.15 at 1 s) |
+| ... against (c) beyond 18 m | the detector's ground range is 6-11 % nearer than the lead at 18-32 m, the box width agrees to 0.5-4 %: no finding against the lead |
+| the speed (relative: the lead's less the model's own of the same pair), of a lead that stands, both at rest | +0.01 m/s, sd 0.006-0.05 (stated 0.03-0.06) |
+| ... of a lead that stands while the car closes | +0.07 m/s (the car at 0.5 m/s) to +0.28 (5.7 m/s): about +0.05 x the car's speed; sd 0.11 |
+| ... of a lead that moves, against (b) over 2 s | it under-reads the opening by 0.06 m/s (lead at 0.3-2 m/s), 0.21 (2-5), 0.33 (above 5), 0.30 while the lead accelerates; spread 0.3-0.5 m/s, which is what it states (0.30-0.52): the error is within the stated sigma in 0.58-0.68 of the 2 s windows. Its error lives for seconds, not from frame to frame |
+| ... lag | none found (against the distance's own rate the speed is 0.1-0.25 s EARLY, at a correlation of 0.5) |
+| its lateral place | on a straight road 0.05 m +- 0.42, whatever the vehicle's place in the lane (correlation with the box's lateral place 0.21; stated sigma 0.19, the difference 0.56 m); on bends it follows the path (slope 1.01 against the path's lateral offset at its distance, correlation 0.89). It says "in the car's lane, here along the road" and no more |
+| no lead | probability under 0.3, a distance anywhere (median 27 m), stated sigma 8 m |
+
+So: a range to about +-0.4 m at 4 m and +-1 m at 15 m with no bias the odometer can see, a speed to +-0.1 m/s of a
+lead that stands and +-0.4 m/s of one that moves, both with errors that last a second and more; nothing lateral
+beyond the lane; nothing of a standing vehicle that the car closes on from far. Not measured: how often it names a
+vehicle that is not there with a probability above 0.9; night (two short sessions, one approach).
+
+### What is built (each a knob of `tracker.CFG`, off; with all off the stack's output is the base's, bit for bit)
+
+* **`in_lead`** (`radar/box.py` `_on_lead`, `sensors.RoadLead`, native `SEN_LEAD`, `r_take_lead`; `Tracker.process`).
+  `leads[0]` with a probability of at least `lead_prob` (0.9), at most every `lead_every_s` (0.2 s), is a scan of one
+  return: z = [the range of the vehicle's NEAR FACE from the reference camera, its direction, the range's rate]. The
+  range is the centre's less half the rectangle's depth along the line of sight, as a camera's rows read it (what is
+  not known of that depth goes into the row's variance); the rate is the lead's speed less the model's own of the
+  same image pair; the direction is its lateral place with a sigma of `lead_y_std` (0.7 m) at least.
+  * **Which object it is of** is the scan's own machinery (`Hyp.cycle`): the objects about its place take part
+    (`_lead_objs`: generously; the others are not touched, not even stepped), each leaf is gated and weighed with the
+    sigmas as stated, "none of them: a vehicle the tracker has no object for" has the density `lead_other`, and the
+    pairing stays open over the scans like any other. A return outside the gate of the object as a whole is inside
+    where it is inside the gate of one of its hypotheses (a believed-standing object and a return that says "it has
+    started").
+  * **No existence.** A return adds nothing to the log odds of the leaf that takes it, counts as no sighting, leaves
+    the time of the last box as it was; a leaf that takes none loses nothing; a return no object takes starts none.
+    The object's life (seen, coast, `seen_max_s`, `swept`, `coast_std_m`, the field's cover, hidden) is its boxes'
+    as before: the record of what the last scan could see of it is not overwritten, and `Tracker.manage` reads the
+    last sighting of a sensor that looks at objects. What it does give: `sources` and `seen` carry `lead`, the
+    distance counts as measured (`range_t`: the consider parameters of section 2 are learnt while it is fresh, the
+    threat's `threat_range_s`), and the verdict takes it as a sensor that measures speed.
+  * **Errors that last.** A row is taken with the smaller of two variances (`r_take_lead`): R S / (S - R), which
+    leaves the hypothesis with the row's own stated variance and no better however often it comes (what the motion
+    model has opened since the last return is closed at once: a change is followed without lag); and R x (the
+    error's life `lead_tau_x` 1 s, `lead_tau_v` 2 s over the time since the previous return), by which a hypothesis
+    that states its range better than the network does is still moved, at the rate at which the network's errors are
+    new ones. The stated sigmas are read as `lead_x_k` (1.4) x the range's, no less than 0.25 m, and `lead_v_k`
+    (1.25) x the speed's, no less than 0.1 m/s; the speed of a lead that drives is raised by `lead_v_bias` (0.045) x
+    that speed, at most 0.35 m/s (the under-reading of the table).
+  * **"It stands" expects a sharp speed.** For the standing hypothesis the rate's sigma is `lead_v_stand` (0.12 m/s)
+    + `lead_v_stand_rel` (0.06) x the car's speed, whatever the network states of this return (it states 0.3-0.5 as
+    soon as it sees motion): that is the measured error of a lead that stands, and it is what lets "it stands" lose
+    to the first returns of a start.
+  * **A range the object does not know as well as it states** (`lead_open`, 1 sigma). A hypothesis whose near face
+    is further from the return's than 1 sigma of the two together is opened along the line of sight until the
+    return is that far, and the return then taken (covariance matching on the innovation). The range of a standing
+    thing from boxes cut at the bottom is stated to 0.2-0.6 m and wrong by metres (section 12).
+* **`sil_near`** (native `r_sil_angle`, `r_extent_update`). A box's width is the angle between the outermost corners
+  of the object's rectangle as the camera sees them. It was the rectangle's silhouette over the range of its CENTRE:
+  right far away, but the rear of a car 4 m ahead (centre 6.2 m) fills 0.44 rad where that says 0.29, and the
+  rectangle explained the rest by its length and heading (the fixture of `tests/test_radar_lead.py`: a car standing
+  4 m ahead becomes 6.8 m long and turns 0.27 rad in 6 s; with the knob 4.9 m and 0.00). The tracked lead within 6 m
+  on the recordings was 6.3 m long (median; 8.4 m at the ninth decile) and turned 0.24 rad off the lane (0.42): the
+  "3 m wide, or turned by 25 degrees" of section 12. Measured, not proposed (below).
+* **`pose_gn_cut_deg`** (`radar/box.py`). Degrees added, in quadrature, to the sigma of the pose head's ground point of
+  a box cut by the bottom of the VIEW (the extrapolation that reads 2.5-6.3 m far with a stated 1-3 degrees).
+  Measured, not proposed (below).
+
+The simulator: the world option `lead_real` (`ScenarioWorld._lead_real`, `LEAD_REAL`; the detector presets take
+`+lead`: `detin_pose_scale+lead`) gives the road model's lead the structure of the table: whether it has the vehicle
+(by distance; a standing one closed on, far less; held or lost for a second at a time; short losses), an offset per
+ride (0.3 m), a slow error of 8.5 % of the distance (4 % while both stand) that lives 1.2 s plus a little white, the
+stated 9 %; a speed of the image pair 0.1 s ago with the bias of a standing lead closed on, the under-reading of a
+moving one, a slow error of what it states that lives 2 s; a lateral place that carries a fifth of the vehicle's. Off
+(the default) the world and `VisionSim`'s stream are what they were (`tests/test_radar_lead.py::Simulator`: the hash of
+the first 200 leads of `queue_creep`). `sim/radar_score.py` feeds the lead to the radar where the world has it.
+
+Tests: `tests/test_radar_lead.py` (fixtures at the radar box: off and unread; the measurement and its Jacobian; a
+cut-box lead takes the lead's range and states no better than it; a far standing car does not take the return of a
+near vehicle; a standing lead that starts is let go within 1 s and followed with its id; a lead that brakes to a stop
+stands; a lead creeping with the car is not called standing; no object started, kept or counted by returns; the rear
+of a near car is a car along the lane; the simulator's lead). `lead_open` and `pose_gn_cut_deg` have no fixture of
+their own: what holds them is the recordings' numbers below.
+
+### Measured
+
+**The recordings** (the six driving sessions re-run through the whole stack with the phone's knobs, which now include
+`see_through`, `swept`, `coast_std_m` 3: 41 said `obstacle_ahead` episodes, section 12's count; the base against the
+base + `in_lead`; `/home/piotr/scratch/qstart/tools/`: `replay.sh`, `honest.py`, `eps.py`, `epclass.py`, `fate.py`). A
+re-run is one sample: knob sets that differ in nothing a case depends on still differ by three to five said episodes
+(the lead with eight variations of its own knobs: 38 to 48), so the totals say little and the cases are read one by
+one.
+
+The tracked lead (the object in the lane nearest the lead's place) against two references: the stop distance + the
+car's odometer on the approaches to a lead that stands (independent of the lead's own numbers but for the stop
+distance), and the road model's lead itself, smoothed both ways in time (not independent: it is the input).
+
+| | base | `in_lead` |
+|---|---|---|
+| the lead (probability >= 0.97, within 20 m) has an object: day, within 6 / 6-10 / 10-20 m | 80 / 80 / 77 % | 85 / 82 / 83 % |
+| ... night | 72 / 46 / 92 % | 69 / 94 / 99 % |
+| near face minus stop distance + odometer, 0-6 m: median, rms; stated sigma; within 1 / 2 sigma | +1.78 m, 2.88; 0.63; 0.16 / 0.33 | +0.58 m, 0.78; 0.40; 0.30 / 0.76 |
+| ... 6-10 m | +1.78, 2.32; 0.80; 0.31 / 0.47 | +0.62, 0.90; 0.61; 0.45 / 0.84 |
+| near face minus the lead's, lead within 6 m: median, p10..p90, rms | +2.90 m, +0.93..+6.76, 4.02 | +0.34 m, +0.01..+0.75, 0.64 |
+| ... 6-10 m | +1.94, -0.21..+4.61, 2.76 | +0.15, -0.72..+0.81, 0.58 |
+| ... 10-20 m | +0.91, -2.04..+4.88, 2.81 | -0.08, -1.01..+0.96, 0.82 |
+| ... a lead creeping at 0.3-3 m/s within 10 m | +2.41, +0.42..+6.29, 3.47 | +0.29, -0.40..+0.89, 0.77 |
+| ... night, all | +3.04, -1.69..+6.93, 4.00 | +0.41, -0.63..+0.93, 0.93 |
+| ... within 1 / 2 stated sigma: day, night | 0.15 / 0.27, 0.29 / 0.47 | 0.42 / 0.83, 0.55 / 0.85 |
+| relative speed minus the rate of the lead's distance over 2 s, creeping lead: rms; within 1 / 2 sigma | 1.00 m/s; 0.57 / 0.74 | 0.66 m/s; 0.65 / 0.88 |
+| ... on the approaches (the lead stands: against the car's own speed), 0-6 m | 0.53; 0.84 / 0.99 | 0.32; 0.78 / 0.96 |
+| the lead's rectangle within 6 m (cars): length median / ninth decile; heading off the lane | 6.3 / 8.4 m; 0.24 / 0.42 rad | 4.7 / 5.8 m; 0.11 / 0.34 rad |
+
+The range bias of section 12 (+2 to +3 m, wandering by 3 m) is +0.3 to +0.6 m with a spread of 0.6-0.9 m, about the
+lead's own. The stated sigma covers the approach reference in 0.76-0.84 of the frames at 2 sigma (0.33-0.47 before);
+at 1 sigma it is still short (0.30-0.45 where 0.68 would be honest): a standing object within 6 m states 0.2-0.4 m
+and sits 0.3 m beyond the lead, where its boxes' rows pull it (`lead_open` 1 is what holds it within 2 sigma: with
+2 the coverage was 0.48). The heading that remains is the pose head's (+-16 degrees on a rear view). The share of
+the night lead within 6 m with an object (69 %) is two standstills of one session; the variants put it at 69-87 %.
+
+The said episodes by what the alert's object is against the lead at the said time (`epclass.py`; the lead present
+with a probability of 0.9; "the lead's object": within 1.5 m or 20 % of its distance, in the lane):
+
+| | base | `in_lead` | `in_lead` + `sil_near` |
+|---|---|---|---|
+| A: the lead, followed right (speed within 1 m/s), closing with less than 4 s to the bumper: true or arguable | 2 | 6 | 11 |
+| B: the lead, followed right, not closing | 0 | 4 | 5 |
+| C: the lead's object with its speed off by more than 1 m/s | 3 | 0 | 2 |
+| D: a standing object beyond the lead in the lane | 1 | 2 | 2 |
+| E: another object | 35 | 26 | 25 |
+| said | 41 | 38 | 45 |
+
+* **The queue starts** (section 12's eight; nine by the said times of this re-run). With `in_lead`: `153449` 583,
+  1778 and 1871 s are no longer said. `152055` 250 and 567 s and `153449` 1458 s are still said, on a lead that is
+  now followed right (B: near face within 0.4-0.6 m, speed within 0.5 m/s of the lead's): the car pulls away
+  2.7-4.3 m behind the lead's bumper and the alert is said as the low-speed suppression lifts at 3 m/s. `153449` 582
+  and 948 s are still said on a standing object 7-8 m beyond the lead (the next vehicle of the queue, hidden by the
+  lead), 1462 s on an object 3.8 m beside the lane. The car's own two of 27 November
+  (20:30:53, 20:33:07, both under the suppression): at 20:30:53 the lead is an object now (near face 0.4 m from the
+  lead's) and the alert is said at 20:30:54, as the car passes 3 m/s 4.4 m behind the lead's bumper accelerating at
+  1.9 m/s^2 (B); 20:33:07 stays under the suppression (in this re-run on a standing object 6 m beyond the lead; in
+  another of the variants on the lead's own object, 0.2 m from it).
+* **Why B is said.** The tracker's picture is right there. The decision layer's future has the car keep its
+  acceleration and the lead its speed; at a queue's start both accelerate. What would settle it is the lead's
+  acceleration: the network's own is next to nothing (0.02-0.04 m/s^2 while the lead pulls away at 1 m/s^2), and the
+  tracker's follows from a speed it knows to +-0.4 m/s, with a stated spread (0.6-1.2 m/s at such a start) that the
+  decision layer reads as risk. Not the tracker's to settle, and not settled: the queue start is no longer a lead
+  that is not tracked, it is a lead the decision layer warns of.
+* **The true ones.** The base's closings on a slow or stopped lead that the road model confirms (`153449` 389, 403,
+  680 s; `114700` 378 s) are all still said. Two more are said that the base did not say: `202650` 202 s (the lead
+  10.7 m ahead, closing at 6.5 m/s) and `114700` 46 s (9.2 m, 6.0 m/s): 1.2-1.3 s to its bumper, on a lead the base
+  did not have.
+* **Others.** Of the base's 35 on other objects 9 are no longer said and 5 new ones are (young objects, turns, narrow
+  streets: section 12's classes; the lead does not touch them, the re-run's noise does).
+
+**The simulator** (`tools/alert_truth.py`, the phone's knobs as the base, the road model's lead as measured
+(`+lead`), paired over the same runs: six streets and the pedestrian controls x seeds 1-6, the scripted conflicts x
+seeds 1-3, day and night; +- the bootstrap's 1 sigma):
+
+| stream | knobs added | false episodes | conflicts warned | lost / gained / later / earlier |
+|---|---|---|---|---|
+| `queue_creep` + `left_behind`, the reach modelled, seeds 1-6 | `in_lead` | 21 -> 8 (-13 +- 3.0) | 4 -> 4 of 6 | 0 / 0 / 0 / 0 |
+| `detin_pose_scale+lead` | `in_lead` | 84 -> 82 (-2 +- 3.4) | 42 -> 42 of 72 | 0 / 0 / 0 / 3 (0.82 -> 0.91, 0.92 -> 1.29, 2.97 -> 3.21 s) |
+| `scale+lead` | `in_lead` | 66 -> 71 (+5 +- 2.2) | 37 -> 40 | 0 / 3 (night: `bend_exit_stopped_13` s2, `bend_stopped_13` s1, `half_in_lane_straight_13` s1) / 2 (1.45 -> 1.29, 2.97 -> 2.81 s) / 1 |
+| `detin_pose_scale+lead` | `in_lead` + `sil_near` | 84 -> 75 (-9 +- 4.9) | 42 -> 41 | 1 (`half_in_lane_straight_13` s2 night, 0.96 s) / 0 / 0 / 3 |
+| `scale+lead` | `in_lead` + `sil_near` | 66 -> 74 (+8 +- 3.3) | 37 -> 38 | 0 / 1 / 4 (by 0.1-0.5 s) / 2 |
+| `detin_pose_scale+lead` | `sil_near` alone | 84 -> 79 (-5 +- 3.0) | 42 -> 41 | 1 (the same) / 0 / 0 / 0 |
+
+The +5 of the plain stream is `slow_lead` (1 -> 6: the car follows a lead at 7 m/s, and the lead's speed error of
+0.5 m/s that lives for seconds reads as closing). How the lead's speed is weighed decides that scenario against
+`queue_creep`, on the stream with the reach modelled (12 runs each): the stated sigma as it is and no bias taken out
+8 / 22 false (queue / slow lead; base 21 / 3), the bias taken out 7 / 10, times 1.25 (the default) 8 / 7, times 1.5
+13 / 4, times 2 15 / 2. No true warning is lost with `in_lead` on either stream; two of the plain stream's come
+0.16 s later, three are gained.
+
+Identities (the radar alone, `sim/radar_score.py`, `detin_pose_scale+lead`, eleven scenarios x seeds 1-3 x day and
+night, `in_lead` against the phone's): id switches 138 -> 128 (paired -0.15 +- 0.12 a run), held share 0.373 ->
+0.381. `slow_lead` 9 -> 1 (held 0.50 -> 0.62), `queue` 14 -> 10, `crossing_pair` 8 -> 5; `platoon` 3 -> 9 (held
+0.505 -> 0.485; not looked into); the other seven within one switch.
+
+Cost (`tools/cost_bench.py run`, the whole path over a session, three runs each, on the P52; `in_lead` + `sil_near`
+against the phone's knobs): the radar plug-in 0.205 -> 0.246 ms per road frame on `202650` and 0.489 -> 0.577 ms on
+`152055` (the whole path 2.06 -> 2.08 and 3.02 -> 3.15 ms): five scans a second of one return, in which only the
+objects about the lead's place are stepped. `in_lead` by itself was not timed apart. Not measured on the
+phone. With the knobs off the three captures of `/home/piotr/scratch/cost-rest` (`cost_bench.py
+diff`: IDENTICAL) and the six sessions (the dumps' sha256) are the base's.
+
+**`pd_cut`, `gate_hyp`, `pose_gn_cut_deg`, measured again** with the lead in (on `in_lead` + `sil_near`):
+
+| knob added | recordings: said, by class A / B / C / D / E | simulator `detin_pose_scale+lead`: false episodes; conflicts |
+|---|---|---|
+| (none) | 45: 11 / 5 / 2 / 2 / 25 | - |
+| `pd_cut` | 44: 9 / 5 / 1 / 0 / 29 | 75 -> 75 (+0 +- 2.5); 41 -> 41 warned, one earlier |
+| `gate_hyp` 6 | 47: 10 / 5 / 0 / 4 / 28 | 75 -> 76 (+1 +- 1.7); 41 -> 41 |
+| `pose_gn_cut_deg` 6 | 44: 8 / 5 / 1 / 2 / 28 | 75 -> 78 (+3 +- 2.9); 41 -> 41, one later (0.75 -> 0.51 s), two earlier |
+
+### Proposed for the car, and what is not solved
+
+In the phone's `radar.json`: **`"in_lead": true`**.
+
+Not `sil_near`: one night warning of the simulator is lost with it (`half_in_lane_straight_13`, 0.96 s), four of the
+plain stream's come later, and on the recordings the lead's rectangle then comes out short (3.7 m, 1.7 m wide:
+the lead's zero is some tenths of a metre nearer than the box's width puts the vehicle) with the heading no better
+(0.17 rad). The model is the right one; it wants the lead's zero settled (`lead_off_m`) and the pose head's heading
+of a rear view weighed as what it is.
+
+Not `pd_cut`, not `gate_hyp`, not `pose_gn_cut_deg`: none shows a gain with the lead in.
+`pd_cut`: section 12's objection (a lead that keeps its boxes is said with its range and speed errors) has fallen for
+the lead itself, whose range is now the road model's; what is left is no gain in the simulator (0 +- 2.5) and four
+more said episodes on other objects on the recordings (25 -> 29: inside a re-run's noise, and not a gain).
+`gate_hyp`: +1 +- 1.7, two more said. `pose_gn_cut_deg` 6: the lead's range bias within 6 m goes from +0.4 to +0.2 m
+(rms 0.6 -> 0.4 m against the lead), but +3 +- 2.9 false episodes and one night warning 0.24 s later in the
+simulator.
+
+Not solved, and why:
+
+* **The queue's start as an alert** (B above): the lead is followed, and the decision layer says it. Its future needs
+  the lead's acceleration, or to know that a queue starts.
+* **The next vehicle of the queue, hidden by the lead**, kept as a standing object 7-8 m beyond it while the queue
+  drives off (`153449` 582, 948 s): the lead names one vehicle and says nothing of the next; `coast_std_m` does not
+  touch a standing object.
+* **The stated sigma of a standing lead's range** (0.2-0.4 m against an error of 0.6-0.8 m at 1 sigma): the boxes'
+  rows of a cut box are stated too well; the lead holds the object within 2 sigma, not within 1.
+* **The lead's zero** (some tenths of a metre between the network's distance and the camera's), **its false
+  positives** (a lead named with a probability above 0.9 where no vehicle is: not measured; the tracker then places
+  whatever object is there, and adds no existence), **night** (two short sessions).
+* **Following a lead at speed**: where the boxes are whole the lead's speed is the worse witness, and the
+  simulator's `slow_lead` on the plain stream says 5 false episodes more for it in 12 runs. The recordings show no
+  such episode in 43 minutes of following (the four "B" are queue starts).

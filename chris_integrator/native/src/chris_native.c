@@ -4972,7 +4972,7 @@ static int rnums_get_tail(PyObject *o, Py_ssize_t nmin, Py_ssize_t n, double *ou
 }
 
 /* ---- the sensors (sensors.py): what a scan measures of a state ---- */
-enum { SEN_CAMERA = 0, SEN_MICROWAVE = 1, SEN_POSITION = 2 };
+enum { SEN_CAMERA = 0, SEN_MICROWAVE = 1, SEN_POSITION = 2, SEN_LEAD = 3 };
 enum { K_B = 0, K_RB = 1, K_RBH = 2, K_BT = 3, K_NONE = 4, K_SCALE = 8 };
 #define RSENS 32
 /* the learnt chance of a box (Hyp.pdl): per view of the camera its key, then per bin of the box height (three to
@@ -4992,6 +4992,14 @@ typedef struct {
     double bias_var, dp_var, jit2, bias_floor2, top_rel, top_range, gm_var, gm_tau;
     /* microwave */
     double mx, my, yaw, fov, clutter, extended;
+    /* the road model's lead (SEN_LEAD: sensors.py `RoadLead`): the variance of its range rate for a vehicle that
+     * stands (the network is sharp there: what "it stands" expects of a return); 0: as stated */
+    double vstand2;
+    double corr[3];                  /* ... and how many returns share one error (range, direction, range rate): its
+                                        errors' life over the time since the previous return, no less than 1 */
+    double open2;                    /* a hypothesis whose range is further from the return's than this many sigma
+                                        (squared) of the two together does not know its range as well as it states:
+                                        opened along the line of sight until it is that far; 0: not */
     /* the detector's further inputs for this scan (NULL: none; set by Hyp.cycle) */
     const struct RXc *xc;
     double grade_k;                  /* the road's vertical curvature, 1 sigma (1/m); 0: not modelled */
@@ -5000,6 +5008,8 @@ typedef struct {
     double pdl_n0;
     int sil;                         /* a box's centre is the centre of the object's silhouette (r_sil_shift) */
     int nax;                         /* the near face's depth along the camera's axis (XC_NAX) */
+    int siln;                        /* a box's width is the angle between the rectangle's outermost corners as the
+                                        camera sees them (XC_NAX, bit 2), not its silhouette over the centre's range */
     const double *sprev;             /* the car's pose at the far end of the scan's scale-rate baselines: nsprev x
                                         (baseline s, X, Y, heading), or NULL */
     int nsprev;
@@ -5027,6 +5037,12 @@ static int sens_get(PyObject *o, RSens *s)
         s->extended = v[8];
     } else if (s->type == SEN_POSITION) {
         s->fov = v[1]; s->max_range = v[2]; s->p_d = v[3]; s->clutter = v[4];
+    } else if (s->type == SEN_LEAD) {
+        s->fov = v[1]; s->max_range = v[2]; s->p_d = v[3]; s->clutter = v[4];
+        s->vstand2 = v[5] > 0.0 ? v[5] : 0.0;
+        for (int k = 0; k < 3; k++)
+            s->corr[k] = v[6 + k] >= 1.0 ? v[6 + k] : 1.0;
+        s->open2 = v[9] > 0.0 ? v[9] * v[9] : 0.0;
     } else {
         PyErr_SetString(PyExc_ValueError, "radar: a sensor of a kind the native core does not know");
         return -1;
@@ -5085,7 +5101,7 @@ static inline double pymin(double a, double b) { return b < a ? b : a; }     /* 
 /* the measurement row that is an angle (wrapped), or -1 (sensors.py `rows`) */
 static int r_angle_row(const RSens *s, int kind)
 {
-    if (s->type == SEN_MICROWAVE)
+    if (s->type == SEN_MICROWAVE || s->type == SEN_LEAD)
         return 1;
     if (s->type == SEN_POSITION)
         return -1;
@@ -5259,6 +5275,29 @@ static int r_h(const RSens *s, int kind, double sdt, const double *x, const doub
         z[2] = rr;
         return 3;
     }
+    if (s->type == SEN_LEAD) {
+        /* the road model's lead: how far the vehicle's NEAR FACE is from the reference camera (the centre's range
+         * less half the rectangle's depth along the line of sight, as a camera's rows read it), the centre's
+         * direction, and the range's rate (the vehicle's velocity over the ground along the line of sight, the
+         * car's own taken out) */
+        double dx = x[R_PX] - pose[0], dy = x[R_PY] - pose[1];
+        double rc = pymax(py_hypot(dx, dy), 0.5);
+        double hd = e ? r_half_depth(e, atan2(dy, dx), NULL) : 0.0;
+        double rvx = x[R_VX] - pose[3], rvy = x[R_VY] - pose[4];
+        double rr = (dx * rvx + dy * rvy) / rc;
+        H[R_PX] = dx / rc;
+        H[R_PY] = dy / rc;
+        H[RN + R_PX] = -dy / (rc * rc);
+        H[RN + R_PY] = dx / (rc * rc);
+        H[2 * RN + R_PX] = rvx / rc - rr * dx / (rc * rc);
+        H[2 * RN + R_PY] = rvy / rc - rr * dy / (rc * rc);
+        H[2 * RN + R_VX] = dx / rc;
+        H[2 * RN + R_VY] = dy / rc;
+        z[0] = pymax(rc - hd, 0.3);
+        z[1] = wrap_pi(atan2(dy, dx) - pose[2]);
+        z[2] = rr;
+        return 3;
+    }
     int base = kind & 7, m = 0;
     double near = 1.0;                                  /* the near face's range over the centre's */
     if (base != K_NONE) {
@@ -5341,6 +5380,10 @@ static double r_coverage(const RSens *s, double xc, double yc)
     if (s->type == SEN_POSITION) {
         double r = py_hypot(xc, yc);
         return (1.0 < r && r < s->max_range && fabs(atan2(yc, xc)) < s->fov) ? s->p_d : 0.0;
+    }
+    if (s->type == SEN_LEAD) {
+        double r = py_hypot(xc, yc);
+        return (0.5 < r && r < s->max_range && fabs(atan2(yc, xc)) < s->fov) ? s->p_d : 0.0;
     }
     if (s->type == SEN_MICROWAVE) {
         double dx = xc - s->mx, dy = yc - s->my;
@@ -8408,6 +8451,13 @@ static void r_reff(const RSens *sen, int kind, const double *row, const double *
 {
     memcpy(Rf, R, 4 * sizeof(double));
     int base = kind & 7;
+    if (sen->type == SEN_LEAD) {                        /* its range is the near face's: the depth not known */
+        const double *x = row + RO_X, *e = row + RO_E, *Pe = row + RO_PE;
+        double dda, a = e[2] - atan2(x[R_PY] - pose[1], x[R_PX] - pose[0]);
+        r_half_depth(e, atan2(x[R_PY] - pose[1], x[R_PX] - pose[0]), &dda);
+        Rf[0] += 0.25 * (cos(a) * cos(a) * Pe[0] + sin(a) * sin(a) * Pe[4]) + dda * dda * pymin(Pe[8], 0.6);
+        return;
+    }
     if (sen->type != SEN_CAMERA || base == K_NONE)
         return;
     const double *x = row + RO_X, *e = row + RO_E, *Pe = row + RO_PE;
@@ -8525,6 +8575,24 @@ static void ras_row(const RAs *q, const double *row, double pd, double pdlo, dou
                  * box: each hypothesis that is not ruled out gates with its own prediction. Only for a box that
                  * lies on the object's last one (its middle within half their mean width of where the object
                  * predicts it): a doubtful hypothesis is wide, and would hold a neighbour's box too */
+                for (int mm = 0; mm < 3 && !in; mm++) {
+                    if (mu[mm] < 1e-4)
+                        continue;
+                    double zh[4], Hh[4 * RN], HPh[4 * RN], Sh[16], sh;
+                    r_h(sen, kind, sdt, row + RO_XS + mm * RN, pose, zh, Hh, row + RO_E);
+                    r_hph(Hh, m, row + RO_PS + mm * RNN, HPh, Sh);
+                    for (int r = 0; r < m; r++) {
+                        nuj[r] = r == ar ? wrap_pi(d[D_Z + r] - zh[r]) : d[D_Z + r] - zh[r];
+                        Sh[r * m + r] += Rf[r];
+                    }
+                    if (r_mahal(Sh, m, nuj, &sh, NULL) == 0 && sh <= gate)
+                        in = 1;
+                }
+            }
+            if (!in && ok[a] && sen->type == SEN_LEAD) {
+                /* the road model's lead: inside where it is inside the gate of one of the object's hypotheses. The
+                 * combination is where the believed hypothesis is, and the return that says "it has started" lies
+                 * outside it by its speed while "it moves", weighed a hundredth, expects just that */
                 for (int mm = 0; mm < 3 && !in; mm++) {
                     if (mu[mm] < 1e-4)
                         continue;
@@ -8706,6 +8774,61 @@ static int r_take_parts(double *x, double *P, const RSens *sen, int kind, double
     return 0;
 }
 
+/* A return of the road model's lead into one hypothesis (SEN_LEAD). Its errors are not noise from return to return:
+ * the network reads nearly the same pixels thirteen times a second, and what it has wrong of a vehicle's distance or
+ * speed it has wrong for a second or more (measured: docs/RADAR.md, section 13). Two readings of that, and a row is
+ * taken with the smaller variance of the two:
+ *   - no better than stated: the variance that leaves the hypothesis, in that row, with the row's own (R S / (S - R)
+ *     for the row's predicted variance S). What the hypothesis' motion has opened since the last return this one
+ *     closes at once (a change is followed without lag), and a level is never known better than the network knows it;
+ *   - one return per life of the error: R x corr (corr: that life over the time since the previous return). A
+ *     hypothesis that states its range better than the network does (from the boxes) is still moved by it, at the
+ *     rate at which the network's errors are new ones.
+ * like: the likelihood of the return under the hypothesis, with the variances Rl as stated (not held back: how well a
+ * hypothesis predicted the return is what weighs "it stands" against "it drives"). 0: taken; -1: singular.
+ * A hypothesis that has the range elsewhere than the return by more than `open` sigma of what the two state does
+ * not know it as well as it states (the range of a box cut at the bottom of the view is an extrapolation with a
+ * stated spread of a few tenths of a metre: section 12): its place is opened along the line of sight until the
+ * return is `open` sigma away, and the return then taken (covariance matching on the innovation). */
+static int r_take_lead(double *x, double *P, const RSens *sen, const double *pose, const double *z, const double *R,
+                       const double *Rl, const double *e, double *like)
+{
+    double nu[4], H[4 * RN], S[16], Si[16], K[RN * 4], det, t[4], d2 = 0.0, Rg[4];
+    int m = r_innov(sen, K_NONE, 0.0, x, P, pose, z, Rl, nu, H, S, e);
+    if (r_inv(S, m, Si, &det) < 0)
+        return -1;
+    for (int c = 0; c < m; c++) {
+        double acc = 0.0;
+        for (int r = 0; r < m; r++)
+            acc += nu[r] * Si[r * m + c];
+        t[c] = acc;
+    }
+    for (int c = 0; c < m; c++)
+        d2 += t[c] * nu[c];
+    *like = exp(-0.5 * pymin(d2, 400.0)) / sqrt(pymax(pow(2.0 * PI, (double)m) * det, 1e-30));
+    if (sen->open2 > 0.0 && nu[0] * nu[0] > sen->open2 * S[0]) {
+        double add = nu[0] * nu[0] / sen->open2 - S[0], ux = H[R_PX], uy = H[R_PY];
+        P[R_PX * RN + R_PX] += add * ux * ux;
+        P[R_PX * RN + R_PY] += add * ux * uy;
+        P[R_PY * RN + R_PX] += add * ux * uy;
+        P[R_PY * RN + R_PY] += add * uy * uy;
+        m = r_innov(sen, K_NONE, 0.0, x, P, pose, z, Rl, nu, H, S, e);
+    }
+    for (int k = 0; k < m; k++) {
+        double sk = S[k * m + k] - Rl[k];                /* the row's variance as the hypothesis predicts it */
+        Rg[k] = R[k] * sen->corr[k];
+        if (sk > R[k] && R[k] * sk / (sk - R[k]) < Rg[k])
+            Rg[k] = R[k] * sk / (sk - R[k]);
+    }
+    for (int k = 0; k < m; k++)
+        S[k * m + k] += Rg[k] - Rl[k];
+    if (r_inv(S, m, Si, &det) < 0)
+        return -1;
+    r_gain(P, H, m, Si, K);
+    r_take(x, P, K, H, Rg, nu, m, 1.0);
+    return 0;
+}
+
 /* ---- the scale rate of a thing that stands is its range ----
  * A thing that stands comes nearer at the car's own speed: its image grows at v / depth, and the rate measures the
  * depth outright (time to contact x the car's speed), whatever its size and wherever the road lies. That function
@@ -8823,7 +8946,16 @@ static int r_update_full(double *row, const RSens *sen, const double *pose, cons
             memcpy(x0, x, sizeof(x0));
             memcpy(P0, P, sizeof(P0));
         }
-        int took = r_take_parts(x, P, sen, kind, sdt, pose, d + D_Z, Rf, row + RO_E, rel,
+        int took;
+        if (sen->type == SEN_LEAD) {
+            double Rs[4];
+            memcpy(Rs, Rf, sizeof(Rs));
+            if (j == R_STAND && sen->vstand2 > 0.0 && sen->vstand2 < Rf[2])
+                Rs[2] = sen->vstand2;                    /* of a vehicle that stands the road model's speed is sharp,
+                                                          * whatever spread it states of this one */
+            took = r_take_lead(x, P, sen, pose, d + D_Z, Rf, Rs, row + RO_E, &like[j]) == 0;
+        } else
+            took = r_take_parts(x, P, sen, kind, sdt, pose, d + D_Z, Rf, row + RO_E, rel,
                                 cons && sen->type == SEN_CAMERA && (j != R_STAND || cons >= 2), &like[j]) == 0;
         if (took && siter > 0 && j == R_STAND)
             r_take_iter(x, P, x0, P0, sen, kind, sdt, pose, d + D_Z, Rf, row + RO_E, 1, siter);
@@ -8836,7 +8968,9 @@ static int r_update_full(double *row, const RSens *sen, const double *pose, cons
                 x[k] = 0.0;
         x[R_DP] = clamp_dp(x[R_DP]);
     }
-    if (r_take_parts(row + RO_XF, row + RO_PF, sen, kind, sdt, pose, d + D_Z, Rf, row + RO_E, rel, 0, &lf) == 0) {
+    if (sen->type == SEN_LEAD)
+        r_take_lead(row + RO_XF, row + RO_PF, sen, pose, d + D_Z, Rf, Rf, row + RO_E, &lf);
+    else if (r_take_parts(row + RO_XF, row + RO_PF, sen, kind, sdt, pose, d + D_Z, Rf, row + RO_E, rel, 0, &lf) == 0) {
         if (naux)
             x_aux_take(sen->xc, row + RO_XF, row + RO_PF, pose, aux, naux, 0, NULL);
         row[RO_XF + R_DP] = clamp_dp(row[RO_XF + R_DP]);
@@ -8847,7 +8981,7 @@ static int r_update_full(double *row, const RSens *sen, const double *pose, cons
      * stands" against "it drives"; the hypotheses keep their probabilities) */
     if (d[D_LOW] != 0.0)
         tot = 0.0;
-    if (tot > 0.0 && (sen->type == SEN_MICROWAVE || hits >= hold || (kind & K_SCALE))) {
+    if (tot > 0.0 && (sen->type == SEN_MICROWAVE || sen->type == SEN_LEAD || hits >= hold || (kind & K_SCALE))) {
         double nm[3], s2 = 0.0, post[3];
         for (int j = 0; j < 3; j++) {
             double v = w[j] / tot;
@@ -9444,6 +9578,26 @@ static void r_sensor_at(const RSens *sen, const double *pose, double *sx, double
     }
 }
 
+/* The angle a rectangle (e: length, width, heading) whose centre is (dx, dy) from the camera fills across the
+ * picture: between its outermost corners as seen. The silhouette over the centre's range is that for a thing far
+ * away; the rear of a car 4 m ahead (its centre 6.2 m ahead) fills 0.44 rad where that says 0.29. */
+static double r_sil_angle(const double *e, double dx, double dy)
+{
+    double ch = cos(e[E_HDG]), sh = sin(e[E_HDG]), hl = 0.5 * e[E_LEN], hw = 0.5 * e[E_WID];
+    double r = pymax(hypot(dx, dy), 1e-6), ux = dx / r, uy = dy / r, lo = INFINITY, hi = -INFINITY;
+    for (int k = 0; k < 4; k++) {
+        double a = (k & 1) ? hl : -hl, b = (k & 2) ? hw : -hw;
+        double cx = dx + a * ch - b * sh, cy = dy + a * sh + b * ch;
+        double along = pymax(ux * cx + uy * cy, 0.3), across = -uy * cx + ux * cy;
+        double be = atan2(across, along);
+        if (be < lo)
+            lo = be;
+        if (be > hi)
+            hi = be;
+    }
+    return hi - lo;
+}
+
 /* What a detection says about the extent of the leaf that took it (after the motion state took it). A camera box
  * whose sides are both in the picture: its width as an angle is the silhouette over the range. A cell of several
  * returns of a microwave radar: the scatter of their places is that of the two sides that face the sensor. */
@@ -9454,7 +9608,22 @@ static void r_extent_update(double *row, const RSens *sen, const double *d, cons
     double sx, sy, axis;
     r_sensor_at(sen, pose, &sx, &sy, &axis);
     double dx = x[R_PX] - sx, dy = x[R_PY] - sy, r = pymax(hypot(dx, dy), 1.0), los = atan2(dy, dx);
-    if (sen->type == SEN_CAMERA && d[D_W] > 0.0 && d[D_WOK] > 0.0) {
+    if (sen->type == SEN_CAMERA && d[D_W] > 0.0 && d[D_WOK] > 0.0 && sen->siln) {
+        /* the box's width as the rectangle's corners give it from where the camera is (r_sil_angle) */
+        static const double step[3] = {0.05, 0.05, 0.01};
+        double H[3], wp = r_sil_angle(e, dx, dy);
+        for (int k = 0; k < 3; k++) {
+            double ep[3] = {e[0], e[1], e[2]}, em[3] = {e[0], e[1], e[2]};
+            ep[k] += step[k];
+            em[k] -= step[k];
+            H[k] = (r_sil_angle(ep, dx, dy) - r_sil_angle(em, dx, dy)) / (2.0 * step[k]);
+        }
+        double ux = dx / r, uy = dy / r;
+        double vr = ux * ux * P[0] + 2.0 * ux * uy * P[1] + uy * uy * P[RN + 1];
+        double dr = (r_sil_angle(e, dx + 0.05 * ux, dy + 0.05 * uy) - r_sil_angle(e, dx - 0.05 * ux, dy - 0.05 * uy)) / 0.1;
+        double R = pow(0.06 * d[D_W], 2.0) + pow(3.0 / exp(sen->logf), 2.0) + dr * dr * pymax(vr, 0.0);
+        r_extent_take(e, Pe, H, d[D_W] - wp, R, 16.0);
+    } else if (sen->type == SEN_CAMERA && d[D_W] > 0.0 && d[D_WOK] > 0.0) {
         double H[3], wp = r_silhouette(e, los, H) / r;
         for (int i = 0; i < 3; i++)
             H[i] /= r;
@@ -10223,7 +10392,7 @@ static double r_visible(Scan *s, int a, double cx, double cy)
         lo = s->sen.bmin;
         hi = s->sen.bmax;
         edged = 1;
-    } else if (s->sen.type == SEN_MICROWAVE) {
+    } else if (s->sen.type == SEN_MICROWAVE || s->sen.type == SEN_LEAD) {
         lo = -s->sen.fov;
         hi = s->sen.fov;
         edged = 1;
@@ -10325,6 +10494,15 @@ static void h_ratios(Scan *s)
         double dx = x[R_PX] - s->pose[0], dy = x[R_PY] - s->pose[1];
         double cx = cph * dx + sph * dy, cy = -sph * dx + cph * dy;
         double vis = r_visible(s, a, cx, cy);
+        if (s->sen.type == SEN_LEAD) {
+            /* what the road model's lead says is a place and a speed, not what could be seen of the object: the
+             * record of that stays the last scan's of a sensor that looks at objects */
+            const double *M0 = s->A + (Py_ssize_t)s->lold[a] * RROW + RO_M;
+            double *M1 = s->A + (Py_ssize_t)s->lrow[a] * RROW + RO_M;
+            M1[M_VIS] = M0[M_VIS];
+            M1[M_OCC] = M0[M_OCC];
+            M1[M_OCCBY] = M0[M_OCCBY];
+        }
         double psen = r_p_detect(&s->sen, cx, cy, x);
         s->lcov[a] = r_coverage(&s->sen, cx, cy);
         s->lvis[a] = vis;
@@ -10336,7 +10514,7 @@ static void h_ratios(Scan *s)
                            x_view_key(&s->sen), s->t, psen, vis);
         double pd = psen * vis;
         s->lpd[a] = pd;
-        if (s->lcov[a] <= 0.0)
+        if (s->lcov[a] <= 0.0 && s->sen.type != SEN_LEAD)
             s->A[(Py_ssize_t)s->lrow[a] * RROW + RO_M + M_OCC] = 3.0;    /* outside the sensor's field */
         double r = sigm(M[M_L]);
         s->lnr[a] = log(pymax(r, 1e-300));
@@ -10639,7 +10817,12 @@ static int32_t h_detchild(Scan *s, int a, int j)
             }
         }
     }
-    if (low) {
+    if (s->sen.type == SEN_LEAD) {
+        /* the road model's lead is a range and a range rate of an object, not evidence that there is one (its
+         * errors and the boxes' are of the same pixels): no existence, no sighting counted, the time of the last
+         * box as it was */
+        dl = 0.0;
+    } else if (low) {
         /* a box of the low-score list: it takes back the miss and adds the least a detection adds (it must not
          * confirm anything: no sighting counted, no score, no box remembered as a feature) */
         M[M_L] = pymax(-12.0, pymin(12.0, M[M_L] + pymin(dl, log(1.5))));
@@ -10647,7 +10830,8 @@ static int32_t h_detchild(Scan *s, int a, int j)
         M[M_L] = pymax(-12.0, pymin(12.0, M[M_L] + dl + d[D_SCORE]));
         M[M_HITS] += 1.0;
     }
-    M[M_THIT] = s->t;
+    if (s->sen.type != SEN_LEAD)
+        M[M_THIT] = s->t;
     if (!(s->sen.type == SEN_CAMERA && (base == K_B || base == K_BT)))
         M[M_RANGE_T] = s->t;                             /* a box cut at the bottom gives a direction only */
     if (d[D_W] > 0.0 && !low) {
@@ -10661,7 +10845,8 @@ static int32_t h_detchild(Scan *s, int a, int j)
         M[M_HOLD] = 2.0;                                 /* seen by a sensor that returns the parts of a thing */
     M[M_DET] = (double)j;
     M[M_SRC] = (double)s->src;
-    M[M_PD] = s->lpd[a];
+    if (s->sen.type != SEN_LEAD)
+        M[M_PD] = s->lpd[a];
     if (h_leaf_add(&H->tr[h], r) < 0)
         return -1;
     *slot = r;
@@ -11220,7 +11405,7 @@ static int scan_core(Hyp *H, Scan *sc, Py_ssize_t cap, const Py_ssize_t *th, Py_
             if (took)
                 h_ratios(sc);
         }
-        for (a = 0; a < nl; a++) {
+        for (a = 0; a < nl && sc->sen.type != SEN_LEAD; a++) {
             double *M = sc->A + (Py_ssize_t)sc->lrow[a] * RROW + RO_M;
             M[M_PD] = sc->lpd[a];
             M[M_COV] = sc->lcov[a];
@@ -11295,7 +11480,8 @@ static int scan_core(Hyp *H, Scan *sc, Py_ssize_t cap, const Py_ssize_t *th, Py_
             if (sc->mark[sc->lrow[a]] != 3)
                 continue;
             sc->mark[sc->lrow[a]] = 0;
-            if (sc->lpd[a] > 0.0)
+            if (sc->lpd[a] > 0.0 && sc->sen.type != SEN_LEAD)   /* (the road model's lead names one vehicle: of the
+                                                                  * others it says nothing) */
                 sc->A[(Py_ssize_t)sc->lrow[a] * RROW + RO_M + M_L] += log(pymax(1.0 - (sc->lpd[a] + sc->lpdlo[a]), 1e-3));
         }
         /* a detection no object could have given starts one by itself */
@@ -12667,7 +12853,8 @@ static PyObject *hyp_cycle(PyObject *self, PyObject *args)
         s.sen.grade_k = xcs.c[XC_GRADE];
         s.sen.lcol = xcs.c[XC_LCOL] != 0.0;
         s.sen.sil = xcs.c[XC_SIL] != 0.0;
-        s.sen.nax = xcs.c[XC_NAX] != 0.0;
+        s.sen.nax = ((int)xcs.c[XC_NAX] & 1) != 0;
+        s.sen.siln = ((int)xcs.c[XC_NAX] & 2) != 0;
         s.sen.nsprev = (int)pymin(pymax(xcs.c[XC_SPN], 0.0), (double)RSPREV);
         s.sen.sprev = s.sen.nsprev ? xcs.c + XC_SPT : NULL;
     }
@@ -12805,13 +12992,15 @@ static PyObject *hyp_cycle(PyObject *self, PyObject *args)
             T[ROT_PP] = tr->pp;
             T[ROT_NLEAF] = (double)tr->nleaf;
             T[ROT_INMAP] = tr->in_map ? 1.0 : 0.0;
-            if (M[M_COV] > 0.0)
+            if (M[M_COV] > 0.0 && s.sen.type != SEN_LEAD)
                 T[ROT_COVER] = t;
-            if (M[M_OCC] == 1.0 || M[M_OCC] == 2.0)      /* hidden by an object or cut by the edge in this scan */
+            if ((M[M_OCC] == 1.0 || M[M_OCC] == 2.0) && s.sen.type != SEN_LEAD)   /* hidden by an object or cut by the
+                                                                                    * edge in this scan */
                 T[ROT_HIDDEN] = t;
             int j = (int)M[M_DET];
             if (j >= 0) {
-                T[ROT_COVER] = t;
+                if (s.sen.type != SEN_LEAD)
+                    T[ROT_COVER] = t;
                 PyObject *o = Py_BuildValue("(ni)", pos[k], j);
                 if (o == NULL || PyList_Append(hits, o) < 0) {
                     Py_XDECREF(o);
