@@ -1377,6 +1377,7 @@ seeds 1-3, day and night; paired over the same runs, +- the bootstrap's 1 sigma)
 | `v_track` 1.0 | 82 -> 93 (+11 +- 3.7): `slow_lead` 7 -> 16; 0 / 0 / 0 / 0 | 71 -> 76 (+5 +- 2.2): `slow_lead` 6 -> 11; 0 / 0 / 0 / 1 |
 | all but `v_track` and the evidence rule | 82 -> 78 (-4 +- 3.6); 42 -> 42 warned; 0 / 0 / 1 (3.21 -> 3.14 s) / 3 | 71 -> 65 (-6 +- 3.3); 40 -> 40; 0 / 0 / 2 (3.48 -> 3.40, 1.55 -> 1.46 s) / 1 |
 | ... with `v_track` 1.0 (the proposed set less the evidence rule) | 82 -> 86 (+4 +- 4.6); 42 -> 42; 0 / 0 / 1 / 3 | 71 -> 67 (-4 +- 4.1); 40 -> 40; 0 / 0 / 3 (4.12 -> 3.41, 3.48 -> 3.40, 1.55 -> 1.46 s) / 2 |
+| the proposed set | 82 -> 80 (-2 +- 5.2): `slow_lead` 7 -> 15; 42 -> 42; 0 / 0 / 2 (3.23 -> 3.16, 3.21 -> 3.05 s) / 6 | 71 -> 66 (-5 +- 4.1): `slow_lead` 6 -> 10; 40 -> 40; 0 / 0 / 4 (4.12 -> 3.41, 3.48 -> 3.40, 3.31 -> 2.58, 1.55 -> 1.46 s) / 5 |
 
 `queue_creep` + `left_behind` (the reach modelled, seeds 1-6): 8 -> 5 false (-3 +- 2.5), `stopped_cruise_14` 4 of 6
 warned at the same frames, with or without `v_track`. The driver scenarios, the reach modelled, seeds 1-6, day
@@ -1388,7 +1389,7 @@ and night (48 runs; all but `v_track`):
 | `turn_parked` (12 runs) | 5 | 3 |
 | `narrow_oncoming` (12 runs) | 13 | 14 |
 | all three | 30 | 19 (-11 +- 1.0) |
-| `queue_start_stall`: warned; first said before contact, median (least) | 12 of 12; 1.19 s (0.56 s) | 12 of 12; 0.56 s (0.43 s); with `v_track` 0.60-0.71 s (0.49 s) |
+| `queue_start_stall`: warned; first said before contact, median (least) | 12 of 12; 1.19 s (0.56 s) | 12 of 12; 0.56 s (0.43 s); the proposed set 0.60-0.71 s (0.49 s), the three scenarios 30 -> 18 (-12 +- 1.4) |
 
 Every start was said by the base (12 of 12): its warning of the lead that stalls is the one it gives of every lead
 that starts, said as the car passes 3 m/s: in six of the twelve runs within a quarter of a second of the lead's
