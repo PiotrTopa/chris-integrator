@@ -1431,8 +1431,8 @@ the shadow log shows cautions in steady following, `v_track` is the knob to take
 
 Not solved, and why:
 
-* **Class 4**, the oncoming or standing vehicle passed on a narrow street (5 of 5; `narrow_oncoming` 13 of 12
-  runs): the driver passes 0.6-1 m from a body whose place the track knows to 0.3-0.7 m. What is right is the same
+* **Class 4**, the oncoming or standing vehicle passed on a narrow street (5 of 5; `narrow_oncoming` 13 episodes
+  in 12 runs): the driver passes 0.6-1 m from a body whose place the track knows to 0.3-0.7 m. What is right is the same
   interaction model across the car as `ego_follow` is along it (a driver who passes is steering by the thing it
   passes: the car's lateral place is not independent of the object's); not built.
 * **Class 2** beyond the arc: a stop the driver is about to make (parking), and the track's place of near objects
