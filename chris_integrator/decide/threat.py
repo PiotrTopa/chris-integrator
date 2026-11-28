@@ -109,6 +109,22 @@ DEFAULT_CFG = dict(
     # 2026-11-24 it holds none of the false episodes with comfortable braking (docs/DESIGN.md 17.2)
     place_hold=False, place_hold_decel=3.0, place_hold_range_rel=0.09, place_hold_sigma=2.0, place_hold_p=0.9,
     place_hold_level=1,
+    # The car's own spread in a turn (0: off). Its futures' lateral spread is that of a car keeping its lane
+    # (ego_lat_sigma, at most ego_lat_cap_m = 0.3 m); in a turn nothing keeps a lane: of what a future moves the car
+    # aside of the line it is on now, this share is not known (1 sigma, across the car, on top of the cap). Measured on
+    # the drives of 26/27 Nov 2026: the arc of the car's speed and yaw rate is off by 0.07 m after 1 s, 0.4 m after
+    # 2 s and 1.1 m after 3 s (median) in turns below 6 m/s, the road model's plan by 0.15 / 0.4 / 0.9 m: about a
+    # third of the lateral move itself (docs/DESIGN.md 17.3)
+    ego_turn_rel=0.0,
+    # What stands between the car and an object (False: off). A vehicle ahead on the car's most likely future cannot
+    # be reached before another object on that future nearer the car (existence at least screen_exist, sighted
+    # within screen_seen_s): its futures' weights are scaled by 1 - P(screened) (decide.objects[].screen). A future
+    # of the nearer one screens where it stays in the strip the car sweeps until the car would be at the further
+    # object and (a) is still the nearer one then (the car meets it first; its own record says what that takes), or
+    # (b) has by then driven through the place of an object not seen now (the radar's `occ` "object", or no sighting
+    # for screen_seen_s): the next vehicle of a queue, kept standing behind a leader that has driven off through
+    # its place. A leader driving into a standing vehicle in plain view screens nothing
+    screen=False, screen_exist=0.9, screen_seen_s=0.5,
 )
 
 
@@ -197,7 +213,8 @@ class ThreatModel:
                          list_min_p,
                          # (DX_HOLD..): a standing vehicle of two places: the level held while the range can still resolve
                          1.0 if c["place_hold"] else 0.0, c["place_hold_decel"], c["place_hold_range_rel"],
-                         c["place_hold_sigma"], c["place_hold_p"], float(c["place_hold_level"])], float)
+                         c["place_hold_sigma"], c["place_hold_p"], float(c["place_hold_level"]),
+                         c["ego_turn_rel"], 1.0 if c["screen"] else 0.0, c["screen_exist"], c["screen_seen_s"]], float)
 
     def frame(self, objects, ego, futures=None, path=None, road=None, shown=None, opt=0):
         """One radar message's decision (decide.c `decide_frame`): objects, ego: the message's; futures: a

@@ -3240,11 +3240,119 @@ EGO_SCENARIOS = {"park_out_curve": sc_park_out_curve}
 STALE_SCENARIOS = {"queue_creep": sc_queue_creep, "left_behind": sc_left_behind}
 
 
+# ---- the driver as a driver (docs/DESIGN.md 17.3): what the car does where the alert was said on the drives of
+# 26 / 27 November 2026 although nothing was wrong, and the same with something wrong ------------------------------
+def _queue_start(seed, stall):
+    rng = random.Random(seed * 101 + (36 if stall else 35))
+    t1 = 5.0 + rng.uniform(-1.0, 1.0)
+    a_l = rng.uniform(1.5, 2.0)                       # the lead's start
+    v_l = rng.uniform(9.0, 11.0)
+    a_e = a_l * rng.uniform(0.85, 1.0)                # the car's own: with the lead, a little less
+    gap = 2.3 + rng.uniform(0.0, 0.8)                 # standing, bumper to bumper
+    lead_v = [(0, 0.0), (t1, 0.0), (t1 + v_l / a_l, v_l)]
+    ego_v = [(0, 0.0), (t1 + 0.1, 0.0), (t1 + 0.11, v_l - 0.4)]
+    T = t1 + 14.0
+    spec = dict(speed=ego_v, curv=[(0, 0.0)], accel_lim=a_e, lead_range_m=100.0,
+                layout=dict(n_left=0, n_right=0, oncoming=True, park_right=0.0, park_left=0.0))
+    if stall:
+        # the lead brakes to a stop again 1.6-2.2 s after it started (3.5 m/s^2); the car goes on as it was
+        t_s = t1 + rng.uniform(1.6, 2.2)
+        v_s = a_l * (t_s - t1)
+        lead_v = [(0, 0.0), (t1, 0.0), (t_s, v_s), (t_s + v_s / 3.5, 0.0)]
+        w0 = World(seed=1, scenario=dict(T=T, speed=ego_v, curv=[(0, 0.0)]), targets=[], statics=False, accel_lim=a_e)
+        tt = w0.t - w0.t0
+        vl = np.interp(tt, [q[0] for q in lead_v], [q[1] for q in lead_v])
+        sl = np.concatenate([[0.0], np.cumsum(0.5 * (vl[1:] + vl[:-1]) * np.diff(tt))])
+        hit = np.flatnonzero(w0.s - w0.s[0] >= gap + sl)
+        t_col = float(tt[hit[0]]) if len(hit) else T
+        spec.update(collision_t=t_col, approach=float(np.interp(t_col, tt, w0.v)), mode="cruise")
+        T = t_col - 0.3
+    spec["T"] = T
+
+    def actors(w):
+        s0 = float(w.s[0]) + CAM_TO_AXLE + 2.1             # the car's front at the start
+        L = DIMS["car"][0]
+        a = [Actor(930, "car", "stopped_in_lane" if stall else "lead", s0 + gap + L / 2, speed=lead_v,
+                   lateral=[(0, rng.gauss(0, 0.15))])]
+        # the next one of the queue, hidden by the lead, starts 1.2 s before it
+        a.append(Actor(931, "car", "lead", s0 + gap + L * 1.5 + 4.0,
+                       speed=[(0, 0.0), (t1 - 1.2, 0.0), (t1 - 1.2 + v_l / a_l, v_l)], lateral=[(0, rng.gauss(0, 0.2))]))
+        if not stall:
+            w.spec["labels"] = [(930, t1 + 1.0, t1 + 8.0, ("follow", "keep"))]
+        return a
+    spec["actors"] = actors
+    return spec
+
+
+def sc_queue_start(seed, night):
+    """A queue starts (the drives of 2026-11-26, 15:25:06, 15:30:23, 15:59:08): the car stands 2.3-3.1 m behind a
+    lead's bumper, the lead pulls away at 1.5-2 m/s^2 to 9-11 m/s, and the car starts with it (a tenth of a second
+    later, at 0.85-1 of the lead's acceleration): at 3 m/s it is 3-4.5 m behind the lead's bumper and gaining speed
+    at 1.3-2 m/s^2, as a driver does who is following a start. The next vehicle of the queue stands ahead of the
+    lead, hidden by it, and starts 1.2 s before it. Nothing here is a conflict."""
+    return _queue_start(seed, False)
+
+
+def sc_queue_start_stall(seed, night):
+    """The same start, and the lead brakes to a stop again 1.6-2.2 s after it began (3.5 m/s^2) while the car goes
+    on gaining speed as it was: the driver is not looking. The run ends 0.3 s before the car's front would touch
+    the lead (`collision_t`)."""
+    return _queue_start(seed, True)
+
+
+def sc_turn_parked(seed, night):
+    """A turn among parked cars: a narrow one-way street at 8 m/s, the car slows to 4.5 m/s and turns left by 90
+    degrees on a radius of 10 m into another one; cars are parked on both sides before and after the turn (their
+    middles 2.5-3.0 m from the car's line) and one stands at the outside of the corner. The car's line passes all of
+    them by 0.5 m and more, as a driver steers; in the turn its straight-on and its present arc both run over one."""
+    rng = random.Random(seed * 101 + 37)
+
+    def actors(w):
+        a = _parked_row(rng, 100, 8.0, 42.0, -1, lat=(2.5, 3.0), p_gap=0.2, p_truck=0.0)
+        a += _parked_row(rng, 150, 8.0, 36.0, +1, lat=(2.5, 3.0), p_gap=0.4, p_truck=0.0)
+        a.append(Actor(190, "car", "parked", 53.0 + rng.uniform(-1.0, 1.0), lateral=[(0, -rng.uniform(2.9, 3.3))],
+                       yaw_rel=rng.gauss(0.0, 0.05)))
+        a += _parked_row(rng, 200, 67.0, 125.0, -1, lat=(2.5, 3.0), p_gap=0.2, p_truck=0.0)
+        a += _parked_row(rng, 300, 68.0, 125.0, +1, lat=(2.5, 3.0), p_gap=0.2, p_truck=0.0)
+        return a
+    return dict(T=22.0, speed=[(0, 8.0), (2.5, 8.0), (5.0, 4.5), (11.0, 4.5), (14.0, 8.0)],
+                curv=[(0, 0.0), (45, 0.0), (45, 1 / 10.0), (45 + 15.7, 1 / 10.0), (45 + 15.7, 0.0)],
+                actors=actors, lead_range_m=70.0 if night else 100.0,
+                layout=dict(n_left=0, n_right=0, oncoming=False, park_right=0.9, park_left=0.9))
+
+
+def sc_narrow_oncoming(seed, night):
+    """A narrow two-way street at 7 m/s: cars parked on the right (their middles 2.5-2.9 m from the car's line) and
+    oncoming cars at 4-7 m/s every 5-8 s whose middles pass 2.4-2.8 m to the left: 0.6-1 m between the bodies, as
+    drivers pass on such a street. Nobody leaves their line."""
+    rng = random.Random(seed * 101 + 38)
+
+    def actors(w):
+        a = _parked_row(rng, 100, 20.0, 330.0, -1, lat=(2.5, 2.9), p_gap=0.3, p_truck=0.0)
+        t, k = 0.0, 0
+        while t < 38.0:
+            v = rng.uniform(4.0, 7.0)
+            t_meet = t + 6.0
+            a.append(Actor(400 + k, "car", "oncoming", _ego_s(w, t_meet) + v * t_meet, speed=[(0, -v)],
+                           lateral=[(0, rng.uniform(2.4, 2.8))]))
+            k += 1
+            t += rng.uniform(5.0, 8.0)
+        return a
+    return dict(T=44.0, speed=[(0, 7.0)], curv=[(0, 0.0)], actors=actors, lead_range_m=70.0 if night else 100.0,
+                layout=dict(n_left=0, n_right=0, oncoming=True, park_right=0.9, park_left=0.0))
+
+
+# (not in ALERT_SCENARIOS: the tools and tests that walk that list are as they were)
+DRIVER_SCENARIOS = {"queue_start": sc_queue_start, "queue_start_stall": sc_queue_start_stall,
+                    "turn_parked": sc_turn_parked, "narrow_oncoming": sc_narrow_oncoming}
+
+
 def scenario(name, seed=1, night=False, world=None):
-    """A ScenarioWorld by name (SCENARIOS, PREDICT_SCENARIOS, EGO_SCENARIOS or ALERT_SCENARIOS). world: world
+    """A ScenarioWorld by name (SCENARIOS, PREDICT_SCENARIOS, EGO_SCENARIOS, STALE_SCENARIOS, DRIVER_SCENARIOS or
+    ALERT_SCENARIOS). world: world
     options (e.g. {"dims_spread": True}); also read from CHRIS_SIM_DET's "world" key (explicit `world` wins)."""
     fn = SCENARIOS.get(name) or PREDICT_SCENARIOS.get(name) or EGO_SCENARIOS.get(name) or STALE_SCENARIOS.get(name) \
-        or ALERT_SCENARIOS[name]
+        or DRIVER_SCENARIOS.get(name) or ALERT_SCENARIOS[name]
     spec = fn(seed, night)
     return ScenarioWorld(spec, seed=seed, name=name, night=night, world=world)
 

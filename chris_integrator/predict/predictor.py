@@ -20,6 +20,7 @@ NAMES, LANES, SLOTS, _W = _N.predict_names()
 NO, NS_, NF, NR, NB, NA, NE, NK, KMAX, EMODES = _W
 NATIVE_CFG = _N.predict_cfg()                 # {name: default} of the native constants, in the array's order
 _NAT_KEYS = tuple(NATIVE_CFG)
+_EGO_FOLLOW, _EGO_CTRA = NAMES.index("follow", NAMES.index("path")), NAMES.index("ctra")
 
 # object row (predict.c PO_*), state row, road row, band row, arm row
 (O_X, O_Y, O_VX, O_VY, O_AX, O_AY, O_SX, O_SY, O_SVX, O_SVY, O_KIND, O_PSTAT, O_LEN, O_WID, O_HDG, O_HDGSD, O_EXIST,
@@ -416,6 +417,8 @@ class Predictor:
         self.native_cfg = nat
         self._cfg = np.array([nat[k] for k in _NAT_KEYS])
         self.right_hand = nat["right_hand"] >= 0.0
+        self._efol_on = nat.get("ego_follow", 0.0) > 0.5 and nat.get("interact", 1.0) > 0.5
+        self._earc_on = nat.get("ego_arc", 0.0) > 0.5 and nat.get("ego_yaw_trend_s", 0.0) > 0.0
         self.times = sample_times(self.cfg)
         self._times = self.times.tolist()
         self._kin = _kin_table()
@@ -436,6 +439,7 @@ class Predictor:
         self._stood = {}                      # object id -> (time, +1 beside the road on the left / -1 right / 0 in the lane)
         self._lane_key = self._lanes = self._lane_nopath = None
         self._ground = None
+        self._efol = None
 
     def _state(self, ids):
         rows, S = self._rows, self._S
@@ -526,8 +530,19 @@ class Predictor:
             road[R_ROWL], road[R_ROWR] = self._row_odds
         centre, ameta, apts, xing, has_path = path_arrays(context)
         sig = context.get("turn_signal")
+        fol = self._efol if self._efol_on else None      # (belief "the driver follows the one ahead", when): native ego_follow
+        if fol is not None and not 0.0 <= T - fol[1] <= 1.0:
+            fol = self._efol = None
+        wdot = 0.0
+        if self._earc_on:                                 # the yaw rate's change over the last half second (native ego_arc)
+            et, ep = self.ego.t, self.ego.p
+            k = len(et) - 1
+            while k > 0 and T - et[k] < 0.5:
+                k -= 1
+            if k >= 0 and 0.3 <= T - et[k] <= 1.0:
+                wdot = (w - ep[k][4]) / (T - et[k])
         ego = np.array([v, w, acc, 1.0 if sig == "left" else -1.0 if sig == "right" else 0.0, 1.0 if has_path else 0.0,
-                        0.0, 0.0, 0.0])
+                        fol[0] if fol else 0.0, T - fol[1] if fol else 0.0, wdot])
         nt = len(self.times)
         lane, intent, feat = np.zeros((n, 7)), np.zeros((n, len(SLOTS))), np.zeros((n, NF))
         modes, traj = np.zeros((n, 5, KMAX)), np.full((n, KMAX, nt, 6), math.nan)
@@ -536,6 +551,14 @@ class Predictor:
                                  lane, intent, feat, modes, traj, ego_out, ego_traj, stats)
         if n:
             self._S[idx] = st
+        if self._efol_on and stats[7] >= 0.0:            # the car has a leader: the belief as this frame leaves it
+            pf = pc = 0.0
+            for m in range(int(ego_n)):
+                if int(ego_out[m, 1]) == _EGO_FOLLOW:
+                    pf = ego_out[m, 0]
+                elif int(ego_out[m, 1]) == _EGO_CTRA and has_path:
+                    pc = ego_out[m, 0]
+            self._efol = (min(0.98, max(0.02, pf / (1.0 - pc) if pc < 1.0 else 0.5)), T)
         self._learned(a, lane, feat)
         if self.cfg["row_odds_max"] > 1.0:
             self._row_odds = self._row_count(T, ids, a, feat, float(road[R_W]))

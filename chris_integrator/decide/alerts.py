@@ -57,6 +57,12 @@ ALERT_DEFAULTS = dict(
     # level is entered by time as ever. None: the evidence rule whatever the margin (a car half in the lane, P(in
     # the way) 0.4 for a second and a half, margin gone, was not said: the sum had not added up)
     entry_evidence_tm_s=None,
+    # ... the evidence rule also for an object whose velocity is not known yet: one tracked for less than this (the
+    # radar's `age_s`). Its futures run on a velocity of three to five sightings, which is the tracker's prior as much
+    # as a measurement; a conflict with it is entered by time only where the mass at the level is `entry_evidence` or
+    # more (someone stepping out in front of the car), and in proportion where it is just over the minimum (a car
+    # first seen 30 m off whose first velocity points across the road). None: off
+    entry_evidence_young_s=None,
     mass_min=None,                                  # {kind: (4 minima)}; None: threat.THRESHOLDS
     latch_imminent=True,
     switch_hold_s=0.3,
@@ -67,6 +73,11 @@ ALERT_DEFAULTS = dict(
     # steering suppressed a stage, the object left, and the held stage was then said without an object: 2-7 of
     # the said episodes of a set of the simulator's streets.) False: as before
     unsaid_needs_object=True,
+    # ... and (True) not said on the strength of its holds alone: a stage entered while suppressed (the car crawled
+    # behind a queue, the stage latched) is said when the suppression lifts only while its object's entry level NOW is
+    # one that is said (show_from at least); below that it stays unsaid, suppressed "held_unsaid", until the level is
+    # there again or the holds run out. The holds are there so that something SHOWN does not flicker. False: as before
+    unsaid_needs_level=False,
     # an object whose velocity is not observed yet (the radar's verdict unknown, its velocity's 1 sigma above
     # this, whichever futures are judged): its "it stands" is near the radar's prior, not evidence; it raises at
     # most `immature_max_stage` until p_stationary has moved to `immature_stand_p` (a lead appearing far ahead
@@ -252,6 +263,9 @@ class Alert:
             tm = (rec or {}).get("tm_s")
             if doubt and c["entry_evidence_tm_s"] is not None and isinstance(tm, (int, float)) and tm <= c["entry_evidence_tm_s"]:
                 doubt = False                       # acting cannot wait for the evidence
+            if not doubt and c["entry_evidence_young_s"] is not None and rec is not None:
+                age = (objs.get(rec["id"]) or {}).get("age_s")
+                doubt = isinstance(age, (int, float)) and age < c["entry_evidence_young_s"]
             for L in range(1, 5):
                 if le >= L:
                     # how sure the conflict is: its whole collision probability (the level is held by the mass at it;
@@ -298,6 +312,9 @@ class Alert:
             sup = self._suppress(rec, ctx)
             if sup is None and rec is None and not self.shown and c["unsaid_needs_object"] and c["source"] == "threat":
                 sup = "object_gone"
+            if sup is None and rec is not None and not self.shown and c["unsaid_needs_level"] and c["source"] == "threat" \
+                    and le < c["show_from"]:
+                sup = "held_unsaid"
             if sup is None and self.stage >= c["show_from"]:
                 self.shown = True
         else:

@@ -198,6 +198,18 @@ width and reads no column beyond the 25th), the further constants are optional, 
 where it exists: this Python runs with a version-12 binary built before the change, and the binary with the Python
 before it.
 
+Since 2026-11-28 (lane DSTART, docs/DESIGN.md 17.3) `predict_cfg()` has `v_track`, `start_go`, `ego_follow` (with
+`ego_front_m`, `ego_a_max`, `ego_ff`, `ego_dv_fol`, `ego_dv_free`, `ego_fol_hz`), `ego_arc` (with `ego_arc_r_min`,
+`ego_yaw_trend_s`), all off; the three spare numbers of `predict_frame`'s `ego` row are in use (`PE_FOL`,
+`PE_FOLDT`: the belief "the driver is following" of the frame before and the time since; `PE_WDOT`: the yaw rate's
+change over the last half second; zeros: none); `decide_frame` reads four further constants where its array reaches
+them (`DX_TURN_REL`, `DX_SCREEN`, `DX_SCREEN_EXIST`, `DX_SCREEN_SEEN`), writes `screen` into a record and, with
+`screen` on, keeps the ids of refuted objects in the dict of the levels shown under `"_refuted"`. With the knobs
+off the code computes what it computed before (the goldens and the three captures' dumps). No function's arguments
+or results changed shape and the native version is unchanged (16): this Python runs with a version-16 binary built
+before the change as long as the new constants are not named in `predict.json` (the predictor refuses a constant
+the binary does not have; the decision layer's further constants are ignored by it).
+
 ### Inputs the C code takes, and what it does with others
 
 * Arrays: float64 (index arrays: the platform's 64-bit integer), C-contiguous. The Python around a call makes

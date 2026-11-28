@@ -666,6 +666,19 @@ constants, each a switch):
   counts up to 0.3).
 * `ego_path_p` 0.95 (was 0.8): the car's straight-on future (`ctra`) held a fifth of the weight in every frame
   and ran through the bends' roadside cars; it still takes over where the yaw rate leaves the path.
+* `v_track`, `start_go`, `ego_follow`, `ego_arc` (all 0; lane DSTART, docs/DESIGN.md 17.3; `predict.json`
+  `{"native": {"v_track": 1.0, "start_go": 1, "ego_follow": 1, "ego_arc": 1}}`). `v_track` (m/s): a future starts
+  at the track's own speed where the track states it to this or better (in proportion up to 1.5 times it), not at
+  the predictor's second filter over it. `start_go`: a vehicle in a lane that gains speed below the road's speed
+  goes on gaining it (the car-following law's free term scaled to its acceleration; one that stood and has moved
+  off within 3 s at the law's own acceleration at least). `ego_follow`: the car behind a vehicle in its lane as the
+  follower its driver is: the gap between the bumpers (`ego_front_m` 2.1), no shorter gap asked for than the one the
+  driver keeps, the leader's acceleration fed forward (`ego_ff` 1), the driver's own acceleration up to `ego_a_max`
+  (2.5 m/s^2); "the driver is following" is kept from frame to frame (forgotten at `ego_fol_hz` 0.1 / s; a frame
+  against it counts in full; not kept while the car is faster than its leader by more than one to two sigma of the
+  leader's speed). `ego_arc`: the car's kinematic future (`ctra`, and the road's frame where no road is known) is
+  the arc of its speed and yaw rate (radius down to `ego_arc_r_min` 5 m), the yaw rate changing on for
+  `ego_yaw_trend_s` (0.5 s) as it has over the last half second.
 * `std_rho` (1; lane SPREAD): where the radar object carries `std_rho` (the radar box's `std_rho: true`) the
   place's covariance is [[sx^2, rho sx sy], [rho sx sy, sy^2]] and the needle is its long axis, whatever its
   direction: read at the same three or nine places along that axis, the two places' futures along it, and the
@@ -1173,6 +1186,25 @@ suppressed all along) and whose object is no longer a candidate is not said for 
 own steering suppressed a stage, the object left the list, and the held stage was then said without an object
 (`object: null`) until its minimum hold ran out: 2-7 of the said episodes of a set of the simulator's streets. An
 alert that was said keeps its holds as before, object or not.
+
+`unsaid_needs_level` (false; lane DSTART, docs/DESIGN.md 17.3): an alert that has not been said since it left none is
+said only while its object's entry level now is one that is said (`show_from` at least); below that it stays
+`suppressed: "held_unsaid"` until the level is there again or its holds run out. (The car creeps behind a queue, the
+stage goes to imminent under the low-speed suppression and latches; the lead pulls away, the level falls to
+information, the car passes 3 m/s, and the latched stage was said.)
+
+`entry_evidence_young_s` (null; e.g. 2.0): the evidence rule of `entry_evidence` also for an object tracked for less
+than this (the radar's `age_s`): its velocity is three to five sightings old.
+
+`{"threat": {"ego_turn_rel": 0.35}}` (0): the car's lateral spread in the collision probability is a lane keeper's
+(`ego_lat_sigma`, at most `ego_lat_cap_m`); with this, a share of what a future moves the car aside of the line it
+is on now is added to it (1 sigma, across the car). `{"threat": {"screen": true}}` (false): a vehicle (or a thing of
+no known kind) ahead on the car's most likely future is not reached before another object on that future nearer
+the car (existence at least `screen_exist` 0.9, sighted within `screen_seen_s` 0.5 s): its futures' weights are
+scaled by 1 - P(screened), and its record carries `"screen": P`. A future of the nearer object screens where it
+stays in the strip the car sweeps until the car would be at the further one and is then still the nearer one, or
+has by then driven through the place of an object that is not seen now (`occ: "object"`, or no sighting for
+`screen_seen_s`); an object refuted so stays refuted (screen 1) until it is sighted again.
 
 `tools/alert_truth.py run | sum | cmp`: the said episodes of the simulator's streets against the truth (true /
 arguable / false, the false ones by cause), the lead time on a scripted conflict's obstacle (the first said frame
