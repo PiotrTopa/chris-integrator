@@ -250,6 +250,8 @@ class ScenarioWorld(World):
             if abs(o["lane_offset"]) <= half_lane and (best is None or o["ref_x"] < best["x"]):
                 best = {"id": o["id"], "x": o["ref_x"], "y": o["y"], "vx": o["vx"], "vy": o["vy"], "kind": o["kind"],
                         "d": o["lane_offset"]}
+        if self.world_opts.get("lead_real"):
+            return self._lead_real(t, best)
         if best is None or not self.lead_noise:
             return best
         r = self.lead_range
@@ -259,6 +261,64 @@ class ScenarioWorld(World):
         best["x"] *= 1.0 + e
         best["vx"] += self._lead_rng.gauss(0.0, self._lead_vsig[0] + self._lead_vsig[1] * best["x"])
         return best
+
+    def _lead_real(self, t, best):
+        """The road model's lead with the error structure measured on the recorded drives of 26 / 27 November 2026
+        (world option `lead_real`; docs/RADAR.md, section 13; `LEAD_REAL`). `best`: the true lead (the nearest vehicle
+        in the ego's lane) or None. Returns it with "real": what the network says of it (prob, x, y, the range's
+        rate, the stated sigmas), or None where it reports no lead. One call per road frame (sim.VisionSim): the
+        slow errors and the "has it / has lost it" chain live from call to call."""
+        c = LEAD_REAL
+        st = self.__dict__.get("_lead_st")
+        if st is None:
+            r = random.Random(self.seed * 131 + 17)
+            st = self._lead_st = {"rng": r, "gx": _GM(r, 1.0, c["x_tau"]), "gv": _GM(r, 1.0, c["v_tau"]), "t": None, "on": True,
+                                  "id": None, "off_until": -1e18, "ofs": r.gauss(0.0, c["x_offset"])}
+        r = st["rng"]
+        dt = 0.08 if st["t"] is None else min(max(t - st["t"], 0.0), 1.0)
+        st["t"] = t
+        gx, gv = st["gx"].at(t), st["gv"].at(t)
+        if best is None:
+            st["id"] = None
+            return None
+        ego = self.truth_at(t)
+        v_ego = ego["v"]
+        # its speed is of an image pair pair_s apart: the lead as it was half that ago
+        old = next((o for o in self.actors_at(t - 0.5 * c["pair_s"], max_range=self.lead_range + 10.0) if o["id"] == best["id"]), None)
+        v_lead = math.hypot(old["vx"], old["vy"]) if old is not None else math.hypot(best["vx"], best["vy"])
+        vrel = (old["vx"] if old is not None else best["vx"]) - self.truth_at(t - 0.5 * c["pair_s"])["v"]
+        x = best["x"]
+        stands = v_lead < 0.3
+        closing = max(0.0, -vrel)
+        # does it report this vehicle: always when near; a vehicle that drives, less from have_m on; one that stands
+        # and is closed on, far less (a chain: it has it for a while, or it has not)
+        if stands and closing > c["stand_closing"]:
+            p_have = float(np.interp(x, c["stand_have"][0], c["stand_have"][1]))
+        else:
+            p_have = float(np.interp(x, c["have"][0], c["have"][1]))
+        if st["id"] != best["id"]:                       # another vehicle: looked at anew
+            st["id"], st["on"] = best["id"], r.random() < p_have
+        else:
+            k = 1.0 - math.exp(-dt / c["have_tau"])
+            if r.random() < k:
+                st["on"] = r.random() < p_have
+        if r.random() < dt / c["drop_every_s"]:          # a short loss inside a steady lead
+            st["off_until"] = t + r.uniform(*c["drop_s"])
+        if not st["on"] or t < st["off_until"]:
+            return None
+        moving = (not stands) or v_ego > 0.3
+        sx_true = (c["x_rel_move"] if moving else c["x_rel_still"]) * x
+        xm = x + st["ofs"] + gx * sx_true + r.gauss(0.0, c["x_white"] + c["x_white_rel"] * x)
+        if stands:
+            ve = c["v_stand_bias"] * v_ego + gv * (c["v_stand"] + c["v_stand_rel"] * v_ego) + r.gauss(0.0, c["v_white_stand"])
+            sv = c["sv_stand"] + c["sv_stand_rel"] * x * (1.0 if v_ego > 0.3 else 0.0)
+        else:
+            sv = c["sv_move"] + c["sv_move_rel"] * x
+            ve = -min(c["v_move_bias"] + c["v_move_bias_rel"] * v_lead, c["v_move_bias_max"]) + gv * sv + r.gauss(0.0, c["v_white_move"])
+        out = dict(best)
+        out["real"] = {"prob": round(r.uniform(*c["prob"]), 3), "x": max(xm, 0.6), "y": c["y_gain"] * best["y"] + r.gauss(0.0, c["y_white"]),
+                       "v_rel": vrel + ve, "x_std": max(c["sx_floor"], c["sx_rel"] * x), "y_std": c["y_std"], "v_std": sv}
+        return out
 
     def path_ahead(self, t, xs):
         """The road model's plan: the centre of the lane the ego is in, until the ego starts its lane change."""
@@ -622,11 +682,40 @@ def pose_params(v):
     return out
 
 
+# The road model's lead as measured on the recorded drives (docs/RADAR.md, section 13), for the world option
+# `lead_real` (ScenarioWorld._lead_real): against the stop distance + the car's odometer on approaches to a lead that
+# stands, the lead's own speed integrated, and the tracker's settled objects on the path.
+LEAD_REAL = dict(
+    # whether it reports the vehicle (probability >= 0.9), by distance: one that drives or that the car follows /
+    # one that stands and is closed on faster than stand_closing; held or lost for have_tau at a time
+    have=((0.0, 25.0, 32.0, 50.0, 65.0), (0.99, 0.98, 0.6, 0.2, 0.0)),
+    stand_have=((0.0, 8.0, 15.0, 25.0, 40.0), (0.99, 0.95, 0.7, 0.3, 0.1)), stand_closing=3.0, have_tau=1.0,
+    drop_every_s=170.0, drop_s=(0.05, 0.7),          # short losses inside a steady lead
+    prob=(0.97, 1.0),
+    # the distance: an offset per ride (where the network's zero is against the camera's), a slow part (share of the
+    # distance; while both stand a smaller one) that lives x_tau, a white part
+    x_offset=0.3, x_rel_move=0.085, x_rel_still=0.04, x_tau=1.2, x_white=0.05, x_white_rel=0.02,
+    sx_rel=0.09, sx_floor=0.27,                      # ... and what it states
+    # the range's rate, of an image pair pair_s apart. Of a lead that stands: a bias with the car's own speed, a slow
+    # part, a little white; states sv_stand (+ sv_stand_rel x the distance while the car moves). Of one that drives:
+    # it under-reads the opening (v_move_bias + v_move_bias_rel x its speed), a slow part of what it states, white
+    pair_s=0.2, v_tau=2.0,
+    v_stand_bias=0.05, v_stand=0.06, v_stand_rel=0.02, v_white_stand=0.02, sv_stand=0.04, sv_stand_rel=0.015,
+    v_move_bias=0.1, v_move_bias_rel=0.03, v_move_bias_max=0.35, v_white_move=0.1, sv_move=0.25, sv_move_rel=0.03,
+    # its lateral place says little of where the vehicle is in the lane
+    y_gain=0.2, y_white=0.17, y_std=0.19,
+)
+
+
 def det_params_arg(s):
     """A DetectorSim parameter dict from a command line / environment string: "detin" (DETIN), "detin_reid"
     (DETIN_REID), "detin_pose" (DETIN_POSE), or a JSON object ({"detin": true, ...} / {"detin_pose": true, ...} start
     from the preset and override; "pose": true or a dict of POSE overrides switches the pose head on)."""
     s = s.strip()
+    if s.endswith("+lead"):                         # ... with the road model's lead as measured (world `lead_real`)
+        d = det_params_arg(s[:-5])
+        d["world"] = dict(d.get("world") or {}, lead_real=True)
+        return d
     if s in ("detin", "detin_reid", "detin_pose"):
         return dict({"detin": DETIN, "detin_reid": DETIN_REID, "detin_pose": DETIN_POSE}[s])
     if s in _SCALE_PRESETS:                         # ... with the detector's scale rate (SCALE_DAY / SCALE_NIGHT)

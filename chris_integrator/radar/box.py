@@ -5,7 +5,8 @@ In:
     on_ego(msg)           or a plain vehicle feed (`ego`: speed_mps, yaw_rate_rps, accel_long_mps2)
     on_road_users(msg)    a camera's class detector (`road_users`, core/roadusers.py): bearing, ground range
     on_objects(msg)       a range sensor's detections (`objects` of kind radar / lidar, vehicle input API)
-    on_road(msg)          the road model's frame: its plan is the path the objects are judged against
+    on_road(msg)          the road model's frame: its plan is the path the objects are judged against; with the
+                          tracker's `in_lead` its lead is a range and a range rate of the vehicle ahead (sensor `lead`)
 
 Out, `frame(ts_mono_ns)` -> {"type": "radar", ...}: every object in the car frame of that time (x forward,
 y LEFT, origin the reference camera):
@@ -67,7 +68,7 @@ from ..core.roadusers import Camera
 from ..native import round                  # builtins.round, native where built
 from . import models as M
 from .ego import EgoMotion
-from .sensors import CAMERA_CFG, CameraBoxes, MicrowaveRadar
+from .sensors import CAMERA_CFG, CameraBoxes, MicrowaveRadar, RoadLead
 from .tracker import (M_HITS, M_RANGE_T, M_T, OT_CONS, OT_HASVS, OT_NCHECKS, OT_NLEAF, OT_PE, OT_PERR, OT_UNPRED, OT_VS,
                       Tracker)
 
@@ -138,6 +139,7 @@ class Radar:
         self.dropped = 0
         self._in_since = {}              # object id -> since when it has surely stood on the path
         self._threat_since = {}
+        self._lead = None                # when the road model's lead was last given to the tracker
 
     # ---- inputs -------------------------------------------------------------------------------------------
     def on_ego_state(self, msg):
@@ -280,6 +282,8 @@ class Radar:
                     # the bottom of the box is not the object's: the head's point is the row this box lacked. The
                     # contact lies no higher in the picture than the visible bottom: the Gaussian cut there
                     sg = pgn[1] * (tc["pose_gn_occ"] if under else 1.0)
+                    if tc["pose_gn_cut_deg"] > 0.0 and not under:    # cut by the view: an extrapolation (tracker.CFG)
+                        sg = math.hypot(sg, math.radians(tc["pose_gn_cut_deg"]))
                     gb = self.cam.ground(0.5 * (box[0] + box[2]), box[3])
                     rb = math.hypot(gb[0], gb[1]) if gb is not None else 0.0
                     if rb > 0.5:
@@ -436,8 +440,55 @@ class Radar:
                          "attrs": {k: o[k] for k in ("class", "prob") if k in o}})
         self._push((ts / NS, sid, sen, dets))
 
+    def _on_lead(self, msg, ts):
+        """The road model's lead as a scan of the tracker (`in_lead`; sensors.RoadLead): `leads[0]` where it is
+        probable enough, as the range of the vehicle's near face from the reference camera, its direction and the
+        range's rate (the lead's speed less the model's own of the same image pair: what the pair shows is how the
+        distance changes), with the model's stated spreads as far as the recorded drives bear them out
+        (docs/RADAR.md, section 13)."""
+        c = self.tracker.cfg
+        leads = msg.get("leads")
+        if not isinstance(leads, list) or not leads or not isinstance(leads[0], dict) or msg.get("valid") is False:
+            return
+        ld = leads[0]
+
+        def first(k):
+            v = ld.get(k)
+            v = v[0] if isinstance(v, list) and v else v
+            return float(v) if _fin(v) else None
+        p, x, y, v, sx, sy, sv = ld.get("prob"), first("x"), first("y"), first("v"), first("x_std"), first("y_std"), first("v_std")
+        if not _fin(p) or p < c["lead_prob"] or x is None or v is None or sx is None or sv is None:
+            return
+        x += c["lead_off_m"]
+        if not 0.5 < x <= c["lead_max_m"]:
+            return
+        t = ts / NS
+        last = self._lead
+        if last is not None and 0.0 <= t - last < c["lead_every_s"] - 0.01:
+            return
+        vm = (msg.get("pose") or {}).get("vx")
+        if not _fin(vm):
+            vm = msg.get("v_ego")
+        if not _fin(vm):
+            return
+        y = y or 0.0
+        r, az, rr = math.hypot(x, y), math.atan2(-y, x), v - vm          # (the road model's y is right)
+        if c["lead_v_bias"] > 0.0 and v > 0.3:           # of a lead that drives it under-reads the opening (measured)
+            rr += min(c["lead_v_bias_max"], c["lead_v_bias"] * v)
+        sr = max(c["lead_x_floor"], c["lead_x_k"] * sx)
+        sl = max(c["lead_y_std"], sy or 0.0)
+        sw = math.hypot(max(c["lead_v_floor"], c["lead_v_k"] * sv), c["lead_v_rel"] * x)
+        dt = min(max(t - last, 0.05), 10.0) if last is not None else 10.0
+        self._lead = t
+        kx, kv = max(1.0, c["lead_tau_x"] / dt), max(1.0, c["lead_tau_v"] / dt)
+        sen = RoadLead(c["lead_pd"], c["lead_other"], v_stand=c["lead_v_stand"] + c["lead_v_stand_rel"] * abs(vm),
+                       corr=(kx, kx, kv), open_sigma=c["lead_open"])
+        self._push((t, "lead", sen, [{"z": np.array([r, az, rr]), "R": np.array([sr * sr, (sl / r) ** 2, sw * sw]), "attrs": {}}]))
+
     def on_road(self, msg):
         plan, ts = msg.get("plan"), msg.get("ts_mono_ns")
+        if self.tracker.cfg["in_lead"] and isinstance(ts, int):
+            self._on_lead(msg, ts)
         if isinstance(plan, dict) and isinstance(plan.get("x"), list) and isinstance(plan.get("y"), list) \
                 and len(plan["x"]) >= 2 and len(plan["x"]) == len(plan["y"]) and isinstance(ts, int):
             xs = plan["x"]

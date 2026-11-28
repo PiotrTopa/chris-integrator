@@ -178,6 +178,13 @@ class VisionSim:
                     lead = {"prob": round(p if ld["x"] < 90 else 0.4 * p, 3), "x": [round(x, 2)], "y": [round(-ld["y"] + rng.gauss(0, 0.15), 2)],
                             "v": [round(vl, 3)], "a": [0.0], "x_std": [round(0.5 + 0.06 * d, 2)], "y_std": [0.3],
                             "v_std": [round(0.3 + 0.01 * d, 2)], "a_std": [1.0]}
+                if ld is not None and ld.get("real") is not None:
+                    # the lead with the error structure measured on recorded drives (the world's `lead_real`): its
+                    # speed is the model's own of this pair plus the range's rate as the network has it
+                    q = ld["real"]
+                    lead = {"prob": q["prob"], "x": [round(q["x"], 3)], "y": [round(-q["y"], 3)], "v": [round(vx + q["v_rel"], 3)],
+                            "a": [0.0], "x_std": [round(q["x_std"], 3)], "y_std": [round(q["y_std"], 3)],
+                            "v_std": [round(q["v_std"], 3)], "a_std": [1.0]}
                 if knocked:                                    # the incident's fake lead a few metres ahead
                     lead = {"prob": 0.8, "x": [round(5.5 + rng.gauss(0, 0.8), 2)], "y": [0.0], "v": [round(vx, 2)], "a": [0.0],
                             "x_std": [1.0], "y_std": [0.3], "v_std": [0.5], "a_std": [1.0]}
